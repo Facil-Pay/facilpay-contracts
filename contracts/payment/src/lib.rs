@@ -23,6 +23,7 @@ pub enum Error {
     PaymentNotFound = 1,
     InvalidStatus = 2,
     AlreadyProcessed = 3,
+    Unauthorized = 4,
 }
 
 #[contractevent]
@@ -39,6 +40,14 @@ pub struct PaymentRefunded {
     pub payment_id: u64,
     pub customer: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentCancelled {
+    pub payment_id: u64,
+    pub cancelled_by: Address,
+    pub timestamp: u64,
 }
 
 #[derive(Clone)]
@@ -160,6 +169,46 @@ impl PaymentContract {
             payment_id,
             customer: payment.customer,
             amount: payment.amount,
+        };
+
+        Ok(())
+    }
+
+    pub fn cancel_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Check authorization: caller must be customer, merchant, or admin
+        let is_authorized = payment.customer == caller || payment.merchant == caller;
+        if !is_authorized {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check payment status is Pending
+        match payment.status {
+            PaymentStatus::Pending => {
+                payment.status = PaymentStatus::Cancelled;
+            }
+            PaymentStatus::Completed => return Err(Error::InvalidStatus),
+            PaymentStatus::Refunded => return Err(Error::InvalidStatus),
+            PaymentStatus::Cancelled => return Err(Error::InvalidStatus),
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        let timestamp = env.ledger().timestamp();
+        PaymentCancelled {
+            payment_id,
+            cancelled_by: caller,
+            timestamp,
         };
 
         Ok(())
