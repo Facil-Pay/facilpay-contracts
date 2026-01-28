@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String,
+};
 
 #[derive(Clone)]
 #[contracttype]
@@ -200,15 +202,15 @@ impl RefundContract {
         // Transfer tokens from merchant to customer
         // Assuming merchant has approved this contract to spend tokens on their behalf
         let token_client = token::Client::new(&env, &refund.token);
-        
+
         // We use transfer_from to move funds from merchant to customer
         // The merchant must have authorized this contract.
         // If the merchant revoked auth or lacks funds, this will fail.
         let transfer_result = token_client.try_transfer_from(
             &env.current_contract_address(),
-            &refund.merchant, 
-            &refund.customer, 
-            &refund.amount
+            &refund.merchant,
+            &refund.customer,
+            &refund.amount,
         );
 
         match transfer_result {
@@ -216,7 +218,7 @@ impl RefundContract {
                 // Update status to Processed
                 refund.status = RefundStatus::Processed;
                 let processed_at = env.ledger().timestamp();
-                
+
                 // Store updated refund
                 env.storage()
                     .instance()
@@ -232,9 +234,9 @@ impl RefundContract {
                     processed_at,
                 }
                 .publish(&env);
-                
+
                 Ok(())
-            },
+            }
             Err(_) => {
                 // Return TransferFailed error, status remains Approved
                 Err(Error::TransferFailed)
