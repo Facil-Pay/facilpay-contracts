@@ -88,5 +88,6 @@ Processes refund requests:
 
 <!-- - [Website](https://facilpay.com) coming soon -->
 <!-- - [Documentation](https://docs.facilpay.com) coming soon -->
+- Telegram: https://t.me/+afM9uh7GGtVkYmZk
 - [API Repository](https://github.com/facilpay/facilpay-api)
 - [SDK Repository](https://github.com/facilpay/facilpay-sdk)
