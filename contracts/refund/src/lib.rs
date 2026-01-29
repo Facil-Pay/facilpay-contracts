@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String, Vec
 };
 
 #[derive(Clone)]
@@ -8,6 +8,12 @@ use soroban_sdk::{
 pub enum DataKey {
     Refund(u64),
     RefundCounter,
+    MerchantRefunds(Address, u64),
+    CustomerRefunds(Address, u64),
+    PaymentRefunds(u64, u64),
+    MerchantRefundCount(Address),
+    CustomerRefundCount(Address),
+    PaymentRefundCount(u64),
     Admin,
 }
 
@@ -144,6 +150,45 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::RefundCounter, &refund_id);
+
+        // Index refund by merchant
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRefundCount(merchant.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefunds(merchant.clone(), merchant_count), &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefundCount(merchant.clone()), &(merchant_count + 1));
+
+        // Index refund by customer
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerRefundCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerRefunds(customer.clone(), customer_count), &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerRefundCount(customer.clone()), &(customer_count + 1));
+
+        // Index refund by payment
+        let payment_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCount(payment_id))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRefunds(payment_id, payment_count), &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRefundCount(payment_id), &(payment_count + 1));
 
         // Emit RefundRequested event
         RefundRequested {
@@ -341,6 +386,141 @@ impl RefundContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    pub fn get_refunds_by_merchant(
+        env: Env,
+        merchant: Address,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Refund> {
+        let mut refunds = Vec::new(&env);
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRefundCount(merchant.clone()))
+            .unwrap_or(0);
+
+        if offset >= total_count {
+            return refunds;
+        }
+
+        let end = if offset + limit > total_count {
+            total_count
+        } else {
+            offset + limit
+        };
+
+        for i in offset..end {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get(&DataKey::MerchantRefunds(merchant.clone(), i))
+            {
+                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
+                    refunds.push_back(refund);
+                }
+            }
+        }
+
+        refunds
+    }
+
+    pub fn get_refund_count_by_merchant(env: Env, merchant: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantRefundCount(merchant))
+            .unwrap_or(0)
+    }
+
+    pub fn get_refunds_by_customer(
+        env: Env,
+        customer: Address,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Refund> {
+        let mut refunds = Vec::new(&env);
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerRefundCount(customer.clone()))
+            .unwrap_or(0);
+
+        if offset >= total_count {
+            return refunds;
+        }
+
+        let end = if offset + limit > total_count {
+            total_count
+        } else {
+            offset + limit
+        };
+
+        for i in offset..end {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get(&DataKey::CustomerRefunds(customer.clone(), i))
+            {
+                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
+                    refunds.push_back(refund);
+                }
+            }
+        }
+
+        refunds
+    }
+
+    pub fn get_refund_count_by_customer(env: Env, customer: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerRefundCount(customer))
+            .unwrap_or(0)
+    }
+
+    pub fn get_refunds_by_payment(
+        env: Env,
+        payment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Refund> {
+        let mut refunds = Vec::new(&env);
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCount(payment_id))
+            .unwrap_or(0);
+
+        if offset >= total_count {
+            return refunds;
+        }
+
+        let end = if offset + limit > total_count {
+            total_count
+        } else {
+            offset + limit
+        };
+
+        for i in offset..end {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get(&DataKey::PaymentRefunds(payment_id, i))
+            {
+                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
+                    refunds.push_back(refund);
+                }
+            }
+        }
+
+        refunds
+    }
+
+    pub fn get_refund_count_by_payment(env: Env, payment_id: u64) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCount(payment_id))
+            .unwrap_or(0)
     }
 }
 

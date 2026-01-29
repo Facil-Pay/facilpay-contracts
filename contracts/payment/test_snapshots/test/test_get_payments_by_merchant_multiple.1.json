@@ -26,9 +26,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "u64": "0"
                 }
               ]
             }
@@ -57,9 +54,6 @@
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                },
-                {
-                  "u64": "0"
                 }
               ]
             }
@@ -75,13 +69,19 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "cancel_payment",
+              "function_name": "create_payment",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "u64": "1"
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                },
+                {
+                  "i128": "3000"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
                 }
               ]
             }
@@ -90,7 +90,6 @@
         }
       ]
     ],
-    [],
     []
   ],
   "ledger": {
@@ -138,7 +137,7 @@
                           ]
                         },
                         "val": {
-                          "u64": "1"
+                          "u64": "2"
                         }
                       },
                       {
@@ -181,6 +180,24 @@
                               "symbol": "CustomerPayments"
                             },
                             {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                            },
+                            {
+                              "u64": "1"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": "3"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "CustomerPayments"
+                            },
+                            {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                             },
                             {
@@ -204,7 +221,7 @@
                           ]
                         },
                         "val": {
-                          "u64": "2"
+                          "u64": "3"
                         }
                       },
                       {
@@ -247,6 +264,24 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MerchantPayments"
+                            },
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                            },
+                            {
+                              "u64": "2"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u64": "3"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Payment"
                             },
                             {
@@ -282,14 +317,6 @@
                             },
                             {
                               "key": {
-                                "symbol": "expires_at"
-                              },
-                              "val": {
-                                "u64": "0"
-                              }
-                            },
-                            {
-                              "key": {
                                 "symbol": "id"
                               },
                               "val": {
@@ -311,7 +338,7 @@
                               "val": {
                                 "vec": [
                                   {
-                                    "symbol": "Cancelled"
+                                    "symbol": "Pending"
                                   }
                                 ]
                               }
@@ -366,7 +393,67 @@
                             },
                             {
                               "key": {
-                                "symbol": "expires_at"
+                                "symbol": "id"
+                              },
+                              "val": {
+                                "u64": "2"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "merchant"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "status"
+                              },
+                              "val": {
+                                "vec": [
+                                  {
+                                    "symbol": "Pending"
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "token"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Payment"
+                            },
+                            {
+                              "u64": "3"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "amount"
+                              },
+                              "val": {
+                                "i128": "3000"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "created_at"
                               },
                               "val": {
                                 "u64": "0"
@@ -374,10 +461,18 @@
                             },
                             {
                               "key": {
+                                "symbol": "customer"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "id"
                               },
                               "val": {
-                                "u64": "2"
+                                "u64": "3"
                               }
                             },
                             {
@@ -420,7 +515,7 @@
                           ]
                         },
                         "val": {
-                          "u64": "2"
+                          "u64": "3"
                         }
                       }
                     ]
