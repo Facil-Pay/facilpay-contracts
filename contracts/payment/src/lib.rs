@@ -1,11 +1,15 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec};
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
     Payment(u64),
     PaymentCounter,
+    CustomerPayments(Address, u64),
+    MerchantPayments(Address, u64),
+    CustomerPaymentCount(Address),
+    MerchantPaymentCount(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,7 +90,7 @@ impl PaymentContract {
         let payment = Payment {
             id: payment_id,
             customer: customer.clone(),
-            merchant,
+            merchant: merchant.clone(),
             amount,
             token,
             status: PaymentStatus::Pending,
@@ -99,6 +103,32 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::PaymentCounter, &payment_id);
+
+        // Index by customer
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerPaymentCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerPayments(customer.clone(), customer_count), &payment_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerPaymentCount(customer), &(customer_count + 1));
+
+        // Index by merchant
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantPaymentCount(merchant.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantPayments(merchant.clone(), merchant_count), &payment_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantPaymentCount(merchant), &(merchant_count + 1));
 
         payment_id
     }
@@ -212,6 +242,90 @@ impl PaymentContract {
         };
 
         Ok(())
+    }
+
+    pub fn get_payments_by_customer(
+        env: Env,
+        customer: Address,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerPaymentCount(customer.clone()))
+            .unwrap_or(0);
+
+        let mut payments = Vec::new(&env);
+        let start = offset;
+        let end = (offset + limit).min(total_count);
+
+        for i in start..end {
+            if let Some(payment_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::CustomerPayments(customer.clone(), i))
+            {
+                if let Some(payment) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
+                {
+                    payments.push_back(payment);
+                }
+            }
+        }
+
+        payments
+    }
+
+    pub fn get_payment_count_by_customer(env: Env, customer: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerPaymentCount(customer))
+            .unwrap_or(0)
+    }
+
+    pub fn get_payments_by_merchant(
+        env: Env,
+        merchant: Address,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantPaymentCount(merchant.clone()))
+            .unwrap_or(0);
+
+        let mut payments = Vec::new(&env);
+        let start = offset;
+        let end = (offset + limit).min(total_count);
+
+        for i in start..end {
+            if let Some(payment_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::MerchantPayments(merchant.clone(), i))
+            {
+                if let Some(payment) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Payment>(&DataKey::Payment(payment_id))
+                {
+                    payments.push_back(payment);
+                }
+            }
+        }
+
+        payments
+    }
+
+    pub fn get_payment_count_by_merchant(env: Env, merchant: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantPaymentCount(merchant))
+            .unwrap_or(0)
     }
 }
 
