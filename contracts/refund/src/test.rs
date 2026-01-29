@@ -18,8 +18,8 @@ fn test_request_refund_with_valid_data() {
 
     env.mock_all_auths();
 
-    let refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     assert_eq!(refund_id, 1u64);
 }
@@ -41,11 +41,23 @@ fn test_refund_id_increments_correctly() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    let refund_id1 = client
-        .request_refund(&merchant1, &payment_id1, &customer1, &amount, &token, &reason);
+    let refund_id1 = client.request_refund(
+        &merchant1,
+        &payment_id1,
+        &customer1,
+        &amount,
+        &token,
+        &reason,
+    );
 
-    let refund_id2 = client
-        .request_refund(&merchant2, &payment_id2, &customer2, &amount, &token, &reason);
+    let refund_id2 = client.request_refund(
+        &merchant2,
+        &payment_id2,
+        &customer2,
+        &amount,
+        &token,
+        &reason,
+    );
 
     assert_eq!(refund_id1, 1u64);
     assert_eq!(refund_id2, 2u64);
@@ -65,8 +77,8 @@ fn test_get_refund_by_id() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    let refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     let refund = client.get_refund(&refund_id);
 
@@ -102,14 +114,32 @@ fn test_request_multiple_refunds_and_retrieve_each() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    let refund_id1 = client
-        .request_refund(&merchant1, &payment_id1, &customer1, &amount1, &token, &reason);
+    let refund_id1 = client.request_refund(
+        &merchant1,
+        &payment_id1,
+        &customer1,
+        &amount1,
+        &token,
+        &reason,
+    );
 
-    let refund_id2 = client
-        .request_refund(&merchant2, &payment_id2, &customer2, &amount2, &token, &reason);
+    let refund_id2 = client.request_refund(
+        &merchant2,
+        &payment_id2,
+        &customer2,
+        &amount2,
+        &token,
+        &reason,
+    );
 
-    let refund_id3 = client
-        .request_refund(&merchant3, &payment_id3, &customer3, &amount3, &token, &reason);
+    let refund_id3 = client.request_refund(
+        &merchant3,
+        &payment_id3,
+        &customer3,
+        &amount3,
+        &token,
+        &reason,
+    );
 
     let refund1 = client.get_refund(&refund_id1);
     let refund2 = client.get_refund(&refund_id2);
@@ -143,8 +173,7 @@ fn test_request_refund_with_zero_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 }
 
 #[test]
@@ -162,8 +191,7 @@ fn test_request_refund_with_negative_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 }
 
 #[test]
@@ -181,8 +209,7 @@ fn test_request_refund_with_invalid_payment_id_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 }
 
 #[test]
@@ -210,8 +237,8 @@ fn test_refund_requested_event_is_emitted() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    let _refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let _refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     // Check that the event was emitted
     let events = env.events().all();
@@ -236,8 +263,8 @@ fn test_refund_stored_with_requested_status() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    let refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.status, RefundStatus::Requested);
@@ -257,8 +284,8 @@ fn test_request_refund_without_reason() {
     let reason = String::from_str(&env, ""); // Empty reason
 
     env.mock_all_auths();
-    let refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.reason, String::from_str(&env, ""));
@@ -279,8 +306,8 @@ fn test_request_refund_with_reason() {
     let reason = String::from_str(&env, "Customer not satisfied with product quality");
 
     env.mock_all_auths();
-    let refund_id = client
-        .request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
+    let refund_id =
+        client.request_refund(&merchant, &payment_id, &customer, &amount, &token, &reason);
 
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.reason, reason);
