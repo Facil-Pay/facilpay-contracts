@@ -28,7 +28,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 },
                 {
-                  "u64": "0"
+                  "u64": "3600"
                 }
               ]
             }
@@ -114,7 +114,7 @@
                                 "symbol": "expires_at"
                               },
                               "val": {
-                                "u64": "0"
+                                "u64": "3600"
                               }
                             },
                             {
