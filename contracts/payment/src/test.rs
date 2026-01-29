@@ -474,3 +474,280 @@ fn test_cancel_multiple_payments_correct_modification() {
     assert_eq!(payment1.status, PaymentStatus::Cancelled);
     assert_eq!(payment2.status, PaymentStatus::Pending);
 }
+
+
+#[test]
+fn test_get_payments_by_customer_multiple() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 3 payments for same customer
+    let id1 = client.create_payment(&customer, &merchant1, &1000, &token);
+    let id2 = client.create_payment(&customer, &merchant2, &2000, &token);
+    let id3 = client.create_payment(&customer, &merchant1, &3000, &token);
+
+    let payments = client.get_payments_by_customer(&customer, &10, &0);
+    assert_eq!(payments.len(), 3);
+    assert_eq!(payments.get(0).unwrap().id, id1);
+    assert_eq!(payments.get(1).unwrap().id, id2);
+    assert_eq!(payments.get(2).unwrap().id, id3);
+}
+
+#[test]
+fn test_get_payments_by_merchant_multiple() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 3 payments for same merchant
+    let id1 = client.create_payment(&customer1, &merchant, &1000, &token);
+    let id2 = client.create_payment(&customer2, &merchant, &2000, &token);
+    let id3 = client.create_payment(&customer1, &merchant, &3000, &token);
+
+    let payments = client.get_payments_by_merchant(&merchant, &10, &0);
+    assert_eq!(payments.len(), 3);
+    assert_eq!(payments.get(0).unwrap().id, id1);
+    assert_eq!(payments.get(1).unwrap().id, id2);
+    assert_eq!(payments.get(2).unwrap().id, id3);
+}
+
+#[test]
+fn test_customer_payment_count() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    assert_eq!(client.get_payment_count_by_customer(&customer), 0);
+
+    client.create_payment(&customer, &merchant, &1000, &token);
+    assert_eq!(client.get_payment_count_by_customer(&customer), 1);
+
+    client.create_payment(&customer, &merchant, &2000, &token);
+    assert_eq!(client.get_payment_count_by_customer(&customer), 2);
+
+    client.create_payment(&customer, &merchant, &3000, &token);
+    assert_eq!(client.get_payment_count_by_customer(&customer), 3);
+}
+
+#[test]
+fn test_merchant_payment_count() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    assert_eq!(client.get_payment_count_by_merchant(&merchant), 0);
+
+    client.create_payment(&customer, &merchant, &1000, &token);
+    assert_eq!(client.get_payment_count_by_merchant(&merchant), 1);
+
+    client.create_payment(&customer, &merchant, &2000, &token);
+    assert_eq!(client.get_payment_count_by_merchant(&merchant), 2);
+
+    client.create_payment(&customer, &merchant, &3000, &token);
+    assert_eq!(client.get_payment_count_by_merchant(&merchant), 3);
+}
+
+#[test]
+fn test_pagination_first_page() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 10 payments
+    for i in 1..=10 {
+        client.create_payment(&customer, &merchant, &(i * 100), &token);
+    }
+
+    let payments = client.get_payments_by_customer(&customer, &5, &0);
+    assert_eq!(payments.len(), 5);
+    assert_eq!(payments.get(0).unwrap().amount, 100);
+    assert_eq!(payments.get(4).unwrap().amount, 500);
+}
+
+#[test]
+fn test_pagination_second_page() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 10 payments
+    for i in 1..=10 {
+        client.create_payment(&customer, &merchant, &(i * 100), &token);
+    }
+
+    let payments = client.get_payments_by_customer(&customer, &5, &5);
+    assert_eq!(payments.len(), 5);
+    assert_eq!(payments.get(0).unwrap().amount, 600);
+    assert_eq!(payments.get(4).unwrap().amount, 1000);
+}
+
+#[test]
+fn test_pagination_limit_larger_than_total() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 3 payments
+    client.create_payment(&customer, &merchant, &1000, &token);
+    client.create_payment(&customer, &merchant, &2000, &token);
+    client.create_payment(&customer, &merchant, &3000, &token);
+
+    let payments = client.get_payments_by_customer(&customer, &100, &0);
+    assert_eq!(payments.len(), 3);
+}
+
+#[test]
+fn test_pagination_offset_beyond_available() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create 3 payments
+    client.create_payment(&customer, &merchant, &1000, &token);
+    client.create_payment(&customer, &merchant, &2000, &token);
+    client.create_payment(&customer, &merchant, &3000, &token);
+
+    let payments = client.get_payments_by_customer(&customer, &5, &10);
+    assert_eq!(payments.len(), 0);
+}
+
+#[test]
+fn test_query_customer_with_no_payments() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+
+    let payments = client.get_payments_by_customer(&customer, &10, &0);
+    assert_eq!(payments.len(), 0);
+
+    let count = client.get_payment_count_by_customer(&customer);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_query_merchant_with_no_payments() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let merchant = Address::generate(&env);
+
+    let payments = client.get_payments_by_merchant(&merchant, &10, &0);
+    assert_eq!(payments.len(), 0);
+
+    let count = client.get_payment_count_by_merchant(&merchant);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_payments_not_mixed_between_customers() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create payments for customer1
+    let id1 = client.create_payment(&customer1, &merchant, &1000, &token);
+    let id2 = client.create_payment(&customer1, &merchant, &2000, &token);
+
+    // Create payments for customer2
+    let id3 = client.create_payment(&customer2, &merchant, &3000, &token);
+
+    let payments1 = client.get_payments_by_customer(&customer1, &10, &0);
+    assert_eq!(payments1.len(), 2);
+    assert_eq!(payments1.get(0).unwrap().id, id1);
+    assert_eq!(payments1.get(1).unwrap().id, id2);
+
+    let payments2 = client.get_payments_by_customer(&customer2, &10, &0);
+    assert_eq!(payments2.len(), 1);
+    assert_eq!(payments2.get(0).unwrap().id, id3);
+}
+
+#[test]
+fn test_payments_not_mixed_between_merchants() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Create payments for merchant1
+    let id1 = client.create_payment(&customer, &merchant1, &1000, &token);
+    let id2 = client.create_payment(&customer, &merchant1, &2000, &token);
+
+    // Create payments for merchant2
+    let id3 = client.create_payment(&customer, &merchant2, &3000, &token);
+
+    let payments1 = client.get_payments_by_merchant(&merchant1, &10, &0);
+    assert_eq!(payments1.len(), 2);
+    assert_eq!(payments1.get(0).unwrap().id, id1);
+    assert_eq!(payments1.get(1).unwrap().id, id2);
+
+    let payments2 = client.get_payments_by_merchant(&merchant2, &10, &0);
+    assert_eq!(payments2.len(), 1);
+    assert_eq!(payments2.get(0).unwrap().id, id3);
+}
