@@ -28,6 +28,9 @@ pub enum Error {
     InvalidStatus = 2,
     AlreadyProcessed = 3,
     Unauthorized = 4,
+    PaymentExpired = 5,
+    NotExpired = 6,
+    NoExpiration = 7,
 }
 
 #[contractevent]
@@ -54,6 +57,13 @@ pub struct PaymentCancelled {
     pub timestamp: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentExpired {
+    pub payment_id: u64,
+    pub expiration_timestamp: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Payment {
@@ -64,6 +74,7 @@ pub struct Payment {
     pub token: Address,
     pub status: PaymentStatus,
     pub created_at: u64,
+    pub expires_at: u64,
 }
 
 #[contract]
@@ -77,6 +88,7 @@ impl PaymentContract {
         merchant: Address,
         amount: i128,
         token: Address,
+        expiration_duration: u64,
     ) -> u64 {
         customer.require_auth();
 
@@ -87,6 +99,13 @@ impl PaymentContract {
             .unwrap_or(0);
         let payment_id = counter + 1;
 
+        let current_timestamp = env.ledger().timestamp();
+        let expires_at = if expiration_duration > 0 {
+            current_timestamp + expiration_duration
+        } else {
+            0
+        };
+
         let payment = Payment {
             id: payment_id,
             customer: customer.clone(),
@@ -94,7 +113,8 @@ impl PaymentContract {
             amount,
             token,
             status: PaymentStatus::Pending,
-            created_at: env.ledger().timestamp(),
+            created_at: current_timestamp,
+            expires_at,
         };
 
         env.storage()
@@ -140,6 +160,54 @@ impl PaymentContract {
             .expect("Payment not found")
     }
 
+    pub fn is_payment_expired(env: &Env, payment_id: u64) -> bool {
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return false;
+        }
+        let payment = PaymentContract::get_payment(env, payment_id);
+        payment.expires_at > 0 && env.ledger().timestamp() > payment.expires_at
+    }
+
+    pub fn expire_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        // Retrieve payment from storage
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Check payment status is Pending
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Check payment has expiration set
+        if payment.expires_at == 0 {
+            return Err(Error::NoExpiration);
+        }
+
+        // Check current time is past expires_at
+        if env.ledger().timestamp() <= payment.expires_at {
+            return Err(Error::NotExpired);
+        }
+
+        // Update payment status to Cancelled
+        payment.status = PaymentStatus::Cancelled;
+
+        // Store updated payment back to storage
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        // Emit PaymentExpired event
+        PaymentExpired {
+            payment_id,
+            expiration_timestamp: payment.expires_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn complete_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
@@ -149,6 +217,11 @@ impl PaymentContract {
         }
 
         let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Before updating status, check if payment is expired
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::PaymentExpired);
+        }
 
         match payment.status {
             PaymentStatus::Pending => {
@@ -181,6 +254,11 @@ impl PaymentContract {
         }
 
         let mut payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Before updating status, check if payment is expired
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::PaymentExpired);
+        }
 
         match payment.status {
             PaymentStatus::Pending => {

@@ -22,13 +22,13 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "i128": "5000"
+                  "i128": "1000"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
                 },
                 {
-                  "u64": "0"
+                  "u64": "10"
                 }
               ]
             }
@@ -37,12 +37,13 @@
         }
       ]
     ],
+    [],
     []
   ],
   "ledger": {
     "protocol_version": 23,
     "sequence_number": 0,
-    "timestamp": 0,
+    "timestamp": 11,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -76,72 +77,6 @@
                         "key": {
                           "vec": [
                             {
-                              "symbol": "CustomerPaymentCount"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "1"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "CustomerPayments"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                            },
-                            {
-                              "u64": "0"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "1"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "MerchantPaymentCount"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "1"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "MerchantPayments"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                            },
-                            {
-                              "u64": "0"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u64": "1"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
                               "symbol": "Payment"
                             },
                             {
@@ -156,7 +91,7 @@
                                 "symbol": "amount"
                               },
                               "val": {
-                                "i128": "5000"
+                                "i128": "1000"
                               }
                             },
                             {
@@ -180,7 +115,7 @@
                                 "symbol": "expires_at"
                               },
                               "val": {
-                                "u64": "0"
+                                "u64": "10"
                               }
                             },
                             {
@@ -206,7 +141,7 @@
                               "val": {
                                 "vec": [
                                   {
-                                    "symbol": "Pending"
+                                    "symbol": "Cancelled"
                                   }
                                 ]
                               }
