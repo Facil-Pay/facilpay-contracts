@@ -1,20 +1,14 @@
 #![no_std]
-use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String, Vec
-};
+use soroban_sdk::{contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec};
 
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
     Refund(u64),
     RefundCounter,
-    MerchantRefunds(Address, u64),
-    CustomerRefunds(Address, u64),
-    PaymentRefunds(u64, u64),
-    MerchantRefundCount(Address),
-    CustomerRefundCount(Address),
-    PaymentRefundCount(u64),
-    Admin,
+    RefundsByStatus(RefundStatus, u64),
+    RefundStatusCount(RefundStatus),
+    RefundStatusIndex(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +31,8 @@ pub enum Error {
     NotApproved = 6,
     InvalidStatus = 5,
     AlreadyProcessed = 6,
+    RefundExceedsPayment = 7,
+    TotalRefundsExceedPayment = 8,
 }
 
 #[contractevent]
@@ -82,6 +78,7 @@ pub struct Refund {
     pub merchant: Address,
     pub customer: Address,
     pub amount: i128,
+    pub original_payment_amount: i128,
     pub token: Address,
     pub status: RefundStatus,
     pub requested_at: u64,
@@ -106,6 +103,7 @@ impl RefundContract {
         payment_id: u64,
         customer: Address,
         amount: i128,
+        original_payment_amount: i128,
         token: Address,
         reason: String,
     ) -> Result<u64, Error> {
@@ -117,10 +115,16 @@ impl RefundContract {
             return Err(Error::InvalidAmount);
         }
 
+        if amount > original_payment_amount {
+            return Err(Error::RefundExceedsPayment);
+        }
+
         // Validate payment_id is valid (greater than 0)
         if payment_id == 0 {
             return Err(Error::InvalidPaymentId);
         }
+
+        Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
 
         // Get and increment refund counter
         let counter: u64 = env
@@ -137,6 +141,7 @@ impl RefundContract {
             merchant: merchant.clone(),
             customer: customer.clone(),
             amount,
+            original_payment_amount,
             token: token.clone(),
             status: RefundStatus::Requested,
             requested_at: env.ledger().timestamp(),
@@ -150,6 +155,7 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::RefundCounter, &refund_id);
+        Self::add_to_status_index(&env, RefundStatus::Requested, refund_id);
 
         // Index refund by merchant
         let merchant_count: u64 = env
@@ -328,6 +334,8 @@ impl RefundContract {
             return Err(Error::InvalidStatus);
         }
 
+        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+
         // Update refund status to Approved
         refund.status = RefundStatus::Approved;
 
@@ -335,6 +343,7 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Approved, refund_id);
 
         // Emit RefundApproved event
         RefundApproved {
@@ -368,6 +377,8 @@ impl RefundContract {
             return Err(Error::InvalidStatus);
         }
 
+        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+
         // Update refund status to Rejected
         refund.status = RefundStatus::Rejected;
 
@@ -375,6 +386,7 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
 
         // Emit RefundRejected event
         RefundRejected {
@@ -388,139 +400,169 @@ impl RefundContract {
         Ok(())
     }
 
-    pub fn get_refunds_by_merchant(
-        env: Env,
-        merchant: Address,
+    pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.status != RefundStatus::Approved {
+            return Err(Error::InvalidStatus);
+        }
+
+        Self::can_refund_payment(
+            &env,
+            refund.payment_id,
+            refund.amount,
+            refund.original_payment_amount,
+        )?;
+
+        Self::remove_from_status_index(&env, RefundStatus::Approved, refund_id)?;
+        refund.status = RefundStatus::Processed;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Processed, refund_id);
+
+        Ok(())
+    }
+
+    pub fn get_refunds_by_status(
+        env: &Env,
+        status: RefundStatus,
         limit: u64,
         offset: u64,
     ) -> Vec<Refund> {
-        let mut refunds = Vec::new(&env);
-        let total_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MerchantRefundCount(merchant.clone()))
-            .unwrap_or(0);
+        let mut results: Vec<Refund> = Vec::new(env);
+        let total = Self::get_refund_count_by_status(env, status.clone());
 
-        if offset >= total_count {
-            return refunds;
+        if limit == 0 || offset >= total {
+            return results;
         }
 
-        let end = if offset + limit > total_count {
-            total_count
-        } else {
-            offset + limit
-        };
-
-        for i in offset..end {
+        let end = core::cmp::min(total, offset.saturating_add(limit));
+        let mut index = offset;
+        while index < end {
             if let Some(refund_id) = env
                 .storage()
                 .instance()
-                .get(&DataKey::MerchantRefunds(merchant.clone(), i))
+                .get::<_, u64>(&DataKey::RefundsByStatus(status.clone(), index))
             {
-                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
-                    refunds.push_back(refund);
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    results.push_back(refund);
                 }
             }
+            index += 1;
         }
 
-        refunds
+        results
     }
 
-    pub fn get_refund_count_by_merchant(env: Env, merchant: Address) -> u64 {
+    pub fn get_refund_count_by_status(env: &Env, status: RefundStatus) -> u64 {
         env.storage()
             .instance()
-            .get(&DataKey::MerchantRefundCount(merchant))
+            .get(&DataKey::RefundStatusCount(status))
             .unwrap_or(0)
     }
 
-    pub fn get_refunds_by_customer(
-        env: Env,
-        customer: Address,
-        limit: u64,
-        offset: u64,
-    ) -> Vec<Refund> {
-        let mut refunds = Vec::new(&env);
-        let total_count: u64 = env
+    pub fn get_total_refunded_amount(env: &Env, payment_id: u64) -> i128 {
+        let total_refunds: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::CustomerRefundCount(customer.clone()))
+            .get(&DataKey::RefundCounter)
             .unwrap_or(0);
+        let mut total: i128 = 0;
 
-        if offset >= total_count {
-            return refunds;
-        }
-
-        let end = if offset + limit > total_count {
-            total_count
-        } else {
-            offset + limit
-        };
-
-        for i in offset..end {
-            if let Some(refund_id) = env
-                .storage()
-                .instance()
-                .get(&DataKey::CustomerRefunds(customer.clone(), i))
-            {
-                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
-                    refunds.push_back(refund);
+        let mut id: u64 = 1;
+        while id <= total_refunds {
+            if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(id)) {
+                if refund.payment_id == payment_id && refund.status == RefundStatus::Processed {
+                    total += refund.amount;
                 }
             }
+            id += 1;
         }
 
-        refunds
+        total
     }
 
-    pub fn get_refund_count_by_customer(env: Env, customer: Address) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::CustomerRefundCount(customer))
-            .unwrap_or(0)
-    }
-
-    pub fn get_refunds_by_payment(
-        env: Env,
+    pub fn can_refund_payment(
+        env: &Env,
         payment_id: u64,
-        limit: u64,
-        offset: u64,
-    ) -> Vec<Refund> {
-        let mut refunds = Vec::new(&env);
-        let total_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PaymentRefundCount(payment_id))
-            .unwrap_or(0);
-
-        if offset >= total_count {
-            return refunds;
+        requested_amount: i128,
+        original_amount: i128,
+    ) -> Result<bool, Error> {
+        let total_refunded = Self::get_total_refunded_amount(env, payment_id);
+        if requested_amount.saturating_add(total_refunded) > original_amount {
+            return Err(Error::TotalRefundsExceedPayment);
         }
 
-        let end = if offset + limit > total_count {
-            total_count
-        } else {
-            offset + limit
-        };
-
-        for i in offset..end {
-            if let Some(refund_id) = env
-                .storage()
-                .instance()
-                .get(&DataKey::PaymentRefunds(payment_id, i))
-            {
-                if let Some(refund) = env.storage().instance().get(&DataKey::Refund(refund_id)) {
-                    refunds.push_back(refund);
-                }
-            }
-        }
-
-        refunds
+        Ok(true)
     }
 
-    pub fn get_refund_count_by_payment(env: Env, payment_id: u64) -> u64 {
+    fn add_to_status_index(env: &Env, status: RefundStatus, refund_id: u64) {
+        let count = Self::get_refund_count_by_status(env, status.clone());
         env.storage()
             .instance()
-            .get(&DataKey::PaymentRefundCount(payment_id))
-            .unwrap_or(0)
+            .set(&DataKey::RefundsByStatus(status.clone(), count), &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundStatusCount(status.clone()), &(count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundStatusIndex(refund_id), &count);
+    }
+
+    fn remove_from_status_index(
+        env: &Env,
+        status: RefundStatus,
+        refund_id: u64,
+    ) -> Result<(), Error> {
+        let count = Self::get_refund_count_by_status(env, status.clone());
+        if count == 0 {
+            return Err(Error::InvalidStatus);
+        }
+
+        let index: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundStatusIndex(refund_id))
+            .ok_or(Error::InvalidStatus)?;
+        let last_index = count - 1;
+
+        if index != last_index {
+            let last_refund_id: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RefundsByStatus(status.clone(), last_index))
+                .ok_or(Error::InvalidStatus)?;
+            env.storage()
+                .instance()
+                .set(&DataKey::RefundsByStatus(status.clone(), index), &last_refund_id);
+            env.storage()
+                .instance()
+                .set(&DataKey::RefundStatusIndex(last_refund_id), &index);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::RefundsByStatus(status.clone(), last_index));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RefundStatusIndex(refund_id));
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundStatusCount(status), &last_index);
+
+        Ok(())
     }
 }
 
