@@ -191,10 +191,34 @@
                             },
                             {
                               "key": {
+                                "symbol": "dispute_started_at"
+                              },
+                              "val": {
+                                "u64": "0"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "escalation_level"
+                              },
+                              "val": {
+                                "u64": "0"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "id"
                               },
                               "val": {
                                 "u64": "1"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "last_activity_at"
+                              },
+                              "val": {
+                                "u64": "0"
                               }
                             },
                             {

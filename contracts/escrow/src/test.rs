@@ -453,3 +453,87 @@ fn test_multiple_escrows() {
     assert_eq!(escrow2.merchant, merchant2);
     assert_eq!(escrow2.amount, 2000_i128);
 }
+
+#[test]
+fn test_submit_evidence_by_both_parties() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+    env.ledger().set_timestamp(1200);
+    client.submit_evidence(&customer, &escrow_id, &String::from_str(&env, "ipfs://hash1"));
+    env.ledger().set_timestamp(1300);
+    client.submit_evidence(&merchant, &escrow_id, &String::from_str(&env, "ipfs://hash2"));
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 2);
+    let items = client.get_evidence(&escrow_id, &10_u64, &0_u64);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items.get(0).unwrap().submitter, customer);
+    assert_eq!(items.get(1).unwrap().submitter, merchant);
+}
+
+#[test]
+fn test_auto_resolve_to_customer_on_timeout() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+    env.ledger().set_timestamp(1200);
+    client.submit_evidence(&customer, &escrow_id, &String::from_str(&env, "ipfs://cust"));
+    env.ledger().set_timestamp(1801);
+    client.auto_resolve_dispute(&escrow_id);
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn test_auto_resolve_to_merchant_on_timeout() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&merchant, &escrow_id);
+    env.ledger().set_timestamp(1200);
+    client.submit_evidence(&merchant, &escrow_id, &String::from_str(&env, "ipfs://merch"));
+    env.ledger().set_timestamp(1801);
+    client.auto_resolve_dispute(&escrow_id);
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_escalate_dispute() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+    client.escalate_dispute(&customer, &escrow_id);
+    let mut escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.escalation_level, 1);
+    client.escalate_dispute(&merchant, &escrow_id);
+    escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.escalation_level, 2);
+}

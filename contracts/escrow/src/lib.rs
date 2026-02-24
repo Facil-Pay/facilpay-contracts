@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
 };
 
 #[derive(Clone)]
@@ -12,6 +12,8 @@ pub enum DataKey {
     MerchantEscrows(Address, u64),
     CustomerEscrowCount(Address),
     MerchantEscrowCount(Address),
+    EscrowEvidence(u64, u64),
+    EscrowEvidenceCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,6 +34,7 @@ pub enum Error {
     Unauthorized = 4,
     ReleaseNotYetAvailable = 5,
     NotDisputed = 6,
+    TimeoutNotReached = 7,
 }
 
 #[contractevent]
@@ -68,6 +71,21 @@ pub struct EscrowResolved {
     pub amount: i128,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceSubmitted {
+    pub escrow_id: u64,
+    pub submitter: Address,
+    pub ipfs_hash: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeEscalated {
+    pub escrow_id: u64,
+    pub level: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Escrow {
@@ -79,6 +97,17 @@ pub struct Escrow {
     pub status: EscrowStatus,
     pub created_at: u64,
     pub release_timestamp: u64,
+    pub dispute_started_at: u64,
+    pub last_activity_at: u64,
+    pub escalation_level: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct Evidence {
+    pub submitter: Address,
+    pub ipfs_hash: String,
+    pub submitted_at: u64,
 }
 
 #[contract]
@@ -114,6 +143,9 @@ impl EscrowContract {
             status: EscrowStatus::Locked,
             created_at: current_timestamp,
             release_timestamp,
+            dispute_started_at: 0,
+            last_activity_at: current_timestamp,
+            escalation_level: 0,
         };
 
         env.storage()
@@ -228,6 +260,8 @@ impl EscrowContract {
         match escrow.status {
             EscrowStatus::Locked => {
                 escrow.status = EscrowStatus::Disputed;
+                escrow.dispute_started_at = env.ledger().timestamp();
+                escrow.last_activity_at = escrow.dispute_started_at;
             }
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
@@ -244,6 +278,164 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        Ok(())
+    }
+
+    pub fn submit_evidence(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        ipfs_hash: String,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowEvidenceCount(escrow_id))
+            .unwrap_or(0);
+        let evidence = Evidence {
+            submitter: caller.clone(),
+            ipfs_hash: ipfs_hash.clone(),
+            submitted_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowEvidence(escrow_id, count), &evidence);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowEvidenceCount(escrow_id), &(count + 1));
+        escrow.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        EvidenceSubmitted {
+            escrow_id,
+            submitter: caller,
+            ipfs_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_evidence_count(env: &Env, escrow_id: u64) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowEvidenceCount(escrow_id))
+            .unwrap_or(0)
+    }
+
+    pub fn get_evidence(
+        env: Env,
+        escrow_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Evidence> {
+        let total: u64 = EscrowContract::get_evidence_count(&env, escrow_id);
+        let mut items = Vec::new(&env);
+        if limit == 0 || offset >= total {
+            return items;
+        }
+        let end = core::cmp::min(total, offset.saturating_add(limit));
+        let mut i = offset;
+        while i < end {
+            if let Some(ev) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Evidence>(&DataKey::EscrowEvidence(escrow_id, i))
+            {
+                items.push_back(ev);
+            }
+            i += 1;
+        }
+        items
+    }
+
+    pub fn escalate_dispute(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        escrow.escalation_level = escrow.escalation_level.saturating_add(1);
+        escrow.last_activity_at = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        DisputeEscalated {
+            escrow_id,
+            level: escrow.escalation_level,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn auto_resolve_dispute(env: Env, escrow_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        let now = env.ledger().timestamp();
+        let last = if escrow.last_activity_at == 0 {
+            escrow.dispute_started_at
+        } else {
+            escrow.last_activity_at
+        };
+        let timeout: u64 = 500;
+        if now.saturating_sub(last) < timeout {
+            return Err(Error::TimeoutNotReached);
+        }
+        let total = EscrowContract::get_evidence_count(&env, escrow_id);
+        let mut cust: u64 = 0;
+        let mut merch: u64 = 0;
+        let mut i: u64 = 0;
+        while i < total {
+            if let Some(ev) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Evidence>(&DataKey::EscrowEvidence(escrow_id, i))
+            {
+                if ev.submitter == escrow.customer {
+                    cust = cust.saturating_add(1);
+                } else if ev.submitter == escrow.merchant {
+                    merch = merch.saturating_add(1);
+                }
+            }
+            i += 1;
+        }
+        let release_to_merchant = merch > cust;
+        escrow.status = if release_to_merchant {
+            EscrowStatus::Released
+        } else {
+            EscrowStatus::Resolved
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        EscrowResolved {
+            escrow_id,
+            released_to_merchant: release_to_merchant,
+            amount: escrow.amount,
+        }
+        .publish(&env);
         Ok(())
     }
 
