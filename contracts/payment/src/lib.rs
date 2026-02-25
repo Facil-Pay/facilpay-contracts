@@ -14,6 +14,17 @@ pub enum DataKey {
     CustomerPaymentCount(Address),
     MerchantPaymentCount(Address),
     PaymentNotes(u64),
+    ConversionRate(Currency),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum Currency {
+    XLM,
+    USDC,
+    USDT,
+    BTC,
+    ETH,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -38,6 +49,7 @@ pub enum Error {
     TransferFailed = 8,
     MetadataTooLarge = 9,
     NotesTooLarge = 10,
+    InvalidCurrency = 11,
 }
 
 #[contractevent]
@@ -79,6 +91,7 @@ pub struct Payment {
     pub merchant: Address,
     pub amount: i128,
     pub token: Address,
+    pub currency: Currency,
     pub status: PaymentStatus,
     pub created_at: u64,
     pub expires_at: u64,
@@ -108,10 +121,16 @@ impl PaymentContract {
         merchant: Address,
         amount: i128,
         token: Address,
+        currency: Currency,
         expiration_duration: u64,
         metadata: String,
     ) -> Result<u64, Error> {
         customer.require_auth();
+
+        // Validate currency
+        if !PaymentContract::is_valid_currency(&currency) {
+            return Err(Error::InvalidCurrency);
+        }
 
         // Validate metadata size
         if metadata.len() > MAX_METADATA_SIZE {
@@ -138,6 +157,7 @@ impl PaymentContract {
             merchant: merchant.clone(),
             amount,
             token,
+            currency,
             status: PaymentStatus::Pending,
             created_at: current_timestamp,
             expires_at,
@@ -506,6 +526,40 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::MerchantPaymentCount(merchant))
             .unwrap_or(0)
+    }
+
+    fn is_valid_currency(currency: &Currency) -> bool {
+        matches!(currency, Currency::XLM | Currency::USDC | Currency::USDT | Currency::BTC | Currency::ETH)
+    }
+
+    pub fn set_conversion_rate(env: Env, admin: Address, currency: Currency, rate: i128) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if !PaymentContract::is_valid_currency(&currency) {
+            return Err(Error::InvalidCurrency);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ConversionRate(currency), &rate);
+
+        Ok(())
+    }
+
+    pub fn get_conversion_rate(env: Env, currency: Currency) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConversionRate(currency))
+            .unwrap_or(1_0000000)
     }
 }
 
