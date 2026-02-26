@@ -35,6 +35,7 @@ pub enum Error {
     ReleaseNotYetAvailable = 5,
     NotDisputed = 6,
     TimeoutNotReached = 7,
+    ReleaseOnHoldPeriod = 7,
 }
 
 #[contractevent]
@@ -108,6 +109,7 @@ pub struct Evidence {
     pub submitter: Address,
     pub ipfs_hash: String,
     pub submitted_at: u64,
+    pub min_hold_period: u64,
 }
 
 #[contract]
@@ -122,6 +124,7 @@ impl EscrowContract {
         amount: i128,
         token: Address,
         release_timestamp: u64,
+        min_hold_period: u64,
     ) -> u64 {
         customer.require_auth();
 
@@ -146,6 +149,7 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
+            min_hold_period,
         };
 
         env.storage()
@@ -205,8 +209,15 @@ impl EscrowContract {
             .expect("Escrow not found")
     }
 
-    pub fn release_escrow(env: Env, admin: Address, escrow_id: u64) -> Result<(), Error> {
+    pub fn release_escrow(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        early_release: bool,
+    ) -> Result<(), Error> {
         admin.require_auth();
+
+        let current_time: u64 = env.ledger().timestamp();
 
         // Check if escrow exists
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
@@ -217,9 +228,15 @@ impl EscrowContract {
 
         match escrow.status {
             EscrowStatus::Locked => {
-                // Check current time has passed release_timestamp
-                if env.ledger().timestamp() < escrow.release_timestamp {
-                    return Err(Error::ReleaseNotYetAvailable);
+                // Enforce timelock unless admin approves early release
+                if !early_release {
+                    if current_time < escrow.release_timestamp {
+                        return Err(Error::ReleaseNotYetAvailable);
+                    }
+
+                    if current_time < escrow.created_at + escrow.min_hold_period {
+                        return Err(Error::ReleaseOnHoldPeriod);
+                    }
                 }
                 escrow.status = EscrowStatus::Released;
             }

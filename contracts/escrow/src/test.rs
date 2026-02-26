@@ -15,10 +15,18 @@ fn test_create_escrow() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 10_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
     assert_eq!(escrow_id, 1);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -29,6 +37,7 @@ fn test_create_escrow() {
     assert_eq!(escrow.token, token);
     assert_eq!(escrow.status, EscrowStatus::Locked);
     assert_eq!(escrow.release_timestamp, release_timestamp);
+    assert_eq!(escrow.min_hold_period, min_hold_period);
 }
 
 #[test]
@@ -42,10 +51,18 @@ fn test_get_escrow() {
     let token = Address::generate(&env);
     let amount = 5000_i128;
     let release_timestamp = 2000_u64;
+    let min_hold_period = 10_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     let escrow = client.get_escrow(&escrow_id);
 
@@ -56,6 +73,7 @@ fn test_get_escrow() {
     assert_eq!(escrow.token, token);
     assert_eq!(escrow.status, EscrowStatus::Locked);
     assert_eq!(escrow.release_timestamp, release_timestamp);
+    assert_eq!(escrow.min_hold_period, min_hold_period);
 }
 
 #[test]
@@ -81,13 +99,21 @@ fn test_release_escrow_success() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Release the escrow
-    client.release_escrow(&admin, &escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 
     // Verify status changed to Released
     let escrow = client.get_escrow(&escrow_id);
@@ -108,13 +134,21 @@ fn test_release_escrow_before_release_timestamp() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Try to release before release timestamp - should fail
-    client.release_escrow(&admin, &escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 }
 
 #[test]
@@ -128,7 +162,7 @@ fn test_release_escrow_not_found() {
 
     env.mock_all_auths();
 
-    client.release_escrow(&admin, &999);
+    client.release_escrow(&admin, &999, &false);
 }
 
 #[test]
@@ -145,16 +179,24 @@ fn test_release_already_released_escrow() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Release the escrow
-    client.release_escrow(&admin, &escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 
     // Try to release again - should fail
-    client.release_escrow(&admin, &escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 }
 
 #[test]
@@ -170,16 +212,24 @@ fn test_release_disputed_escrow() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Dispute the escrow
     client.dispute_escrow(&customer, &escrow_id);
 
     // Try to release a disputed escrow - should fail
-    client.release_escrow(&admin, &escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 }
 
 #[test]
@@ -193,10 +243,18 @@ fn test_dispute_escrow_by_customer() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Customer disputes the escrow
     client.dispute_escrow(&customer, &escrow_id);
@@ -217,10 +275,18 @@ fn test_dispute_escrow_by_merchant() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Merchant disputes the escrow
     client.dispute_escrow(&merchant, &escrow_id);
@@ -243,10 +309,18 @@ fn test_dispute_escrow_by_unauthorized() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Unauthorized user tries to dispute - should fail
     client.dispute_escrow(&other, &escrow_id);
@@ -278,10 +352,18 @@ fn test_dispute_already_disputed_escrow() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Dispute the escrow
     client.dispute_escrow(&customer, &escrow_id);
@@ -302,10 +384,18 @@ fn test_resolve_dispute_release_to_merchant() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Dispute the escrow
     client.dispute_escrow(&customer, &escrow_id);
@@ -330,10 +420,18 @@ fn test_resolve_dispute_release_to_customer() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Dispute the escrow
     client.dispute_escrow(&customer, &escrow_id);
@@ -373,10 +471,18 @@ fn test_resolve_dispute_not_disputed() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Try to resolve without dispute - should fail
     client.resolve_dispute(&admin, &escrow_id, &true);
@@ -395,10 +501,18 @@ fn test_resolve_already_resolved_dispute() {
     let token = Address::generate(&env);
     let amount = 1000_i128;
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &amount, &token, &release_timestamp);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
 
     // Dispute the escrow
     client.dispute_escrow(&customer, &escrow_id);
@@ -421,6 +535,7 @@ fn test_multiple_escrows() {
     let merchant2 = Address::generate(&env);
     let token = Address::generate(&env);
     let release_timestamp = 1000_u64;
+    let min_hold_period = 0_u64;
 
     env.mock_all_auths();
 
@@ -431,6 +546,7 @@ fn test_multiple_escrows() {
         &1000_i128,
         &token,
         &release_timestamp,
+        &min_hold_period,
     );
     assert_eq!(escrow_id1, 1);
 
@@ -441,6 +557,7 @@ fn test_multiple_escrows() {
         &2000_i128,
         &token,
         &release_timestamp,
+        &min_hold_period,
     );
     assert_eq!(escrow_id2, 2);
 
@@ -514,6 +631,143 @@ fn test_auto_resolve_to_merchant_on_timeout() {
     client.submit_evidence(&merchant, &escrow_id, &String::from_str(&env, "ipfs://merch"));
     env.ledger().set_timestamp(1801);
     client.auto_resolve_dispute(&escrow_id);
+#[should_panic]
+fn test_release_blocked_by_min_hold_period() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let release_timestamp = 900_u64; // already passed
+    let min_hold_period = 500_u64; // still active
+
+    env.mock_all_auths();
+
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &1000_i128,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
+
+    // Try release before hold period ends → should fail
+    client.release_escrow(&admin, &escrow_id, &false);
+}
+
+#[test]
+fn test_early_release_by_admin() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let release_timestamp = 5000_u64; // future
+    let min_hold_period = 5000_u64; // future
+
+    env.mock_all_auths();
+
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &2000_i128,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
+
+    // Admin forces early release
+    client.release_escrow(&admin, &escrow_id, &true);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_release_after_min_hold_period() {
+    let env = Env::default();
+
+    // Created at = 1000
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let release_timestamp = 1100_u64;
+    let min_hold_period = 200_u64;
+
+    env.mock_all_auths();
+
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &3000_i128,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
+
+    // Move time forward past both locks
+    env.ledger().set_timestamp(1300);
+
+    client.release_escrow(&admin, &escrow_id, &false);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_release_exact_hold_period_boundary() {
+    let env = Env::default();
+
+    // Escrow created at 1000
+    env.ledger().set_timestamp(1000);
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let release_timestamp = 900_u64; // already passed
+    let min_hold_period = 500_u64;
+
+    env.mock_all_auths();
+
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &1000_i128,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
+
+    // EXACT boundary: created_at + hold
+    env.ledger().set_timestamp(1500);
+
+    client.release_escrow(&admin, &escrow_id, &false);
+
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Released);
 }
@@ -536,4 +790,33 @@ fn test_escalate_dispute() {
     client.escalate_dispute(&merchant, &escrow_id);
     escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.escalation_level, 2);
+#[should_panic]
+fn test_release_when_only_release_timestamp_passed() {
+    let env = Env::default();
+
+    env.ledger().set_timestamp(2000);
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let release_timestamp = 1000_u64; // passed
+    let min_hold_period = 3000_u64; // not passed
+
+    env.mock_all_auths();
+
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &500_i128,
+        &token,
+        &release_timestamp,
+        &min_hold_period,
+    );
+
+    client.release_escrow(&admin, &escrow_id, &false);
 }
