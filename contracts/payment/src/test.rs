@@ -7,19 +7,19 @@ use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 // ── RATE LIMITING / ANTI-FRAUD TESTS ────────────────────────────────────────
 
-fn setup_rate_limit_contract(env: &Env) -> (PaymentContractClient, Address) {
+fn setup_rate_limit_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     env.mock_all_auths();
     client.initialize(&admin);
-    (client, admin)
+    (client, admin, contract_id)
 }
 
 #[test]
 fn test_rate_limit_window_resets_after_duration() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -54,7 +54,7 @@ fn test_rate_limit_window_resets_after_duration() {
 #[should_panic]
 fn test_rate_limit_exceeded_within_window() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -81,7 +81,7 @@ fn test_rate_limit_exceeded_within_window() {
 #[test]
 fn test_flag_address_blocks_payments() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -118,7 +118,7 @@ fn test_flag_address_blocks_payments() {
 #[test]
 fn test_unflag_address_allows_payments() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -148,7 +148,7 @@ fn test_unflag_address_allows_payments() {
 #[test]
 fn test_flag_unflag_events_emitted() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
 
@@ -173,7 +173,7 @@ fn test_flag_unflag_events_emitted() {
 #[test]
 fn test_rate_limit_breach_event_emitted() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -193,7 +193,7 @@ fn test_rate_limit_breach_event_emitted() {
     env.ledger().set_timestamp(1000);
     client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
 
-    // Second attempt should fail and emit RateLimitBreached.
+    // Second attempt should fail due to the per-window limit.
     let result = client.try_create_payment(
         &customer, &merchant, &50, &token, &Currency::USDC, &0, &meta,
     );
@@ -201,12 +201,13 @@ fn test_rate_limit_breach_event_emitted() {
 
     // Failed invocations may rollback emitted events in host simulation.
     // The key behavior is that the payment attempt is rejected.
+    assert_eq!(result.unwrap_err().unwrap(), Error::RateLimitExceeded);
 }
 
 #[test]
 fn test_amount_exceeds_limit() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -237,7 +238,7 @@ fn test_amount_exceeds_limit() {
 #[test]
 fn test_daily_volume_limit() {
     let env = Env::default();
-    let (client, admin) = setup_rate_limit_contract(&env);
+    let (client, admin, _) = setup_rate_limit_contract(&env);
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);

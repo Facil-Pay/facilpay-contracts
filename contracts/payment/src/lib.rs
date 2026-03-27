@@ -108,6 +108,15 @@ pub enum Error {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentCreated {
+    pub payment_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCompleted {
     pub payment_id: u64,
     pub merchant: Address,
@@ -379,6 +388,14 @@ impl PaymentContract {
             &DataKey::MerchantPaymentCount(merchant),
             &(merchant_count + 1),
         );
+
+        PaymentCreated {
+            payment_id,
+            customer: payment.customer,
+            merchant: payment.merchant,
+            amount: payment.amount,
+        }
+        .publish(&env);
 
         Ok(payment_id)
     }
