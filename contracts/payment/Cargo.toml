@@ -10,6 +10,8 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+escrow = { path = "../escrow" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+escrow = { path = "../escrow" }

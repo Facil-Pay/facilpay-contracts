@@ -3,6 +3,7 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env,
     String, Vec,
 };
+use escrow::EscrowContractClient;
 
 #[derive(Clone)]
 #[contracttype]
@@ -24,6 +25,7 @@ pub enum DataKey {
     MerchantSubscriptionCount(Address),
     RateLimitConfig,
     AddressRateLimit(Address),
+    EscrowedPayment(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,6 +102,8 @@ pub enum Error {
     DailyVolumeExceeded = 21,
     AddressFlagged = 22,
     AmountExceedsLimit = 23,
+    EscrowMappingNotFound = 24,
+    EscrowBridgeFailed = 25,
 }
 
 #[contractevent]
@@ -131,6 +135,28 @@ pub struct PaymentCancelled {
 pub struct PaymentExpired {
     pub payment_id: u64,
     pub expiration_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowedPaymentCreated {
+    pub payment_id: u64,
+    pub escrow_id: u64,
+    pub escrow_contract: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowedPaymentCompleted {
+    pub payment_id: u64,
+    pub escrow_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowedPaymentCancelled {
+    pub payment_id: u64,
+    pub escrow_id: u64,
 }
 
 #[contractevent]
@@ -234,6 +260,15 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowedPayment {
+    pub payment_id: u64,
+    pub escrow_id: u64,
+    pub escrow_contract: Address,
+    pub auto_release_on_complete: bool,
 }
 
 #[contract]
@@ -353,6 +388,150 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Payment(payment_id))
             .expect("Payment not found")
+    }
+
+    pub fn create_escrowed_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        escrow_contract: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        metadata: String,
+        auto_release_on_complete: bool,
+    ) -> Result<(u64, u64), Error> {
+        let payment_id = PaymentContract::create_payment(
+            env.clone(),
+            customer.clone(),
+            merchant.clone(),
+            amount,
+            token.clone(),
+            currency,
+            0,
+            metadata,
+        )?;
+
+        let escrow_id = PaymentContract::invoke_escrow_create(
+            &env,
+            &escrow_contract,
+            &customer,
+            &merchant,
+            amount,
+            &token,
+            release_timestamp,
+            min_hold_period,
+        )?;
+
+        let bridge = EscrowedPayment {
+            payment_id,
+            escrow_id,
+            escrow_contract: escrow_contract.clone(),
+            auto_release_on_complete,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowedPayment(payment_id), &bridge);
+
+        // Custody is shifted to escrow contract account on creation.
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(&contract_address, &customer, &escrow_contract, &amount);
+
+        EscrowedPaymentCreated {
+            payment_id,
+            escrow_id,
+            escrow_contract,
+        }
+        .publish(&env);
+
+        Ok((payment_id, escrow_id))
+    }
+
+    pub fn complete_escrowed_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Contract not initialized");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
+        if escrow_client
+            .try_release_escrow(&admin, &bridge.escrow_id, &bridge.auto_release_on_complete)
+            .is_err()
+        {
+            return Err(Error::EscrowBridgeFailed);
+        }
+
+        payment.status = PaymentStatus::Completed;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        EscrowedPaymentCompleted {
+            payment_id,
+            escrow_id: bridge.escrow_id,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_escrowed_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if payment.customer != caller && payment.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
+        if escrow_client
+            .try_refund_escrow(&caller, &bridge.escrow_id)
+            .is_err()
+        {
+            return Err(Error::EscrowBridgeFailed);
+        }
+
+        payment.status = PaymentStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        EscrowedPaymentCancelled {
+            payment_id,
+            escrow_id: bridge.escrow_id,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn get_escrowed_payment(env: Env, payment_id: u64) -> Result<EscrowedPayment, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowedPayment(payment_id))
+            .ok_or(Error::EscrowMappingNotFound)
     }
 
     pub fn update_payment_notes(
@@ -1398,6 +1577,32 @@ impl PaymentContract {
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
 
         Ok(())
+    }
+
+    fn invoke_escrow_create(
+        env: &Env,
+        escrow_contract: &Address,
+        customer: &Address,
+        merchant: &Address,
+        amount: i128,
+        token: &Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+    ) -> Result<u64, Error> {
+        let client = EscrowContractClient::new(env, escrow_contract);
+        let call = client
+            .try_create_escrow(
+                customer,
+                merchant,
+                &amount,
+                token,
+                &release_timestamp,
+                &min_hold_period,
+            );
+        match call {
+            Ok(Ok(escrow_id)) => Ok(escrow_id),
+            _ => Err(Error::EscrowBridgeFailed),
+        }
     }
 }
 

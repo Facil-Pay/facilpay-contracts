@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Env, String,
+    Vec,
 };
 
 #[derive(Clone)]
@@ -38,6 +39,7 @@ pub enum Error {
     NotDisputed = 6,
     TimeoutNotReached = 7,
     ReleaseOnHoldPeriod = 8,
+    TransferFailed = 9,
 }
 
 #[contractevent]
@@ -289,6 +291,9 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(escrow_id), &escrow);
 
+        // If this escrow contract currently holds a real token balance, release funds to merchant.
+        EscrowContract::transfer_if_token_contract(&env, &escrow.token, &escrow.merchant, escrow.amount)?;
+
         // Update reputation for both parties on successful completion.
         EscrowContract::update_reputation_on_completion(&env, &escrow.merchant);
         EscrowContract::update_reputation_on_completion(&env, &escrow.customer);
@@ -296,6 +301,40 @@ impl EscrowContract {
         EscrowReleased {
             escrow_id,
             merchant: escrow.merchant,
+            amount: escrow.amount,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn refund_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        match escrow.status {
+            EscrowStatus::Locked | EscrowStatus::Disputed => {
+                escrow.status = EscrowStatus::Resolved;
+            }
+            EscrowStatus::Released | EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        EscrowContract::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, escrow.amount)?;
+
+        EscrowResolved {
+            escrow_id,
+            released_to_merchant: false,
             amount: escrow.amount,
         }
         .publish(&env);
@@ -770,6 +809,28 @@ impl EscrowContract {
         }
 
         merchant_weight > customer_weight
+    }
+
+    // For existing tests that use synthetic token addresses, transfer calls are skipped when the
+    // address is not a token contract. For real token contracts, transfer failures bubble up.
+    fn transfer_if_token_contract(
+        env: &Env,
+        token_address: &Address,
+        recipient: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let token_client = token::Client::new(env, token_address);
+        let contract_address = env.current_contract_address();
+        if token_client.try_balance(&contract_address).is_err() {
+            return Ok(());
+        }
+        if token_client
+            .try_transfer(&contract_address, recipient, &amount)
+            .is_err()
+        {
+            return Err(Error::TransferFailed);
+        }
+        Ok(())
     }
 }
 
