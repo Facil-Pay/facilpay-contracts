@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod timelock_tests {
-    use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use crate::*;
+    use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
 
     #[test]
     fn test_queue_action() {
@@ -12,7 +12,7 @@ mod timelock_tests {
         EscrowContract::initialize(env.clone(), admin.clone());
 
         let escrow_id = 1u64;
-        let action_type = EscrowActionType::ResolveDispute { release_to_merchant: true };
+        let action_type = EscrowActionType::ResolveDispute(true);
         let data = Bytes::new(&env);
 
         let action_id = EscrowContract::queue_action(
@@ -40,7 +40,7 @@ mod timelock_tests {
         EscrowContract::initialize(env.clone(), admin.clone());
 
         let escrow_id = 1u64;
-        let action_type = EscrowActionType::ResolveDispute { release_to_merchant: true };
+        let action_type = EscrowActionType::ResolveDispute(true);
         let data = Bytes::new(&env);
 
         let action_id = EscrowContract::queue_action(

@@ -12,7 +12,7 @@ pub enum DataKey {
     MultiPartyEscrow(u64),
     MultiPartyEscrowCounter,
     CustomerEscrows(Address, u64),
-    Merch3antEscrows(Address, u64),
+    MerchantEscrows(Address, u64),
     CustomerEscrowCount(Address),
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
@@ -65,10 +65,10 @@ pub enum Error {
     InsufficientAdmins = 23,
     NotAnAdmin = 24,
     AlreadyApproved = 25,
-    ActionNotReady = 9,
-    ActionExpired = 10,
-    ActionAlreadyExecuted = 11,
-    ActionCancelled = 12,
+    ActionNotReady = 26,
+    ActionExpired = 27,
+    ActionAlreadyExecuted = 28,
+    ActionCancelled = 29,
 }
 
 #[contractevent]
@@ -333,12 +333,13 @@ pub struct TimeLockAction {
 
 #[contracttype]
 pub enum EscrowActionType {
-    ResolveDispute { release_to_merchant: bool },
+    ResolveDispute(bool),
     ForceRelease,
-    UpdateReleaseTimestamp { new_timestamp: u64 },
+    UpdateReleaseTimestamp(u64),
     CancelEscrow,
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct TimeLockConfig {
     pub delay: u64,           // minimum seconds before execution
@@ -2189,7 +2190,7 @@ impl EscrowContract {
         env.storage().instance().set(&DataKey::TimeLockAction(action_id), &action);
 
         match action.action_type {
-            EscrowActionType::ResolveDispute { release_to_merchant } => {
+            EscrowActionType::ResolveDispute(release_to_merchant) => {
                 Self::internal_resolve_dispute(env.clone(), action.proposed_by, action.escrow_id, release_to_merchant)?;
             }
             EscrowActionType::ForceRelease => {
