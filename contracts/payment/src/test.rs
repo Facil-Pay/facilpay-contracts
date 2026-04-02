@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::testutils::{ Events, Ledger };
 use soroban_sdk::{ testutils::Address as _, token, Address, Env };
-use escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use escrow::{ EscrowContract, EscrowContractClient, EscrowStatus };
 
 // ── RATE LIMITING / ANTI-FRAUD TESTS ────────────────────────────────────────
 
@@ -3127,9 +3127,7 @@ fn test_create_escrowed_payment_locks_funds_in_escrow() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3157,7 +3155,7 @@ fn test_create_escrowed_payment_locks_funds_in_escrow() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true,
+        &true
     );
 
     assert_eq!(ids.0, 1);
@@ -3178,9 +3176,7 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3210,7 +3206,7 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true,
+        &true
     );
 
     payment_client.complete_escrowed_payment(&admin, &ids.0);
@@ -3229,9 +3225,7 @@ fn test_cancel_escrowed_payment_refunds_customer() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3259,7 +3253,7 @@ fn test_cancel_escrowed_payment_refunds_customer() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true,
+        &true
     );
 
     payment_client.cancel_escrowed_payment(&customer, &ids.0);
@@ -3304,21 +3298,23 @@ fn test_payment_multisig_propose_complete_payment() {
     client.initialize(&admin);
     env.ledger().set_timestamp(1000);
     let payment_id = client.create_payment(
-        &customer, &merchant, &500_i128, &token,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &500_i128,
+        &token,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
 
     let mut data_bytes = [0u8; 8];
     let id_bytes = payment_id.to_be_bytes();
-    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    for i in 0..8 {
+        data_bytes[i] = id_bytes[i];
+    }
     let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
 
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::CompletePayment,
-        &merchant,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::CompletePayment, &merchant, &data);
     assert_eq!(proposal_id, String::from_str(&env, "1"));
 }
 
@@ -3353,12 +3349,7 @@ fn test_payment_multisig_reject_action() {
     client.update_required_signatures(&admin, &2_u32);
 
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 8]);
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::CompletePayment,
-        &admin2,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::CompletePayment, &admin2, &data);
 
     client.reject_action(&admin2, &proposal_id);
 
@@ -3381,12 +3372,7 @@ fn test_payment_multisig_not_admin_propose() {
 
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 8]);
     // Non-admin trying to propose should panic
-    client.propose_action(
-        &non_admin,
-        &ActionType::CompletePayment,
-        &non_admin,
-        &data,
-    );
+    client.propose_action(&non_admin, &ActionType::CompletePayment, &non_admin, &data);
 }
 
 // ── BATCH PAYMENT TESTS ──────────────────────────────────────────────────────
@@ -3423,7 +3409,7 @@ fn test_create_batch_payment_success() {
             currency: Currency::USDC,
             expiration_duration: 0,
             metadata: String::from_str(&env, "entry2"),
-        },
+        }
     ];
 
     let results = client.create_batch_payment(&entries);
@@ -3494,12 +3480,12 @@ fn test_create_batch_payment_partial_failure() {
     // Set a rate limit that allows only 1 payment per window
     client.set_rate_limit_config(
         &admin,
-        &RateLimitConfig {
+        &(RateLimitConfig {
             max_payments_per_window: 1,
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        }
+        })
     );
 
     let entries = soroban_sdk::vec![
@@ -3521,7 +3507,7 @@ fn test_create_batch_payment_partial_failure() {
             currency: Currency::USDC,
             expiration_duration: 0,
             metadata: String::from_str(&env, "fail"),
-        },
+        }
     ];
 
     let results = client.create_batch_payment(&entries);
@@ -3554,12 +3540,22 @@ fn test_complete_batch_payment_success() {
     env.ledger().set_timestamp(1000);
 
     let pid1 = client.create_payment(
-        &customer, &merchant, &100_i128, &token_contract_id,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &100_i128,
+        &token_contract_id,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
     let pid2 = client.create_payment(
-        &customer, &merchant, &200_i128, &token_contract_id,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &200_i128,
+        &token_contract_id,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
 
     let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
@@ -3591,8 +3587,13 @@ fn test_complete_batch_payment_partial_failure() {
     token_user_client.approve(&customer, &contract_id, &100_i128, &10_000);
 
     let pid1 = client.create_payment(
-        &customer, &merchant, &100_i128, &token_contract_id,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &100_i128,
+        &token_contract_id,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
     // Complete pid1 first so it's already processed
     client.complete_payment(&admin, &pid1);
@@ -3620,12 +3621,22 @@ fn test_cancel_batch_payment_success() {
     client.initialize(&admin);
 
     let pid1 = client.create_payment(
-        &customer, &merchant, &100_i128, &token,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &100_i128,
+        &token,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
     let pid2 = client.create_payment(
-        &customer, &merchant, &200_i128, &token,
-        &Currency::USDC, &0_u64, &String::from_str(&env, ""),
+        &customer,
+        &merchant,
+        &200_i128,
+        &token,
+        &Currency::USDC,
+        &0_u64,
+        &String::from_str(&env, "")
     );
 
     let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
@@ -3654,18 +3665,15 @@ fn test_batch_payment_events_emitted() {
 
     client.initialize(&admin);
 
-    let entries = soroban_sdk::vec![
-        &env,
-        BatchPaymentEntry {
-            customer: customer.clone(),
-            merchant: merchant.clone(),
-            amount: 100_i128,
-            token: token.clone(),
-            currency: Currency::USDC,
-            expiration_duration: 0,
-            metadata: String::from_str(&env, "batch_event_test"),
-        },
-    ];
+    let entries = soroban_sdk::vec![&env, BatchPaymentEntry {
+        customer: customer.clone(),
+        merchant: merchant.clone(),
+        amount: 100_i128,
+        token: token.clone(),
+        currency: Currency::USDC,
+        expiration_duration: 0,
+        metadata: String::from_str(&env, "batch_event_test"),
+    }];
 
     let results = client.create_batch_payment(&entries);
     assert!(results.get(0).unwrap().success);
@@ -3679,11 +3687,10 @@ fn test_batch_payment_events_emitted() {
 // ── FEE MANAGEMENT TESTS ─────────────────────────────────────────────────────
 
 fn setup_fee_contract(
-    env: &Env,
+    env: &Env
 ) -> (PaymentContractClient<'_>, Address, Address, Address, Address) {
     let token_admin = Address::generate(env);
-    let token_contract_id =
-        env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
 
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(env, &contract_id);
@@ -3754,7 +3761,7 @@ fn test_fee_deducted_from_payment_amount() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3782,8 +3789,8 @@ fn test_fee_min_clamping() {
     let amount = 100_i128;
 
     let fee_config = FeeConfig {
-        fee_bps: 10,     // 0.10%: raw_fee = 100 * 10 / 10000 = 0
-        min_fee: 5,      // clamped to 5
+        fee_bps: 10, // 0.10%: raw_fee = 100 * 10 / 10000 = 0
+        min_fee: 5, // clamped to 5
         max_fee: 0,
         treasury: treasury.clone(),
         fee_token: token_contract_id.clone(),
@@ -3801,7 +3808,7 @@ fn test_fee_min_clamping() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3825,9 +3832,9 @@ fn test_fee_max_clamping() {
     let amount = 100_000_i128;
 
     let fee_config = FeeConfig {
-        fee_bps: 100,   // 1%: raw_fee = 100_000 * 100 / 10_000 = 1000
+        fee_bps: 100, // 1%: raw_fee = 100_000 * 100 / 10_000 = 1000
         min_fee: 0,
-        max_fee: 50,    // clamped to 50
+        max_fee: 50, // clamped to 50
         treasury: treasury.clone(),
         fee_token: token_contract_id.clone(),
         active: true,
@@ -3844,7 +3851,7 @@ fn test_fee_max_clamping() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3887,7 +3894,7 @@ fn test_merchant_tier_upgrade_to_silver() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3929,7 +3936,7 @@ fn test_merchant_tier_upgrade_to_gold() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3970,7 +3977,7 @@ fn test_merchant_tier_upgrade_to_platinum() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4002,7 +4009,7 @@ fn test_tier_discount_reduces_fee() {
 
     // First: push merchant to Silver (volume > 10_000)
     let vol_amount = 10_001_i128;
-    let fee1 = 10_001_i128 * 1000 / 10_000; // = 1000 (Standard, no discount)
+    let fee1 = (10_001_i128 * 1000) / 10_000; // = 1000 (Standard, no discount)
     token_client.mint(&customer, &(vol_amount + 10_000));
     token_user_client.approve(&customer, &contract_id, &(vol_amount + 10_000), &200);
 
@@ -4013,7 +4020,7 @@ fn test_tier_discount_reduces_fee() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &pid1);
 
@@ -4031,7 +4038,7 @@ fn test_tier_discount_reduces_fee() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &pid2);
 
@@ -4041,7 +4048,7 @@ fn test_tier_discount_reduces_fee() {
     assert_eq!(client.get_accumulated_fees(), total_fees);
 
     let merchant_balance = token_user_client.balance(&merchant);
-    assert_eq!(merchant_balance, (vol_amount - fee1) + (amount2 - expected_fee2));
+    assert_eq!(merchant_balance, vol_amount - fee1 + (amount2 - expected_fee2));
 }
 
 #[test]
@@ -4077,7 +4084,7 @@ fn test_withdraw_fees_to_treasury() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4125,7 +4132,7 @@ fn test_withdraw_fees_only_to_treasury_address() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4168,7 +4175,7 @@ fn test_withdraw_fees_exceeds_accumulated_fails() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4210,7 +4217,7 @@ fn test_fee_not_collected_when_inactive() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, ""),
+        &String::from_str(&env, "")
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4252,4 +4259,554 @@ fn test_get_merchant_fee_record_default() {
     assert_eq!(record.total_fees_paid, 0);
     assert_eq!(record.total_volume, 0);
     assert_eq!(record.fee_tier, FeeTier::Standard);
+}
+
+// ── CONDITIONAL PAYMENT TESTS ────────────────────────────────────────────
+
+fn setup_conditional_payment_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    (client, admin, contract_id)
+}
+
+#[test]
+fn test_create_conditional_payment_timestamp_after() {
+    let env = Env::default();
+    let (client, _admin, contract_id) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let metadata = String::from_str(&env, "Test conditional payment");
+
+    // Set timestamp to 1000, condition is after 2000
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(2000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &metadata,
+        &condition
+    );
+
+    // Verify conditional payment was created
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert_eq!(conditional_payment.payment_id, payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, None);
+
+    // Verify base payment was also created
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.id, payment_id);
+    assert_eq!(payment.status, PaymentStatus::Pending);
+
+    // Verify event was published (at least one event should be emitted)
+    let events = env.events().all();
+    assert!(!events.is_empty());
+}
+
+#[test]
+fn test_create_conditional_payment_timestamp_before() {
+    let env = Env::default();
+    let (client, _admin, contract_id) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let metadata = String::from_str(&env, "Test conditional payment");
+
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampBefore(2000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &metadata,
+        &condition
+    );
+
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert_eq!(conditional_payment.payment_id, payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, None);
+}
+
+#[test]
+fn test_create_conditional_payment_oracle_price() {
+    let env = Env::default();
+    let (client, _admin, contract_id) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let metadata = String::from_str(&env, "Test oracle conditional payment");
+
+    let condition = ConditionType::OraclePrice(
+        oracle,
+        String::from_str(&env, "BTC"),
+        50000,
+        PriceComparison::GreaterThan
+    );
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::BTC,
+        &0,
+        &metadata,
+        &condition
+    );
+
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert_eq!(conditional_payment.payment_id, payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, None);
+
+    // Verify event was published
+    let events = env.events().all();
+    let condition_event = events.last().unwrap();
+    // Verify this is from our contract
+    assert_eq!(condition_event.0, contract_id);
+}
+
+#[test]
+fn test_create_conditional_payment_cross_contract_state() {
+    let env = Env::default();
+    let (client, _admin, contract_id) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let target_contract = Address::generate(&env);
+    let metadata = String::from_str(&env, "Test cross-contract conditional payment");
+
+    let state_hash = BytesN::from_array(&env, &[1; 32]);
+    let condition = ConditionType::CrossContractState(target_contract, state_hash);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::ETH,
+        &0,
+        &metadata,
+        &condition
+    );
+
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert_eq!(conditional_payment.payment_id, payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, None);
+
+    // Verify event was published
+    let events = env.events().all();
+    let condition_event = events.last().unwrap();
+    // Verify this is from our contract
+    assert_eq!(condition_event.0, contract_id);
+}
+
+#[test]
+fn test_evaluate_condition_timestamp_after_met() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 1000, condition is after 500
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(500);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Evaluate condition - should be true since 1000 > 500
+    let result = client.evaluate_condition(&payment_id);
+    assert!(result);
+
+    // Verify result was cached
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert!(conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, Some(1000));
+
+    // Second evaluation should return cached result
+    let result2 = client.evaluate_condition(&payment_id);
+    assert!(result2);
+}
+
+#[test]
+fn test_evaluate_condition_timestamp_after_not_met() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 1000, condition is after 2000
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(2000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Evaluate condition - should be false since 1000 <= 2000
+    let result = client.evaluate_condition(&payment_id);
+    assert!(!result);
+
+    // Verify result was cached
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, Some(1000));
+}
+
+#[test]
+fn test_evaluate_condition_timestamp_before_met() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 1000, condition is before 2000
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampBefore(2000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Evaluate condition - should be true since 1000 < 2000
+    let result = client.evaluate_condition(&payment_id);
+    assert!(result);
+
+    // Verify result was cached
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert!(conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, Some(1000));
+}
+
+#[test]
+fn test_evaluate_condition_timestamp_before_not_met() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 2000, condition is before 1000
+    env.ledger().set_timestamp(2000);
+    let condition = ConditionType::TimestampBefore(1000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Evaluate condition - should be false since 2000 >= 1000
+    let result = client.evaluate_condition(&payment_id);
+    assert!(!result);
+
+    // Verify result was cached
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert_eq!(conditional_payment.evaluated_at, Some(2000));
+}
+
+#[test]
+fn test_evaluate_condition_oracle_price_fails() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    let condition = ConditionType::OraclePrice(
+        oracle,
+        String::from_str(&env, "BTC"),
+        50000,
+        PriceComparison::GreaterThan
+    );
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::BTC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Oracle conditions should fail with OracleCallFailed error
+    let result = client.try_evaluate_condition(&payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::OracleCallFailed)));
+}
+
+#[test]
+fn test_evaluate_condition_cross_contract_state_false() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let target_contract = Address::generate(&env);
+
+    let state_hash = BytesN::from_array(&env, &[1; 32]);
+    let condition = ConditionType::CrossContractState(target_contract, state_hash);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::ETH,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Cross-contract state conditions should return false (mock implementation)
+    let result = client.evaluate_condition(&payment_id);
+    assert!(!result);
+
+    // Verify result was cached
+    let conditional_payment = client.get_conditional_payment(&payment_id);
+    assert!(!conditional_payment.condition_met);
+    assert!(conditional_payment.evaluated_at.is_some());
+}
+
+#[test]
+fn test_complete_conditional_payment_success() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 1000, condition is after 500 (should be met)
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(500);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Complete the conditional payment
+    client.complete_conditional_payment(&admin, &payment_id);
+
+    // Verify payment was completed
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+}
+
+#[test]
+fn test_complete_conditional_payment_condition_not_met() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Set timestamp to 1000, condition is after 2000 (should not be met)
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(2000);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Attempt to complete should fail with ConditionNotMet
+    let result = client.try_complete_conditional_payment(&admin, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::ConditionNotMet)));
+
+    // Verify payment is still pending
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Pending);
+}
+
+#[test]
+fn test_complete_conditional_payment_expired() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(500);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &100, // Expires at 1100
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Advance time past expiration
+    env.ledger().set_timestamp(1200);
+
+    // Attempt to complete should fail with PaymentExpired
+    let result = client.try_complete_conditional_payment(&admin, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::PaymentExpired)));
+}
+
+#[test]
+fn test_complete_conditional_payment_unauthorized() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let unauthorized_user = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(500);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // Attempt to complete with unauthorized user should fail
+    let result = client.try_complete_conditional_payment(&unauthorized_user, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_get_conditional_payment_not_found() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    // Attempt to get non-existent conditional payment should fail
+    let result = client.try_get_conditional_payment(&999);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::PaymentNotFound)));
+}
+
+#[test]
+fn test_condition_evaluation_caching() {
+    let env = Env::default();
+    let (client, admin, _) = setup_conditional_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    let condition = ConditionType::TimestampAfter(500);
+
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &1000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+        &condition
+    );
+
+    // First evaluation
+    let result1 = client.evaluate_condition(&payment_id);
+    assert!(result1);
+
+    let conditional_payment1 = client.get_conditional_payment(&payment_id);
+    let evaluated_at1 = conditional_payment1.evaluated_at.unwrap();
+
+    // Advance time and evaluate again
+    env.ledger().set_timestamp(2000);
+    let result2 = client.evaluate_condition(&payment_id);
+    assert!(result2); // Should return cached result
+
+    let conditional_payment2 = client.get_conditional_payment(&payment_id);
+    let evaluated_at2 = conditional_payment2.evaluated_at.unwrap();
+
+    // Evaluation timestamp should be the same (cached)
+    assert_eq!(evaluated_at1, evaluated_at2);
+    assert_eq!(evaluated_at1, 1000);
 }

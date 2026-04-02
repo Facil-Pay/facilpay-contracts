@@ -8,6 +8,7 @@ use soroban_sdk::{
     token,
     Address,
     Bytes,
+    BytesN,
     Env,
     String,
     Vec,
@@ -37,6 +38,7 @@ pub enum DataKey {
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
+    ConditionalPayment(u64),
     MultiSigConfig,
     AdminProposal(String),
     ProposalCounter,
@@ -74,6 +76,23 @@ pub enum SubscriptionStatus {
     Expired,
     InDunning,
     Suspended,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ConditionType {
+    TimestampAfter(u64),
+    TimestampBefore(u64),
+    OraclePrice(Address, String, i128, PriceComparison),
+    CrossContractState(Address, BytesN<32>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum PriceComparison {
+    GreaterThan,
+    LessThan,
+    EqualTo,
 }
 
 #[derive(Clone)]
@@ -139,6 +158,9 @@ pub enum Error {
     AlreadyApproved = 37,
     FeeConfigNotFound = 38,
     InsufficientFees = 39,
+    ConditionNotMet = 40,
+    ConditionAlreadyEvaluated = 41,
+    OracleCallFailed = 42,
 }
 
 #[contractevent]
@@ -364,6 +386,15 @@ pub struct EscrowedPayment {
     pub auto_release_on_complete: bool,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct ConditionalPayment {
+    pub payment_id: u64,
+    pub condition: ConditionType,
+    pub condition_met: bool,
+    pub evaluated_at: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum ActionType {
@@ -425,9 +456,9 @@ pub struct BatchResult {
 #[contracttype]
 pub enum FeeTier {
     Standard,
-    Silver,     // > 10,000 XLM volume
-    Gold,       // > 100,000 XLM volume
-    Platinum,   // > 1,000,000 XLM volume
+    Silver, // > 10,000 XLM volume
+    Gold, // > 100,000 XLM volume
+    Platinum, // > 1,000,000 XLM volume
 }
 
 #[derive(Clone)]
@@ -516,6 +547,21 @@ pub struct MerchantTierUpgraded {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionEvaluated {
+    pub payment_id: u64,
+    pub met: bool,
+    pub evaluated_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalPaymentCreated {
+    pub payment_id: u64,
+    pub condition_type: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeConfigUpdated {
     pub fee_bps: u32,
     pub treasury: Address,
@@ -550,14 +596,11 @@ impl PaymentContract {
         env.storage().instance().set(&DataKey::MultiSigConfig, &config);
         // Keep Admin key for backward compat
         env.storage().instance().set(&DataKey::Admin, &admin);
-        AdminAdded { admin }.publish(&env);
+        (AdminAdded { admin }).publish(&env);
     }
 
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
-        env.storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig)
-            .expect("MultiSig not initialized")
+        env.storage().instance().get(&DataKey::MultiSigConfig).expect("MultiSig not initialized")
     }
 
     pub fn propose_action(
@@ -565,7 +608,7 @@ impl PaymentContract {
         proposer: Address,
         action_type: ActionType,
         target: Address,
-        data: Bytes,
+        data: Bytes
     ) -> Result<String, Error> {
         proposer.require_auth();
 
@@ -579,12 +622,7 @@ impl PaymentContract {
             return Err(Error::NotAnAdmin);
         }
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposalCounter)
-            .unwrap_or(0)
-            + 1;
+        let counter: u64 = env.storage().instance().get(&DataKey::ProposalCounter).unwrap_or(0) + 1;
         env.storage().instance().set(&DataKey::ProposalCounter, &counter);
 
         let proposal_id = PaymentContract::u64_to_string(&env, counter);
@@ -607,25 +645,18 @@ impl PaymentContract {
             expires_at: now + config.proposal_ttl,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+        env.storage().instance().set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
 
-        ActionProposed {
+        (ActionProposed {
             proposal_id: proposal_id.clone(),
             proposer,
             action_type,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(proposal_id)
     }
 
-    pub fn approve_action(
-        env: Env,
-        approver: Address,
-        proposal_id: String,
-    ) -> Result<(), Error> {
+    pub fn approve_action(env: Env, approver: Address, proposal_id: String) -> Result<(), Error> {
         approver.require_auth();
 
         let config: MultiSigConfig = env
@@ -659,24 +690,18 @@ impl PaymentContract {
         proposal.approvals.push_back(approver.clone());
         proposal.approval_count += 1;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+        env.storage().instance().set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
 
-        ActionApproved {
+        (ActionApproved {
             proposal_id,
             approver,
             approval_count: proposal.approval_count,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
 
-    pub fn execute_action(
-        env: Env,
-        proposal_id: String,
-    ) -> Result<(), Error> {
+    pub fn execute_action(env: Env, proposal_id: String) -> Result<(), Error> {
         let config: MultiSigConfig = env
             .storage()
             .instance()
@@ -702,22 +727,16 @@ impl PaymentContract {
         }
 
         proposal.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+        env.storage().instance().set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
 
         PaymentContract::dispatch_action(&env, &proposal)?;
 
-        ActionExecuted { proposal_id }.publish(&env);
+        (ActionExecuted { proposal_id }).publish(&env);
 
         Ok(())
     }
 
-    pub fn reject_action(
-        env: Env,
-        rejecter: Address,
-        proposal_id: String,
-    ) -> Result<(), Error> {
+    pub fn reject_action(env: Env, rejecter: Address, proposal_id: String) -> Result<(), Error> {
         rejecter.require_auth();
 
         let config: MultiSigConfig = env
@@ -741,24 +760,17 @@ impl PaymentContract {
         }
 
         proposal.rejected = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+        env.storage().instance().set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
 
-        ActionRejected {
+        (ActionRejected {
             proposal_id,
             rejected_by: rejecter,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(())
     }
 
-    pub fn add_admin(
-        env: Env,
-        caller: Address,
-        new_admin: Address,
-    ) -> Result<(), Error> {
+    pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
         caller.require_auth();
 
         let mut config: MultiSigConfig = env
@@ -775,17 +787,13 @@ impl PaymentContract {
             config.admins.push_back(new_admin.clone());
             config.total_admins += 1;
             env.storage().instance().set(&DataKey::MultiSigConfig, &config);
-            AdminAdded { admin: new_admin }.publish(&env);
+            (AdminAdded { admin: new_admin }).publish(&env);
         }
 
         Ok(())
     }
 
-    pub fn remove_admin(
-        env: Env,
-        caller: Address,
-        admin: Address,
-    ) -> Result<(), Error> {
+    pub fn remove_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
         caller.require_auth();
 
         let mut config: MultiSigConfig = env
@@ -816,7 +824,7 @@ impl PaymentContract {
         config.admins = new_admins;
         config.total_admins -= 1;
         env.storage().instance().set(&DataKey::MultiSigConfig, &config);
-        AdminRemoved { admin }.publish(&env);
+        (AdminRemoved { admin }).publish(&env);
 
         Ok(())
     }
@@ -824,7 +832,7 @@ impl PaymentContract {
     pub fn update_required_signatures(
         env: Env,
         caller: Address,
-        required: u32,
+        required: u32
     ) -> Result<(), Error> {
         caller.require_auth();
 
@@ -859,7 +867,16 @@ impl PaymentContract {
         metadata: String
     ) -> Result<u64, Error> {
         customer.require_auth();
-        PaymentContract::do_create_payment(&env, customer, merchant, amount, token, currency, expiration_duration, metadata)
+        PaymentContract::do_create_payment(
+            &env,
+            customer,
+            merchant,
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata
+        )
     }
 
     fn do_create_payment(
@@ -939,13 +956,12 @@ impl PaymentContract {
             .instance()
             .set(&DataKey::MerchantPaymentCount(merchant), &(merchant_count + 1));
 
-        PaymentCreated {
+        (PaymentCreated {
             payment_id,
             customer: payment.customer,
             merchant: payment.merchant,
             amount: payment.amount,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok(payment_id)
     }
@@ -965,7 +981,7 @@ impl PaymentContract {
         release_timestamp: u64,
         min_hold_period: u64,
         metadata: String,
-        auto_release_on_complete: bool,
+        auto_release_on_complete: bool
     ) -> Result<(u64, u64), Error> {
         let payment_id = PaymentContract::create_payment(
             env.clone(),
@@ -975,7 +991,7 @@ impl PaymentContract {
             token.clone(),
             currency,
             0,
-            metadata,
+            metadata
         )?;
 
         let escrow_id = PaymentContract::invoke_escrow_create(
@@ -986,7 +1002,7 @@ impl PaymentContract {
             amount,
             &token,
             release_timestamp,
-            min_hold_period,
+            min_hold_period
         )?;
 
         let bridge = EscrowedPayment {
@@ -995,26 +1011,27 @@ impl PaymentContract {
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
         };
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowedPayment(payment_id), &bridge);
+        env.storage().instance().set(&DataKey::EscrowedPayment(payment_id), &bridge);
 
         // Custody is shifted to escrow contract account on creation.
         let token_client = token::Client::new(&env, &token);
         let contract_address = env.current_contract_address();
         token_client.transfer_from(&contract_address, &customer, &escrow_contract, &amount);
 
-        EscrowedPaymentCreated {
+        (EscrowedPaymentCreated {
             payment_id,
             escrow_id,
             escrow_contract,
-        }
-        .publish(&env);
+        }).publish(&env);
 
         Ok((payment_id, escrow_id))
     }
 
-    pub fn complete_escrowed_payment(env: Env, admin: Address, payment_id: u64) -> Result<(), Error> {
+    pub fn complete_escrowed_payment(
+        env: Env,
+        admin: Address,
+        payment_id: u64
+    ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -1035,27 +1052,29 @@ impl PaymentContract {
         }
 
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
-        if escrow_client
-            .try_release_escrow(&admin, &bridge.escrow_id, &bridge.auto_release_on_complete)
-            .is_err()
+        if
+            escrow_client
+                .try_release_escrow(&admin, &bridge.escrow_id, &bridge.auto_release_on_complete)
+                .is_err()
         {
             return Err(Error::EscrowBridgeFailed);
         }
 
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
-        EscrowedPaymentCompleted {
+        (EscrowedPaymentCompleted {
             payment_id,
             escrow_id: bridge.escrow_id,
-        }
-        .publish(&env);
+        }).publish(&env);
         Ok(())
     }
 
-    pub fn cancel_escrowed_payment(env: Env, caller: Address, payment_id: u64) -> Result<(), Error> {
+    pub fn cancel_escrowed_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64
+    ) -> Result<(), Error> {
         caller.require_auth();
         if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
             return Err(Error::PaymentNotFound);
@@ -1071,23 +1090,17 @@ impl PaymentContract {
         }
 
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
-        if escrow_client
-            .try_refund_escrow(&caller, &bridge.escrow_id)
-            .is_err()
-        {
+        if escrow_client.try_refund_escrow(&caller, &bridge.escrow_id).is_err() {
             return Err(Error::EscrowBridgeFailed);
         }
 
         payment.status = PaymentStatus::Cancelled;
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
 
-        EscrowedPaymentCancelled {
+        (EscrowedPaymentCancelled {
             payment_id,
             escrow_id: bridge.escrow_id,
-        }
-        .publish(&env);
+        }).publish(&env);
         Ok(())
     }
 
@@ -1228,7 +1241,7 @@ impl PaymentContract {
             payment.amount,
             &payment.merchant,
             &payment.token,
-            &payment.customer,
+            &payment.customer
         );
 
         // Token transfer: net amount from customer to merchant
@@ -2373,18 +2386,17 @@ impl PaymentContract {
         amount: i128,
         token: &Address,
         release_timestamp: u64,
-        min_hold_period: u64,
+        min_hold_period: u64
     ) -> Result<u64, Error> {
         let client = EscrowContractClient::new(env, escrow_contract);
-        let call = client
-            .try_create_escrow(
-                customer,
-                merchant,
-                &amount,
-                token,
-                &release_timestamp,
-                &min_hold_period,
-            );
+        let call = client.try_create_escrow(
+            customer,
+            merchant,
+            &amount,
+            token,
+            &release_timestamp,
+            &min_hold_period
+        );
         match call {
             Ok(Ok(escrow_id)) => Ok(escrow_id),
             _ => Err(Error::EscrowBridgeFailed),
@@ -2441,7 +2453,7 @@ impl PaymentContract {
                     config.admins.push_back(new_admin.clone());
                     config.total_admins += 1;
                     env.storage().instance().set(&DataKey::MultiSigConfig, &config);
-                    AdminAdded { admin: new_admin }.publish(env);
+                    (AdminAdded { admin: new_admin }).publish(env);
                 }
             }
             ActionType::RemoveAdmin => {
@@ -2463,7 +2475,7 @@ impl PaymentContract {
                 config.admins = new_admins;
                 config.total_admins -= 1;
                 env.storage().instance().set(&DataKey::MultiSigConfig, &config);
-                AdminRemoved { admin: admin_to_remove }.publish(env);
+                (AdminRemoved { admin: admin_to_remove }).publish(env);
             }
             ActionType::UpdateRequiredSignatures => {
                 let required = PaymentContract::read_u64_from_bytes(&proposal.data, 0) as u32;
@@ -2486,11 +2498,7 @@ impl PaymentContract {
     // ── FEE MANAGEMENT ───────────────────────────────────────────────────────
 
     /// Admin sets the platform fee configuration.
-    pub fn set_fee_config(
-        env: Env,
-        admin: Address,
-        fee_config: FeeConfig,
-    ) -> Result<(), Error> {
+    pub fn set_fee_config(env: Env, admin: Address, fee_config: FeeConfig) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -2500,29 +2508,29 @@ impl PaymentContract {
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
-        FeeConfigUpdated {
+        (FeeConfigUpdated {
             fee_bps: fee_config.fee_bps,
             treasury: fee_config.treasury.clone(),
-        }
-        .publish(&env);
+        }).publish(&env);
         env.storage().instance().set(&DataKey::FeeConfig, &fee_config);
         Ok(())
     }
 
     /// Returns the current fee configuration.
     pub fn get_fee_config(env: Env) -> Result<FeeConfig, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::FeeConfig)
-            .ok_or(Error::FeeConfigNotFound)
+        env.storage().instance().get(&DataKey::FeeConfig).ok_or(Error::FeeConfigNotFound)
     }
 
     /// Calculates the fee for a given amount and merchant (accounting for tier discount).
     pub fn calculate_fee(env: Env, amount: i128, merchant: Address) -> i128 {
         let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
         let config = match config {
-            None => return 0,
-            Some(c) if !c.active => return 0,
+            None => {
+                return 0;
+            }
+            Some(c) if !c.active => {
+                return 0;
+            }
             Some(c) => c,
         };
         let record: MerchantFeeRecord = env
@@ -2540,7 +2548,7 @@ impl PaymentContract {
             config.fee_bps,
             &record.fee_tier,
             config.min_fee,
-            config.max_fee,
+            config.max_fee
         )
     }
 
@@ -2563,11 +2571,7 @@ impl PaymentContract {
     }
 
     /// Admin withdraws accumulated fees to the treasury address.
-    pub fn withdraw_fees(
-        env: Env,
-        admin: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
+    pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         admin.require_auth();
         let multisig: MultiSigConfig = env
             .storage()
@@ -2595,11 +2599,10 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::AccumulatedFees, &(accumulated - amount));
-        FeesWithdrawn {
+        (FeesWithdrawn {
             amount,
             treasury: fee_config.treasury.clone(),
-        }
-        .publish(&env);
+        }).publish(&env);
         Ok(())
     }
 
@@ -2611,13 +2614,19 @@ impl PaymentContract {
         amount: i128,
         merchant: &Address,
         token: &Address,
-        customer: &Address,
+        customer: &Address
     ) -> i128 {
         let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
         let config = match config {
-            None => return amount,
-            Some(c) if !c.active => return amount,
-            Some(c) if c.fee_token != *token => return amount,
+            None => {
+                return amount;
+            }
+            Some(c) if !c.active => {
+                return amount;
+            }
+            Some(c) if c.fee_token != *token => {
+                return amount;
+            }
             Some(c) => c,
         };
 
@@ -2637,7 +2646,7 @@ impl PaymentContract {
             config.fee_bps,
             &record.fee_tier,
             config.min_fee,
-            config.max_fee,
+            config.max_fee
         );
 
         if fee <= 0 {
@@ -2669,24 +2678,20 @@ impl PaymentContract {
         let new_tier = PaymentContract::get_tier_for_volume(record.total_volume);
         if new_tier != old_tier {
             record.fee_tier = new_tier.clone();
-            MerchantTierUpgraded {
+            (MerchantTierUpgraded {
                 merchant: merchant.clone(),
                 old_tier,
                 new_tier,
-            }
-            .publish(env);
+            }).publish(env);
         }
 
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantFeeRecord(merchant.clone()), &record);
+        env.storage().instance().set(&DataKey::MerchantFeeRecord(merchant.clone()), &record);
 
-        FeeCollected {
+        (FeeCollected {
             payment_id,
             fee_amount: fee,
             merchant: merchant.clone(),
-        }
-        .publish(env);
+        }).publish(env);
 
         net_amount
     }
@@ -2697,23 +2702,27 @@ impl PaymentContract {
         fee_bps: u32,
         tier: &FeeTier,
         min_fee: i128,
-        max_fee: i128,
+        max_fee: i128
     ) -> i128 {
         let discount = PaymentContract::get_tier_discount_bps(tier);
-        let effective_bps = fee_bps - (fee_bps * discount / 10000);
-        let raw_fee = amount * effective_bps as i128 / 10000;
+        let effective_bps = fee_bps - (fee_bps * discount) / 10000;
+        let raw_fee = (amount * (effective_bps as i128)) / 10000;
 
         let fee = if min_fee > 0 && raw_fee < min_fee { min_fee } else { raw_fee };
         let fee = if max_fee > 0 && fee > max_fee { max_fee } else { fee };
 
-        if fee < 0 { 0 } else { fee }
+        if fee < 0 {
+            0
+        } else {
+            fee
+        }
     }
 
     fn get_tier_discount_bps(tier: &FeeTier) -> u32 {
         match tier {
             FeeTier::Standard => 0,
-            FeeTier::Silver => 500,   // 5% discount on fee
-            FeeTier::Gold => 1500,    // 15% discount on fee
+            FeeTier::Silver => 500, // 5% discount on fee
+            FeeTier::Gold => 1500, // 15% discount on fee
             FeeTier::Platinum => 3000, // 30% discount on fee
         }
     }
@@ -2742,7 +2751,7 @@ impl PaymentContract {
 
     pub fn create_batch_payment(
         env: Env,
-        entries: Vec<BatchPaymentEntry>,
+        entries: Vec<BatchPaymentEntry>
     ) -> Result<Vec<BatchResult>, Error> {
         PaymentContract::validate_batch_size(entries.len())?;
 
@@ -2766,7 +2775,7 @@ impl PaymentContract {
                 entry.token.clone(),
                 entry.currency.clone(),
                 entry.expiration_duration,
-                entry.metadata.clone(),
+                entry.metadata.clone()
             );
 
             match result {
@@ -2793,7 +2802,7 @@ impl PaymentContract {
     pub fn complete_batch_payment(
         env: Env,
         admin: Address,
-        payment_ids: Vec<u64>,
+        payment_ids: Vec<u64>
     ) -> Result<Vec<BatchResult>, Error> {
         admin.require_auth();
 
@@ -2837,7 +2846,7 @@ impl PaymentContract {
     pub fn cancel_batch_payment(
         env: Env,
         caller: Address,
-        payment_ids: Vec<u64>,
+        payment_ids: Vec<u64>
     ) -> Result<Vec<BatchResult>, Error> {
         caller.require_auth();
 
@@ -2846,11 +2855,7 @@ impl PaymentContract {
         let mut results = Vec::new(&env);
 
         for payment_id in payment_ids.iter() {
-            let result = PaymentContract::do_cancel_payment(
-                &env,
-                caller.clone(),
-                payment_id,
-            );
+            let result = PaymentContract::do_cancel_payment(&env, caller.clone(), payment_id);
 
             match result {
                 Ok(()) => {
@@ -2871,6 +2876,160 @@ impl PaymentContract {
         }
 
         Ok(results)
+    }
+
+    pub fn create_conditional_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+        condition: ConditionType
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        // Create the base payment first
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer.clone(),
+            merchant.clone(),
+            amount,
+            token.clone(),
+            currency,
+            expiration_duration,
+            metadata
+        )?;
+
+        // Create the conditional payment
+        let conditional_payment = ConditionalPayment {
+            payment_id,
+            condition: condition.clone(),
+            condition_met: false,
+            evaluated_at: None,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalPayment(payment_id), &conditional_payment);
+
+        // Publish event with condition type
+        let condition_type_str = match &condition {
+            ConditionType::TimestampAfter(_) => String::from_str(&env, "TimestampAfter"),
+            ConditionType::TimestampBefore(_) => String::from_str(&env, "TimestampBefore"),
+            ConditionType::OraclePrice(_, _, _, _) => String::from_str(&env, "OraclePrice"),
+            ConditionType::CrossContractState(_, _) => String::from_str(&env, "CrossContractState"),
+        };
+
+        (ConditionalPaymentCreated {
+            payment_id,
+            condition_type: condition_type_str,
+        }).publish(&env);
+
+        Ok(payment_id)
+    }
+
+    pub fn evaluate_condition(env: Env, payment_id: u64) -> Result<bool, Error> {
+        let mut conditional_payment: ConditionalPayment = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConditionalPayment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        // Return cached result if already evaluated
+        if let Some(_evaluated_at) = conditional_payment.evaluated_at {
+            return Ok(conditional_payment.condition_met);
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        let condition_met = match &conditional_payment.condition {
+            ConditionType::TimestampAfter(timestamp) => current_timestamp > *timestamp,
+            ConditionType::TimestampBefore(timestamp) => current_timestamp < *timestamp,
+            ConditionType::OraclePrice(_oracle_contract, _asset, _threshold, _comparison) => {
+                // Mock oracle call - in real implementation this would call the oracle contract
+                // For now, return false to indicate oracle call failed
+                return Err(Error::OracleCallFailed);
+            }
+            ConditionType::CrossContractState(_target_contract, _expected_state_hash) => {
+                // Mock cross-contract state check
+                // In real implementation, this would call the target contract and compare state
+                // For now, return false to indicate check failed
+                false
+            }
+        };
+
+        // Cache the result
+        conditional_payment.condition_met = condition_met;
+        conditional_payment.evaluated_at = Some(current_timestamp);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalPayment(payment_id), &conditional_payment);
+
+        (ConditionEvaluated {
+            payment_id,
+            met: condition_met,
+            evaluated_at: current_timestamp,
+        }).publish(&env);
+
+        Ok(condition_met)
+    }
+
+    pub fn complete_conditional_payment(
+        env: Env,
+        admin: Address,
+        payment_id: u64
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        // Check if conditional payment exists
+        if !env.storage().instance().has(&DataKey::ConditionalPayment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Check if payment is expired
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::PaymentExpired);
+        }
+
+        // Evaluate condition
+        let condition_met = PaymentContract::evaluate_condition(env.clone(), payment_id)?;
+        if !condition_met {
+            return Err(Error::ConditionNotMet);
+        }
+
+        // Complete the payment
+        PaymentContract::do_complete_payment(&env, payment_id)?;
+
+        Ok(())
+    }
+
+    pub fn get_conditional_payment(env: Env, payment_id: u64) -> Result<ConditionalPayment, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConditionalPayment(payment_id))
+            .ok_or(Error::PaymentNotFound)
     }
 }
 
