@@ -37,7 +37,8 @@ fn test_reputation_increases_on_escrow_completion() {
 
     // Use default config (completion_reward = 100).
     env.ledger().set_timestamp(2000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
     client.release_escrow(&admin, &escrow_id, &true);
 
     let merchant_rep = client.get_reputation(&merchant);
@@ -72,7 +73,8 @@ fn test_reputation_config_overrides_defaults() {
     );
 
     env.ledger().set_timestamp(2000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
     client.release_escrow(&admin, &escrow_id, &true);
 
     // completion_reward is 50 now.
@@ -94,7 +96,8 @@ fn test_reputation_after_dispute_win() {
     env.mock_all_auths();
 
     // Default config: win_reward=200, loss_penalty=200.
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     // Admin resolves in merchant's favour.
@@ -122,7 +125,8 @@ fn test_reputation_after_dispute_loss() {
 
     env.mock_all_auths();
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&merchant, &escrow_id);
 
     // Admin resolves in customer's favour.
@@ -160,7 +164,8 @@ fn test_score_clamped_at_10000() {
         },
     );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
     client.resolve_dispute(&admin, &escrow_id, &true); // merchant wins
 
@@ -191,7 +196,8 @@ fn test_score_clamped_at_zero() {
         },
     );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
     client.resolve_dispute(&admin, &escrow_id, &true); // merchant wins, customer loses
 
@@ -216,7 +222,7 @@ fn test_weighted_auto_resolve_merchant_wins_higher_reputation() {
     client.set_reputation_config(
         &admin,
         &ReputationConfig {
-            win_reward: 3000, // push merchant to 8000
+            win_reward: 3000,   // push merchant to 8000
             loss_penalty: 3000, // push customer to 2000
             completion_reward: 0,
             dispute_initiation_penalty: 0,
@@ -224,19 +230,29 @@ fn test_weighted_auto_resolve_merchant_wins_higher_reputation() {
     );
 
     // First escrow to establish reputation difference.
-    let escrow_id1 = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id1 =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id1);
     client.resolve_dispute(&admin, &escrow_id1, &true); // merchant wins → merchant=8000, customer=2000
 
     // Second escrow for the weighted auto-resolve test.
     env.ledger().set_timestamp(100);
-    let escrow_id2 = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id2 =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id2);
 
     // Each party submits one piece of evidence.
     env.ledger().set_timestamp(200);
-    client.submit_evidence(&customer, &escrow_id2, &String::from_str(&env, "ipfs://cust"));
-    client.submit_evidence(&merchant, &escrow_id2, &String::from_str(&env, "ipfs://merch"));
+    client.submit_evidence(
+        &customer,
+        &escrow_id2,
+        &String::from_str(&env, "ipfs://cust"),
+    );
+    client.submit_evidence(
+        &merchant,
+        &escrow_id2,
+        &String::from_str(&env, "ipfs://merch"),
+    );
 
     // After timeout, auto-resolve should favour merchant (higher reputation).
     env.ledger().set_timestamp(800); // > 200 + 500 timeout
@@ -271,18 +287,28 @@ fn test_weighted_auto_resolve_customer_wins_higher_reputation() {
     );
 
     // First escrow: customer wins → customer=8000, merchant=2000.
-    let escrow_id1 = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id1 =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&merchant, &escrow_id1);
     client.resolve_dispute(&admin, &escrow_id1, &false); // customer wins
 
     // Second escrow for weighted auto-resolve.
     env.ledger().set_timestamp(100);
-    let escrow_id2 = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let escrow_id2 =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&merchant, &escrow_id2);
 
     env.ledger().set_timestamp(200);
-    client.submit_evidence(&customer, &escrow_id2, &String::from_str(&env, "ipfs://cust"));
-    client.submit_evidence(&merchant, &escrow_id2, &String::from_str(&env, "ipfs://merch"));
+    client.submit_evidence(
+        &customer,
+        &escrow_id2,
+        &String::from_str(&env, "ipfs://cust"),
+    );
+    client.submit_evidence(
+        &merchant,
+        &escrow_id2,
+        &String::from_str(&env, "ipfs://merch"),
+    );
 
     env.ledger().set_timestamp(800);
     client.auto_resolve_dispute(&escrow_id2);
@@ -892,13 +918,22 @@ fn test_submit_evidence_by_both_parties() {
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
     env.mock_all_auths();
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
     env.ledger().set_timestamp(1000);
     client.dispute_escrow(&customer, &escrow_id);
     env.ledger().set_timestamp(1200);
-    client.submit_evidence(&customer, &escrow_id, &String::from_str(&env, "ipfs://hash1"));
+    client.submit_evidence(
+        &customer,
+        &escrow_id,
+        &String::from_str(&env, "ipfs://hash1"),
+    );
     env.ledger().set_timestamp(1300);
-    client.submit_evidence(&merchant, &escrow_id, &String::from_str(&env, "ipfs://hash2"));
+    client.submit_evidence(
+        &merchant,
+        &escrow_id,
+        &String::from_str(&env, "ipfs://hash2"),
+    );
     let count = client.get_evidence_count(&escrow_id);
     assert_eq!(count, 2);
     let items = client.get_evidence(&escrow_id, &10_u64, &0_u64);
@@ -916,11 +951,16 @@ fn test_auto_resolve_to_customer_on_timeout() {
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
     env.mock_all_auths();
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
     env.ledger().set_timestamp(1000);
     client.dispute_escrow(&customer, &escrow_id);
     env.ledger().set_timestamp(1200);
-    client.submit_evidence(&customer, &escrow_id, &String::from_str(&env, "ipfs://cust"));
+    client.submit_evidence(
+        &customer,
+        &escrow_id,
+        &String::from_str(&env, "ipfs://cust"),
+    );
     env.ledger().set_timestamp(1801);
     client.auto_resolve_dispute(&escrow_id);
     let escrow = client.get_escrow(&escrow_id);
@@ -936,11 +976,16 @@ fn test_auto_resolve_to_merchant_on_timeout() {
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
     env.mock_all_auths();
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
     env.ledger().set_timestamp(1000);
     client.dispute_escrow(&merchant, &escrow_id);
     env.ledger().set_timestamp(1200);
-    client.submit_evidence(&merchant, &escrow_id, &String::from_str(&env, "ipfs://merch"));
+    client.submit_evidence(
+        &merchant,
+        &escrow_id,
+        &String::from_str(&env, "ipfs://merch"),
+    );
     env.ledger().set_timestamp(1801);
     client.auto_resolve_dispute(&escrow_id);
     let escrow = client.get_escrow(&escrow_id);
@@ -1098,7 +1143,8 @@ fn test_escalate_dispute() {
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
     env.mock_all_auths();
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
     env.ledger().set_timestamp(1000);
     client.dispute_escrow(&customer, &escrow_id);
     client.escalate_dispute(&customer, &escrow_id);
@@ -1179,16 +1225,15 @@ fn test_create_vesting_escrow_with_milestones() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &4000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4000_u64,
+        &milestones,
+    );
 
     assert_eq!(escrow_id, 1);
 
@@ -1215,16 +1260,15 @@ fn test_create_vesting_escrow_time_linear() {
 
     // Create time-linear vesting (no milestones)
     let milestones = Vec::new(&env);
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &2000_u64,
-            &10000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &10000_u64,
+        &milestones,
+    );
 
     let vesting_schedule = client.get_vesting_schedule(&escrow_id);
     assert_eq!(vesting_schedule.total_amount, 10000);
@@ -1262,16 +1306,15 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
         },
     ];
 
-    client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &4000_u64,
-            &milestones,
-        );
+    client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4000_u64,
+        &milestones,
+    );
 }
 
 // ── MULTI-PARTY ESCROW TESTS ────────────────────────────────────────────────
@@ -1285,7 +1328,9 @@ fn test_create_multi_party_escrow_success() {
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
 
     let customer = Address::generate(&env);
@@ -1352,16 +1397,15 @@ fn test_create_vesting_escrow_cliff_before_current_time() {
 
     // Cliff timestamp is in the past - should fail
     let milestones = Vec::new(&env);
-    client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &500_u64,
-            &4000_u64,
-            &milestones,
-        );
+    client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &500_u64,
+        &4000_u64,
+        &milestones,
+    );
 }
 
 #[test]
@@ -1380,16 +1424,15 @@ fn test_create_vesting_escrow_end_before_cliff() {
 
     // End timestamp is before cliff - should fail
     let milestones = Vec::new(&env);
-    client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &5000_u64,
-            &4000_u64,
-            &milestones,
-        );
+    client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &5000_u64,
+        &4000_u64,
+        &milestones,
+    );
 }
 
 #[test]
@@ -1406,16 +1449,15 @@ fn test_get_vested_amount_before_cliff() {
     env.mock_all_auths();
 
     let milestones = Vec::new(&env);
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &2000_u64,
-            &10000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &10000_u64,
+        &milestones,
+    );
 
     // Before cliff - should be 0
     env.ledger().set_timestamp(1500);
@@ -1437,16 +1479,15 @@ fn test_get_vested_amount_after_cliff_linear() {
     env.mock_all_auths();
 
     let milestones = Vec::new(&env);
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &2000_u64,
-            &10000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &10000_u64,
+        &milestones,
+    );
 
     // At cliff - nothing vested yet in linear model (elapsed = 0)
     env.ledger().set_timestamp(2000);
@@ -1499,16 +1540,15 @@ fn test_get_vested_amount_milestone_based() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &4000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4000_u64,
+        &milestones,
+    );
 
     // Before first milestone
     env.ledger().set_timestamp(1800);
@@ -1561,16 +1601,15 @@ fn test_get_releasable_amount() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &3000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &3000_u64,
+        &milestones,
+    );
 
     // After first milestone - releasable = vested
     env.ledger().set_timestamp(2500);
@@ -1620,16 +1659,15 @@ fn test_release_vested_amount_milestone() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &3000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &3000_u64,
+        &milestones,
+    );
 
     // Try to release before cliff - should fail
     env.ledger().set_timestamp(1400);
@@ -1671,16 +1709,15 @@ fn test_release_vested_amount_before_cliff() {
     env.mock_all_auths();
 
     let milestones = Vec::new(&env);
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &2000_u64,
-            &10000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &10000_u64,
+        &milestones,
+    );
 
     // Try to release before cliff
     env.ledger().set_timestamp(1500);
@@ -1722,7 +1759,9 @@ fn test_approve_release_success() {
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
     let customer = Address::generate(&env);
     token_client.mint(&customer, &10000);
@@ -1744,7 +1783,8 @@ fn test_approve_release_success() {
         required_approval: true,
     });
 
-    let escrow_id = client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+    let escrow_id =
+        client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
 
     client.approve_release(&p1, &escrow_id);
     let escrow = client.get_multi_party_escrow(&escrow_id);
@@ -1764,7 +1804,9 @@ fn test_release_multi_party_escrow_success() {
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
     let token_user_client = token::Client::new(&env, &token_id);
 
@@ -1796,7 +1838,8 @@ fn test_release_multi_party_escrow_success() {
     });
 
     env.ledger().set_timestamp(500);
-    let escrow_id = client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+    let escrow_id =
+        client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
 
     client.approve_release(&p1, &escrow_id);
     client.approve_release(&p2, &escrow_id);
@@ -1838,16 +1881,15 @@ fn test_release_vested_amount_nothing_to_release() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &2000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &2000_u64,
+        &milestones,
+    );
 
     // Before milestone unlocks
     env.ledger().set_timestamp(1800);
@@ -1896,16 +1938,15 @@ fn test_full_vesting_completion() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &5000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &5000_u64,
+        &milestones,
+    );
 
     // Release each milestone as it unlocks
     env.ledger().set_timestamp(2500);
@@ -1960,16 +2001,15 @@ fn test_partial_milestone_release() {
         },
     ];
 
-    let escrow_id = client
-        .create_vesting_escrow(
-            &customer,
-            &merchant,
-            &10000_i128,
-            &token,
-            &1500_u64,
-            &3000_u64,
-            &milestones,
-        );
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &3000_u64,
+        &milestones,
+    );
 
     // Only first milestone unlocked
     env.ledger().set_timestamp(2500);
@@ -1995,7 +2035,9 @@ fn test_release_multi_party_escrow_threshold_not_met() {
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_id);
 
     let customer = Address::generate(&env);
@@ -2018,7 +2060,8 @@ fn test_release_multi_party_escrow_threshold_not_met() {
         required_approval: true,
     });
 
-    let escrow_id = client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+    let escrow_id =
+        client.create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
 
     client.approve_release(&p1, &escrow_id);
     // Only 1 approval, 2 required
@@ -2058,21 +2101,19 @@ fn test_multisig_propose_release_escrow() {
 
     client.initialize(&admin);
     env.ledger().set_timestamp(2000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
 
     // Encode escrow_id as 8 big-endian bytes + 1 byte for early_release=true
     let mut data_bytes = [0u8; 9];
     let id_bytes = escrow_id.to_be_bytes();
-    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    for i in 0..8 {
+        data_bytes[i] = id_bytes[i];
+    }
     data_bytes[8] = 1u8; // early_release = true
     let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
 
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &merchant,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &merchant, &data);
 
     // proposal id should be "1"
     assert_eq!(proposal_id, String::from_str(&env, "1"));
@@ -2091,29 +2132,25 @@ fn test_multisig_approve_and_execute() {
 
     client.initialize(&admin);
     env.ledger().set_timestamp(2000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
 
     // Encode escrow_id + early_release=true
     let mut data_bytes = [0u8; 9];
     let id_bytes = escrow_id.to_be_bytes();
-    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    for i in 0..8 {
+        data_bytes[i] = id_bytes[i];
+    }
     data_bytes[8] = 1u8;
     let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
 
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &merchant,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &merchant, &data);
 
     // With required_signatures=1 and 1 approval already from proposer, execute directly
     client.execute_action(&proposal_id);
 
     // Verify escrow was released by querying via client
-    let escrow = env.as_contract(&contract_id, || {
-        EscrowContract::get_escrow(&env, escrow_id)
-    });
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
     assert_eq!(escrow.status, EscrowStatus::Released);
 }
 
@@ -2133,12 +2170,7 @@ fn test_multisig_duplicate_approval_rejected() {
     client.update_required_signatures(&admin, &2_u32);
 
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &admin2,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &admin2, &data);
 
     // admin already approved when proposing, approving again should panic
     client.approve_action(&admin, &proposal_id);
@@ -2159,12 +2191,7 @@ fn test_multisig_proposal_expires() {
 
     env.ledger().set_timestamp(1000);
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &admin2,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &admin2, &data);
 
     // Advance past TTL (604800 seconds = 7 days)
     env.ledger().set_timestamp(1000 + 604801);
@@ -2189,12 +2216,7 @@ fn test_multisig_threshold_not_met() {
     client.update_required_signatures(&admin, &2_u32);
 
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &admin2,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &admin2, &data);
 
     // Only 1 approval (from proposer), threshold is 2 — should panic
     client.execute_action(&proposal_id);
@@ -2245,12 +2267,7 @@ fn test_multisig_reject_action() {
     client.update_required_signatures(&admin, &2_u32);
 
     let data = soroban_sdk::Bytes::from_slice(&env, &[0u8; 9]);
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ReleaseEscrow,
-        &admin2,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ReleaseEscrow, &admin2, &data);
 
     client.reject_action(&admin2, &proposal_id);
 
@@ -2272,27 +2289,23 @@ fn test_multisig_resolve_dispute_via_proposal() {
 
     client.initialize(&admin);
     env.ledger().set_timestamp(2000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     // Encode escrow_id + release_to_merchant=false (0)
     let mut data_bytes = [0u8; 9];
     let id_bytes = escrow_id.to_be_bytes();
-    for i in 0..8 { data_bytes[i] = id_bytes[i]; }
+    for i in 0..8 {
+        data_bytes[i] = id_bytes[i];
+    }
     data_bytes[8] = 0u8; // release to customer
     let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
 
-    let proposal_id = client.propose_action(
-        &admin,
-        &ActionType::ResolveDispute,
-        &customer,
-        &data,
-    );
+    let proposal_id = client.propose_action(&admin, &ActionType::ResolveDispute, &customer, &data);
 
     client.execute_action(&proposal_id);
 
-    let escrow = env.as_contract(&contract_id, || {
-        EscrowContract::get_escrow(&env, escrow_id)
-    });
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }

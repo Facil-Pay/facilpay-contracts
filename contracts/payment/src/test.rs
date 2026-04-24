@@ -1,9 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::testutils::{ Events, Ledger };
-use soroban_sdk::{ testutils::Address as _, token, Address, Env };
-use escrow::{ EscrowContract, EscrowContractClient, EscrowStatus };
+use escrow::{EscrowContract, EscrowContractClient, EscrowStatus};
+use soroban_sdk::testutils::{Events, Ledger};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 // ── RATE LIMITING / ANTI-FRAUD TESTS ────────────────────────────────────────
 
@@ -34,17 +34,41 @@ fn test_rate_limit_window_resets_after_duration() {
             window_duration: 100,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     env.ledger().set_timestamp(1000);
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 
     // Advance past the window; counter should reset.
     env.ledger().set_timestamp(1200);
     // This third payment would fail if the window hadn't reset.
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 
     let rl = client.get_address_rate_limit(&customer);
     assert_eq!(rl.payment_count, 1); // only 1 payment in the new window
@@ -69,13 +93,29 @@ fn test_rate_limit_exceeded_within_window() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     env.ledger().set_timestamp(1000);
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
     // Second payment in the same window — must panic.
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 }
 
 #[test]
@@ -96,11 +136,15 @@ fn test_flag_address_blocks_payments() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     // Flag the customer.
-    client.flag_address(&admin, &customer, &String::from_str(&env, "velocity attack"));
+    client.flag_address(
+        &admin,
+        &customer,
+        &String::from_str(&env, "velocity attack"),
+    );
     let rl = client.get_address_rate_limit(&customer);
     assert!(rl.flagged);
 
@@ -112,7 +156,7 @@ fn test_flag_address_blocks_payments() {
         &token,
         &Currency::USDC,
         &0,
-        &meta
+        &meta,
     );
     assert!(result.is_err());
 }
@@ -134,7 +178,7 @@ fn test_unflag_address_allows_payments() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     client.flag_address(&admin, &customer, &String::from_str(&env, "test"));
@@ -144,7 +188,15 @@ fn test_unflag_address_allows_payments() {
     assert!(!rl.flagged);
 
     // Payment must succeed after unflag.
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 }
 
 #[test]
@@ -161,7 +213,7 @@ fn test_flag_unflag_events_emitted() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     client.flag_address(&admin, &customer, &String::from_str(&env, "fraud"));
@@ -189,11 +241,19 @@ fn test_rate_limit_breach_event_emitted() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     env.ledger().set_timestamp(1000);
-    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 
     // Second attempt should fail due to the per-window limit.
     let result = client.try_create_payment(
@@ -203,7 +263,7 @@ fn test_rate_limit_breach_event_emitted() {
         &token,
         &Currency::USDC,
         &0,
-        &meta
+        &meta,
     );
     assert!(result.is_err());
 
@@ -230,11 +290,19 @@ fn test_amount_exceeds_limit() {
             window_duration: 100_000,
             max_payment_amount: 100,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     // Within limit — must succeed.
-    client.create_payment(&customer, &merchant, &100, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 
     // Over limit — must fail.
     let result = client.try_create_payment(
@@ -244,7 +312,7 @@ fn test_amount_exceeds_limit() {
         &token,
         &Currency::USDC,
         &0,
-        &meta
+        &meta,
     );
     assert!(result.is_err());
 }
@@ -267,28 +335,45 @@ fn test_daily_volume_limit() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 200,
-        })
+        }),
     );
 
     env.ledger().set_timestamp(1000);
-    client.create_payment(&customer, &merchant, &100, &token, &Currency::USDC, &0, &meta);
-    client.create_payment(&customer, &merchant, &100, &token, &Currency::USDC, &0, &meta);
-
-    // Third payment would exceed daily volume.
-    let result = client.try_create_payment(
+    client.create_payment(
         &customer,
         &merchant,
-        &1,
+        &100,
         &token,
         &Currency::USDC,
         &0,
-        &meta
+        &meta,
     );
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+
+    // Third payment would exceed daily volume.
+    let result =
+        client.try_create_payment(&customer, &merchant, &1, &token, &Currency::USDC, &0, &meta);
     assert!(result.is_err());
 
     // Advance a full day — daily volume resets.
     env.ledger().set_timestamp(1000 + 86400 + 1);
-    client.create_payment(&customer, &merchant, &100, &token, &Currency::USDC, &0, &meta);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 }
 
 #[test]
@@ -312,7 +397,7 @@ fn test_create_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
     assert_eq!(payment_id, 1);
 
@@ -347,7 +432,7 @@ fn test_get_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment = client.get_payment(&payment_id);
@@ -377,7 +462,9 @@ fn test_complete_payment_success() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -401,7 +488,7 @@ fn test_complete_payment_success() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -415,7 +502,9 @@ fn test_complete_payment_event_emission() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -439,7 +528,7 @@ fn test_complete_payment_event_emission() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -453,7 +542,10 @@ fn test_complete_payment_event_emission() {
             payment_event_count += 1;
         }
     }
-    assert_eq!(payment_event_count, 1, "PaymentCompleted must be emitted exactly once");
+    assert_eq!(
+        payment_event_count, 1,
+        "PaymentCompleted must be emitted exactly once"
+    );
 
     // PaymentCompleted is the last event emitted by complete_payment
     let last_event = all_events.last().unwrap();
@@ -483,7 +575,7 @@ fn test_refund_payment_success() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Refund the payment
@@ -517,14 +609,18 @@ fn test_refund_payment_event_emission() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.refund_payment(&admin, &payment_id);
 
     // Verify PaymentRefunded event is emitted exactly once
     let events = env.events().all();
-    assert_eq!(events.len(), 1, "PaymentRefunded must be emitted exactly once");
+    assert_eq!(
+        events.len(),
+        1,
+        "PaymentRefunded must be emitted exactly once"
+    );
     let event = events.get(0).unwrap();
     assert_eq!(event.0, contract_id);
 }
@@ -585,7 +681,7 @@ fn test_complete_already_completed_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Complete the payment first time
@@ -619,7 +715,7 @@ fn test_refund_already_refunded_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Refund the payment first time
@@ -653,7 +749,7 @@ fn test_complete_refunded_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Refund the payment first
@@ -685,7 +781,7 @@ fn test_refund_completed_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Complete the payment first
@@ -701,7 +797,9 @@ fn test_multiple_payments_correct_modification() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -726,7 +824,7 @@ fn test_multiple_payments_correct_modification() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment_id2 = client.create_payment(
         &customer2,
@@ -735,7 +833,7 @@ fn test_multiple_payments_correct_modification() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id1);
@@ -767,7 +865,7 @@ fn test_customer_cancel_pending_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Customer cancels their pending payment
@@ -799,7 +897,7 @@ fn test_merchant_cancel_pending_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Merchant cancels the pending payment
@@ -848,7 +946,7 @@ fn test_cancel_payment_unauthorized() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Try to cancel as unauthorized user
@@ -864,7 +962,9 @@ fn test_cancel_completed_payment() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -888,7 +988,7 @@ fn test_cancel_completed_payment() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -919,7 +1019,7 @@ fn test_cancel_refunded_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Refund the payment first
@@ -951,7 +1051,7 @@ fn test_cancel_already_cancelled_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Cancel the payment first time
@@ -983,14 +1083,18 @@ fn test_cancel_payment_event_emission() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.cancel_payment(&customer, &payment_id);
 
     // Verify PaymentCancelled event is emitted exactly once
     let events = env.events().all();
-    assert_eq!(events.len(), 1, "PaymentCancelled must be emitted exactly once");
+    assert_eq!(
+        events.len(),
+        1,
+        "PaymentCancelled must be emitted exactly once"
+    );
     let event = events.get(0).unwrap();
     assert_eq!(event.0, contract_id);
 }
@@ -1016,7 +1120,7 @@ fn test_cancel_multiple_payments_correct_modification() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment_id2 = client.create_payment(
         &customer2,
@@ -1025,7 +1129,7 @@ fn test_cancel_multiple_payments_correct_modification() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Cancel first payment
@@ -1060,7 +1164,7 @@ fn test_get_payments_by_customer_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id2 = client.create_payment(
         &customer,
@@ -1069,7 +1173,7 @@ fn test_get_payments_by_customer_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id3 = client.create_payment(
         &customer,
@@ -1078,7 +1182,7 @@ fn test_get_payments_by_customer_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments = client.get_payments_by_customer(&customer, &10, &0);
@@ -1109,7 +1213,7 @@ fn test_get_payments_by_merchant_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id2 = client.create_payment(
         &customer2,
@@ -1118,7 +1222,7 @@ fn test_get_payments_by_merchant_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id3 = client.create_payment(
         &customer1,
@@ -1127,7 +1231,7 @@ fn test_get_payments_by_merchant_multiple() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments = client.get_payments_by_merchant(&merchant, &10, &0);
@@ -1158,7 +1262,7 @@ fn test_customer_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_customer(&customer), 1);
 
@@ -1169,7 +1273,7 @@ fn test_customer_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_customer(&customer), 2);
 
@@ -1180,7 +1284,7 @@ fn test_customer_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_customer(&customer), 3);
 }
@@ -1206,7 +1310,7 @@ fn test_merchant_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_merchant(&merchant), 1);
 
@@ -1217,7 +1321,7 @@ fn test_merchant_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_merchant(&merchant), 2);
 
@@ -1228,7 +1332,7 @@ fn test_merchant_payment_count() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     assert_eq!(client.get_payment_count_by_merchant(&merchant), 3);
 }
@@ -1254,7 +1358,7 @@ fn test_pagination_first_page() {
             &token,
             &Currency::USDC,
             &0,
-            &String::from_str(&env, "")
+            &String::from_str(&env, ""),
         );
     }
 
@@ -1285,7 +1389,7 @@ fn test_pagination_second_page() {
             &token,
             &Currency::USDC,
             &0,
-            &String::from_str(&env, "")
+            &String::from_str(&env, ""),
         );
     }
 
@@ -1315,7 +1419,7 @@ fn test_pagination_limit_larger_than_total() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.create_payment(
         &customer,
@@ -1324,7 +1428,7 @@ fn test_pagination_limit_larger_than_total() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.create_payment(
         &customer,
@@ -1333,7 +1437,7 @@ fn test_pagination_limit_larger_than_total() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments = client.get_payments_by_customer(&customer, &100, &0);
@@ -1360,7 +1464,7 @@ fn test_pagination_offset_beyond_available() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.create_payment(
         &customer,
@@ -1369,7 +1473,7 @@ fn test_pagination_offset_beyond_available() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.create_payment(
         &customer,
@@ -1378,7 +1482,7 @@ fn test_pagination_offset_beyond_available() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments = client.get_payments_by_customer(&customer, &5, &10);
@@ -1436,7 +1540,7 @@ fn test_payments_not_mixed_between_customers() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id2 = client.create_payment(
         &customer1,
@@ -1445,7 +1549,7 @@ fn test_payments_not_mixed_between_customers() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Create payments for customer2
@@ -1456,7 +1560,7 @@ fn test_payments_not_mixed_between_customers() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments1 = client.get_payments_by_customer(&customer1, &10, &0);
@@ -1490,7 +1594,7 @@ fn test_payments_not_mixed_between_merchants() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id2 = client.create_payment(
         &customer,
@@ -1499,7 +1603,7 @@ fn test_payments_not_mixed_between_merchants() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     // Create payments for merchant2
@@ -1510,7 +1614,7 @@ fn test_payments_not_mixed_between_merchants() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payments1 = client.get_payments_by_merchant(&merchant1, &10, &0);
@@ -1547,7 +1651,7 @@ fn test_create_payment_with_expiration_duration() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment = client.get_payment(&payment_id);
@@ -1575,7 +1679,7 @@ fn test_create_payment_no_expiration() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment = client.get_payment(&payment_id);
@@ -1603,10 +1707,11 @@ fn test_is_payment_expired_true() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     assert!(client.is_payment_expired(&payment_id));
 }
@@ -1632,7 +1737,7 @@ fn test_is_payment_expired_false_not_yet() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
@@ -1661,7 +1766,7 @@ fn test_is_payment_expired_false_no_expiration() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
@@ -1701,10 +1806,11 @@ fn test_expire_pending_payment_success() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     let result = client.try_expire_payment(&payment_id);
     assert!(result.is_ok());
@@ -1747,7 +1853,7 @@ fn test_expire_payment_before_expiration() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
@@ -1777,7 +1883,7 @@ fn test_expire_payment_no_expiration_set() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
 
@@ -1809,11 +1915,12 @@ fn test_expire_completed_payment() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -1843,11 +1950,12 @@ fn test_expire_refunded_payment() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.refund_payment(&admin, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -1874,11 +1982,12 @@ fn test_expire_cancelled_payment() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.cancel_payment(&customer, &payment_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 }
@@ -1904,11 +2013,12 @@ fn test_payment_expired_event_emitted() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let _expected_expires_at = env.ledger().timestamp() + expiration_duration;
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.expire_payment(&payment_id);
 
@@ -1939,7 +2049,7 @@ fn test_multiple_payments_different_expiration_times() {
         &token,
         &Currency::USDC,
         &10,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let initial_timestamp1 = env.ledger().timestamp();
 
@@ -1950,7 +2060,7 @@ fn test_multiple_payments_different_expiration_times() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment_id3 = client.create_payment(
@@ -1960,7 +2070,7 @@ fn test_multiple_payments_different_expiration_times() {
         &token,
         &Currency::USDC,
         &30,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let initial_timestamp3 = env.ledger().timestamp();
 
@@ -2008,10 +2118,11 @@ fn test_complete_expired_payment_fails() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.complete_payment(&admin, &payment_id);
 }
@@ -2041,10 +2152,11 @@ fn test_refund_expired_payment_fails() {
         &token,
         &Currency::USDC,
         &expiration_duration,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
 
     client.refund_payment(&admin, &payment_id);
 }
@@ -2056,7 +2168,9 @@ fn test_complete_payment_transfers_tokens_to_merchant() {
 
     // Register a real mock token contract
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -2084,7 +2198,7 @@ fn test_complete_payment_transfers_tokens_to_merchant() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -2100,7 +2214,9 @@ fn test_complete_payment_status_is_completed_after_transfer() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -2124,7 +2240,7 @@ fn test_complete_payment_status_is_completed_after_transfer() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -2140,7 +2256,9 @@ fn test_complete_payment_fails_without_allowance() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
 
     let contract_id = env.register(PaymentContract, ());
@@ -2163,7 +2281,7 @@ fn test_complete_payment_fails_without_allowance() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -2176,7 +2294,9 @@ fn test_complete_payment_fails_insufficient_balance() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
     let contract_id = env.register(PaymentContract, ());
@@ -2199,7 +2319,7 @@ fn test_complete_payment_fails_insufficient_balance() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -2211,7 +2331,9 @@ fn test_complete_payment_partial_allowance_with_exact_amount() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -2236,7 +2358,7 @@ fn test_complete_payment_partial_allowance_with_exact_amount() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.complete_payment(&admin, &payment_id);
@@ -2268,7 +2390,7 @@ fn test_create_payment_with_metadata() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let payment = client.get_payment(&payment_id);
@@ -2297,7 +2419,7 @@ fn test_create_payment_with_empty_metadata() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let payment = client.get_payment(&payment_id);
@@ -2327,7 +2449,7 @@ fn test_create_payment_metadata_too_large() {
         &token,
         &Currency::USDC,
         &0,
-        &large_metadata
+        &large_metadata,
     );
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().unwrap(), Error::MetadataTooLarge);
@@ -2356,7 +2478,7 @@ fn test_create_payment_metadata_at_max_size() {
         &token,
         &Currency::USDC,
         &0,
-        &max_metadata
+        &max_metadata,
     );
 
     let payment = client.get_payment(&payment_id);
@@ -2384,7 +2506,7 @@ fn test_update_payment_notes_success() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let notes = String::from_str(&env, "Customer requested express delivery");
@@ -2416,7 +2538,7 @@ fn test_update_payment_notes_multiple_times() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let notes1 = String::from_str(&env, "First note");
@@ -2451,7 +2573,7 @@ fn test_update_payment_notes_unauthorized() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let notes = String::from_str(&env, "Unauthorized note");
@@ -2481,7 +2603,7 @@ fn test_update_payment_notes_customer_cannot_update() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let notes = String::from_str(&env, "Customer trying to add notes");
@@ -2527,7 +2649,7 @@ fn test_update_payment_notes_too_large() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     // Create notes larger than MAX_NOTES_SIZE (1024)
@@ -2558,7 +2680,7 @@ fn test_update_payment_notes_at_max_size() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     // Create notes exactly at MAX_NOTES_SIZE (1024)
@@ -2576,7 +2698,9 @@ fn test_metadata_persists_through_payment_lifecycle() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -2601,7 +2725,7 @@ fn test_metadata_persists_through_payment_lifecycle() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     // Add notes
@@ -2639,7 +2763,7 @@ fn test_metadata_included_in_query_responses() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata1
+        &metadata1,
     );
     let id2 = client.create_payment(
         &customer,
@@ -2648,7 +2772,7 @@ fn test_metadata_included_in_query_responses() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata2
+        &metadata2,
     );
 
     // Query by customer
@@ -2685,7 +2809,7 @@ fn test_notes_persist_after_cancellation() {
         &token,
         &Currency::USDC,
         &0,
-        &metadata
+        &metadata,
     );
 
     let notes = String::from_str(&env, "Customer requested cancellation");
@@ -2719,7 +2843,7 @@ fn test_create_payment_with_xlm_currency() {
         &token,
         &Currency::XLM,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.currency, Currency::XLM);
@@ -2744,7 +2868,7 @@ fn test_create_payment_with_btc_currency() {
         &token,
         &Currency::BTC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.currency, Currency::BTC);
@@ -2769,7 +2893,7 @@ fn test_create_payment_with_eth_currency() {
         &token,
         &Currency::ETH,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.currency, Currency::ETH);
@@ -2794,7 +2918,7 @@ fn test_create_payment_with_usdt_currency() {
         &token,
         &Currency::USDT,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let payment = client.get_payment(&payment_id);
     assert_eq!(payment.currency, Currency::USDT);
@@ -2884,7 +3008,7 @@ fn test_multiple_currencies_in_payments() {
         &token,
         &Currency::XLM,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id2 = client.create_payment(
         &customer,
@@ -2893,7 +3017,7 @@ fn test_multiple_currencies_in_payments() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let id3 = client.create_payment(
         &customer,
@@ -2902,7 +3026,7 @@ fn test_multiple_currencies_in_payments() {
         &token,
         &Currency::BTC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let p1 = client.get_payment(&id1);
@@ -2939,7 +3063,7 @@ fn test_partial_refund_success() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.partial_refund(&admin, &payment_id, &300);
@@ -2972,7 +3096,7 @@ fn test_multiple_partial_refunds() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.partial_refund(&admin, &payment_id, &200);
@@ -3006,7 +3130,7 @@ fn test_partial_refund_becomes_full_refund() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.partial_refund(&admin, &payment_id, &600);
@@ -3040,7 +3164,7 @@ fn test_partial_refund_exceeds_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let result = client.try_partial_refund(&admin, &payment_id, &1500);
@@ -3071,7 +3195,7 @@ fn test_partial_refund_cumulative_exceeds_payment() {
         &token,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     client.partial_refund(&admin, &payment_id, &700);
@@ -3083,7 +3207,7 @@ fn test_partial_refund_cumulative_exceeds_payment() {
 // ── DUNNING MANAGEMENT TESTS ─────────────────────────────────────────
 
 fn setup_dunning_contract(
-    env: &Env
+    env: &Env,
 ) -> (PaymentContractClient, Address, Address, Address, Address) {
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(env, &contract_id);
@@ -3099,11 +3223,11 @@ fn setup_dunning_contract(
     client.set_dunning_config(
         &admin,
         &(DunningConfig {
-            grace_period: 86400, // 1 day
+            grace_period: 86400,                                                 // 1 day
             retry_intervals: Vec::from_array(env, [3600u64, 7200u64, 14400u64]), // 1h, 2h, 4h
             max_dunning_attempts: 4,
             suspend_after_attempts: 3,
-        })
+        }),
     );
 
     (client, admin, customer, merchant, token)
@@ -3127,7 +3251,9 @@ fn test_create_escrowed_payment_locks_funds_in_escrow() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3155,7 +3281,7 @@ fn test_create_escrowed_payment_locks_funds_in_escrow() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true
+        &true,
     );
 
     assert_eq!(ids.0, 1);
@@ -3176,7 +3302,9 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3206,7 +3334,7 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true
+        &true,
     );
 
     payment_client.complete_escrowed_payment(&admin, &ids.0);
@@ -3225,7 +3353,9 @@ fn test_cancel_escrowed_payment_refunds_customer() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3253,7 +3383,7 @@ fn test_cancel_escrowed_payment_refunds_customer() {
         &1000_u64,
         &0_u64,
         &String::from_str(&env, "bridge"),
-        &true
+        &true,
     );
 
     payment_client.cancel_escrowed_payment(&customer, &ids.0);
@@ -3304,7 +3434,7 @@ fn test_payment_multisig_propose_complete_payment() {
         &token,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let mut data_bytes = [0u8; 8];
@@ -3485,7 +3615,7 @@ fn test_create_batch_payment_partial_failure() {
             window_duration: 100_000,
             max_payment_amount: 0,
             max_daily_volume: 0,
-        })
+        }),
     );
 
     let entries = soroban_sdk::vec![
@@ -3522,7 +3652,9 @@ fn test_complete_batch_payment_success() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_mint_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3546,7 +3678,7 @@ fn test_complete_batch_payment_success() {
         &token_contract_id,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let pid2 = client.create_payment(
         &customer,
@@ -3555,7 +3687,7 @@ fn test_complete_batch_payment_success() {
         &token_contract_id,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
@@ -3572,7 +3704,9 @@ fn test_complete_batch_payment_partial_failure() {
     env.mock_all_auths();
 
     let token_admin = Address::generate(&env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_mint_client = token::StellarAssetClient::new(&env, &token_contract_id);
     let token_user_client = token::Client::new(&env, &token_contract_id);
 
@@ -3593,7 +3727,7 @@ fn test_complete_batch_payment_partial_failure() {
         &token_contract_id,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     // Complete pid1 first so it's already processed
     client.complete_payment(&admin, &pid1);
@@ -3627,7 +3761,7 @@ fn test_cancel_batch_payment_success() {
         &token,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     let pid2 = client.create_payment(
         &customer,
@@ -3636,7 +3770,7 @@ fn test_cancel_batch_payment_success() {
         &token,
         &Currency::USDC,
         &0_u64,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
 
     let payment_ids = soroban_sdk::vec![&env, pid1, pid2];
@@ -3665,15 +3799,18 @@ fn test_batch_payment_events_emitted() {
 
     client.initialize(&admin);
 
-    let entries = soroban_sdk::vec![&env, BatchPaymentEntry {
-        customer: customer.clone(),
-        merchant: merchant.clone(),
-        amount: 100_i128,
-        token: token.clone(),
-        currency: Currency::USDC,
-        expiration_duration: 0,
-        metadata: String::from_str(&env, "batch_event_test"),
-    }];
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "batch_event_test"),
+        }
+    ];
 
     let results = client.create_batch_payment(&entries);
     assert!(results.get(0).unwrap().success);
@@ -3687,10 +3824,18 @@ fn test_batch_payment_events_emitted() {
 // ── FEE MANAGEMENT TESTS ─────────────────────────────────────────────────────
 
 fn setup_fee_contract(
-    env: &Env
-) -> (PaymentContractClient<'_>, Address, Address, Address, Address) {
+    env: &Env,
+) -> (
+    PaymentContractClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let token_admin = Address::generate(env);
-    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
 
     let contract_id = env.register(PaymentContract, ());
     let client = PaymentContractClient::new(env, &contract_id);
@@ -3700,6 +3845,20 @@ fn setup_fee_contract(
     client.initialize(&admin);
 
     (client, admin, contract_id, token_contract_id, token_admin)
+}
+
+fn fee_tier_thresholds(
+    env: &Env,
+    silver: i128,
+    gold: i128,
+    platinum: i128,
+) -> Vec<(FeeTier, i128)> {
+    soroban_sdk::vec![
+        env,
+        (FeeTier::Silver, silver),
+        (FeeTier::Gold, gold),
+        (FeeTier::Platinum, platinum)
+    ]
 }
 
 #[test]
@@ -3761,7 +3920,7 @@ fn test_fee_deducted_from_payment_amount() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3790,7 +3949,7 @@ fn test_fee_min_clamping() {
 
     let fee_config = FeeConfig {
         fee_bps: 10, // 0.10%: raw_fee = 100 * 10 / 10000 = 0
-        min_fee: 5, // clamped to 5
+        min_fee: 5,  // clamped to 5
         max_fee: 0,
         treasury: treasury.clone(),
         fee_token: token_contract_id.clone(),
@@ -3808,7 +3967,7 @@ fn test_fee_min_clamping() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3851,7 +4010,7 @@ fn test_fee_max_clamping() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3894,7 +4053,7 @@ fn test_merchant_tier_upgrade_to_silver() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3936,7 +4095,7 @@ fn test_merchant_tier_upgrade_to_gold() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -3977,7 +4136,7 @@ fn test_merchant_tier_upgrade_to_platinum() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4020,7 +4179,7 @@ fn test_tier_discount_reduces_fee() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &pid1);
 
@@ -4038,7 +4197,7 @@ fn test_tier_discount_reduces_fee() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &pid2);
 
@@ -4048,7 +4207,10 @@ fn test_tier_discount_reduces_fee() {
     assert_eq!(client.get_accumulated_fees(), total_fees);
 
     let merchant_balance = token_user_client.balance(&merchant);
-    assert_eq!(merchant_balance, vol_amount - fee1 + (amount2 - expected_fee2));
+    assert_eq!(
+        merchant_balance,
+        vol_amount - fee1 + (amount2 - expected_fee2)
+    );
 }
 
 #[test]
@@ -4084,7 +4246,7 @@ fn test_withdraw_fees_to_treasury() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4132,7 +4294,7 @@ fn test_withdraw_fees_only_to_treasury_address() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4175,7 +4337,7 @@ fn test_withdraw_fees_exceeds_accumulated_fails() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4217,7 +4379,7 @@ fn test_fee_not_collected_when_inactive() {
         &token_contract_id,
         &Currency::USDC,
         &0,
-        &String::from_str(&env, "")
+        &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &payment_id);
 
@@ -4261,6 +4423,185 @@ fn test_get_merchant_fee_record_default() {
     assert_eq!(record.fee_tier, FeeTier::Standard);
 }
 
+#[test]
+fn test_get_and_set_tier_thresholds() {
+    let env = Env::default();
+    let (client, admin, _, _, _) = setup_fee_contract(&env);
+
+    let defaults = client.get_tier_thresholds();
+    assert_eq!(
+        defaults,
+        fee_tier_thresholds(&env, 10_000, 100_000, 1_000_000)
+    );
+
+    let updated = fee_tier_thresholds(&env, 500, 1_500, 5_000);
+    client.set_tier_thresholds(&admin, &updated);
+
+    assert_eq!(client.get_tier_thresholds(), updated);
+}
+
+#[test]
+fn test_set_tier_thresholds_requires_ascending_order() {
+    let env = Env::default();
+    let (client, admin, _, _, _) = setup_fee_contract(&env);
+
+    let invalid = soroban_sdk::vec![
+        &env,
+        (FeeTier::Silver, 1_000_i128),
+        (FeeTier::Gold, 500_i128),
+        (FeeTier::Platinum, 5_000_i128)
+    ];
+
+    let result = client.try_set_tier_thresholds(&admin, &invalid);
+    assert_eq!(result.err(), Some(Ok(Error::InvalidTierThresholds)));
+}
+
+#[test]
+fn test_merchant_tier_upgrade_runs_after_complete_payment_without_fee_collection() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let amount = 10_001_i128;
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.total_fees_paid, 0);
+    assert_eq!(record.total_volume, amount);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Silver);
+}
+
+#[test]
+fn test_merchant_tier_upgrade_uses_configured_thresholds() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.set_tier_thresholds(&admin, &fee_tier_thresholds(&env, 100, 200, 300));
+
+    let amount = 250_i128;
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.total_volume, amount);
+    assert_eq!(record.fee_tier, FeeTier::Gold);
+}
+
+#[test]
+fn test_merchant_tier_does_not_auto_downgrade() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.set_tier_thresholds(&admin, &fee_tier_thresholds(&env, 100, 200, 300));
+
+    let first_amount = 250_i128;
+    token_client.mint(&customer, &(first_amount + 1));
+    token_user_client.approve(&customer, &contract_id, &(first_amount + 1), &200);
+
+    let first_payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &first_amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &first_payment_id);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Gold);
+
+    client.set_tier_thresholds(&admin, &fee_tier_thresholds(&env, 500, 1_000, 2_000));
+
+    let second_payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &1_i128,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &second_payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.total_volume, 251);
+    assert_eq!(record.fee_tier, FeeTier::Gold);
+}
+
+#[test]
+fn test_manually_set_merchant_tier_overrides_record() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let amount = 10_001_i128;
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Silver);
+
+    client.manually_set_merchant_tier(&admin, &merchant, &FeeTier::Standard);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.total_volume, amount);
+    assert_eq!(record.fee_tier, FeeTier::Standard);
+}
+
 // ── CONDITIONAL PAYMENT TESTS ────────────────────────────────────────────
 
 fn setup_conditional_payment_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
@@ -4294,7 +4635,7 @@ fn test_create_conditional_payment_timestamp_after() {
         &Currency::USDC,
         &0,
         &metadata,
-        &condition
+        &condition,
     );
 
     // Verify conditional payment was created
@@ -4334,7 +4675,7 @@ fn test_create_conditional_payment_timestamp_before() {
         &Currency::USDC,
         &0,
         &metadata,
-        &condition
+        &condition,
     );
 
     let conditional_payment = client.get_conditional_payment(&payment_id);
@@ -4358,7 +4699,7 @@ fn test_create_conditional_payment_oracle_price() {
         oracle,
         String::from_str(&env, "BTC"),
         50000,
-        PriceComparison::GreaterThan
+        PriceComparison::GreaterThan,
     );
 
     let payment_id = client.create_conditional_payment(
@@ -4369,7 +4710,7 @@ fn test_create_conditional_payment_oracle_price() {
         &Currency::BTC,
         &0,
         &metadata,
-        &condition
+        &condition,
     );
 
     let conditional_payment = client.get_conditional_payment(&payment_id);
@@ -4406,7 +4747,7 @@ fn test_create_conditional_payment_cross_contract_state() {
         &Currency::ETH,
         &0,
         &metadata,
-        &condition
+        &condition,
     );
 
     let conditional_payment = client.get_conditional_payment(&payment_id);
@@ -4442,7 +4783,7 @@ fn test_evaluate_condition_timestamp_after_met() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Evaluate condition - should be true since 1000 > 500
@@ -4480,7 +4821,7 @@ fn test_evaluate_condition_timestamp_after_not_met() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Evaluate condition - should be false since 1000 <= 2000
@@ -4514,7 +4855,7 @@ fn test_evaluate_condition_timestamp_before_met() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Evaluate condition - should be true since 1000 < 2000
@@ -4548,7 +4889,7 @@ fn test_evaluate_condition_timestamp_before_not_met() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Evaluate condition - should be false since 2000 >= 1000
@@ -4575,7 +4916,7 @@ fn test_evaluate_condition_oracle_price_fails() {
         oracle,
         String::from_str(&env, "BTC"),
         50000,
-        PriceComparison::GreaterThan
+        PriceComparison::GreaterThan,
     );
 
     let payment_id = client.create_conditional_payment(
@@ -4586,7 +4927,7 @@ fn test_evaluate_condition_oracle_price_fails() {
         &Currency::BTC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Oracle conditions should fail with OracleCallFailed error
@@ -4616,7 +4957,7 @@ fn test_evaluate_condition_cross_contract_state_false() {
         &Currency::ETH,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Cross-contract state conditions should return false (mock implementation)
@@ -4650,7 +4991,7 @@ fn test_complete_conditional_payment_success() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Complete the conditional payment
@@ -4682,7 +5023,7 @@ fn test_complete_conditional_payment_condition_not_met() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Attempt to complete should fail with ConditionNotMet
@@ -4715,7 +5056,7 @@ fn test_complete_conditional_payment_expired() {
         &Currency::USDC,
         &100, // Expires at 1100
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Advance time past expiration
@@ -4748,7 +5089,7 @@ fn test_complete_conditional_payment_unauthorized() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // Attempt to complete with unauthorized user should fail
@@ -4788,7 +5129,7 @@ fn test_condition_evaluation_caching() {
         &Currency::USDC,
         &0,
         &String::from_str(&env, ""),
-        &condition
+        &condition,
     );
 
     // First evaluation

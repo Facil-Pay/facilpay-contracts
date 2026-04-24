@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{ testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String };
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String,
+};
 
 #[test]
 fn test_set_refund_policy_successfully() {
@@ -25,7 +27,7 @@ fn test_set_refund_policy_successfully() {
         &refund_window,
         &max_refund_percentage,
         &requires_admin_approval,
-        &auto_approve_below
+        &auto_approve_below,
     );
 
     let policy = client.get_refund_policy(&merchant);
@@ -62,7 +64,7 @@ fn test_set_refund_policy_with_invalid_percentage_should_fail() {
         &refund_window,
         &max_refund_percentage,
         &requires_admin_approval,
-        &auto_approve_below
+        &auto_approve_below,
     );
 }
 
@@ -128,7 +130,7 @@ fn test_admin_override_policy_successfully() {
         &1000i128,
         &token,
         &String::from_str(&env, "Test"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Then admin overrides policy
@@ -165,7 +167,7 @@ fn test_admin_override_policy_by_non_admin_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Test"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Try to override with unauthorized user
@@ -194,7 +196,7 @@ fn test_refund_window_expired_should_fail() {
         &(24u64 * 60u64 * 60u64), // 1 day
         &10000u32,
         &true,
-        &0i128
+        &0i128,
     );
 
     // Simulate payment created 2 days ago
@@ -209,7 +211,7 @@ fn test_refund_window_expired_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Too late"),
-        &payment_created_at
+        &payment_created_at,
     );
 
     assert_eq!(result, Err(Ok(Error::RefundWindowExpired)));
@@ -235,7 +237,7 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
         &(30u64 * 24u64 * 60u64 * 60u64),
         &5000u32, // 50%
         &true,
-        &0i128
+        &0i128,
     );
 
     // Try to request 75% refund
@@ -247,7 +249,7 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Too much"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     assert_eq!(result, Err(Ok(Error::RefundExceedsPolicy)));
@@ -272,8 +274,8 @@ fn test_auto_approve_below_threshold() {
         &merchant,
         &(30u64 * 24u64 * 60u64 * 60u64),
         &10000u32,
-        &false, // No admin approval required
-        &500i128 // Auto-approve below 500
+        &false,   // No admin approval required
+        &500i128, // Auto-approve below 500
     );
 
     // Request refund for 300 (should be auto-approved)
@@ -285,7 +287,7 @@ fn test_auto_approve_below_threshold() {
         &1000i128,
         &token,
         &String::from_str(&env, "Small refund"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Check that AutoApproved event was emitted (before next contract call clears events)
@@ -311,7 +313,13 @@ fn test_refund_with_inactive_policy_should_fail() {
 
     env.mock_all_auths();
     // Set a policy
-    client.set_refund_policy(&merchant, &(30u64 * 24u64 * 60u64 * 60u64), &10000u32, &true, &0i128);
+    client.set_refund_policy(
+        &merchant,
+        &(30u64 * 24u64 * 60u64 * 60u64),
+        &10000u32,
+        &true,
+        &0i128,
+    );
 
     // Deactivate it
     client.deactivate_refund_policy(&merchant);
@@ -325,7 +333,7 @@ fn test_refund_with_inactive_policy_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Inactive policy"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     assert_eq!(result, Err(Ok(Error::PolicyInactive)));
@@ -356,7 +364,7 @@ fn test_refund_without_merchant_policy_uses_default() {
         &1000i128,
         &token,
         &String::from_str(&env, "Default policy"),
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     let refund = client.get_refund(&refund_id);

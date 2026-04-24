@@ -465,6 +465,58 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MerchantFeeRecord"
+                            },
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "map": [
+                            {
+                              "key": {
+                                "symbol": "fee_tier"
+                              },
+                              "val": {
+                                "vec": [
+                                  {
+                                    "symbol": "Standard"
+                                  }
+                                ]
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "merchant"
+                              },
+                              "val": {
+                                "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_fees_paid"
+                              },
+                              "val": {
+                                "i128": "0"
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "total_volume"
+                              },
+                              "val": {
+                                "i128": "100"
+                              }
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MerchantPaymentCount"
                             },
                             {

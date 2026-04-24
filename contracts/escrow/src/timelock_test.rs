@@ -15,13 +15,9 @@ mod timelock_tests {
         let action_type = EscrowActionType::ResolveDispute(true);
         let data = Bytes::new(&env);
 
-        let action_id = EscrowContract::queue_action(
-            env.clone(),
-            admin.clone(),
-            escrow_id,
-            action_type,
-            data,
-        ).unwrap();
+        let action_id =
+            EscrowContract::queue_action(env.clone(), admin.clone(), escrow_id, action_type, data)
+                .unwrap();
 
         assert_eq!(action_id, 1);
 
@@ -43,13 +39,9 @@ mod timelock_tests {
         let action_type = EscrowActionType::ResolveDispute(true);
         let data = Bytes::new(&env);
 
-        let action_id = EscrowContract::queue_action(
-            env.clone(),
-            admin.clone(),
-            escrow_id,
-            action_type,
-            data,
-        ).unwrap();
+        let action_id =
+            EscrowContract::queue_action(env.clone(), admin.clone(), escrow_id, action_type, data)
+                .unwrap();
 
         // Try to execute immediately - should fail
         let result = EscrowContract::execute_queued_action(env.clone(), action_id);
@@ -68,13 +60,9 @@ mod timelock_tests {
         let action_type = EscrowActionType::ForceRelease;
         let data = Bytes::new(&env);
 
-        let action_id = EscrowContract::queue_action(
-            env.clone(),
-            admin.clone(),
-            escrow_id,
-            action_type,
-            data,
-        ).unwrap();
+        let action_id =
+            EscrowContract::queue_action(env.clone(), admin.clone(), escrow_id, action_type, data)
+                .unwrap();
 
         EscrowContract::cancel_queued_action(env.clone(), admin.clone(), action_id).unwrap();
 
@@ -91,7 +79,7 @@ mod timelock_tests {
         EscrowContract::initialize(env.clone(), admin.clone());
 
         let config = TimeLockConfig {
-            delay: 7200,      // 2 hours
+            delay: 7200,        // 2 hours
             grace_period: 3600, // 1 hour
         };
 
@@ -112,7 +100,7 @@ mod timelock_tests {
 
         // Test delay too short (less than 1 hour)
         let config = TimeLockConfig {
-            delay: 1800,      // 30 minutes
+            delay: 1800, // 30 minutes
             grace_period: 3600,
         };
 
@@ -121,7 +109,7 @@ mod timelock_tests {
 
         // Test delay too long (more than 7 days)
         let config = TimeLockConfig {
-            delay: 700000,    // > 7 days
+            delay: 700000, // > 7 days
             grace_period: 3600,
         };
 

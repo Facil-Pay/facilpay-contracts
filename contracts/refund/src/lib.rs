@@ -302,7 +302,9 @@ impl RefundContract {
             auto_approve_below: 0, // No auto-approve by default
             active: true,
         };
-        env.storage().instance().set(&DataKey::DefaultRefundPolicy, &default_policy);
+        env.storage()
+            .instance()
+            .set(&DataKey::DefaultRefundPolicy, &default_policy);
     }
 
     pub fn request_refund(
@@ -314,7 +316,7 @@ impl RefundContract {
         original_payment_amount: i128,
         token: Address,
         reason: String,
-        payment_created_at: u64
+        payment_created_at: u64,
     ) -> Result<u64, Error> {
         // Require merchant authentication
         merchant.require_auth();
@@ -341,11 +343,15 @@ impl RefundContract {
             &merchant,
             amount,
             original_payment_amount,
-            payment_created_at
+            payment_created_at,
         )?;
 
         // Get and increment refund counter
-        let counter: u64 = env.storage().instance().get(&DataKey::RefundCounter).unwrap_or(0);
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
         let refund_id = counter + 1;
 
         // Determine initial status based on policy
@@ -374,8 +380,12 @@ impl RefundContract {
         };
 
         // Store refund in contract storage
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
-        env.storage().instance().set(&DataKey::RefundCounter, &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundCounter, &refund_id);
         Self::add_to_status_index(&env, initial_status.clone(), refund_id);
 
         // Index refund by merchant
@@ -431,14 +441,12 @@ impl RefundContract {
             customer,
             amount,
             token,
-        }).publish(&env);
+        })
+        .publish(&env);
 
         // Emit AutoApproved event if applicable
         if initial_status == RefundStatus::Approved {
-            (AutoApproved {
-                refund_id,
-                amount,
-            }).publish(&env);
+            (AutoApproved { refund_id, amount }).publish(&env);
         }
 
         // Return the new refund ID
@@ -447,7 +455,10 @@ impl RefundContract {
 
     pub fn get_refund(env: &Env, refund_id: u64) -> Result<Refund, Error> {
         // Retrieve refund from storage by ID
-        env.storage().instance().get(&DataKey::Refund(refund_id)).ok_or(Error::RefundNotFound)
+        env.storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)
     }
 
     pub fn approve_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
@@ -472,7 +483,9 @@ impl RefundContract {
         refund.status = RefundStatus::Approved;
 
         // Store updated refund back to storage
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Approved, refund_id);
 
         // Emit RefundApproved event
@@ -480,7 +493,8 @@ impl RefundContract {
             refund_id,
             approved_by: admin,
             approved_at: env.ledger().timestamp(),
-        }).publish(&env);
+        })
+        .publish(&env);
 
         Ok(())
     }
@@ -489,7 +503,7 @@ impl RefundContract {
         env: Env,
         admin: Address,
         refund_id: u64,
-        rejection_reason: String
+        rejection_reason: String,
     ) -> Result<(), Error> {
         // Require admin authentication
         admin.require_auth();
@@ -512,7 +526,9 @@ impl RefundContract {
         refund.status = RefundStatus::Rejected;
 
         // Store updated refund back to storage
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
 
         // Emit RefundRejected event
@@ -521,7 +537,8 @@ impl RefundContract {
             rejected_by: admin,
             rejected_at: env.ledger().timestamp(),
             rejection_reason,
-        }).publish(&env);
+        })
+        .publish(&env);
 
         Ok(())
     }
@@ -543,13 +560,15 @@ impl RefundContract {
             &env,
             refund.payment_id,
             refund.amount,
-            refund.original_payment_amount
+            refund.original_payment_amount,
         )?;
 
         Self::remove_from_status_index(&env, RefundStatus::Approved, refund_id)?;
         refund.status = RefundStatus::Processed;
 
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Processed, refund_id);
 
         Ok(())
@@ -811,7 +830,7 @@ impl RefundContract {
         env: &Env,
         status: RefundStatus,
         limit: u64,
-        offset: u64
+        offset: u64,
     ) -> Vec<Refund> {
         let mut results: Vec<Refund> = Vec::new(env);
         let total = Self::get_refund_count_by_status(env, status.clone());
@@ -823,17 +842,15 @@ impl RefundContract {
         let end = core::cmp::min(total, offset.saturating_add(limit));
         let mut index = offset;
         while index < end {
-            if
-                let Some(refund_id) = env
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::RefundsByStatus(status.clone(), index))
+            {
+                if let Some(refund) = env
                     .storage()
                     .instance()
-                    .get::<_, u64>(&DataKey::RefundsByStatus(status.clone(), index))
-            {
-                if
-                    let Some(refund) = env
-                        .storage()
-                        .instance()
-                        .get::<_, Refund>(&DataKey::Refund(refund_id))
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
                 {
                     results.push_back(refund);
                 }
@@ -845,11 +862,18 @@ impl RefundContract {
     }
 
     pub fn get_refund_count_by_status(env: &Env, status: RefundStatus) -> u64 {
-        env.storage().instance().get(&DataKey::RefundStatusCount(status)).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundStatusCount(status))
+            .unwrap_or(0)
     }
 
     pub fn get_total_refunded_amount(env: &Env, payment_id: u64) -> i128 {
-        let total_refunds: u64 = env.storage().instance().get(&DataKey::RefundCounter).unwrap_or(0);
+        let total_refunds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
         let mut total: i128 = 0;
 
         let mut id: u64 = 1;
@@ -873,7 +897,7 @@ impl RefundContract {
         env: &Env,
         payment_id: u64,
         requested_amount: i128,
-        original_amount: i128
+        original_amount: i128,
     ) -> Result<bool, Error> {
         let total_refunded = Self::get_total_refunded_amount(env, payment_id);
         if requested_amount.saturating_add(total_refunded) > original_amount {
@@ -889,7 +913,7 @@ impl RefundContract {
         refund_window: u64,
         max_refund_percentage: u32,
         requires_admin_approval: bool,
-        auto_approve_below: i128
+        auto_approve_below: i128,
     ) -> Result<(), Error> {
         // Require merchant authentication
         merchant.require_auth();
@@ -908,19 +932,24 @@ impl RefundContract {
             active: true,
         };
 
-        env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
 
         // Emit RefundPolicySet event
         (RefundPolicySet {
             merchant,
             refund_window,
-        }).publish(&env);
+        })
+        .publish(&env);
 
         Ok(())
     }
 
     pub fn get_refund_policy(env: &Env, merchant: Address) -> Option<RefundPolicy> {
-        env.storage().instance().get(&DataKey::RefundPolicy(merchant))
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundPolicy(merchant))
     }
 
     pub fn deactivate_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
@@ -938,7 +967,9 @@ impl RefundContract {
         }
 
         policy.active = false;
-        env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
 
         // Emit RefundPolicyDeactivated event
         (RefundPolicyDeactivated { merchant }).publish(&env);
@@ -950,7 +981,7 @@ impl RefundContract {
         env: Env,
         admin: Address,
         refund_id: u64,
-        reason: String
+        reason: String,
     ) -> Result<(), Error> {
         // Require admin authentication
         admin.require_auth();
@@ -977,7 +1008,8 @@ impl RefundContract {
             refund_id,
             admin,
             reason,
-        }).publish(&env);
+        })
+        .publish(&env);
 
         Ok(())
     }
@@ -987,26 +1019,25 @@ impl RefundContract {
         merchant: &Address,
         amount: i128,
         original_amount: i128,
-        payment_created_at: u64
+        payment_created_at: u64,
     ) -> Result<(), Error> {
         // Get merchant-specific policy or default
-        let policy: RefundPolicy = if
-            let Some(merchant_policy) = Self::get_refund_policy(env, merchant.clone())
-        {
-            merchant_policy
-        } else {
-            env.storage()
-                .instance()
-                .get(&DataKey::DefaultRefundPolicy)
-                .unwrap_or_else(|| RefundPolicy {
-                    merchant: merchant.clone(),
-                    refund_window: 30 * 24 * 60 * 60, // 30 days
-                    max_refund_percentage: 10000, // 100%
-                    requires_admin_approval: true,
-                    auto_approve_below: 0,
-                    active: true,
-                })
-        };
+        let policy: RefundPolicy =
+            if let Some(merchant_policy) = Self::get_refund_policy(env, merchant.clone()) {
+                merchant_policy
+            } else {
+                env.storage()
+                    .instance()
+                    .get(&DataKey::DefaultRefundPolicy)
+                    .unwrap_or_else(|| RefundPolicy {
+                        merchant: merchant.clone(),
+                        refund_window: 30 * 24 * 60 * 60, // 30 days
+                        max_refund_percentage: 10000,     // 100%
+                        requires_admin_approval: true,
+                        auto_approve_below: 0,
+                        active: true,
+                    })
+            };
 
         // Check if policy is active
         if !policy.active {
@@ -1035,17 +1066,21 @@ impl RefundContract {
 
     fn add_to_status_index(env: &Env, status: RefundStatus, refund_id: u64) {
         let count = Self::get_refund_count_by_status(env, status.clone());
-        env.storage().instance().set(&DataKey::RefundsByStatus(status.clone(), count), &refund_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundsByStatus(status.clone(), count), &refund_id);
         env.storage()
             .instance()
             .set(&DataKey::RefundStatusCount(status.clone()), &(count + 1));
-        env.storage().instance().set(&DataKey::RefundStatusIndex(refund_id), &count);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundStatusIndex(refund_id), &count);
     }
 
     fn remove_from_status_index(
         env: &Env,
         status: RefundStatus,
-        refund_id: u64
+        refund_id: u64,
     ) -> Result<(), Error> {
         let count = Self::get_refund_count_by_status(env, status.clone());
         if count == 0 {
@@ -1074,9 +1109,15 @@ impl RefundContract {
                 .set(&DataKey::RefundStatusIndex(last_refund_id), &index);
         }
 
-        env.storage().instance().remove(&DataKey::RefundsByStatus(status.clone(), last_index));
-        env.storage().instance().remove(&DataKey::RefundStatusIndex(refund_id));
-        env.storage().instance().set(&DataKey::RefundStatusCount(status), &last_index);
+        env.storage()
+            .instance()
+            .remove(&DataKey::RefundsByStatus(status.clone(), last_index));
+        env.storage()
+            .instance()
+            .remove(&DataKey::RefundStatusIndex(refund_id));
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundStatusCount(status), &last_index);
 
         Ok(())
     }
@@ -1084,12 +1125,16 @@ impl RefundContract {
     // ── ANALYTICS FUNCTIONS ────────────────────────────────────────────────
 
     pub fn get_refund_analytics(env: Env) -> RefundAnalytics {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get(&DataKey::RefundAnalyticsKey)
             .unwrap_or(RefundAnalytics {
-                total_refunds_requested: 0, total_refunds_approved: 0,
-                total_refunds_rejected: 0, total_refunds_processed: 0,
-                total_refund_volume: 0, approval_rate_bps: 0,
+                total_refunds_requested: 0,
+                total_refunds_approved: 0,
+                total_refunds_rejected: 0,
+                total_refunds_processed: 0,
+                total_refund_volume: 0,
+                approval_rate_bps: 0,
             })
     }
 
@@ -1097,15 +1142,20 @@ impl RefundContract {
 
     pub fn pause_contract(env: Env, admin: Address, reason: String) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin = env.storage().instance()
+        let stored_admin = env
+            .storage()
+            .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         if admin != stored_admin {
             return Err(Error::Unauthorized);
         }
         let now = env.ledger().timestamp();
-        let pause_state = if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+        let pause_state = if let Some(mut state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
             state.globally_paused = true;
             state.paused_at = now;
             state.paused_by = admin.clone();
@@ -1120,8 +1170,12 @@ impl RefundContract {
                 pause_reason: reason.clone(),
             }
         };
-        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
-        let history_count: u64 = env.storage().instance()
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseStateKey, &pause_state);
+        let history_count: u64 = env
+            .storage()
+            .instance()
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -1132,27 +1186,45 @@ impl RefundContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
-        (ContractPausedEvent { paused_by: admin, reason, paused_at: now }).publish(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (ContractPausedEvent {
+            paused_by: admin,
+            reason,
+            paused_at: now,
+        })
+        .publish(&env);
         Ok(())
     }
 
     pub fn unpause_contract(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin = env.storage().instance()
+        let stored_admin = env
+            .storage()
+            .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         if admin != stored_admin {
             return Err(Error::Unauthorized);
         }
-        if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+        if let Some(mut state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
             state.globally_paused = false;
-            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+            env.storage()
+                .instance()
+                .set(&DataKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
-        let history_count: u64 = env.storage().instance()
+        let history_count: u64 = env
+            .storage()
+            .instance()
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -1163,9 +1235,17 @@ impl RefundContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
-        (ContractUnpausedEvent { unpaused_by: admin, unpaused_at: now }).publish(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (ContractUnpausedEvent {
+            unpaused_by: admin,
+            unpaused_at: now,
+        })
+        .publish(&env);
         Ok(())
     }
 
@@ -1176,15 +1256,20 @@ impl RefundContract {
         reason: String,
     ) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin = env.storage().instance()
+        let stored_admin = env
+            .storage()
+            .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         if admin != stored_admin {
             return Err(Error::Unauthorized);
         }
         let now = env.ledger().timestamp();
-        let mut pause_state = if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+        let mut pause_state = if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
             state
         } else {
             PauseState {
@@ -1196,10 +1281,16 @@ impl RefundContract {
             }
         };
         if !pause_state.paused_functions.contains(&function_name) {
-            pause_state.paused_functions.push_back(function_name.clone());
+            pause_state
+                .paused_functions
+                .push_back(function_name.clone());
         }
-        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
-        let history_count: u64 = env.storage().instance()
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseStateKey, &pause_state);
+        let history_count: u64 = env
+            .storage()
+            .instance()
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -1210,26 +1301,36 @@ impl RefundContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
-        (FunctionPausedEvent { function_name, paused_by: admin, reason }).publish(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (FunctionPausedEvent {
+            function_name,
+            paused_by: admin,
+            reason,
+        })
+        .publish(&env);
         Ok(())
     }
 
-    pub fn unpause_function(
-        env: Env,
-        admin: Address,
-        function_name: String,
-    ) -> Result<(), Error> {
+    pub fn unpause_function(env: Env, admin: Address, function_name: String) -> Result<(), Error> {
         admin.require_auth();
-        let stored_admin = env.storage().instance()
+        let stored_admin = env
+            .storage()
+            .instance()
             .get(&DataKey::Admin)
             .ok_or(Error::Unauthorized)?;
         if admin != stored_admin {
             return Err(Error::Unauthorized);
         }
-        if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+        if let Some(mut state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
             let mut new_paused = Vec::new(&env);
             for fn_name in state.paused_functions.iter() {
                 if fn_name != function_name {
@@ -1237,10 +1338,14 @@ impl RefundContract {
                 }
             }
             state.paused_functions = new_paused;
-            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+            env.storage()
+                .instance()
+                .set(&DataKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
-        let history_count: u64 = env.storage().instance()
+        let history_count: u64 = env
+            .storage()
+            .instance()
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -1251,14 +1356,23 @@ impl RefundContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
-        (FunctionUnpausedEvent { function_name, unpaused_by: admin }).publish(&env);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        (FunctionUnpausedEvent {
+            function_name,
+            unpaused_by: admin,
+        })
+        .publish(&env);
         Ok(())
     }
 
     pub fn get_pause_state(env: Env) -> PauseState {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get(&DataKey::PauseStateKey)
             .unwrap_or(PauseState {
                 globally_paused: false,
@@ -1270,19 +1384,29 @@ impl RefundContract {
     }
 
     pub fn is_function_paused(env: Env, function_name: String) -> bool {
-        if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
-            if state.globally_paused { return true; }
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
+            if state.globally_paused {
+                return true;
+            }
             for fn_name in state.paused_functions.iter() {
-                if fn_name == function_name { return true; }
+                if fn_name == function_name {
+                    return true;
+                }
             }
         }
         false
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
-        if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PauseState>(&DataKey::PauseStateKey)
+        {
             if state.globally_paused {
                 return Err(Error::ContractPaused);
             }
@@ -1298,5 +1422,5 @@ impl RefundContract {
 }
 
 mod test;
-mod test_process;
 mod test_policy;
+mod test_process;
