@@ -32,6 +32,10 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    InsurancePool,
+    InsuranceConfig,
+    InsuranceClaim(u64),
+    InsuranceClaimCounter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -41,6 +45,32 @@ pub enum EscrowStatus {
     Released,
     Disputed,
     Resolved,
+    Cancelled,
+}
+
+#[contracttype]
+pub struct InsurancePool {
+    pub token: Address,
+    pub balance: i128,
+    pub total_premiums_collected: i128,
+    pub total_claims_paid: i128,
+}
+
+#[contracttype]
+pub struct InsuranceConfig {
+    pub premium_bps: i128,
+    pub max_coverage_bps: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+pub struct InsuranceClaim {
+    pub claim_id: u64,
+    pub escrow_id: u64,
+    pub claimant: Address,
+    pub amount: i128,
+    pub approved: bool,
+    pub paid_at: Option<u64>,
 }
 
 #[contracterror]
@@ -77,6 +107,8 @@ pub enum Error {
     ActionCancelled = 29,
     ContractPaused = 30,
     FunctionPaused = 31,
+    Underfunded = 32,
+    NotClaimable = 33,
 }
 
 #[contractevent]
@@ -1124,7 +1156,7 @@ impl EscrowContract {
 
     fn internal_release_escrow(
         env: Env,
-        admin: Address,
+        _admin: Address,
         escrow_id: u64,
         early_release: bool,
     ) -> Result<(), Error> {
@@ -1154,6 +1186,7 @@ impl EscrowContract {
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::InvalidStatus),
             EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -1215,7 +1248,7 @@ impl EscrowContract {
             EscrowStatus::Locked | EscrowStatus::Disputed => {
                 escrow.status = EscrowStatus::Resolved;
             }
-            EscrowStatus::Released | EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -1263,6 +1296,7 @@ impl EscrowContract {
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
             EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
         }
 
         env.storage()
@@ -1463,7 +1497,7 @@ impl EscrowContract {
 
     fn internal_resolve_dispute(
         env: Env,
-        admin: Address,
+        _admin: Address,
         escrow_id: u64,
         release_to_merchant: bool,
     ) -> Result<(), Error> {
@@ -2172,6 +2206,7 @@ impl EscrowContract {
                     EscrowStatus::Released => return Err(Error::AlreadyProcessed),
                     EscrowStatus::Disputed => return Err(Error::InvalidStatus),
                     EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
+                    EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
                 }
 
                 env.storage()
@@ -2799,9 +2834,107 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::TimeLockConfig)
             .unwrap_or(TimeLockConfig {
-                delay: 86400,        // 24 hours default
-                grace_period: 86400, // 24 hours default
+                delay: 86400,
+                grace_period: 86400,
             })
+    }
+
+    pub fn set_insurance_config(env: Env, admin: Address, config: InsuranceConfig) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::InsuranceConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_insurance_pool(env: Env) -> InsurancePool {
+        env.storage()
+            .instance()
+            .get(&DataKey::InsurancePool)
+            .unwrap_or(InsurancePool {
+                token: env.current_contract_address(), // dummy default
+                balance: 0,
+                total_premiums_collected: 0,
+                total_claims_paid: 0,
+            })
+    }
+
+    pub fn opt_into_insurance(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let config: InsuranceConfig = env.storage().instance().get(&DataKey::InsuranceConfig).ok_or(Error::Unauthorized)?;
+        if !config.enabled { return Err(Error::Unauthorized); }
+
+        let mut escrow = Self::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked { return Err(Error::InvalidStatus); }
+
+        let premium = (escrow.amount * config.premium_bps) / 10000;
+        if premium == 0 { return Ok(()); }
+
+        escrow.amount -= premium;
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        let mut pool = Self::get_insurance_pool(env.clone());
+        pool.token = escrow.token.clone();
+        pool.balance += premium;
+        pool.total_premiums_collected += premium;
+        env.storage().instance().set(&DataKey::InsurancePool, &pool);
+
+        Ok(())
+    }
+
+    pub fn file_insurance_claim(env: Env, admin: Address, escrow_id: u64, amount: i128) -> Result<u64, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) { return Err(Error::Unauthorized); }
+
+        let escrow = Self::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Resolved && escrow.status != EscrowStatus::Cancelled {
+            return Err(Error::NotClaimable);
+        }
+
+        let config: InsuranceConfig = env.storage().instance().get(&DataKey::InsuranceConfig).ok_or(Error::Unauthorized)?;
+        let max_coverage = (escrow.amount * config.max_coverage_bps) / 10000;
+        if amount > max_coverage { return Err(Error::Unauthorized); }
+
+        let counter: u64 = env.storage().instance().get(&DataKey::InsuranceClaimCounter).unwrap_or(0) + 1;
+        let claim = InsuranceClaim {
+            claim_id: counter,
+            escrow_id,
+            claimant: escrow.customer.clone(), // default to customer
+            amount,
+            approved: false,
+            paid_at: None,
+        };
+
+        env.storage().instance().set(&DataKey::InsuranceClaim(counter), &claim);
+        env.storage().instance().set(&DataKey::InsuranceClaimCounter, &counter);
+
+        Ok(counter)
+    }
+
+    pub fn approve_claim(env: Env, admin: Address, claim_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) { return Err(Error::Unauthorized); }
+
+        let mut claim: InsuranceClaim = env.storage().instance().get(&DataKey::InsuranceClaim(claim_id)).ok_or(Error::EscrowNotFound)?;
+        if claim.approved { return Err(Error::AlreadyProcessed); }
+
+        let mut pool = Self::get_insurance_pool(env.clone());
+        if pool.balance < claim.amount { return Err(Error::Underfunded); }
+
+        Self::transfer_if_token_contract(&env, &pool.token, &claim.claimant, claim.amount)?;
+
+        pool.balance -= claim.amount;
+        pool.total_claims_paid += claim.amount;
+        env.storage().instance().set(&DataKey::InsurancePool, &pool);
+
+        claim.approved = true;
+        claim.paid_at = Some(env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::InsuranceClaim(claim_id), &claim);
+
+        Ok(())
     }
 }
 
