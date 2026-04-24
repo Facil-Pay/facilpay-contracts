@@ -2125,7 +2125,7 @@ fn test_multisig_duplicate_approval_rejected() {
     let client = EscrowContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
     let admin2 = Address::generate(&env);
-    let token = Address::generate(&env);
+    let _token = Address::generate(&env);
     env.mock_all_auths();
 
     client.initialize(&admin);
@@ -2295,4 +2295,99 @@ fn test_multisig_resolve_dispute_via_proposal() {
         EscrowContract::get_escrow(&env, escrow_id)
     });
     assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn test_watchdog_release_eligible() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_watchdog_config(&admin, &WatchdogConfig {
+        inactivity_release_seconds: 100,
+        enabled: true,
+        favor_customer_on_release: false, // releases to merchant
+    });
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+
+    // After release_timestamp (1100) + inactivity (100) = 1200
+    env.ledger().set_timestamp(1201);
+    
+    assert!(client.is_watchdog_eligible(&escrow_id));
+    client.trigger_watchdog_release(&escrow_id);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
+
+#[test]
+fn test_watchdog_ineligible_dispute() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_watchdog_config(&admin, &WatchdogConfig {
+        inactivity_release_seconds: 100,
+        enabled: true,
+        favor_customer_on_release: false,
+    });
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    env.ledger().set_timestamp(1201);
+    
+    assert!(!client.is_watchdog_eligible(&escrow_id));
+    let result = client.try_trigger_watchdog_release(&escrow_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_watchdog_premature_trigger() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_watchdog_config(&admin, &WatchdogConfig {
+        inactivity_release_seconds: 100,
+        enabled: true,
+        favor_customer_on_release: false,
+    });
+
+    env.ledger().set_timestamp(1000);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+
+    // Before release_timestamp + inactivity
+    env.ledger().set_timestamp(1150);
+    
+    assert!(!client.is_watchdog_eligible(&escrow_id));
+    let result = client.try_trigger_watchdog_release(&escrow_id);
+    assert!(result.is_err());
 }
