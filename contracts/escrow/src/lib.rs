@@ -86,6 +86,9 @@ pub enum Error {
     OracleStalePriceFeed = 44,
     OracleConditionNotMet = 45,
     NoOracleCondition = 46,
+    MilestoneNotFound = 47,
+    MilestoneNotApproved = 48,
+    MilestoneOverflow = 49,
 }
 
 #[contractevent]
@@ -193,8 +196,16 @@ pub struct VestedAmountReleased {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MilestoneReleased {
     pub escrow_id: u64,
-    pub milestone_index: u32,
+    pub milestone_id: u64,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MilestoneApproved {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub approved_by: Address,
 }
 
 #[derive(Clone)]
@@ -289,10 +300,13 @@ pub struct Evidence {
 #[derive(Clone)]
 #[contracttype]
 pub struct VestingMilestone {
+    pub milestone_id: u64,
     pub unlock_timestamp: u64,
     pub amount: i128,
     pub released: bool,
     pub description: String,
+    pub approved_by: Option<Address>,
+    pub approved_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1958,6 +1972,15 @@ impl EscrowContract {
             .set(&DataKey::EscrowCounter, &escrow_id);
 
         // Create and store the vesting schedule
+        // Assign sequential milestone_ids if not already set
+        let mut indexed_milestones = Vec::new(&env);
+        for (i, mut m) in milestones.iter().enumerate() {
+            if m.milestone_id == 0 {
+                m.milestone_id = (i as u64) + 1;
+            }
+            indexed_milestones.push_back(m);
+        }
+
         let vesting_schedule = VestingSchedule {
             escrow_id,
             total_amount: amount,
@@ -1965,7 +1988,7 @@ impl EscrowContract {
             start_timestamp: current_timestamp,
             cliff_timestamp,
             end_timestamp,
-            milestones,
+            milestones: indexed_milestones,
         };
 
         env.storage()
@@ -2167,11 +2190,12 @@ impl EscrowContract {
                 {
                     milestone.released = true;
                     let amount = milestone.amount;
+                    let mid = milestone.milestone_id;
                     milestones_vec.set(i, milestone);
 
                     MilestoneReleased {
                         escrow_id,
-                        milestone_index: i as u32,
+                        milestone_id: mid,
                         amount,
                     }
                     .publish(&env);
@@ -2193,6 +2217,217 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(releasable_amount)
+    }
+
+    /// Admin approves a specific milestone, enabling it to be released.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneNotFound` - No milestone with the given ID
+    /// * `MilestoneAlreadyReleased` - Milestone was already released
+    /// * `NotAnAdmin` - Caller is not a registered admin
+    pub fn approve_milestone(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut found = false;
+        let mut milestones = vesting_schedule.milestones.clone();
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            if m.milestone_id == milestone_id {
+                found = true;
+                if m.released {
+                    return Err(Error::MilestoneAlreadyReleased);
+                }
+                let now = env.ledger().timestamp();
+                m.approved_by = Some(admin.clone());
+                m.approved_at = Some(now);
+                milestones.set(i, m);
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::MilestoneNotFound);
+        }
+
+        vesting_schedule.milestones = milestones;
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        MilestoneApproved {
+            escrow_id,
+            milestone_id,
+            approved_by: admin,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Releases a specific approved milestone's amount to the merchant.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneNotFound` - No milestone with the given ID
+    /// * `MilestoneNotApproved` - Milestone has not been approved by an admin
+    /// * `MilestoneAlreadyReleased` - Milestone was already released
+    /// * `MilestoneOverflow` - Release would exceed the escrow's locked amount
+    pub fn release_milestone(env: Env, escrow_id: u64, milestone_id: u64) -> Result<i128, Error> {
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut found = false;
+        let mut release_amount: i128 = 0;
+        let mut milestones = vesting_schedule.milestones.clone();
+
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            if m.milestone_id == milestone_id {
+                found = true;
+                if m.released {
+                    return Err(Error::MilestoneAlreadyReleased);
+                }
+                if m.approved_by.is_none() {
+                    return Err(Error::MilestoneNotApproved);
+                }
+                // Guard: total released must not exceed locked amount
+                let new_total = vesting_schedule.released_amount.saturating_add(m.amount);
+                if new_total > vesting_schedule.total_amount {
+                    return Err(Error::MilestoneOverflow);
+                }
+                release_amount = m.amount;
+                m.released = true;
+                milestones.set(i, m);
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::MilestoneNotFound);
+        }
+
+        vesting_schedule.milestones = milestones;
+        vesting_schedule.released_amount = vesting_schedule
+            .released_amount
+            .saturating_add(release_amount);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        // Transfer to merchant
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &escrow.merchant,
+            release_amount,
+        )?;
+
+        MilestoneReleased {
+            escrow_id,
+            milestone_id,
+            amount: release_amount,
+        }
+        .publish(&env);
+
+        Ok(release_amount)
+    }
+
+    /// Returns all milestones that have not yet been released.
+    pub fn get_pending_milestones(env: Env, escrow_id: u64) -> Vec<VestingMilestone> {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(s) => s,
+            None => return Vec::new(&env),
+        };
+
+        let mut pending = Vec::new(&env);
+        for m in vesting_schedule.milestones.iter() {
+            if !m.released {
+                pending.push_back(m);
+            }
+        }
+        pending
+    }
+
+    /// Adds a new milestone to an existing vesting schedule.
+    /// The new milestone's amount must not cause total milestone amounts to exceed the escrow's
+    /// locked amount.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    /// * `MilestoneOverflow` - Adding this milestone would exceed the locked amount
+    /// * `NotAnAdmin` - Caller is not a registered admin
+    pub fn add_milestone(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        milestone: VestingMilestone,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        // Sum existing milestone amounts
+        let mut existing_total: i128 = 0;
+        for m in vesting_schedule.milestones.iter() {
+            existing_total = existing_total.saturating_add(m.amount);
+        }
+
+        if existing_total.saturating_add(milestone.amount) > vesting_schedule.total_amount {
+            return Err(Error::MilestoneOverflow);
+        }
+
+        // Auto-assign milestone_id if not provided
+        let mut new_milestone = milestone;
+        if new_milestone.milestone_id == 0 {
+            new_milestone.milestone_id = (vesting_schedule.milestones.len() as u64) + 1;
+        }
+
+        vesting_schedule.milestones.push_back(new_milestone);
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingSchedule(escrow_id), &vesting_schedule);
+
+        Ok(())
     }
 
     // For existing tests that use synthetic token addresses, transfer calls are skipped when the
@@ -2682,9 +2917,10 @@ impl EscrowContract {
         if !config.admins.contains(&admin) {
             return Err(Error::NotAnAdmin);
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowAnalyticsKey, &EscrowAnalytics::default_value());
+        env.storage().instance().set(
+            &DataKey::EscrowAnalyticsKey,
+            &EscrowAnalytics::default_value(),
+        );
         let now = env.ledger().timestamp();
         AnalyticsReset {
             reset_by: admin,
