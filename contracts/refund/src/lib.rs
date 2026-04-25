@@ -27,6 +27,13 @@ pub enum DataKey {
     PoolToken(u64),
     DefaultRefundPolicy,
     RefundPolicy(Address),
+    // Policy versioning (#134)
+    RefundPolicyVersion(Address, u32),
+    RefundPolicyVersionCount(Address),
+    // Payment contract address (#143)
+    PaymentContractAddress,
+    // Batch refund limit (#135)
+    BatchRefundLimit,
     // Analytics
     RefundAnalyticsKey,
     // Pause system
@@ -71,6 +78,9 @@ pub enum Error {
     NotArbitrator = 16,
     ContractPaused = 17,
     FunctionPaused = 18,
+    BatchRefundTooLarge = 20,
+    PaymentContractNotSet = 27,
+    PaymentOwnershipMismatch = 28,
     CircuitBreakerTripped = 29,
 }
 
@@ -197,6 +207,26 @@ pub struct RefundPolicy {
     pub requires_admin_approval: bool,
     pub auto_approve_below: i128,
     pub active: bool,
+}
+
+// ── Issue #134: Policy versioning struct ──────────────────────────────────
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundPolicyVersion {
+    pub version: u32,
+    pub policy: RefundPolicy,
+    pub created_at: u64,
+    pub created_by: Address,
+}
+
+// ── Issue #135: Batch refund result struct ─────────────────────────────────
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchRefundResult {
+    pub refund_id: u64,
+    pub success: bool,
+    pub error_code: u32,
+    pub amount_refunded: i128,
 }
 
 #[contractevent]
@@ -371,6 +401,23 @@ impl RefundContract {
         // Validate payment_id is valid (greater than 0)
         if payment_id == 0 {
             return Err(Error::InvalidPaymentId);
+        }
+
+        // ── Issue #143: Cross-contract verification (if payment contract is set) ──
+        if let Some(payment_contract_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PaymentContractAddress)
+        {
+            // Verify ownership via cross-contract call; skip if call fails (backward-compatible)
+            let owned = Self::verify_payment_ownership(
+                env.clone(),
+                payment_id,
+                customer.clone(),
+            );
+            if !owned {
+                return Err(Error::PaymentOwnershipMismatch);
+            }
         }
 
         Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
@@ -953,6 +1000,28 @@ impl RefundContract {
 
         env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
 
+        // ── Issue #134: version the policy ──────────────────────────────────
+        let version_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .unwrap_or(0);
+        let new_version = version_count + 1;
+        let versioned = RefundPolicyVersion {
+            version: new_version,
+            policy: policy.clone(),
+            created_at: env.ledger().timestamp(),
+            created_by: merchant.clone(),
+        };
+        env.storage().instance().set(
+            &DataKey::RefundPolicyVersion(merchant.clone(), new_version),
+            &versioned,
+        );
+        env.storage().instance().set(
+            &DataKey::RefundPolicyVersionCount(merchant.clone()),
+            &new_version,
+        );
+
         // Emit RefundPolicySet event
         (RefundPolicySet {
             merchant,
@@ -960,6 +1029,69 @@ impl RefundContract {
         }).publish(&env);
 
         Ok(())
+    }
+
+    // ── Issue #134: Policy versioning query functions ──────────────────────
+
+    pub fn get_refund_policy_version(
+        env: Env,
+        merchant: Address,
+        version: u32,
+    ) -> Option<RefundPolicyVersion> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundPolicyVersion(merchant, version))
+    }
+
+    pub fn get_refund_policy_at_time(
+        env: Env,
+        merchant: Address,
+        timestamp: u64,
+    ) -> Option<RefundPolicyVersion> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .unwrap_or(0);
+        if count == 0 {
+            return None;
+        }
+        // Walk versions in reverse to find the latest one created at or before timestamp
+        let mut result: Option<RefundPolicyVersion> = None;
+        for v in 1..=count {
+            if let Some(pv) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RefundPolicyVersion>(&DataKey::RefundPolicyVersion(merchant.clone(), v))
+            {
+                if pv.created_at <= timestamp {
+                    result = Some(pv);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn get_refund_policy_history(
+        env: Env,
+        merchant: Address,
+    ) -> Vec<RefundPolicyVersion> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .unwrap_or(0);
+        let mut history = Vec::new(&env);
+        for v in 1..=count {
+            if let Some(pv) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RefundPolicyVersion>(&DataKey::RefundPolicyVersion(merchant.clone(), v))
+            {
+                history.push_back(pv);
+            }
+        }
+        history
     }
 
     pub fn get_refund_policy(env: &Env, merchant: Address) -> Option<RefundPolicy> {
@@ -1122,6 +1254,182 @@ impl RefundContract {
         env.storage().instance().set(&DataKey::RefundStatusCount(status), &last_index);
 
         Ok(())
+    }
+
+    // ── Issue #135: Batch refund processing ──────────────────────────────────
+
+    const DEFAULT_BATCH_LIMIT: u32 = 20;
+
+    pub fn get_batch_refund_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BatchRefundLimit)
+            .unwrap_or(Self::DEFAULT_BATCH_LIMIT)
+    }
+
+    pub fn set_batch_refund_limit(env: Env, admin: Address, limit: u32) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&DataKey::BatchRefundLimit, &limit);
+        Ok(())
+    }
+
+    pub fn approve_refund_batch(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u64>,
+    ) -> Vec<BatchRefundResult> {
+        admin.require_auth();
+        let limit = Self::get_batch_refund_limit(env.clone());
+        if refund_ids.len() > limit {
+            // Return single error result indicating batch too large
+            let mut results = Vec::new(&env);
+            results.push_back(BatchRefundResult {
+                refund_id: 0,
+                success: false,
+                error_code: Error::BatchRefundTooLarge as u32,
+                amount_refunded: 0,
+            });
+            return results;
+        }
+
+        let mut results = Vec::new(&env);
+        for refund_id in refund_ids.iter() {
+            let result = Self::approve_refund(env.clone(), admin.clone(), refund_id);
+            match result {
+                Ok(()) => {
+                    let amount = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, Refund>(&DataKey::Refund(refund_id))
+                        .map(|r| r.amount)
+                        .unwrap_or(0);
+                    results.push_back(BatchRefundResult {
+                        refund_id,
+                        success: true,
+                        error_code: 0,
+                        amount_refunded: amount,
+                    });
+                }
+                Err(e) => {
+                    results.push_back(BatchRefundResult {
+                        refund_id,
+                        success: false,
+                        error_code: e as u32,
+                        amount_refunded: 0,
+                    });
+                }
+            }
+        }
+        results
+    }
+
+    pub fn process_refund_batch(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u64>,
+    ) -> Vec<BatchRefundResult> {
+        admin.require_auth();
+        let limit = Self::get_batch_refund_limit(env.clone());
+        if refund_ids.len() > limit {
+            let mut results = Vec::new(&env);
+            results.push_back(BatchRefundResult {
+                refund_id: 0,
+                success: false,
+                error_code: Error::BatchRefundTooLarge as u32,
+                amount_refunded: 0,
+            });
+            return results;
+        }
+
+        let mut results = Vec::new(&env);
+        for refund_id in refund_ids.iter() {
+            let amount = env
+                .storage()
+                .instance()
+                .get::<DataKey, Refund>(&DataKey::Refund(refund_id))
+                .map(|r| r.amount)
+                .unwrap_or(0);
+            let result = Self::process_refund(env.clone(), admin.clone(), refund_id);
+            match result {
+                Ok(()) => {
+                    results.push_back(BatchRefundResult {
+                        refund_id,
+                        success: true,
+                        error_code: 0,
+                        amount_refunded: amount,
+                    });
+                }
+                Err(e) => {
+                    results.push_back(BatchRefundResult {
+                        refund_id,
+                        success: false,
+                        error_code: e as u32,
+                        amount_refunded: 0,
+                    });
+                }
+            }
+        }
+        results
+    }
+
+    // ── Issue #143: Cross-contract payment verification ───────────────────────
+
+    pub fn set_payment_contract_address(
+        env: Env,
+        admin: Address,
+        payment_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentContractAddress, &payment_contract);
+        Ok(())
+    }
+
+    pub fn get_payment_contract_address(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+    }
+
+    pub fn verify_payment_ownership(
+        env: Env,
+        payment_id: u64,
+        customer: Address,
+    ) -> bool {
+        let payment_contract: Address = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+        {
+            Some(addr) => addr,
+            None => return false, // no contract set → skip verification
+        };
+        // Cross-contract call to payment_contract.check_payment_customer(payment_id, customer).
+        // That function returns bool: true if payment exists, belongs to customer, and is Completed.
+        use soroban_sdk::{Symbol, IntoVal};
+        let func = Symbol::new(&env, "check_payment_customer");
+        let args = (payment_id, customer).into_val(&env);
+        match env.try_invoke_contract::<bool>(&payment_contract, &func, args) {
+            Ok(Ok(result)) => result,
+            _ => false,
+        }
     }
 
     // ── ANALYTICS FUNCTIONS ────────────────────────────────────────────────
@@ -1530,3 +1838,12 @@ mod test_policy;
 
 #[cfg(test)]
 mod test_circuit_breaker;
+
+#[cfg(test)]
+mod test_versioning;
+
+#[cfg(test)]
+mod test_batch;
+
+#[cfg(test)]
+mod test_cross_contract;

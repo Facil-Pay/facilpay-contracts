@@ -118,6 +118,9 @@ pub struct Subscription {
     pub retry_count: u64,   // consecutive failed attempts on current cycle
     pub max_retries: u64,   // max retries before marking failed cycle skipped
     pub metadata: String,
+    pub trial_period_seconds: u64, // 0 = no trial
+    pub trial_ends_at: u64,        // 0 = no trial
+    pub converted: bool,           // true after first post-trial charge
 }
 
 #[contracterror]
@@ -275,6 +278,27 @@ pub struct SubscriptionPaused {
 pub struct SubscriptionResumed {
     pub subscription_id: u64,
     pub next_payment_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialStarted {
+    pub subscription_id: u64,
+    pub trial_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialConverted {
+    pub subscription_id: u64,
+    pub converted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrialCancelled {
+    pub subscription_id: u64,
+    pub cancelled_at: u64,
 }
 
 #[contractevent]
@@ -1252,6 +1276,19 @@ impl PaymentContract {
             .expect("Payment not found")
     }
 
+    /// Used by the refund contract for cross-contract ownership verification (#143).
+    /// Returns true if the payment exists, belongs to `customer`, and is Completed.
+    pub fn check_payment_customer(env: Env, payment_id: u64, customer: Address) -> bool {
+        let payment: Option<Payment> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(payment_id));
+        match payment {
+            Some(p) => p.customer == customer && p.status == PaymentStatus::Completed,
+            None => false,
+        }
+    }
+
     pub fn create_escrowed_payment(
         env: Env,
         customer: Address,
@@ -1984,9 +2021,10 @@ impl PaymentContract {
     // ── RECURRING / SUBSCRIPTION METHODS ────────────────────────────────────
 
     /// Create a new subscription. The customer authorises the creation.
-    /// `interval`          – seconds between each automatic payment
-    /// `duration`          – total lifetime in seconds (0 = indefinite)
-    /// `max_retries`       – how many times to retry a failed cycle (0 uses DEFAULT)
+    /// `interval`             – seconds between each automatic payment
+    /// `duration`             – total lifetime in seconds (0 = indefinite)
+    /// `max_retries`          – how many times to retry a failed cycle (0 uses DEFAULT)
+    /// `trial_period_seconds` – free trial duration in seconds (0 = no trial)
     pub fn create_subscription(
         env: Env,
         customer: Address,
@@ -1998,6 +2036,7 @@ impl PaymentContract {
         duration: u64,
         max_retries: u64,
         metadata: String,
+        trial_period_seconds: u64,
     ) -> Result<u64, Error> {
         customer.require_auth();
 
@@ -2023,6 +2062,12 @@ impl PaymentContract {
             max_retries
         };
 
+        let trial_ends_at = if trial_period_seconds > 0 {
+            now + trial_period_seconds
+        } else {
+            0
+        };
+
         let sub = Subscription {
             id: sub_id,
             customer: customer.clone(),
@@ -2040,6 +2085,9 @@ impl PaymentContract {
             retry_count: 0,
             max_retries: retries,
             metadata,
+            trial_period_seconds,
+            trial_ends_at,
+            converted: false,
         };
 
         env.storage()
@@ -2088,6 +2136,15 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Emit TrialStarted if trial is active
+        if sub.trial_ends_at > 0 {
+            (TrialStarted {
+                subscription_id: sub_id,
+                trial_ends_at: sub.trial_ends_at,
+            })
+            .publish(&env);
+        }
+
         Ok(sub_id)
     }
 
@@ -2130,6 +2187,15 @@ impl PaymentContract {
             return Err(Error::PaymentNotDue);
         }
 
+        // Skip charge if still within trial period
+        if sub.trial_ends_at > 0 && now < sub.trial_ends_at {
+            sub.next_payment_at = now + sub.interval;
+            env.storage()
+                .instance()
+                .set(&DataKey::Subscription(subscription_id), &sub);
+            return Ok(());
+        }
+
         // Attempt token transfer
         let token_client = token::Client::new(&env, &sub.token);
         let contract_address = env.current_contract_address();
@@ -2139,6 +2205,16 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
+            // Mark converted on first post-trial charge
+            if sub.trial_ends_at > 0 && !sub.converted {
+                sub.converted = true;
+                (TrialConverted {
+                    subscription_id,
+                    converted_at: now,
+                })
+                .publish(&env);
+            }
+
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
@@ -2220,6 +2296,16 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Subscription(subscription_id), &sub);
+
+        // Emit TrialCancelled if cancelled during trial
+        let now = env.ledger().timestamp();
+        if sub.trial_ends_at > 0 && now < sub.trial_ends_at {
+            (TrialCancelled {
+                subscription_id,
+                cancelled_at: now,
+            })
+            .publish(&env);
+        }
 
         (SubscriptionCancelled {
             subscription_id,
@@ -4016,3 +4102,6 @@ mod test;
 
 #[cfg(test)]
 mod test_analytics;
+
+#[cfg(test)]
+mod test_trial;
