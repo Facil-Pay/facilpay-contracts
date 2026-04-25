@@ -34,6 +34,7 @@ pub enum DataKey {
     ProposalCounter,
     FeeConfig,
     MerchantFeeRecord(Address),
+    TierThresholds,
     AccumulatedFees,
     // Analytics
     PaymentAnalyticsKey,
@@ -167,6 +168,7 @@ pub enum Error {
     OracleCallFailed = 42,
     ContractPaused = 43,
     FunctionPaused = 44,
+    InvalidTierThresholds = 45,
 }
 
 #[contractevent]
@@ -462,9 +464,8 @@ pub struct BatchResult {
 #[contracttype]
 pub enum FeeTier {
     Standard,
-    Silver,   // > 10,000 XLM volume
-    Gold,     // > 100,000 XLM volume
-    Platinum, // > 1,000,000 XLM volume
+    Premium,    // >= configured premium volume
+    Enterprise, // >= configured enterprise volume
 }
 
 #[derive(Clone)]
@@ -672,9 +673,8 @@ const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
 
 // Fee tier volume thresholds (raw token units)
-const SILVER_VOLUME_THRESHOLD: i128 = 10_000;
-const GOLD_VOLUME_THRESHOLD: i128 = 100_000;
-const PLATINUM_VOLUME_THRESHOLD: i128 = 1_000_000;
+const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
+const ENTERPRISE_VOLUME_THRESHOLD: i128 = 100_000;
 
 #[contractimpl]
 impl PaymentContract {
@@ -1534,11 +1534,11 @@ impl PaymentContract {
         }
 
         // Deduct platform fee (if configured) and get net amount for merchant
-        let net_amount = PaymentContract::deduct_fee(
+        let (net_amount, fee_amount) = PaymentContract::deduct_fee(
             env,
             payment_id,
             payment.amount,
-            &payment.merchant,
+            payment.merchant.clone(),
             &payment.token,
             &payment.customer,
         );
@@ -1557,6 +1557,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(payment_id), &payment);
+        PaymentContract::update_merchant_fee_record_post_completion(
+            env,
+            payment.merchant.clone(),
+            payment.amount,
+            fee_amount,
+        );
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -3100,15 +3106,65 @@ impl PaymentContract {
 
     /// Returns the fee record for a given merchant.
     pub fn get_merchant_fee_record(env: Env, merchant: Address) -> MerchantFeeRecord {
+        PaymentContract::get_or_default_merchant_fee_record(&env, merchant)
+    }
+
+    /// Returns only the current tier for a given merchant.
+    pub fn get_merchant_tier(env: Env, merchant: Address) -> FeeTier {
+        PaymentContract::get_or_default_merchant_fee_record(&env, merchant).fee_tier
+    }
+
+    /// Admin manually sets merchant tier (supports explicit downgrade/override).
+    pub fn manually_set_merchant_tier(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        tier: FeeTier,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut record = PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
+        record.fee_tier = tier;
         env.storage()
             .instance()
-            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
-            .unwrap_or(MerchantFeeRecord {
-                merchant,
-                total_fees_paid: 0,
-                total_volume: 0,
-                fee_tier: FeeTier::Standard,
-            })
+            .set(&DataKey::MerchantFeeRecord(merchant), &record);
+        Ok(())
+    }
+
+    /// Returns tier thresholds as (tier, minimum-volume) pairs.
+    pub fn get_tier_thresholds(env: Env) -> Vec<(FeeTier, i128)> {
+        PaymentContract::get_stored_or_default_thresholds(&env)
+    }
+
+    /// Admin sets ascending tier thresholds.
+    pub fn set_tier_thresholds(
+        env: Env,
+        admin: Address,
+        thresholds: Vec<(FeeTier, i128)>,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        PaymentContract::validate_thresholds(&thresholds)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TierThresholds, &thresholds);
+        Ok(())
     }
 
     /// Returns the total fees accumulated in the contract.
@@ -3166,34 +3222,24 @@ impl PaymentContract {
         env: &Env,
         payment_id: u64,
         amount: i128,
-        merchant: &Address,
+        merchant: Address,
         token: &Address,
         customer: &Address,
-    ) -> i128 {
+    ) -> (i128, i128) {
         let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
         let config = match config {
             None => {
-                return amount;
+                return (amount, 0);
             }
             Some(c) if !c.active => {
-                return amount;
+                return (amount, 0);
             }
             Some(c) if c.fee_token != *token => {
-                return amount;
+                return (amount, 0);
             }
             Some(c) => c,
         };
-
-        let mut record: MerchantFeeRecord = env
-            .storage()
-            .instance()
-            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
-            .unwrap_or(MerchantFeeRecord {
-                merchant: merchant.clone(),
-                total_fees_paid: 0,
-                total_volume: 0,
-                fee_tier: FeeTier::Standard,
-            });
+        let record = PaymentContract::get_or_default_merchant_fee_record(env, merchant.clone());
 
         let fee = PaymentContract::compute_fee_amount(
             amount,
@@ -3204,7 +3250,7 @@ impl PaymentContract {
         );
 
         if fee <= 0 {
-            return amount;
+            return (amount, 0);
         }
 
         let net_amount = amount - fee;
@@ -3224,34 +3270,14 @@ impl PaymentContract {
             .instance()
             .set(&DataKey::AccumulatedFees, &(accumulated + fee));
 
-        // Update merchant record and check for tier upgrades
-        let old_tier = record.fee_tier.clone();
-        record.total_fees_paid += fee;
-        record.total_volume += amount;
-
-        let new_tier = PaymentContract::get_tier_for_volume(record.total_volume);
-        if new_tier != old_tier {
-            record.fee_tier = new_tier.clone();
-            (MerchantTierUpgraded {
-                merchant: merchant.clone(),
-                old_tier,
-                new_tier,
-            })
-            .publish(env);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantFeeRecord(merchant.clone()), &record);
-
         (FeeCollected {
             payment_id,
             fee_amount: fee,
-            merchant: merchant.clone(),
+            merchant,
         })
         .publish(env);
 
-        net_amount
+        (net_amount, fee)
     }
 
     /// Computes the fee amount applying tier discount and min/max clamping.
@@ -3287,22 +3313,136 @@ impl PaymentContract {
     fn get_tier_discount_bps(tier: &FeeTier) -> u32 {
         match tier {
             FeeTier::Standard => 0,
-            FeeTier::Silver => 500,    // 5% discount on fee
-            FeeTier::Gold => 1500,     // 15% discount on fee
-            FeeTier::Platinum => 3000, // 30% discount on fee
+            FeeTier::Premium => 750,     // 7.5% discount on fee
+            FeeTier::Enterprise => 2000, // 20% discount on fee
         }
     }
 
-    fn get_tier_for_volume(volume: i128) -> FeeTier {
-        if volume > PLATINUM_VOLUME_THRESHOLD {
-            FeeTier::Platinum
-        } else if volume > GOLD_VOLUME_THRESHOLD {
-            FeeTier::Gold
-        } else if volume > SILVER_VOLUME_THRESHOLD {
-            FeeTier::Silver
+    fn get_or_default_merchant_fee_record(env: &Env, merchant: Address) -> MerchantFeeRecord {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
+            .unwrap_or(MerchantFeeRecord {
+                merchant,
+                total_fees_paid: 0,
+                total_volume: 0,
+                fee_tier: FeeTier::Standard,
+            })
+    }
+
+    fn default_tier_thresholds_for_volume() -> [(FeeTier, i128); 2] {
+        [
+            (FeeTier::Premium, PREMIUM_VOLUME_THRESHOLD),
+            (FeeTier::Enterprise, ENTERPRISE_VOLUME_THRESHOLD),
+        ]
+    }
+
+    fn get_stored_or_default_thresholds(env: &Env) -> Vec<(FeeTier, i128)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TierThresholds)
+            .unwrap_or_else(|| {
+                let defaults = PaymentContract::default_tier_thresholds_for_volume();
+                Vec::from_array(env, defaults)
+            })
+    }
+
+    fn tier_rank(tier: &FeeTier) -> u32 {
+        match tier {
+            FeeTier::Standard => 0,
+            FeeTier::Premium => 1,
+            FeeTier::Enterprise => 2,
+        }
+    }
+
+    fn calculate_tier(env: &Env, total_volume: i128) -> FeeTier {
+        let thresholds = PaymentContract::get_stored_or_default_thresholds(env);
+        let mut premium_threshold = PREMIUM_VOLUME_THRESHOLD;
+        let mut enterprise_threshold = ENTERPRISE_VOLUME_THRESHOLD;
+        for pair in thresholds.iter() {
+            match pair.0 {
+                FeeTier::Standard => {}
+                FeeTier::Premium => premium_threshold = pair.1,
+                FeeTier::Enterprise => enterprise_threshold = pair.1,
+            }
+        }
+
+        if total_volume >= enterprise_threshold {
+            FeeTier::Enterprise
+        } else if total_volume >= premium_threshold {
+            FeeTier::Premium
         } else {
             FeeTier::Standard
         }
+    }
+
+    fn validate_thresholds(thresholds: &Vec<(FeeTier, i128)>) -> Result<(), Error> {
+        if thresholds.len() < 2 || thresholds.len() > 3 {
+            return Err(Error::InvalidTierThresholds);
+        }
+
+        let mut has_premium = false;
+        let mut has_enterprise = false;
+        let mut prev_rank: Option<u32> = None;
+        let mut prev_value: Option<i128> = None;
+
+        for pair in thresholds.iter() {
+            let rank = PaymentContract::tier_rank(&pair.0);
+            if let Some(r) = prev_rank {
+                if rank <= r {
+                    return Err(Error::InvalidTierThresholds);
+                }
+            }
+            if let Some(v) = prev_value {
+                if pair.1 <= v {
+                    return Err(Error::InvalidTierThresholds);
+                }
+            }
+            if pair.1 < 0 {
+                return Err(Error::InvalidTierThresholds);
+            }
+
+            match pair.0 {
+                FeeTier::Premium => has_premium = true,
+                FeeTier::Enterprise => has_enterprise = true,
+                FeeTier::Standard => {}
+            }
+            prev_rank = Some(rank);
+            prev_value = Some(pair.1);
+        }
+
+        if !has_premium || !has_enterprise {
+            return Err(Error::InvalidTierThresholds);
+        }
+        Ok(())
+    }
+
+    fn update_merchant_fee_record_post_completion(
+        env: &Env,
+        merchant: Address,
+        amount: i128,
+        fee_amount: i128,
+    ) {
+        let mut record = PaymentContract::get_or_default_merchant_fee_record(env, merchant.clone());
+        record.total_volume += amount;
+        record.total_fees_paid += fee_amount;
+
+        // Automatic tier changes are monotonic upgrades only.
+        let old_tier = record.fee_tier.clone();
+        let computed_tier = PaymentContract::calculate_tier(env, record.total_volume);
+        if PaymentContract::tier_rank(&computed_tier) > PaymentContract::tier_rank(&record.fee_tier) {
+            record.fee_tier = computed_tier.clone();
+            (MerchantTierUpgraded {
+                merchant: merchant.clone(),
+                old_tier,
+                new_tier: computed_tier,
+            })
+            .publish(env);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantFeeRecord(merchant), &record);
     }
 
     // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────

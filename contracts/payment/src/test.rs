@@ -3861,7 +3861,7 @@ fn test_fee_max_clamping() {
 }
 
 #[test]
-fn test_merchant_tier_upgrade_to_silver() {
+fn test_merchant_tier_upgrade_to_premium() {
     let env = Env::default();
     let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
 
@@ -3882,8 +3882,7 @@ fn test_merchant_tier_upgrade_to_silver() {
     };
     client.set_fee_config(&admin, &fee_config);
 
-    // First payment: 10_001 volume → crosses Silver threshold (> 10_000)
-    let amount = 10_001_i128;
+    let amount = 10_000_i128;
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);
 
@@ -3899,12 +3898,13 @@ fn test_merchant_tier_upgrade_to_silver() {
     client.complete_payment(&admin, &payment_id);
 
     let record = client.get_merchant_fee_record(&merchant);
-    assert_eq!(record.fee_tier, FeeTier::Silver);
+    assert_eq!(record.fee_tier, FeeTier::Premium);
     assert_eq!(record.total_volume, amount);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Premium);
 }
 
 #[test]
-fn test_merchant_tier_upgrade_to_gold() {
+fn test_merchant_tier_upgrade_to_enterprise() {
     let env = Env::default();
     let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
 
@@ -3925,7 +3925,7 @@ fn test_merchant_tier_upgrade_to_gold() {
     };
     client.set_fee_config(&admin, &fee_config);
 
-    let amount = 100_001_i128;
+    let amount = 100_000_i128;
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);
 
@@ -3941,11 +3941,49 @@ fn test_merchant_tier_upgrade_to_gold() {
     client.complete_payment(&admin, &payment_id);
 
     let record = client.get_merchant_fee_record(&merchant);
-    assert_eq!(record.fee_tier, FeeTier::Gold);
+    assert_eq!(record.fee_tier, FeeTier::Enterprise);
 }
 
 #[test]
-fn test_merchant_tier_upgrade_to_platinum() {
+fn test_auto_tier_upgrade_runs_on_complete_payment_even_without_fee_config() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // No fee config set, but tier check must still run after completion.
+    let amount = 10_000_i128;
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &200);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, "")
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let record = client.get_merchant_fee_record(&merchant);
+    assert_eq!(record.fee_tier, FeeTier::Premium);
+}
+
+#[test]
+fn test_auto_tier_upgrade_never_downgrades() {
     let env = Env::default();
     let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
 
@@ -3956,33 +3994,136 @@ fn test_merchant_tier_upgrade_to_platinum() {
     let merchant = Address::generate(&env);
     let treasury = Address::generate(&env);
 
-    let fee_config = FeeConfig {
-        fee_bps: 30,
+    client.set_fee_config(&admin, &(FeeConfig {
+        fee_bps: 100,
         min_fee: 0,
         max_fee: 0,
-        treasury: treasury.clone(),
+        treasury,
         fee_token: token_contract_id.clone(),
         active: true,
-    };
-    client.set_fee_config(&admin, &fee_config);
+    }));
 
-    let amount = 1_000_001_i128;
-    token_client.mint(&customer, &amount);
-    token_user_client.approve(&customer, &contract_id, &amount, &200);
+    // Lower initial thresholds so first completion reaches Enterprise quickly.
+    client.set_tier_thresholds(
+        &admin,
+        &soroban_sdk::vec![
+            &env,
+            (FeeTier::Premium, 100_i128),
+            (FeeTier::Enterprise, 200_i128),
+        ],
+    );
 
-    let payment_id = client.create_payment(
+    token_client.mint(&customer, &500);
+    token_user_client.approve(&customer, &contract_id, &500, &200);
+
+    let first = client.create_payment(
         &customer,
         &merchant,
-        &amount,
+        &250,
         &token_contract_id,
         &Currency::USDC,
         &0,
         &String::from_str(&env, "")
     );
-    client.complete_payment(&admin, &payment_id);
+    client.complete_payment(&admin, &first);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
 
-    let record = client.get_merchant_fee_record(&merchant);
-    assert_eq!(record.fee_tier, FeeTier::Platinum);
+    // Increase thresholds above existing volume. Auto path must not downgrade tier.
+    client.set_tier_thresholds(
+        &admin,
+        &soroban_sdk::vec![
+            &env,
+            (FeeTier::Premium, 1_000_i128),
+            (FeeTier::Enterprise, 2_000_i128),
+        ],
+    );
+
+    let second = client.create_payment(
+        &customer,
+        &merchant,
+        &10,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, "")
+    );
+    client.complete_payment(&admin, &second);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
+}
+
+#[test]
+fn test_manual_override_allows_downgrade() {
+    let env = Env::default();
+    let (client, admin, contract_id, token_contract_id, _) = setup_fee_contract(&env);
+
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    token_client.mint(&customer, &120_000);
+    token_user_client.approve(&customer, &contract_id, &120_000, &200);
+
+    let first = client.create_payment(
+        &customer,
+        &merchant,
+        &100_000,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, "")
+    );
+    client.complete_payment(&admin, &first);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
+
+    client.manually_set_merchant_tier(&admin, &merchant, &FeeTier::Standard);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Standard);
+
+    // Subsequent completion can auto-upgrade back up based on cumulative volume.
+    let second = client.create_payment(
+        &customer,
+        &merchant,
+        &1_000,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, "")
+    );
+    client.complete_payment(&admin, &second);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
+}
+
+#[test]
+fn test_set_tier_thresholds_validates_ascending_order() {
+    let env = Env::default();
+    let (client, admin, _, _, _) = setup_fee_contract(&env);
+
+    let result = client.try_set_tier_thresholds(
+        &admin,
+        &soroban_sdk::vec![
+            &env,
+            (FeeTier::Premium, 200_i128),
+            (FeeTier::Enterprise, 100_i128),
+        ],
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidTierThresholds);
+}
+
+#[test]
+fn test_set_and_get_tier_thresholds() {
+    let env = Env::default();
+    let (client, admin, _, _, _) = setup_fee_contract(&env);
+
+    let updated = soroban_sdk::vec![
+        &env,
+        (FeeTier::Premium, 25_000_i128),
+        (FeeTier::Enterprise, 250_000_i128),
+    ];
+
+    client.set_tier_thresholds(&admin, &updated);
+    let stored = client.get_tier_thresholds();
+    assert_eq!(stored, updated);
 }
 
 #[test]
@@ -4007,9 +4148,9 @@ fn test_tier_discount_reduces_fee() {
     };
     client.set_fee_config(&admin, &fee_config);
 
-    // First: push merchant to Silver (volume > 10_000)
-    let vol_amount = 10_001_i128;
-    let fee1 = (10_001_i128 * 1000) / 10_000; // = 1000 (Standard, no discount)
+    // First: push merchant to Premium (volume >= 10,000)
+    let vol_amount = 10_000_i128;
+    let fee1 = (10_000_i128 * 1000) / 10_000; // = 1000 (Standard, no discount)
     token_client.mint(&customer, &(vol_amount + 10_000));
     token_user_client.approve(&customer, &contract_id, &(vol_amount + 10_000), &200);
 
@@ -4024,12 +4165,12 @@ fn test_tier_discount_reduces_fee() {
     );
     client.complete_payment(&admin, &pid1);
 
-    // Merchant should now be Silver (500 bps discount = 5% off fee)
+    // Merchant should now be Premium (750 bps discount = 7.5% off fee)
     let record = client.get_merchant_fee_record(&merchant);
-    assert_eq!(record.fee_tier, FeeTier::Silver);
+    assert_eq!(record.fee_tier, FeeTier::Premium);
 
-    // Second payment: effective_bps = 1000 - (1000 * 500 / 10000) = 1000 - 50 = 950
-    // fee = 10_000 * 950 / 10_000 = 950
+    // Second payment: effective_bps = 1000 - (1000 * 750 / 10000) = 1000 - 75 = 925
+    // fee = 10_000 * 925 / 10_000 = 925
     let amount2 = 10_000_i128;
     let pid2 = client.create_payment(
         &customer,
@@ -4042,8 +4183,8 @@ fn test_tier_discount_reduces_fee() {
     );
     client.complete_payment(&admin, &pid2);
 
-    // fee1 = 1000 (Standard), fee2 = 950 (Silver with 5% discount)
-    let expected_fee2: i128 = 950;
+    // fee1 = 1000 (Standard), fee2 = 925 (Premium with 7.5% discount)
+    let expected_fee2: i128 = 925;
     let total_fees = fee1 + expected_fee2;
     assert_eq!(client.get_accumulated_fees(), total_fees);
 

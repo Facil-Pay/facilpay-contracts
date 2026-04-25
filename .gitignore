@@ -5,5 +5,6 @@ target
 .soroban
 .stellar
 .claude
+.codex
 
 **/test_snapshots/**
