@@ -2905,3 +2905,233 @@ fn test_analytics_avg_duration_updated_on_release() {
     // duration = 5000 - 1000 = 4000 seconds
     assert_eq!(analytics.avg_escrow_duration_seconds, 4000);
 }
+
+// ── BATCH ESCROW CREATION TESTS ─────────────────────────────────────────
+
+#[test]
+fn test_batch_escrow_creation_success() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Initialize contract
+    client.initialize(&admin);
+
+    env.ledger().set_timestamp(1000);
+
+    let entries = vec![
+        &env,
+        EscrowBatchEntry {
+            customer: customer1.clone(),
+            merchant: merchant1.clone(),
+            token: token.clone(),
+            amount: 1000,
+            release_timestamp: 2000,
+            description: String::from_str(&env, "Test escrow 1"),
+        },
+        EscrowBatchEntry {
+            customer: customer2.clone(),
+            merchant: merchant2.clone(),
+            token: token.clone(),
+            amount: 2000,
+            release_timestamp: 3000,
+            description: String::from_str(&env, "Test escrow 2"),
+        },
+    ];
+
+    let results = client.create_escrow_batch(&admin, &entries);
+
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+    assert_eq!(results.get(0).unwrap().escrow_id, 1);
+    assert_eq!(results.get(1).unwrap().escrow_id, 2);
+    assert_eq!(results.get(0).unwrap().error_code, 0);
+    assert_eq!(results.get(1).unwrap().error_code, 0);
+
+    // Verify escrows were created
+    let escrow1 = client.get_escrow(&1);
+    assert_eq!(escrow1.customer, customer1);
+    assert_eq!(escrow1.merchant, merchant1);
+    assert_eq!(escrow1.amount, 1000);
+
+    let escrow2 = client.get_escrow(&2);
+    assert_eq!(escrow2.customer, customer2);
+    assert_eq!(escrow2.merchant, merchant2);
+    assert_eq!(escrow2.amount, 2000);
+}
+
+#[test]
+fn test_batch_escrow_creation_partial_failure() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Initialize contract
+    client.initialize(&admin);
+
+    env.ledger().set_timestamp(1000);
+
+    let entries = vec![
+        &env,
+        EscrowBatchEntry {
+            customer: customer1.clone(),
+            merchant: merchant1.clone(),
+            token: token.clone(),
+            amount: 1000,
+            release_timestamp: 2000,
+            description: String::from_str(&env, "Valid escrow"),
+        },
+        EscrowBatchEntry {
+            customer: customer2.clone(),
+            merchant: merchant2.clone(),
+            token: token.clone(),
+            amount: -500, // Invalid amount
+            release_timestamp: 3000,
+            description: String::from_str(&env, "Invalid escrow"),
+        },
+        EscrowBatchEntry {
+            customer: customer1.clone(),
+            merchant: merchant2.clone(),
+            token: token.clone(),
+            amount: 1500,
+            release_timestamp: 500, // Past timestamp
+            description: String::from_str(&env, "Another invalid"),
+        },
+    ];
+
+    let results = client.create_escrow_batch(&admin, &entries);
+
+    assert_eq!(results.len(), 3);
+    assert!(results.get(0).unwrap().success);
+    assert!(!results.get(1).unwrap().success);
+    assert!(!results.get(2).unwrap().success);
+    assert_eq!(results.get(0).unwrap().escrow_id, 1);
+    assert_eq!(results.get(1).unwrap().escrow_id, 0);
+    assert_eq!(results.get(2).unwrap().escrow_id, 0);
+    assert_eq!(results.get(0).unwrap().error_code, 0);
+    assert_eq!(results.get(1).unwrap().error_code, Error::InvalidStatus as u32);
+    assert_eq!(results.get(2).unwrap().error_code, Error::ReleaseNotYetAvailable as u32);
+}
+
+#[test]
+fn test_batch_escrow_creation_too_large() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Initialize contract
+    client.initialize(&admin);
+
+    // Set batch limit to 2
+    client.set_batch_limit(&admin, &2);
+
+    let mut entries = Vec::new(&env);
+    for i in 0..4 {
+        let desc = match i {
+            0 => String::from_str(&env, "Escrow 0"),
+            1 => String::from_str(&env, "Escrow 1"),
+            2 => String::from_str(&env, "Escrow 2"),
+            _ => String::from_str(&env, "Escrow 3"),
+        };
+        entries.push_back(EscrowBatchEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            token: token.clone(),
+            amount: 1000,
+            release_timestamp: 2000,
+            description: desc,
+        });
+    }
+
+    let results = client.create_escrow_batch(&admin, &entries);
+
+    assert_eq!(results.len(), 1);
+    assert!(!results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().error_code, Error::BatchTooLarge as u32);
+}
+
+#[test]
+fn test_batch_limit_get_and_set() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Initialize contract
+    client.initialize(&admin);
+
+    // Default limit should be 50
+    assert_eq!(client.get_batch_limit(), 50);
+
+    // Set new limit
+    client.set_batch_limit(&admin, &100);
+    assert_eq!(client.get_batch_limit(), 100);
+
+    // Test invalid limits
+    let result = client.try_set_batch_limit(&admin, &0);
+    assert!(result.is_err());
+
+    let result = client.try_set_batch_limit(&admin, &1001);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_batch_escrow_creation_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let non_admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let entries = vec![
+        &env,
+        EscrowBatchEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            token: token.clone(),
+            amount: 1000,
+            release_timestamp: 2000,
+            description: String::from_str(&env, "Test escrow"),
+        },
+    ];
+
+    let results = client.create_escrow_batch(&non_admin, &entries);
+
+    assert_eq!(results.len(), 1);
+    assert!(!results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().error_code, Error::NotAnAdmin as u32);
+}
