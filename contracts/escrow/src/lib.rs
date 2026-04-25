@@ -39,6 +39,9 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    // Multi-token escrow
+    MultiTokenEscrow(u64),
+    MultiTokenEscrowCounter,
     InsurancePool,
     InsuranceConfig,
     InsuranceClaim(u64),
@@ -117,6 +120,9 @@ pub enum Error {
     ActionCancelled = 29,
     ContractPaused = 30,
     FunctionPaused = 31,
+    EmptyTokenList = 35,
+    DuplicateToken = 36,
+    TokenTransferPartialFailure = 37,
     Underfunded = 32,
     NotClaimable = 33,
     OracleStalePriceFeed = 44,
@@ -189,6 +195,24 @@ pub struct ParticipantApproved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiPartyEscrowReleased {
     pub escrow_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiTokenEscrowCreated {
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token_count: u32,
+    pub release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiTokenEscrowReleased {
+    pub escrow_id: u64,
+    pub merchant: Address,
+    pub token_count: u32,
 }
 
 #[contractevent]
@@ -382,6 +406,25 @@ pub struct MultiPartyEscrow {
     pub status: EscrowStatus,
     pub approvals: Vec<Address>,
     pub required_approvals: u32,
+    pub created_at: u64,
+    pub release_timestamp: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct TokenEntry {
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MultiTokenEscrow {
+    pub id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub tokens: Vec<TokenEntry>,
+    pub status: EscrowStatus,
     pub created_at: u64,
     pub release_timestamp: u64,
 }
@@ -1287,6 +1330,142 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MultiPartyEscrow(escrow_id))
             .unwrap())
+    }
+
+    pub fn create_multi_token_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        tokens: Vec<TokenEntry>,
+        release_timestamp: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        if tokens.len() == 0 {
+            return Err(Error::EmptyTokenList);
+        }
+        if tokens.len() > 10 {
+            return Err(Error::InvalidParticipantCount);
+        }
+
+        // Reject duplicate token addresses
+        let len = tokens.len();
+        for i in 0..len {
+            let entry_i = tokens.get(i).unwrap();
+            for j in (i + 1)..len {
+                let entry_j = tokens.get(j).unwrap();
+                if entry_i.token == entry_j.token {
+                    return Err(Error::DuplicateToken);
+                }
+            }
+        }
+
+        // Pull each token amount into the contract escrow.
+        let contract_address = env.current_contract_address();
+        for entry in tokens.iter() {
+            let token_client = token::Client::new(&env, &entry.token);
+            token_client.transfer(&customer, &contract_address, &entry.amount);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiTokenEscrowCounter)
+            .unwrap_or(0);
+        let escrow_id = counter + 1;
+
+        let current_timestamp = env.ledger().timestamp();
+        let token_count = tokens.len();
+
+        let escrow = MultiTokenEscrow {
+            id: escrow_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            tokens,
+            status: EscrowStatus::Locked,
+            created_at: current_timestamp,
+            release_timestamp,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiTokenEscrow(escrow_id), &escrow);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiTokenEscrowCounter, &escrow_id);
+
+        MultiTokenEscrowCreated {
+            escrow_id,
+            customer,
+            merchant,
+            token_count,
+            release_timestamp,
+        }
+        .publish(&env);
+
+        Ok(escrow_id)
+    }
+
+    pub fn release_multi_token_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let mut escrow: MultiTokenEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiTokenEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        if env.ledger().timestamp() < escrow.release_timestamp {
+            return Err(Error::ReleaseNotYetAvailable);
+        }
+
+        // Pre-flight: verify balances so a partial failure can't leave the escrow
+        // half-released. If any token is unavailable, nothing moves.
+        let contract_address = env.current_contract_address();
+        for entry in escrow.tokens.iter() {
+            let token_client = token::Client::new(&env, &entry.token);
+            let balance = match token_client.try_balance(&contract_address) {
+                Ok(Ok(b)) => b,
+                _ => return Err(Error::TokenTransferPartialFailure),
+            };
+            if balance < entry.amount {
+                return Err(Error::TokenTransferPartialFailure);
+            }
+        }
+
+        for entry in escrow.tokens.iter() {
+            let token_client = token::Client::new(&env, &entry.token);
+            if token_client
+                .try_transfer(&contract_address, &escrow.merchant, &entry.amount)
+                .is_err()
+            {
+                return Err(Error::TokenTransferPartialFailure);
+            }
+        }
+
+        let token_count = escrow.tokens.len();
+        escrow.status = EscrowStatus::Released;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiTokenEscrow(escrow_id), &escrow);
+
+        MultiTokenEscrowReleased {
+            escrow_id,
+            merchant: escrow.merchant,
+            token_count,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_multi_token_escrow(env: Env, escrow_id: u64) -> Result<MultiTokenEscrow, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiTokenEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)
     }
 
     pub fn get_escrow(env: &Env, escrow_id: u64) -> Escrow {

@@ -2367,6 +2367,112 @@ fn test_multisig_resolve_dispute_via_proposal() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
 }
 
+// ── MULTI-TOKEN ESCROW TESTS ────────────────────────────────────────────────
+
+fn setup_token(env: &Env) -> Address {
+    let token_admin = Address::generate(env);
+    env.register_stellar_asset_contract_v2(token_admin).address()
+}
+
+#[test]
+fn test_create_multi_token_escrow_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_a = setup_token(&env);
+    let token_b = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+    let token_b_admin = token::StellarAssetClient::new(&env, &token_b);
+    let token_a_user = token::Client::new(&env, &token_a);
+    let token_b_user = token::Client::new(&env, &token_b);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    token_a_admin.mint(&customer, &1000);
+    token_b_admin.mint(&customer, &500);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
+    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
+
+    let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+
+    let escrow = client.get_multi_token_escrow(&escrow_id);
+    assert_eq!(escrow.id, 1);
+    assert_eq!(escrow.tokens.len(), 2);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+
+    // Funds now held by the escrow contract
+    assert_eq!(token_a_user.balance(&contract_id), 1000);
+    assert_eq!(token_b_user.balance(&contract_id), 500);
+    assert_eq!(token_a_user.balance(&customer), 0);
+    assert_eq!(token_b_user.balance(&customer), 0);
+}
+
+#[test]
+fn test_create_multi_token_escrow_empty_list() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let tokens: Vec<TokenEntry> = Vec::new(&env);
+    let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+    assert_eq!(result, Err(Ok(Error::EmptyTokenList)));
+}
+
+#[test]
+fn test_create_multi_token_escrow_duplicate_token() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_a = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_a_admin.mint(&customer, &2000);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
+
+    let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+    assert_eq!(result, Err(Ok(Error::DuplicateToken)));
+}
+
+#[test]
+fn test_create_multi_token_escrow_too_many_tokens() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let mut tokens = Vec::new(&env);
+    for _ in 0..11 {
+        let tok = setup_token(&env);
+        let admin = token::StellarAssetClient::new(&env, &tok);
+        admin.mint(&customer, &10);
+        tokens.push_back(TokenEntry { token: tok, amount: 10 });
+    }
+
+    let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+    assert_eq!(result, Err(Ok(Error::InvalidParticipantCount)));
+}
+
+#[test]
+fn test_release_multi_token_escrow_atomic() {
 #[test]
 fn test_insurance_system() {
     let env = Env::default();
@@ -2418,6 +2524,73 @@ fn test_timelock_execute_after_expiry_returns_error() {
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
+    let token_a = setup_token(&env);
+    let token_b = setup_token(&env);
+    let token_c = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+    let token_b_admin = token::StellarAssetClient::new(&env, &token_b);
+    let token_c_admin = token::StellarAssetClient::new(&env, &token_c);
+    let token_a_user = token::Client::new(&env, &token_a);
+    let token_b_user = token::Client::new(&env, &token_b);
+    let token_c_user = token::Client::new(&env, &token_c);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    token_a_admin.mint(&customer, &1000);
+    token_b_admin.mint(&customer, &500);
+    token_c_admin.mint(&customer, &250);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
+    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
+    tokens.push_back(TokenEntry { token: token_c.clone(), amount: 250 });
+
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+
+    env.ledger().set_timestamp(1000);
+    client.release_multi_token_escrow(&escrow_id);
+
+    let escrow = client.get_multi_token_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+
+    // Every token landed on the merchant, contract is drained
+    assert_eq!(token_a_user.balance(&merchant), 1000);
+    assert_eq!(token_b_user.balance(&merchant), 500);
+    assert_eq!(token_c_user.balance(&merchant), 250);
+    assert_eq!(token_a_user.balance(&contract_id), 0);
+    assert_eq!(token_b_user.balance(&contract_id), 0);
+    assert_eq!(token_c_user.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_release_multi_token_escrow_before_timestamp() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_a = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_a_admin.mint(&customer, &100);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+
+    // Before release_timestamp, release should fail.
+    let result = client.try_release_multi_token_escrow(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::ReleaseNotYetAvailable)));
+}
+
+#[test]
+fn test_release_multi_token_escrow_double_release() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
@@ -2452,6 +2625,65 @@ fn test_timelock_execute_after_delay_succeeds() {
     env.mock_all_auths();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_a = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_a_admin.mint(&customer, &100);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+
+    env.ledger().set_timestamp(1000);
+    client.release_multi_token_escrow(&escrow_id);
+
+    let result = client.try_release_multi_token_escrow(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_get_multi_token_escrow_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let result = client.try_get_multi_token_escrow(&999_u64);
+    match result {
+        Err(Ok(Error::EscrowNotFound)) => {}
+        _ => panic!("expected EscrowNotFound"),
+    }
+}
+
+#[test]
+fn test_single_token_escrow_still_works_after_multi_token_addition() {
+    // Backwards-compatibility: the legacy single-token escrow path must continue to work.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.initialize(&admin);
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    env.ledger().set_timestamp(1001);
+    client.release_escrow(&admin, &escrow_id, &false);
+
+    let escrow = env.as_contract(&contract_id, || {
+        EscrowContract::get_escrow(&env, escrow_id)
+    });
+    assert_eq!(escrow.status, EscrowStatus::Released);
+}
 
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
