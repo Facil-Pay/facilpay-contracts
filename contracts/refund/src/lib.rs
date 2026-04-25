@@ -33,6 +33,12 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    // Circuit breaker
+    CircuitBreakerConfigKey,
+    CircuitBreakerStateKey,
+    WindowStart,
+    WindowRefundVolume,
+    WindowPaymentVolume,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,6 +71,7 @@ pub enum Error {
     NotArbitrator = 16,
     ContractPaused = 17,
     FunctionPaused = 18,
+    CircuitBreakerTripped = 29,
 }
 
 #[contractevent]
@@ -282,6 +289,39 @@ pub struct PauseHistory {
     pub reason: String,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct CircuitBreakerConfig {
+    pub max_refund_rate_bps: u32,
+    pub measurement_window_seconds: u64,
+    pub cooldown_seconds: u64,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct CircuitBreakerState {
+    pub tripped: bool,
+    pub tripped_at: Option<u64>,
+    pub trip_count: u32,
+    pub last_refund_rate_bps: u32,
+    pub resets_at: Option<u64>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerTrippedEvent {
+    pub refund_rate_bps: u32,
+    pub tripped_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CircuitBreakerResetEvent {
+    pub reset_by: Address,
+    pub reset_at: u64,
+}
+
 #[contract]
 pub struct RefundContract;
 
@@ -334,6 +374,9 @@ impl RefundContract {
         }
 
         Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
+
+        // Circuit breaker check
+        Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
 
         // Validate against refund policy
         Self::validate_against_policy(
@@ -1295,8 +1338,195 @@ impl RefundContract {
         }
         Ok(())
     }
+
+    // ── CIRCUIT BREAKER ────────────────────────────────────────────────────
+
+    pub fn set_circuit_breaker_config(
+        env: Env,
+        admin: Address,
+        config: CircuitBreakerConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerConfigKey, &config);
+        Ok(())
+    }
+
+    pub fn get_circuit_breaker_state(env: Env) -> CircuitBreakerState {
+        env.storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerStateKey)
+            .unwrap_or(CircuitBreakerState {
+                tripped: false,
+                tripped_at: None,
+                trip_count: 0,
+                last_refund_rate_bps: 0,
+                resets_at: None,
+            })
+    }
+
+    pub fn reset_circuit_breaker(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        let mut state = Self::get_circuit_breaker_state(env.clone());
+        state.tripped = false;
+        state.tripped_at = None;
+        state.resets_at = None;
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerStateKey, &state);
+        let now = env.ledger().timestamp();
+        CircuitBreakerResetEvent {
+            reset_by: admin,
+            reset_at: now,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn check_circuit_breaker(env: Env) -> bool {
+        let config: CircuitBreakerConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerConfigKey)
+        {
+            Some(c) => c,
+            None => return false,
+        };
+        if !config.enabled {
+            return false;
+        }
+        let state = Self::get_circuit_breaker_state(env.clone());
+        if !state.tripped {
+            return false;
+        }
+        let now = env.ledger().timestamp();
+        if let Some(resets_at) = state.resets_at {
+            now < resets_at
+        } else {
+            true
+        }
+    }
+
+    fn check_and_update_circuit_breaker(
+        env: &Env,
+        refund_amount: i128,
+        payment_amount: i128,
+    ) -> Result<(), Error> {
+        let config: CircuitBreakerConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerConfigKey)
+        {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        if !config.enabled {
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        let mut state = Self::get_circuit_breaker_state(env.clone());
+
+        // Auto-reset after cooldown
+        if state.tripped {
+            if let Some(resets_at) = state.resets_at {
+                if now >= resets_at {
+                    state.tripped = false;
+                    state.tripped_at = None;
+                    state.resets_at = None;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::CircuitBreakerStateKey, &state);
+                } else {
+                    return Err(Error::CircuitBreakerTripped);
+                }
+            } else {
+                return Err(Error::CircuitBreakerTripped);
+            }
+        }
+
+        // Reset window if expired
+        let window_start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WindowStart)
+            .unwrap_or(0);
+
+        if now >= window_start + config.measurement_window_seconds || window_start == 0 {
+            env.storage().instance().set(&DataKey::WindowStart, &now);
+            env.storage().instance().set(&DataKey::WindowRefundVolume, &0i128);
+            env.storage().instance().set(&DataKey::WindowPaymentVolume, &0i128);
+        }
+
+        let new_refund_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WindowRefundVolume)
+            .unwrap_or(0)
+            + refund_amount;
+
+        let new_payment_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::WindowPaymentVolume)
+            .unwrap_or(0)
+            + payment_amount;
+
+        if new_payment_vol <= 0 {
+            return Ok(());
+        }
+
+        let rate_bps = ((new_refund_vol * 10000) / new_payment_vol) as u32;
+
+        if rate_bps > config.max_refund_rate_bps {
+            state.tripped = true;
+            state.tripped_at = Some(now);
+            state.trip_count += 1;
+            state.last_refund_rate_bps = rate_bps;
+            state.resets_at = Some(now + config.cooldown_seconds);
+            env.storage()
+                .instance()
+                .set(&DataKey::CircuitBreakerStateKey, &state);
+            CircuitBreakerTrippedEvent {
+                refund_rate_bps: rate_bps,
+                tripped_at: now,
+            }
+            .publish(env);
+            return Err(Error::CircuitBreakerTripped);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::WindowRefundVolume, &new_refund_vol);
+        env.storage()
+            .instance()
+            .set(&DataKey::WindowPaymentVolume, &new_payment_vol);
+
+        Ok(())
+    }
 }
 
 mod test;
 mod test_process;
 mod test_policy;
+
+#[cfg(test)]
+mod test_circuit_breaker;

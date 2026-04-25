@@ -51,6 +51,11 @@ pub enum DataKey {
     ReputationDecayConfig,
     EscrowFeeConfigKey,
     AccumulatedEscrowFees(Address),
+    // Beneficiary transfer history
+    BeneficiaryTransferHistory(u64, u64),
+    BeneficiaryTransferCount(u64),
+    // Multi-party dispute
+    MultiPartyDisputeKey(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,6 +167,8 @@ pub enum Error {
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
+    TransferNotAllowed = 42,
+    SameBeneficiary = 43,
 }
 
 
@@ -749,6 +756,58 @@ pub struct PauseHistory {
     pub changed_by: Address,
     pub changed_at: u64,
     pub reason: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BeneficiaryTransfer {
+    pub escrow_id: u64,
+    pub from: Address,
+    pub to: Address,
+    pub transferred_at: u64,
+    pub authorised_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MultiPartyDispute {
+    pub escrow_id: u64,
+    pub votes_for_merchant: Vec<Address>,
+    pub votes_for_customer: Vec<Address>,
+    pub quorum_required: u32,
+    pub resolution_deadline: u64,
+    pub resolved: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeneficiaryTransferred {
+    pub escrow_id: u64,
+    pub old_merchant: Address,
+    pub new_merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyDisputeRaised {
+    pub escrow_id: u64,
+    pub raised_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyDisputeVoteCast {
+    pub escrow_id: u64,
+    pub voter: Address,
+    pub favor_merchant: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyDisputeResolved {
+    pub escrow_id: u64,
+    pub favor_merchant: bool,
+    pub resolved_at: u64,
 }
 
 #[contract]
@@ -4068,6 +4127,326 @@ impl EscrowContract {
         Self::internal_resolve_dispute(env, escrow.customer.clone(), escrow_id, release_to_merchant)
     }
 
+    // ── BENEFICIARY TRANSFER ──────────────────────────────────────────────
+
+    pub fn transfer_escrow_beneficiary(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        new_merchant: Address,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let multisig = Self::get_multisig_config(env.clone());
+        if caller != escrow.merchant && !multisig.admins.contains(&caller) {
+            return Err(Error::Unauthorized);
+        }
+
+        match escrow.status {
+            EscrowStatus::Disputed | EscrowStatus::Resolved => {
+                return Err(Error::TransferNotAllowed);
+            }
+            _ => {}
+        }
+
+        if new_merchant == escrow.merchant {
+            return Err(Error::SameBeneficiary);
+        }
+
+        let old_merchant = escrow.merchant.clone();
+        let now = env.ledger().timestamp();
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BeneficiaryTransferCount(escrow_id))
+            .unwrap_or(0);
+
+        let transfer = BeneficiaryTransfer {
+            escrow_id,
+            from: old_merchant.clone(),
+            to: new_merchant.clone(),
+            transferred_at: now,
+            authorised_by: caller,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::BeneficiaryTransferHistory(escrow_id, count), &transfer);
+        env.storage()
+            .instance()
+            .set(&DataKey::BeneficiaryTransferCount(escrow_id), &(count + 1));
+
+        escrow.merchant = new_merchant.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        BeneficiaryTransferred {
+            escrow_id,
+            old_merchant,
+            new_merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_transfer_history(env: Env, escrow_id: u64) -> Vec<BeneficiaryTransfer> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BeneficiaryTransferCount(escrow_id))
+            .unwrap_or(0);
+
+        let mut history = Vec::new(&env);
+        for i in 0..count {
+            if let Some(transfer) = env
+                .storage()
+                .instance()
+                .get::<DataKey, BeneficiaryTransfer>(&DataKey::BeneficiaryTransferHistory(
+                    escrow_id, i,
+                ))
+            {
+                history.push_back(transfer);
+            }
+        }
+        history
+    }
+
+    // ── MULTI-PARTY DISPUTE ────────────────────────────────────────────────
+
+    pub fn dispute_multi_party_escrow(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        let mut is_participant = false;
+        for p in escrow.participants.iter() {
+            if p.address == caller {
+                is_participant = true;
+                break;
+            }
+        }
+        if !is_participant {
+            return Err(Error::Unauthorized);
+        }
+
+        let participant_count = escrow.participants.len();
+        let quorum_required = (participant_count / 2) + 1;
+        let resolution_deadline = env.ledger().timestamp() + 7 * 24 * 3600;
+
+        let dispute = MultiPartyDispute {
+            escrow_id,
+            votes_for_merchant: Vec::new(&env),
+            votes_for_customer: Vec::new(&env),
+            quorum_required,
+            resolution_deadline,
+            resolved: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyDisputeKey(escrow_id), &dispute);
+
+        escrow.status = EscrowStatus::Disputed;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
+
+        MultiPartyDisputeRaised {
+            escrow_id,
+            raised_by: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn vote_on_multi_party_dispute(
+        env: Env,
+        voter: Address,
+        escrow_id: u64,
+        favor_merchant: bool,
+    ) -> Result<(), Error> {
+        voter.require_auth();
+
+        let escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut dispute: MultiPartyDispute = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyDisputeKey(escrow_id))
+            .ok_or(Error::NotDisputed)?;
+
+        if dispute.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        let mut is_participant = false;
+        for p in escrow.participants.iter() {
+            if p.address == voter {
+                is_participant = true;
+                break;
+            }
+        }
+        if !is_participant {
+            return Err(Error::Unauthorized);
+        }
+
+        for addr in dispute.votes_for_merchant.iter() {
+            if addr == voter {
+                return Err(Error::DuplicateApproval);
+            }
+        }
+        for addr in dispute.votes_for_customer.iter() {
+            if addr == voter {
+                return Err(Error::DuplicateApproval);
+            }
+        }
+
+        if favor_merchant {
+            dispute.votes_for_merchant.push_back(voter.clone());
+        } else {
+            dispute.votes_for_customer.push_back(voter.clone());
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyDisputeKey(escrow_id), &dispute);
+
+        MultiPartyDisputeVoteCast {
+            escrow_id,
+            voter,
+            favor_merchant,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn resolve_multi_party_dispute(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let mut dispute: MultiPartyDispute = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyDisputeKey(escrow_id))
+            .ok_or(Error::NotDisputed)?;
+
+        if dispute.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        let merchant_votes = dispute.votes_for_merchant.len();
+        let customer_votes = dispute.votes_for_customer.len();
+
+        let favor_merchant;
+
+        if merchant_votes >= dispute.quorum_required {
+            favor_merchant = true;
+        } else if customer_votes >= dispute.quorum_required {
+            favor_merchant = false;
+        } else if now > dispute.resolution_deadline {
+            favor_merchant = false;
+        } else {
+            return Err(Error::ApprovalsThresholdNotMet);
+        }
+
+        dispute.resolved = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyDisputeKey(escrow_id), &dispute);
+
+        let token_client = token::Client::new(&env, &escrow.token);
+        let contract_address = env.current_contract_address();
+
+        if favor_merchant {
+            for p in escrow.participants.iter() {
+                if p.share_bps > 0 {
+                    let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                    if amount > 0 {
+                        token_client.transfer(&contract_address, &p.address, &amount);
+                    }
+                }
+            }
+            escrow.status = EscrowStatus::Released;
+        } else {
+            // Refund to the participant with Customer role; fall back to proportional if none found
+            let mut customer_addr: Option<Address> = None;
+            for p in escrow.participants.iter() {
+                if let ParticipantRole::Customer = p.role {
+                    customer_addr = Some(p.address.clone());
+                    break;
+                }
+            }
+
+            if let Some(customer) = customer_addr {
+                token_client.transfer(&contract_address, &customer, &escrow.total_amount);
+            } else {
+                for p in escrow.participants.iter() {
+                    if p.share_bps > 0 {
+                        let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                        if amount > 0 {
+                            token_client.transfer(&contract_address, &p.address, &amount);
+                        }
+                    }
+                }
+            }
+            escrow.status = EscrowStatus::Resolved;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
+
+        MultiPartyDisputeResolved {
+            escrow_id,
+            favor_merchant,
+            resolved_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_multi_party_dispute(
+        env: Env,
+        escrow_id: u64,
+    ) -> Result<MultiPartyDispute, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiPartyDisputeKey(escrow_id))
+            .ok_or(Error::NotDisputed)
+    }
+
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────
 
     fn update_customer_analytics<F>(env: &Env, customer: &Address, update_fn: F)
@@ -4124,3 +4503,9 @@ mod timelock_test;
 
 #[cfg(test)]
 mod collateral_test;
+
+#[cfg(test)]
+mod beneficiary_transfer_test;
+
+#[cfg(test)]
+mod multi_party_dispute_test;

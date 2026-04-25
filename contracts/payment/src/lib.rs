@@ -39,6 +39,12 @@ pub enum DataKey {
     PaymentAnalyticsKey,
     MerchantAnalytics(Address),
     CustomerAnalytics(Address),
+    // Extended customer analytics
+    CustomerMerchantVolume(Address, Address),
+    CustomerMerchantList(Address, u64),
+    CustomerMerchantCount(Address),
+    CustomerMonthlyVolume(Address, u64),
+    CustomerHourCount(Address, u32),
     // Pause system
     PauseStateKey,
     PauseHistoryEntry(u64),
@@ -626,9 +632,13 @@ pub struct MerchantAnalytics {
 pub struct CustomerAnalytics {
     pub total_payments: u64,
     pub total_volume: i128,
-    pub total_completed: u64,
-    pub total_cancelled: u64,
-    pub total_refunded: u64,
+    pub total_refunds: i128,
+    pub avg_transaction_size: i128,
+    pub peak_hour: u32,
+    pub top_merchant: Option<Address>,
+    pub top_merchant_volume: i128,
+    pub first_payment_at: u64,
+    pub last_payment_at: u64,
 }
 
 #[derive(Clone)]
@@ -1138,12 +1148,87 @@ impl PaymentContract {
             .unwrap_or(CustomerAnalytics {
                 total_payments: 0,
                 total_volume: 0,
-                total_completed: 0,
-                total_cancelled: 0,
-                total_refunded: 0,
+                total_refunds: 0,
+                avg_transaction_size: 0,
+                peak_hour: 0,
+                top_merchant: None,
+                top_merchant_volume: 0,
+                first_payment_at: 0,
+                last_payment_at: 0,
             });
         c_analytics.total_payments += 1;
         c_analytics.total_volume += amount;
+        c_analytics.avg_transaction_size = c_analytics.total_volume / (c_analytics.total_payments as i128);
+        if c_analytics.first_payment_at == 0 {
+            c_analytics.first_payment_at = current_timestamp;
+        }
+        c_analytics.last_payment_at = current_timestamp;
+
+        // Track peak hour (UTC hour 0-23)
+        let hour = ((current_timestamp / 3600) % 24) as u32;
+        let hour_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerHourCount(payment.customer.clone(), hour))
+            .unwrap_or(0)
+            + 1;
+        env.storage().instance().set(
+            &DataKey::CustomerHourCount(payment.customer.clone(), hour),
+            &hour_count,
+        );
+        let peak_hour_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerHourCount(payment.customer.clone(), c_analytics.peak_hour))
+            .unwrap_or(0);
+        if hour_count > peak_hour_count || (hour_count == peak_hour_count && hour == c_analytics.peak_hour) {
+            c_analytics.peak_hour = hour;
+        }
+
+        // Track per-merchant volume and update top merchant
+        let prev_merchant_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerMerchantVolume(payment.customer.clone(), payment.merchant.clone()))
+            .unwrap_or(0);
+        if prev_merchant_vol == 0 {
+            // New merchant for this customer — add to list
+            let m_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CustomerMerchantCount(payment.customer.clone()))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::CustomerMerchantList(payment.customer.clone(), m_count),
+                &payment.merchant,
+            );
+            env.storage().instance().set(
+                &DataKey::CustomerMerchantCount(payment.customer.clone()),
+                &(m_count + 1),
+            );
+        }
+        let new_merchant_vol = prev_merchant_vol + amount;
+        env.storage().instance().set(
+            &DataKey::CustomerMerchantVolume(payment.customer.clone(), payment.merchant.clone()),
+            &new_merchant_vol,
+        );
+        if new_merchant_vol > c_analytics.top_merchant_volume {
+            c_analytics.top_merchant = Some(payment.merchant.clone());
+            c_analytics.top_merchant_volume = new_merchant_vol;
+        }
+
+        // Track monthly volume (30-day bucket)
+        let month_bucket = (current_timestamp / 2_592_000) * 2_592_000;
+        let prev_monthly: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerMonthlyVolume(payment.customer.clone(), month_bucket))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::CustomerMonthlyVolume(payment.customer.clone(), month_bucket),
+            &(prev_monthly + amount),
+        );
+
         env.storage().instance().set(
             &DataKey::CustomerAnalytics(payment.customer.clone()),
             &c_analytics,
@@ -1509,23 +1594,6 @@ impl PaymentContract {
             &DataKey::MerchantAnalytics(payment.merchant.clone()),
             &m_analytics,
         );
-        let mut c_analytics: CustomerAnalytics = env
-            .storage()
-            .instance()
-            .get(&DataKey::CustomerAnalytics(payment.customer.clone()))
-            .unwrap_or(CustomerAnalytics {
-                total_payments: 0,
-                total_volume: 0,
-                total_completed: 0,
-                total_cancelled: 0,
-                total_refunded: 0,
-            });
-        c_analytics.total_completed += 1;
-        env.storage().instance().set(
-            &DataKey::CustomerAnalytics(payment.customer.clone()),
-            &c_analytics,
-        );
-
         (PaymentCompleted {
             payment_id,
             merchant: payment.merchant,
@@ -1627,14 +1695,8 @@ impl PaymentContract {
             .storage()
             .instance()
             .get(&DataKey::CustomerAnalytics(payment.customer.clone()))
-            .unwrap_or(CustomerAnalytics {
-                total_payments: 0,
-                total_volume: 0,
-                total_completed: 0,
-                total_cancelled: 0,
-                total_refunded: 0,
-            });
-        c_analytics.total_refunded += 1;
+            .unwrap_or(PaymentContract::default_customer_analytics());
+        c_analytics.total_refunds += payment.amount;
         env.storage().instance().set(
             &DataKey::CustomerAnalytics(payment.customer.clone()),
             &c_analytics,
@@ -1782,23 +1844,6 @@ impl PaymentContract {
             &DataKey::MerchantAnalytics(payment.merchant.clone()),
             &m_analytics,
         );
-        let mut c_analytics: CustomerAnalytics = env
-            .storage()
-            .instance()
-            .get(&DataKey::CustomerAnalytics(payment.customer.clone()))
-            .unwrap_or(CustomerAnalytics {
-                total_payments: 0,
-                total_volume: 0,
-                total_completed: 0,
-                total_cancelled: 0,
-                total_refunded: 0,
-            });
-        c_analytics.total_cancelled += 1;
-        env.storage().instance().set(
-            &DataKey::CustomerAnalytics(payment.customer.clone()),
-            &c_analytics,
-        );
-
         let timestamp = env.ledger().timestamp();
         (PaymentCancelled {
             payment_id,
@@ -3600,13 +3645,87 @@ impl PaymentContract {
         env.storage()
             .instance()
             .get(&DataKey::CustomerAnalytics(customer))
-            .unwrap_or(CustomerAnalytics {
-                total_payments: 0,
-                total_volume: 0,
-                total_completed: 0,
-                total_cancelled: 0,
-                total_refunded: 0,
-            })
+            .unwrap_or(PaymentContract::default_customer_analytics())
+    }
+
+    pub fn get_customer_top_merchants(
+        env: Env,
+        customer: Address,
+        limit: u32,
+    ) -> Vec<(Address, i128)> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerMerchantCount(customer.clone()))
+            .unwrap_or(0);
+
+        let mut pairs: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..count {
+            if let Some(merchant) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::CustomerMerchantList(customer.clone(), i))
+            {
+                let vol: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CustomerMerchantVolume(customer.clone(), merchant.clone()))
+                    .unwrap_or(0);
+                pairs.push_back((merchant, vol));
+            }
+        }
+
+        // Select top `limit` by descending volume (selection without in-place swap)
+        let result_len = core::cmp::min(pairs.len(), limit);
+        let mut result: Vec<(Address, i128)> = Vec::new(&env);
+        let mut selected: Vec<bool> = Vec::new(&env);
+        for _ in 0..pairs.len() {
+            selected.push_back(false);
+        }
+
+        for _ in 0..result_len {
+            let mut best_idx: u32 = 0;
+            let mut best_vol: i128 = -1;
+            for j in 0..pairs.len() {
+                if !selected.get(j).unwrap_or(true) {
+                    let vol = pairs.get(j).map(|(_, v)| v).unwrap_or(0);
+                    if vol > best_vol {
+                        best_vol = vol;
+                        best_idx = j;
+                    }
+                }
+            }
+            if best_vol >= 0 {
+                result.push_back(pairs.get(best_idx).unwrap());
+                selected.set(best_idx, true);
+            }
+        }
+        result
+    }
+
+    pub fn get_customer_monthly_volume(
+        env: Env,
+        customer: Address,
+        month_timestamp: u64,
+    ) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerMonthlyVolume(customer, month_timestamp))
+            .unwrap_or(0)
+    }
+
+    fn default_customer_analytics() -> CustomerAnalytics {
+        CustomerAnalytics {
+            total_payments: 0,
+            total_volume: 0,
+            total_refunds: 0,
+            avg_transaction_size: 0,
+            peak_hour: 0,
+            top_merchant: None,
+            top_merchant_volume: 0,
+            first_payment_at: 0,
+            last_payment_at: 0,
+        }
     }
 
     // ── PAUSE FUNCTIONS ────────────────────────────────────────────────────
@@ -3894,3 +4013,6 @@ impl PaymentContract {
 }
 
 mod test;
+
+#[cfg(test)]
+mod test_analytics;
