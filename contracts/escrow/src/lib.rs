@@ -26,6 +26,7 @@ pub enum DataKey {
     TimeLockAction(u64),
     TimeLockCounter,
     TimeLockConfig,
+    BatchLimit,
     // Oracle conditions
     OracleCondition(u64),
     // Dispute collateral
@@ -164,6 +165,8 @@ pub enum Error {
     OracleStalePriceFeed = 44,
     OracleConditionNotMet = 45,
     NoOracleCondition = 46,
+    BatchTooLarge = 40,
+    BatchPartialFailure = 41,
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
@@ -598,6 +601,26 @@ pub struct OracleCondition {
 pub struct OraclePriceData {
     pub price: i128,
     pub timestamp: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowBatchEntry {
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub release_timestamp: u64,
+    pub description: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchEscrowResult {
+    pub index: u32,
+    pub escrow_id: u64,
+    pub success: bool,
+    pub error_code: u32,
 }
 
 #[contractevent]
@@ -4445,6 +4468,197 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MultiPartyDisputeKey(escrow_id))
             .ok_or(Error::NotDisputed)
+    }
+
+    // ── BATCH ESCROW CREATION ─────────────────────────────────────────────
+
+    pub fn create_escrow_batch(env: Env, admin: Address, entries: Vec<EscrowBatchEntry>) -> Vec<BatchEscrowResult> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            let mut results = Vec::new(&env);
+            for i in 0..entries.len() {
+                results.push_back(BatchEscrowResult {
+                    index: i as u32,
+                    escrow_id: 0,
+                    success: false,
+                    error_code: Error::NotAnAdmin as u32,
+                });
+            }
+            return results;
+        }
+
+        let batch_limit = Self::get_batch_limit(env.clone());
+        if entries.len() as u32 > batch_limit {
+            let mut results = Vec::new(&env);
+            results.push_back(BatchEscrowResult {
+                index: 0,
+                escrow_id: 0,
+                success: false,
+                error_code: Error::BatchTooLarge as u32,
+            });
+            return results;
+        }
+
+        let mut results = Vec::new(&env);
+        let mut has_failure = false;
+
+        for i in 0..entries.len() {
+            let entry = entries.get(i).unwrap();
+            let result = match Self::try_create_single_escrow(&env, &entry, i as u32) {
+                Ok(escrow_id) => BatchEscrowResult {
+                    index: i as u32,
+                    escrow_id,
+                    success: true,
+                    error_code: 0,
+                },
+                Err(err_code) => {
+                    has_failure = true;
+                    BatchEscrowResult {
+                        index: i as u32,
+                        escrow_id: 0,
+                        success: false,
+                        error_code: err_code,
+                    }
+                }
+            };
+            results.push_back(result);
+        }
+
+        if has_failure {
+            // Note: We don't return an error here, just mark partial failure
+            // The caller can check the results to see which succeeded
+        }
+
+        results
+    }
+
+    fn try_create_single_escrow(env: &Env, entry: &EscrowBatchEntry, index: u32) -> Result<u64, u32> {
+        // Validate inputs similar to create_escrow
+        if entry.amount <= 0 {
+            return Err(Error::InvalidStatus as u32); // Using InvalidStatus as generic error
+        }
+
+        let current_timestamp = env.ledger().timestamp();
+        if entry.release_timestamp <= current_timestamp {
+            return Err(Error::ReleaseNotYetAvailable as u32);
+        }
+
+        // Get counter and create escrow
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let escrow_id = counter + 1;
+
+        let escrow = Escrow {
+            id: escrow_id,
+            customer: entry.customer.clone(),
+            merchant: entry.merchant.clone(),
+            amount: entry.amount,
+            token: entry.token.clone(),
+            status: EscrowStatus::Locked,
+            created_at: current_timestamp,
+            release_timestamp: entry.release_timestamp,
+            dispute_started_at: 0,
+            last_activity_at: current_timestamp,
+            escalation_level: 0,
+            min_hold_period: 0, // Default for batch
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowCounter, &escrow_id);
+
+        // Index by customer
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerEscrowCount(entry.customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::CustomerEscrows(entry.customer.clone(), customer_count),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::CustomerEscrowCount(entry.customer.clone()),
+            &(customer_count + 1),
+        );
+
+        // Index by merchant
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantEscrowCount(entry.merchant.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::MerchantEscrows(entry.merchant.clone(), merchant_count),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::MerchantEscrowCount(entry.merchant.clone()),
+            &(merchant_count + 1),
+        );
+
+        // Update global analytics
+        let mut analytics: EscrowAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowAnalyticsKey)
+            .unwrap_or(EscrowAnalytics::default_value());
+        analytics.total_escrows_created += 1;
+        analytics.total_value_locked += entry.amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowAnalyticsKey, &analytics);
+
+        // Update per-address analytics
+        EscrowContract::update_customer_analytics(&env, &entry.customer, |a| {
+            a.total_escrows_created += 1;
+            a.total_value_locked += entry.amount;
+        });
+        EscrowContract::update_merchant_analytics(&env, &entry.merchant, |a| {
+            a.total_escrows_created += 1;
+            a.total_value_locked += entry.amount;
+        });
+
+        EscrowCreated {
+            escrow_id,
+            customer: entry.customer.clone(),
+            merchant: entry.merchant.clone(),
+            amount: entry.amount,
+            token: entry.token.clone(),
+            release_timestamp: entry.release_timestamp,
+        }
+        .publish(env);
+
+        Ok(escrow_id)
+    }
+
+    pub fn get_batch_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BatchLimit)
+            .unwrap_or(50) // Default limit of 50
+    }
+
+    pub fn set_batch_limit(env: Env, admin: Address, limit: u32) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        if limit == 0 || limit > 1000 {
+            return Err(Error::InvalidStatus); // Using InvalidStatus for invalid limit
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BatchLimit, &limit);
+        Ok(())
     }
 
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────
