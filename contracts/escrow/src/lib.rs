@@ -49,6 +49,8 @@ pub enum DataKey {
     WatchdogConfig,
     // Reputation decay
     ReputationDecayConfig,
+    EscrowFeeConfigKey,
+    AccumulatedEscrowFees(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -59,6 +61,35 @@ pub enum EscrowStatus {
     Disputed,
     Resolved,
     Cancelled,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowFeeConfig {
+    pub fee_bps: i128,
+    pub fee_recipient: Address,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFeeCollected {
+    pub escrow_id: u64,
+    pub fee_amount: i128,
+    pub recipient: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFeesWithdrawn {
+    pub amount: i128,
+    pub withdrawn_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowFeeConfigUpdated {
+    pub fee_bps: i128,
 }
 
 #[contracttype]
@@ -375,6 +406,7 @@ pub struct Escrow {
     pub last_activity_at: u64,
     pub escalation_level: u64,
     pub min_hold_period: u64,
+    pub fee_bps: i128,
 }
 
 #[derive(Clone)]
@@ -740,6 +772,58 @@ impl EscrowContract {
         AdminAdded { admin }.publish(&env);
     }
 
+    pub fn set_escrow_fee_config(env: Env, admin: Address, config: EscrowFeeConfig) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        env.storage().instance().set(&DataKey::EscrowFeeConfigKey, &config);
+        EscrowFeeConfigUpdated { fee_bps: config.fee_bps }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_escrow_fee_config(env: Env) -> EscrowFeeConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowFeeConfigKey)
+            .unwrap_or(EscrowFeeConfig {
+                fee_bps: 0,
+                fee_recipient: env.current_contract_address(),
+                enabled: false,
+            })
+    }
+
+    pub fn get_accumulated_escrow_fees(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AccumulatedEscrowFees(token))
+            .unwrap_or(0)
+    }
+
+    pub fn withdraw_escrow_fees(env: Env, admin: Address, token: Address, to: Address) -> Result<i128, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let amount: i128 = env.storage().instance().get(&DataKey::AccumulatedEscrowFees(token.clone())).unwrap_or(0);
+        if amount == 0 {
+            return Ok(0);
+        }
+
+        Self::transfer_if_token_contract(&env, &token, &to, amount)?;
+        env.storage().instance().set(&DataKey::AccumulatedEscrowFees(token.clone()), &0i128);
+
+        EscrowFeesWithdrawn {
+            amount,
+            withdrawn_by: admin,
+        }.publish(&env);
+
+        Ok(amount)
+    }
+
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
         env.storage()
             .instance()
@@ -1044,6 +1128,9 @@ impl EscrowContract {
 
         let current_timestamp = env.ledger().timestamp();
 
+        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_bps = if fee_config.enabled { fee_config.fee_bps } else { 0 };
+
         let escrow = Escrow {
             id: escrow_id,
             customer: customer.clone(),
@@ -1057,6 +1144,7 @@ impl EscrowContract {
             last_activity_at: current_timestamp,
             escalation_level: 0,
             min_hold_period,
+            fee_bps,
         };
 
         env.storage()
@@ -1534,12 +1622,36 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(escrow_id), &escrow);
 
-        // If this escrow contract currently holds a real token balance, release funds to merchant.
+        let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let merchant_amount = escrow.amount - fee_amount;
+
+        if fee_amount > 0 {
+            let fee_config = Self::get_escrow_fee_config(env.clone());
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &fee_config.fee_recipient,
+                fee_amount,
+            )?;
+
+            if fee_config.fee_recipient == env.current_contract_address() {
+                let mut acc: i128 = env.storage().instance().get(&DataKey::AccumulatedEscrowFees(escrow.token.clone())).unwrap_or(0);
+                acc += fee_amount;
+                env.storage().instance().set(&DataKey::AccumulatedEscrowFees(escrow.token.clone()), &acc);
+            }
+
+            EscrowFeeCollected {
+                escrow_id,
+                fee_amount,
+                recipient: fee_config.fee_recipient.clone(),
+            }.publish(&env);
+        }
+
         EscrowContract::transfer_if_token_contract(
             &env,
             &escrow.token,
             &escrow.merchant,
-            escrow.amount,
+            merchant_amount,
         )?;
 
         // Update reputation for both parties on successful completion.
@@ -2288,6 +2400,9 @@ impl EscrowContract {
             .unwrap_or(0);
         let escrow_id = counter + 1;
 
+        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_bps = if fee_config.enabled { fee_config.fee_bps } else { 0 };
+
         let escrow = Escrow {
             id: escrow_id,
             customer: customer.clone(),
@@ -2301,6 +2416,7 @@ impl EscrowContract {
             last_activity_at: current_timestamp,
             escalation_level: 0,
             min_hold_period: 0,
+            fee_bps,
         };
 
         env.storage()
@@ -2854,12 +2970,39 @@ impl EscrowContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::Escrow(escrow_id), &escrow);
+
+                let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+                let merchant_amount = escrow.amount - fee_amount;
+
+                if fee_amount > 0 {
+                    let fee_config = EscrowContract::get_escrow_fee_config(env.clone());
+                    EscrowContract::transfer_if_token_contract(
+                        env,
+                        &escrow.token,
+                        &fee_config.fee_recipient,
+                        fee_amount,
+                    )?;
+
+                    if fee_config.fee_recipient == env.current_contract_address() {
+                        let mut acc: i128 = env.storage().instance().get(&DataKey::AccumulatedEscrowFees(escrow.token.clone())).unwrap_or(0);
+                        acc += fee_amount;
+                        env.storage().instance().set(&DataKey::AccumulatedEscrowFees(escrow.token.clone()), &acc);
+                    }
+
+                    EscrowFeeCollected {
+                        escrow_id,
+                        fee_amount,
+                        recipient: fee_config.fee_recipient.clone(),
+                    }.publish(env);
+                }
+
                 EscrowContract::transfer_if_token_contract(
                     env,
                     &escrow.token,
                     &escrow.merchant,
-                    escrow.amount,
+                    merchant_amount,
                 )?;
+
                 EscrowContract::update_reputation_on_completion(env, &escrow.merchant);
                 EscrowContract::update_reputation_on_completion(env, &escrow.customer);
 
