@@ -4993,14 +4993,9 @@ fn test_evaluate_condition_cross_contract_state_false() {
         &condition
     );
 
-    // Cross-contract state conditions should return false (mock implementation)
-    let result = client.evaluate_condition(&payment_id);
-    assert!(!result);
-
-    // Verify result was cached
-    let conditional_payment = client.get_conditional_payment(&payment_id);
-    assert!(!conditional_payment.condition_met);
-    assert!(conditional_payment.evaluated_at.is_some());
+    // Cross-contract invoke failures should return a typed error.
+    let result = client.try_evaluate_condition(&payment_id);
+    assert_eq!(result.err(), Some(Ok(Error::ConditionEvaluationFailed)));
 }
 
 #[test]
