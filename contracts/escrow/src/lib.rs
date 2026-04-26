@@ -286,6 +286,13 @@ pub struct DisputeEscalated {
     pub level: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecommendationGenerated {
+    pub escrow_id: u64,
+    pub outcome: DisputeOutcome,
+    pub confidence_bps: u32,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -303,6 +310,24 @@ pub struct DisputeCollateral {
     pub amount: i128,
     pub token: Address,
     pub deposited_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum DisputeOutcome {
+    FavorCustomer,
+    FavorMerchant,
+    Inconclusive,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeRecommendation {
+    pub escrow_id: u64,
+    pub customer_score: i128,
+    pub merchant_score: i128,
+    pub recommendation: DisputeOutcome,
+    pub confidence_bps: u32,
 }
 
 #[contractevent]
@@ -2177,6 +2202,48 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Returns an advisory dispute recommendation derived from the customer's
+    /// and merchant's reputation scores. The result is purely advisory and
+    /// `resolve_dispute` does not consult or enforce it. A score difference
+    /// below 100 yields `Inconclusive`.
+    pub fn get_dispute_recommendation(env: Env, escrow_id: u64) -> DisputeRecommendation {
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let customer_rep = EscrowContract::get_or_default_reputation(&env, &escrow.customer);
+        let merchant_rep = EscrowContract::get_or_default_reputation(&env, &escrow.merchant);
+
+        let customer_score = customer_rep.score as i128;
+        let merchant_score = merchant_rep.score as i128;
+
+        let diff = merchant_score - customer_score;
+        let abs_diff = if diff < 0 { -diff } else { diff };
+
+        let recommendation = if abs_diff < 100 {
+            DisputeOutcome::Inconclusive
+        } else if diff > 0 {
+            DisputeOutcome::FavorMerchant
+        } else {
+            DisputeOutcome::FavorCustomer
+        };
+
+        let confidence_bps = abs_diff.min(10000) as u32;
+
+        DisputeRecommendationGenerated {
+            escrow_id,
+            outcome: recommendation.clone(),
+            confidence_bps,
+        }
+        .publish(&env);
+
+        DisputeRecommendation {
+            escrow_id,
+            customer_score,
+            merchant_score,
+            recommendation,
+            confidence_bps,
+        }
     }
 
     pub fn get_escrows_by_customer(
@@ -4552,6 +4619,9 @@ impl EscrowContract {
             .unwrap_or(0);
         let escrow_id = counter + 1;
 
+        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_bps = if fee_config.enabled { fee_config.fee_bps } else { 0 };
+
         let escrow = Escrow {
             id: escrow_id,
             customer: entry.customer.clone(),
@@ -4564,7 +4634,8 @@ impl EscrowContract {
             dispute_started_at: 0,
             last_activity_at: current_timestamp,
             escalation_level: 0,
-            min_hold_period: 0, // Default for batch
+            min_hold_period: 0,
+            fee_bps,
         };
 
         env.storage()

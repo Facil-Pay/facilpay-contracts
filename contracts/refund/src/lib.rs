@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, storage, token, Address,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address,
     BytesN, Env, String, Vec,
 };
 
@@ -55,6 +55,17 @@ pub enum RefundStatus {
     Approved,
     Rejected,
     Processed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum RefundReasonCode {
+    ProductDefect,
+    NonDelivery,
+    DuplicateCharge,
+    Unauthorized,
+    CustomerRequest,
+    Other,
 }
 
 #[contracterror]
@@ -166,6 +177,7 @@ pub struct Refund {
     pub status: RefundStatus,
     pub requested_at: u64,
     pub reason: String,
+    pub reason_code: RefundReasonCode,
 }
 
 #[contracttype]
@@ -397,6 +409,7 @@ impl RefundContract {
         original_payment_amount: i128,
         token: Address,
         reason: String,
+        reason_code: RefundReasonCode,
         payment_created_at: u64
     ) -> Result<u64, Error> {
         // Require merchant authentication
@@ -417,7 +430,7 @@ impl RefundContract {
         }
 
         // ── Issue #143: Cross-contract verification (if payment contract is set) ──
-        if let Some(payment_contract_addr) = env
+        if let Some(_payment_contract_addr) = env
             .storage()
             .instance()
             .get::<DataKey, Address>(&DataKey::PaymentContractAddress)
@@ -478,6 +491,7 @@ impl RefundContract {
             status: initial_status.clone(),
             requested_at: env.ledger().timestamp(),
             reason,
+            reason_code,
         };
 
         // Store refund in contract storage
@@ -949,6 +963,96 @@ impl RefundContract {
         }
 
         results
+    }
+
+    pub fn get_refunds_by_reason_code(
+        env: &Env,
+        code: RefundReasonCode,
+        limit: u64,
+        offset: u64
+    ) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(env);
+        if limit == 0 {
+            return results;
+        }
+
+        let total_refunds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+
+        let mut matched: u64 = 0;
+        let mut collected: u64 = 0;
+        let mut id: u64 = 1;
+        while id <= total_refunds && collected < limit {
+            if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(id)) {
+                if refund.reason_code == code {
+                    if matched >= offset {
+                        results.push_back(refund);
+                        collected += 1;
+                    }
+                    matched += 1;
+                }
+            }
+            id += 1;
+        }
+
+        results
+    }
+
+    pub fn get_reason_code_analytics(env: Env) -> Vec<(RefundReasonCode, u64)> {
+        let mut product_defect: u64 = 0;
+        let mut non_delivery: u64 = 0;
+        let mut duplicate_charge: u64 = 0;
+        let mut unauthorized: u64 = 0;
+        let mut customer_request: u64 = 0;
+        let mut other: u64 = 0;
+
+        let total_refunds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+
+        let mut id: u64 = 1;
+        while id <= total_refunds {
+            if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(id)) {
+                match refund.reason_code {
+                    RefundReasonCode::ProductDefect => product_defect += 1,
+                    RefundReasonCode::NonDelivery => non_delivery += 1,
+                    RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
+                    RefundReasonCode::Unauthorized => unauthorized += 1,
+                    RefundReasonCode::CustomerRequest => customer_request += 1,
+                    RefundReasonCode::Other => other += 1,
+                }
+            }
+            id += 1;
+        }
+
+        let mut ordered = [
+            (RefundReasonCode::ProductDefect, product_defect),
+            (RefundReasonCode::NonDelivery, non_delivery),
+            (RefundReasonCode::DuplicateCharge, duplicate_charge),
+            (RefundReasonCode::Unauthorized, unauthorized),
+            (RefundReasonCode::CustomerRequest, customer_request),
+            (RefundReasonCode::Other, other),
+        ];
+
+        ordered.sort_by(|a, b| {
+            let count_cmp = b.1.cmp(&a.1);
+            if count_cmp == core::cmp::Ordering::Equal {
+                Self::reason_code_rank(&a.0).cmp(&Self::reason_code_rank(&b.0))
+            } else {
+                count_cmp
+            }
+        });
+
+        let mut result = Vec::new(&env);
+        for (code, count) in ordered {
+            result.push_back((code, count));
+        }
+        result
     }
 
     pub fn get_refund_count_by_status(env: &Env, status: RefundStatus) -> u64 {
@@ -1489,7 +1593,7 @@ impl RefundContract {
         use soroban_sdk::{Symbol, IntoVal};
         let func = Symbol::new(&env, "check_payment_customer");
         let args = (payment_id, customer).into_val(&env);
-        match env.try_invoke_contract::<bool>(&payment_contract, &func, args) {
+        match env.try_invoke_contract::<bool, soroban_sdk::InvokeError>(&payment_contract, &func, args) {
             Ok(Ok(result)) => result,
             _ => false,
         }
@@ -1692,6 +1796,17 @@ impl RefundContract {
             }
         }
         false
+    }
+
+    fn reason_code_rank(code: &RefundReasonCode) -> u32 {
+        match code {
+            RefundReasonCode::ProductDefect => 0,
+            RefundReasonCode::NonDelivery => 1,
+            RefundReasonCode::DuplicateCharge => 2,
+            RefundReasonCode::Unauthorized => 3,
+            RefundReasonCode::CustomerRequest => 4,
+            RefundReasonCode::Other => 5,
+        }
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {

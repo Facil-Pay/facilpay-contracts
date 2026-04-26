@@ -25,6 +25,8 @@ pub enum DataKey {
     MerchantSubscriptionCount(Address),
     RateLimitConfig,
     AddressRateLimit(Address),
+    AddressFlagReason(Address),
+    AddressAllowlist(Address),
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
@@ -159,7 +161,8 @@ pub enum Error {
     BatchPartialFailure = 19,
     RateLimitExceeded = 20,
     DailyVolumeExceeded = 21,
-    AddressFlagged = 22,
+    AddressFlagged = 60,
+    AddressAlreadyFlagged = 61,
     AmountExceedsLimit = 23,
     DunningNotFound = 24,
     SubscriptionNotInDunning = 25,
@@ -189,6 +192,7 @@ pub enum Error {
     OracleNotConfigured = 59,
     ConditionEvaluationFailed = 62,
     ConditionRuntimeNotMet = 63,
+    RetryTooEarly = 46,
     PaymentRequiresMultiSig = 64,
     InsufficientPaymentApprovals = 65,
     PaymentProposalExpired = 66,
@@ -369,7 +373,7 @@ pub struct SubscriptionSuspended {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DunningResolved {
     pub subscription_id: u64,
-    pub admin: Address,
+    pub resolved_at: u64,
 }
 
 #[derive(Clone)]
@@ -395,21 +399,19 @@ pub struct AddressRateLimit {
 #[derive(Clone)]
 #[contracttype]
 pub struct DunningConfig {
-    pub grace_period: u64,
-    pub retry_intervals: Vec<u64>,
-    pub max_dunning_attempts: u32,
-    pub suspend_after_attempts: u32,
+    pub initial_backoff_seconds: u64,
+    pub max_retries: u32,
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct DunningState {
     pub subscription_id: u64,
-    pub attempts: u32,
+    pub retry_count: u32,
     pub next_retry_at: u64,
-    pub grace_period_ends_at: u64,
-    pub suspended: bool,
-    pub last_failure_reason: String,
+    pub backoff_seconds: u64,
+    pub max_retries: u32,
+    pub last_failed_at: u64,
 }
 
 #[derive(Clone)]
@@ -1285,6 +1287,13 @@ impl PaymentContract {
         // Validate metadata size
         if metadata.len() > MAX_METADATA_SIZE {
             return Err(Error::MetadataTooLarge);
+        }
+
+        // Enforce sanctions/flag checks at creation entry point.
+        if PaymentContract::is_address_flagged(env.clone(), customer.clone())
+            && !PaymentContract::is_allowlisted(env, &customer)
+        {
+            return Err(Error::AddressFlagged);
         }
 
         // Check rate limits and anti-fraud before processing
@@ -2565,12 +2574,100 @@ impl PaymentContract {
             .get(&DataKey::Subscription(subscription_id))
             .unwrap();
 
-        // Must be Active
+        let now = env.ledger().timestamp();
+
+        // InDunning path: enforce on-chain backoff before retrying
+        if sub.status == SubscriptionStatus::InDunning {
+            let mut dunning: DunningState = env
+                .storage()
+                .instance()
+                .get(&DataKey::DunningState(subscription_id))
+                .ok_or(Error::DunningNotFound)?;
+
+            if now < dunning.next_retry_at {
+                return Err(Error::RetryTooEarly);
+            }
+
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            let transfer_ok = token_client
+                .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+                .is_ok();
+
+            if transfer_ok {
+                sub.payment_count += 1;
+                sub.retry_count = 0;
+                sub.next_payment_at = now + sub.interval;
+                sub.status = SubscriptionStatus::Active;
+
+                if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
+                    sub.status = SubscriptionStatus::Expired;
+                }
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Subscription(subscription_id), &sub);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::DunningState(subscription_id));
+
+                (DunningResolved {
+                    subscription_id,
+                    resolved_at: now,
+                })
+                .publish(&env);
+
+                (RecurringPaymentExecuted {
+                    subscription_id,
+                    payment_count: sub.payment_count,
+                    amount: sub.amount,
+                    next_payment_at: sub.next_payment_at,
+                })
+                .publish(&env);
+            } else {
+                dunning.retry_count += 1;
+                dunning.last_failed_at = now;
+
+                if dunning.retry_count >= dunning.max_retries {
+                    sub.status = SubscriptionStatus::Suspended;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Subscription(subscription_id), &sub);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::DunningState(subscription_id), &dunning);
+
+                    (SubscriptionSuspended {
+                        subscription_id,
+                        reason: String::from_str(&env, "Maximum retries exceeded"),
+                    })
+                    .publish(&env);
+
+                    return Err(Error::MaxRetriesExceeded);
+                }
+
+                // Exponential backoff: backoff_seconds * 2^retry_count
+                dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::DunningState(subscription_id), &dunning);
+
+                (RecurringPaymentFailed {
+                    subscription_id,
+                    retry_count: dunning.retry_count as u64,
+                })
+                .publish(&env);
+
+                return Err(Error::TransferFailed);
+            }
+
+            return Ok(());
+        }
+
+        // Must be Active for the normal payment path
         if sub.status != SubscriptionStatus::Active {
             return Err(Error::SubscriptionNotActive);
         }
-
-        let now = env.ledger().timestamp();
 
         // Check subscription has not ended
         if sub.ends_at > 0 && now >= sub.ends_at {
@@ -2913,18 +3010,8 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::DunningConfig)
             .unwrap_or(DunningConfig {
-                grace_period: 7 * 24 * 60 * 60, // 7 days
-                retry_intervals: Vec::from_array(
-                    &env,
-                    [
-                        60 * 60,          // 1 hour
-                        6 * 60 * 60,      // 6 hours
-                        24 * 60 * 60,     // 1 day
-                        3 * 24 * 60 * 60, // 3 days
-                    ],
-                ),
-                max_dunning_attempts: 5,
-                suspend_after_attempts: 4,
+                initial_backoff_seconds: 3600, // 1 hour
+                max_retries: 5,
             })
     }
 
@@ -2956,7 +3043,7 @@ impl PaymentContract {
             return Err(Error::SubscriptionNotInDunning);
         }
 
-        let mut dunning_state: DunningState = env
+        let mut dunning: DunningState = env
             .storage()
             .instance()
             .get(&DataKey::DunningState(subscription_id))
@@ -2964,31 +3051,9 @@ impl PaymentContract {
 
         let now = env.ledger().timestamp();
 
-        // Check if retry is due
-        if now < dunning_state.next_retry_at {
-            return Err(Error::RetryNotDue);
-        }
-
-        // Check if grace period has expired
-        if now > dunning_state.grace_period_ends_at {
-            // Move to suspended state
-            sub.status = SubscriptionStatus::Suspended;
-            dunning_state.suspended = true;
-
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &sub);
-            env.storage()
-                .instance()
-                .set(&DataKey::DunningState(subscription_id), &dunning_state);
-
-            (SubscriptionSuspended {
-                subscription_id,
-                reason: String::from_str(&env, "Grace period expired"),
-            })
-            .publish(&env);
-
-            return Err(Error::GracePeriodExpired);
+        // Enforce backoff window
+        if now < dunning.next_retry_at {
+            return Err(Error::RetryTooEarly);
         }
 
         // Attempt the payment
@@ -3000,13 +3065,11 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
-            // Payment successful - resolve dunning
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
             sub.status = SubscriptionStatus::Active;
 
-            // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
             }
@@ -3014,11 +3077,15 @@ impl PaymentContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Subscription(subscription_id), &sub);
-
-            // Remove dunning state
             env.storage()
                 .instance()
                 .remove(&DataKey::DunningState(subscription_id));
+
+            (DunningResolved {
+                subscription_id,
+                resolved_at: now,
+            })
+            .publish(&env);
 
             (RecurringPaymentExecuted {
                 subscription_id,
@@ -3030,59 +3097,46 @@ impl PaymentContract {
 
             Ok(())
         } else {
-            // Payment failed - update dunning state
-            dunning_state.attempts += 1;
+            dunning.retry_count += 1;
+            dunning.last_failed_at = now;
 
-            let config = PaymentContract::get_dunning_config(env.clone());
-
-            if dunning_state.attempts >= config.max_dunning_attempts {
-                // Max attempts reached - suspend subscription
+            if dunning.retry_count >= dunning.max_retries {
                 sub.status = SubscriptionStatus::Suspended;
-                dunning_state.suspended = true;
-
                 env.storage()
                     .instance()
                     .set(&DataKey::Subscription(subscription_id), &sub);
                 env.storage()
                     .instance()
-                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
+                    .set(&DataKey::DunningState(subscription_id), &dunning);
 
                 (SubscriptionSuspended {
                     subscription_id,
-                    reason: String::from_str(&env, "Maximum dunning attempts exceeded"),
+                    reason: String::from_str(&env, "Maximum retries exceeded"),
                 })
                 .publish(&env);
 
                 return Err(Error::MaxRetriesExceeded);
-            } else if dunning_state.attempts >= config.suspend_after_attempts {
-                // Suspend after configured attempts
-                sub.status = SubscriptionStatus::Suspended;
-                dunning_state.suspended = true;
-
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &sub);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
-
-                (SubscriptionSuspended {
-                    subscription_id,
-                    reason: String::from_str(&env, "Suspend threshold reached"),
-                })
-                .publish(&env);
-
-                (DunningRetryScheduled {
-                    subscription_id,
-                    retry_at: dunning_state.next_retry_at,
-                })
-                .publish(&env);
-
-                return Err(Error::TransferFailed);
-            } else {
-                // This should not happen, but handle gracefully
-                return Err(Error::TransferFailed);
             }
+
+            // Exponential backoff: backoff_seconds * 2^retry_count
+            dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
+            env.storage()
+                .instance()
+                .set(&DataKey::DunningState(subscription_id), &dunning);
+
+            (DunningRetryScheduled {
+                subscription_id,
+                retry_at: dunning.next_retry_at,
+            })
+            .publish(&env);
+
+            (RecurringPaymentFailed {
+                subscription_id,
+                retry_count: dunning.retry_count as u64,
+            })
+            .publish(&env);
+
+            Err(Error::TransferFailed)
         }
     }
 
@@ -3135,7 +3189,7 @@ impl PaymentContract {
 
         (DunningResolved {
             subscription_id,
-            admin,
+            resolved_at: env.ledger().timestamp(),
         })
         .publish(&env);
 
@@ -3143,23 +3197,19 @@ impl PaymentContract {
     }
 
     /// Internal function to enter dunning for a subscription.
-    fn enter_dunning(env: &Env, subscription_id: u64, reason: String) {
+    fn enter_dunning(env: &Env, subscription_id: u64, _reason: String) {
         let config = PaymentContract::get_dunning_config(env.clone());
         let now = env.ledger().timestamp();
 
-        let first_interval = if config.retry_intervals.len() > 0 {
-            config.retry_intervals.get(0).unwrap()
-        } else {
-            3600u64
-        };
-
+        // retry_count = 0: first retry uses backoff * 2^0 = backoff (1x)
+        // each subsequent failure increments retry_count, giving backoff * 2^retry_count
         let dunning_state = DunningState {
             subscription_id,
-            attempts: 1,
-            next_retry_at: now + first_interval,
-            grace_period_ends_at: now + config.grace_period,
-            suspended: false,
-            last_failure_reason: reason,
+            retry_count: 0,
+            next_retry_at: now + config.initial_backoff_seconds,
+            backoff_seconds: config.initial_backoff_seconds,
+            max_retries: config.max_retries,
+            last_failed_at: now,
         };
 
         env.storage()
@@ -3266,10 +3316,16 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if rate_limit.flagged {
+            return Err(Error::AddressAlreadyFlagged);
+        }
         rate_limit.flagged = true;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressFlagReason(address.clone()), &reason);
         (AddressFlagged { address, reason }).publish(&env);
         Ok(())
     }
@@ -3297,11 +3353,71 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if !rate_limit.flagged {
+            return Err(Error::InvalidStatus);
+        }
         rate_limit.flagged = false;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressFlagReason(address.clone()));
         (AddressUnflagged { address }).publish(&env);
+        Ok(())
+    }
+
+    pub fn is_address_flagged(env: Env, address: Address) -> bool {
+        let rate_limit: AddressRateLimit = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRateLimit(address.clone()))
+            .unwrap_or(AddressRateLimit {
+                address,
+                payment_count: 0,
+                window_start: 0,
+                daily_volume: 0,
+                last_payment_at: 0,
+                flagged: false,
+            });
+        rate_limit.flagged
+    }
+
+    pub fn get_flag_reason(env: Env, address: Address) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressFlagReason(address))
+    }
+
+    pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressAllowlist(address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressAllowlist(address));
         Ok(())
     }
 
@@ -3331,8 +3447,8 @@ impl PaymentContract {
                 flagged: false,
             });
 
-        // Block flagged addresses immediately.
-        if rate_limit.flagged {
+        // Block flagged addresses unless explicitly allowlisted.
+        if rate_limit.flagged && !PaymentContract::is_allowlisted(env, address) {
             return Err(Error::AddressFlagged);
         }
 
@@ -3392,6 +3508,13 @@ impl PaymentContract {
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
 
         Ok(())
+    }
+
+    fn is_allowlisted(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressAllowlist(address.clone()))
+            .unwrap_or(false)
     }
 
     fn invoke_escrow_create(

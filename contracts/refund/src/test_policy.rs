@@ -128,6 +128,7 @@ fn test_admin_override_policy_successfully() {
         &1000i128,
         &token,
         &String::from_str(&env, "Test"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -165,6 +166,7 @@ fn test_admin_override_policy_by_non_admin_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Test"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -209,6 +211,7 @@ fn test_refund_window_expired_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Too late"),
+        &RefundReasonCode::Other,
         &payment_created_at
     );
 
@@ -247,6 +250,7 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Too much"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -285,6 +289,7 @@ fn test_auto_approve_below_threshold() {
         &1000i128,
         &token,
         &String::from_str(&env, "Small refund"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -325,6 +330,7 @@ fn test_refund_with_inactive_policy_should_fail() {
         &1000i128,
         &token,
         &String::from_str(&env, "Inactive policy"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -356,6 +362,7 @@ fn test_refund_without_merchant_policy_uses_default() {
         &1000i128,
         &token,
         &String::from_str(&env, "Default policy"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -527,6 +534,7 @@ fn test_request_refund_uses_global_default_when_no_merchant_policy() {
         &1000i128,
         &token,
         &String::from_str(&env, "Uses global default"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp(),
     );
 
@@ -559,6 +567,7 @@ fn test_request_refund_returns_policy_not_found_when_no_policy_at_all() {
         &1000i128,
         &token,
         &String::from_str(&env, "No policy at all"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp(),
     );
 
@@ -588,6 +597,7 @@ fn test_default_policy_change_does_not_affect_pending_refunds() {
         &1000i128,
         &token,
         &String::from_str(&env, "Pending refund"),
+        &RefundReasonCode::Other,
         &env.ledger().timestamp(),
     );
 

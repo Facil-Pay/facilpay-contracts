@@ -3939,11 +3939,11 @@ fn test_fee_config_snapshot_isolation() {
 
     let escrow_id_after = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
 
-    let analytics = client.get_escrow_analytics();
-    assert_eq!(analytics.total_escrows_released, 1);
-    assert_eq!(analytics.total_value_released, 500);
-    // duration = 5000 - 1000 = 4000 seconds
-    assert_eq!(analytics.avg_escrow_duration_seconds, 4000);
+    let escrow_1 = client.get_escrow(&escrow_id_before);
+    let escrow_2 = client.get_escrow(&escrow_id_after);
+
+    assert_eq!(escrow_1.fee_bps, 0);
+    assert_eq!(escrow_2.fee_bps, 1000);
 }
 
 // ── BATCH ESCROW CREATION TESTS ─────────────────────────────────────────
@@ -4175,9 +4175,153 @@ fn test_batch_escrow_creation_unauthorized() {
     assert!(!results.get(0).unwrap().success);
     assert_eq!(results.get(0).unwrap().error_code, Error::NotAnAdmin as u32);
 }
-    let escrow_1 = client.get_escrow(&escrow_id_before);
-    let escrow_2 = client.get_escrow(&escrow_id_after);
 
-    assert_eq!(escrow_1.fee_bps, 0);
-    assert_eq!(escrow_2.fee_bps, 1000);
+// ── DISPUTE RECOMMENDATION TESTS ────────────────────────────────────────
+
+#[test]
+fn test_dispute_recommendation_favors_merchant() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Configure rewards/penalties large enough to push merchant well above customer.
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed reputations: merchant wins a dispute → merchant=8000, customer=2000.
+    let seed_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &true);
+
+    // Second escrow whose recommendation we want to inspect.
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.escrow_id, escrow_id);
+    assert_eq!(rec.customer_score, 2000);
+    assert_eq!(rec.merchant_score, 8000);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorMerchant);
+    assert_eq!(rec.confidence_bps, 6000);
+}
+
+#[test]
+fn test_dispute_recommendation_favors_customer() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed reputations: customer wins → customer=8000, merchant=2000.
+    let seed_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&merchant, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &false);
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.customer_score, 8000);
+    assert_eq!(rec.merchant_score, 2000);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorCustomer);
+    assert_eq!(rec.confidence_bps, 6000);
+}
+
+#[test]
+fn test_dispute_recommendation_inconclusive_below_threshold() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Both parties stay at the neutral default of 5000, so the difference is 0.
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.customer_score, 5000);
+    assert_eq!(rec.merchant_score, 5000);
+    assert_eq!(rec.recommendation, DisputeOutcome::Inconclusive);
+    assert_eq!(rec.confidence_bps, 0);
+}
+
+#[test]
+fn test_dispute_recommendation_does_not_enforce_resolution() {
+    // Confirms the recommendation is purely advisory: an admin can resolve
+    // against the recommended outcome and resolve_dispute still succeeds.
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed: merchant=8000, customer=2000.
+    let seed_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &true);
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorMerchant);
+
+    // Admin overrides the recommendation and resolves in the customer's favour.
+    client.resolve_dispute(&admin, &escrow_id, &false);
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
 }

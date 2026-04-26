@@ -73,6 +73,20 @@ Processes refund requests:
 - `request_refund()` - Merchant initiates
 - `approve_refund()` - Admin approves
 - `process_refund()` - Execute refund
+- `get_refunds_by_reason_code()` - Filter refunds by structured reason code with pagination
+- `get_reason_code_analytics()` - Count refunds by reason code (sorted by frequency)
+
+#### Refund Reason Code Migration (Breaking)
+
+`request_refund()` now requires a `reason_code: RefundReasonCode` argument in addition to free-text `reason`.
+
+- Old call shape: `request_refund(..., reason, payment_created_at)`
+- New call shape: `request_refund(..., reason, reason_code, payment_created_at)`
+
+Recommended migration path:
+1. Update all callers to pass a concrete enum value (`ProductDefect`, `NonDelivery`, `DuplicateCharge`, `Unauthorized`, `CustomerRequest`, `Other`).
+2. For unknown/legacy flows, pass `Other` first and backfill specific codes in your upstream app logic.
+3. If upgrading a deployed instance with existing data, plan a storage/data migration for historical refunds before reading them as the new `Refund` shape.
 
 ## 🔄 Development Workflow
 

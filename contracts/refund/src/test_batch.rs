@@ -23,6 +23,7 @@ fn make_refund(client: &RefundContractClient, env: &Env, merchant: &Address, pay
         &1000i128,
         &token,
         &String::from_str(env, "reason"),
+        &RefundReasonCode::Other,
         &0u64,
     )
 }

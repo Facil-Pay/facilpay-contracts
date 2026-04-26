@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env};
 
 fn setup(env: &Env) -> (RefundContractClient, Address) {
     let id = env.register(RefundContract, ());

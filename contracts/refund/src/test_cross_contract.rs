@@ -30,6 +30,7 @@ fn test_request_refund_without_payment_contract_set() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0u64,
     );
     assert_eq!(refund_id, 1u64);
@@ -82,6 +83,7 @@ fn test_ownership_mismatch_rejects_refund() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0u64,
     );
     assert!(result.is_err());

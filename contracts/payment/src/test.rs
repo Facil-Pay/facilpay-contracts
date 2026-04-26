@@ -88,23 +88,13 @@ fn test_flag_address_blocks_payments() {
     let token = Address::generate(&env);
     let meta = String::from_str(&env, "");
 
-    // Set a permissive config so the only gate is the flag.
-    client.set_rate_limit_config(
-        &admin,
-        &(RateLimitConfig {
-            max_payments_per_window: 100,
-            window_duration: 100_000,
-            max_payment_amount: 0,
-            max_daily_volume: 0,
-        })
-    );
-
     // Flag the customer.
     client.flag_address(&admin, &customer, &String::from_str(&env, "velocity attack"));
     let rl = client.get_address_rate_limit(&customer);
     assert!(rl.flagged);
+    assert!(client.is_address_flagged(&customer));
 
-    // Payment must fail because address is flagged.
+    // Payment must fail because address is flagged, even without rate-limit config.
     let result = client.try_create_payment(
         &customer,
         &merchant,
@@ -114,7 +104,7 @@ fn test_flag_address_blocks_payments() {
         &0,
         &meta
     );
-    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::AddressFlagged);
 }
 
 #[test]
@@ -142,9 +132,69 @@ fn test_unflag_address_allows_payments() {
 
     let rl = client.get_address_rate_limit(&customer);
     assert!(!rl.flagged);
+    assert!(!client.is_address_flagged(&customer));
 
     // Payment must succeed after unflag.
     client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+}
+
+#[test]
+fn test_allowlist_bypasses_flag_check() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    client.flag_address(&admin, &customer, &String::from_str(&env, "sanctions review"));
+    client.add_to_allowlist(&admin, &customer);
+
+    // Allowlisted addresses can still initiate new payments even when flagged.
+    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+}
+
+#[test]
+fn test_unflag_requires_current_flag() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+
+    let result = client.try_unflag_address(&admin, &customer);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+}
+
+#[test]
+fn test_flag_reason_stored_and_cleared_on_unflag() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let reason = String::from_str(&env, "regulatory hold");
+
+    client.flag_address(&admin, &customer, &reason);
+    assert_eq!(client.get_flag_reason(&customer), Some(reason));
+
+    client.unflag_address(&admin, &customer);
+    assert_eq!(client.get_flag_reason(&customer), None);
+}
+
+#[test]
+fn test_flag_address_fails_if_already_flagged() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+
+    client.flag_address(&admin, &customer, &String::from_str(&env, "first reason"));
+    let result = client.try_flag_address(
+        &admin,
+        &customer,
+        &String::from_str(&env, "second reason")
+    );
+    assert_eq!(result.unwrap_err().unwrap(), Error::AddressAlreadyFlagged);
 }
 
 #[test]
@@ -3099,10 +3149,8 @@ fn setup_dunning_contract(
     client.set_dunning_config(
         &admin,
         &(DunningConfig {
-            grace_period: 86400, // 1 day
-            retry_intervals: Vec::from_array(env, [3600u64, 7200u64, 14400u64]), // 1h, 2h, 4h
-            max_dunning_attempts: 4,
-            suspend_after_attempts: 3,
+            initial_backoff_seconds: 3600, // 1 hour
+            max_retries: 4,
         })
     );
 
@@ -3115,10 +3163,195 @@ fn test_set_and_get_dunning_config() {
     let (client, _admin, _, _, _) = setup_dunning_contract(&env);
 
     let config = client.get_dunning_config();
-    assert_eq!(config.grace_period, 86400);
-    assert_eq!(config.retry_intervals.len(), 3);
-    assert_eq!(config.max_dunning_attempts, 4);
-    assert_eq!(config.suspend_after_attempts, 3);
+    assert_eq!(config.initial_backoff_seconds, 3600);
+    assert_eq!(config.max_retries, 4);
+}
+
+// Helper: create a subscription that will always fail (no customer funds).
+fn setup_failing_subscription(
+    env: &Env,
+    client: &PaymentContractClient<'_>,
+    customer: &Address,
+    merchant: &Address,
+) -> (u64, Address) {
+    let token_admin = Address::generate(env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    env.ledger().set_timestamp(1000);
+
+    let sub_id = client.create_subscription(
+        customer,
+        merchant,
+        &500i128,
+        &token_address,
+        &Currency::USDC,
+        &86400u64, // 1-day interval
+        &0u64,
+        &3u64,
+        &String::from_str(env, ""),
+        &0u64,
+    );
+    (sub_id, token_address)
+}
+
+#[test]
+fn test_dunning_retry_too_early_returns_error() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_dunning_config(
+        &admin,
+        &(DunningConfig {
+            initial_backoff_seconds: 3600,
+            max_retries: 4,
+        }),
+    );
+
+    let (sub_id, _token) = setup_failing_subscription(&env, &client, &customer, &merchant);
+
+    // Advance to payment due time and trigger the first failure → enters dunning
+    env.ledger().set_timestamp(1000 + 86400 + 1);
+    let _ = client.try_execute_recurring_payment(&sub_id);
+
+    let dunning = client.get_dunning_state(&sub_id).unwrap();
+    assert_eq!(dunning.retry_count, 0);
+    let next_retry = dunning.next_retry_at;
+
+    // Calling before next_retry_at must return RetryTooEarly
+    env.ledger().set_timestamp(next_retry - 1);
+    let result = client.try_execute_recurring_payment(&sub_id);
+    assert_eq!(result, Err(Ok(Error::RetryTooEarly)));
+}
+
+#[test]
+fn test_dunning_exponential_backoff_doubles() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let backoff = 3600u64;
+    client.set_dunning_config(
+        &admin,
+        &(DunningConfig {
+            initial_backoff_seconds: backoff,
+            max_retries: 5,
+        }),
+    );
+
+    let (sub_id, _token) = setup_failing_subscription(&env, &client, &customer, &merchant);
+
+    // Initial failure → enter dunning, retry_count = 0, next_retry_at = now + backoff (1x)
+    env.ledger().set_timestamp(1000 + 86400 + 1);
+    let _ = client.try_execute_recurring_payment(&sub_id);
+    let d1 = client.get_dunning_state(&sub_id).unwrap();
+    assert_eq!(d1.retry_count, 0);
+
+    // First retry failure → retry_count = 1, wait = backoff * 2^1 = backoff * 2 (doubles)
+    env.ledger().set_timestamp(d1.next_retry_at + 1);
+    let _ = client.try_execute_recurring_payment(&sub_id);
+    let d2 = client.get_dunning_state(&sub_id).unwrap();
+    assert_eq!(d2.retry_count, 1);
+    // next_retry_at = now + (backoff_seconds << 1) = now + backoff * 2
+    let expected_wait = backoff << 1u32;
+    assert_eq!(d2.next_retry_at, d1.next_retry_at + 1 + expected_wait);
+}
+
+#[test]
+fn test_dunning_max_retries_suspends_subscription() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_dunning_config(
+        &admin,
+        &(DunningConfig {
+            initial_backoff_seconds: 60,
+            max_retries: 3,
+        }),
+    );
+
+    let (sub_id, _token) = setup_failing_subscription(&env, &client, &customer, &merchant);
+
+    // Initial failure → enter dunning (retry_count = 0)
+    env.ledger().set_timestamp(1000 + 86400 + 1);
+    let _ = client.try_execute_recurring_payment(&sub_id);
+
+    // Exhaust retries: retry_count goes 0 → 1 → 2 → 3, suspension fires at 3 >= max_retries(3)
+    for _ in 0..3 {
+        let d = client.get_dunning_state(&sub_id).unwrap();
+        env.ledger().set_timestamp(d.next_retry_at + 1);
+        let _ = client.try_execute_recurring_payment(&sub_id);
+    }
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Suspended);
+
+    let last = client.try_execute_recurring_payment(&sub_id);
+    assert_eq!(last, Err(Ok(Error::SubscriptionNotActive)));
+}
+
+#[test]
+fn test_dunning_successful_retry_fires_dunning_resolved() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_dunning_config(
+        &admin,
+        &(DunningConfig {
+            initial_backoff_seconds: 3600,
+            max_retries: 4,
+        }),
+    );
+
+    // Start with no funds so first payment fails
+    let (sub_id, token_address) =
+        setup_failing_subscription(&env, &client, &customer, &merchant);
+
+    env.ledger().set_timestamp(1000 + 86400 + 1);
+    let _ = client.try_execute_recurring_payment(&sub_id);
+
+    let dunning = client.get_dunning_state(&sub_id).unwrap();
+    assert_eq!(dunning.retry_count, 0);
+
+    // Fund the customer so the retry succeeds
+    let asset_client = token::StellarAssetClient::new(&env, &token_address);
+    asset_client.mint(&customer, &100_000i128);
+
+    env.ledger().set_timestamp(dunning.next_retry_at + 1);
+    client.execute_recurring_payment(&sub_id);
+
+    // Dunning state should be cleared
+    assert!(client.get_dunning_state(&sub_id).is_none());
+
+    // Subscription should be Active again
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.retry_count, 0);
+
 }
 
 #[test]
