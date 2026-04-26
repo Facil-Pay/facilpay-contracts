@@ -4951,3 +4951,321 @@ fn test_condition_evaluation_caching() {
     assert_eq!(evaluated_at1, evaluated_at2);
     assert_eq!(evaluated_at1, 1000);
 }
+
+// ── FEE WAIVER TESTS ─────────────────────────────────────────────────────
+
+fn setup_fee_waiver_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    
+    // Set up fee configuration
+    let fee_config = FeeConfig {
+        fee_bps: 200, // 2%
+        min_fee: 100,
+        max_fee: 10000,
+        treasury: Address::generate(env),
+        fee_token: Address::generate(env),
+        active: true,
+    };
+    client.set_fee_config(&admin, &fee_config);
+    
+    (client, admin, contract_id)
+}
+
+#[test]
+fn test_grant_fee_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Partnership deal");
+
+    // Grant 50% fee waiver (5000 bps)
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // Verify waiver was granted
+    let waiver = client.get_fee_waiver(&merchant);
+    assert!(waiver.is_some());
+    
+    let waiver_data = waiver.unwrap();
+    assert_eq!(waiver_data.merchant, merchant);
+    assert_eq!(waiver_data.waiver_bps, 5000);
+    assert_eq!(waiver_data.valid_until, 1000000000);
+    assert_eq!(waiver_data.reason, reason);
+    assert_eq!(waiver_data.granted_by, admin);
+
+    // Verify event was published
+    let events = env.events().all();
+    let waiver_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "FeeWaiverGranted")
+        .collect();
+    assert_eq!(waiver_events.len(), 1);
+}
+
+#[test]
+#[should_panic]
+fn test_grant_fee_waiver_unauthorized() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let reason = String::from_str(&env, "Unauthorized waiver");
+
+    // Unauthorized user should not be able to grant waiver
+    client.grant_fee_waiver(&unauthorized, &merchant, &5000, &1000000000, &reason);
+}
+
+#[test]
+#[should_panic]
+fn test_grant_fee_waiver_invalid_bps() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Invalid waiver");
+
+    // Waiver BPS over 10000 (100%) should fail
+    client.grant_fee_waiver(&admin, &merchant, &15000, &1000000000, &reason);
+}
+
+#[test]
+fn test_revoke_fee_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Partnership deal");
+
+    // Grant waiver first
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+    
+    // Verify waiver exists
+    assert!(client.get_fee_waiver(&merchant).is_some());
+
+    // Revoke waiver
+    client.revoke_fee_waiver(&admin, &merchant);
+
+    // Verify waiver was revoked
+    assert!(client.get_fee_waiver(&merchant).is_none());
+
+    // Verify event was published
+    let events = env.events().all();
+    let revoke_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "FeeWaiverRevoked")
+        .collect();
+    assert_eq!(revoke_events.len(), 1);
+}
+
+#[test]
+#[should_panic]
+fn test_revoke_fee_waiver_unauthorized() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let unauthorized = Address::generate(&env);
+    let reason = String::from_str(&env, "Partnership deal");
+
+    // Grant waiver first
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // Unauthorized user should not be able to revoke waiver
+    client.revoke_fee_waiver(&unauthorized, &merchant);
+}
+
+#[test]
+#[should_panic]
+fn test_revoke_nonexistent_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+
+    // Should not be able to revoke non-existent waiver
+    client.revoke_fee_waiver(&admin, &merchant);
+}
+
+#[test]
+fn test_expired_waiver_ignored() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Expired waiver");
+
+    // Set timestamp and grant waiver that expires quickly
+    env.ledger().set_timestamp(1000);
+    client.grant_fee_waiver(&admin, &merchant, &5000, &2000, &reason); // Expires at 2000
+
+    // Verify waiver exists initially
+    assert!(client.get_fee_waiver(&merchant).is_some());
+
+    // Advance time past expiration
+    env.ledger().set_timestamp(3000);
+
+    // Waiver should now be expired and removed
+    assert!(client.get_fee_waiver(&merchant).is_none());
+
+    // Verify expiration event was published
+    let events = env.events().all();
+    let expire_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "FeeWaiverExpired")
+        .collect();
+    assert_eq!(expire_events.len(), 1);
+}
+
+#[test]
+fn test_get_effective_fee_bps_with_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "50% waiver");
+
+    // Without waiver: 2% fee = 200 bps
+    assert_eq!(client.get_effective_fee_bps(&merchant), 200);
+
+    // Grant 50% waiver
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // With waiver: 2% * (1 - 0.5) = 1% = 100 bps
+    assert_eq!(client.get_effective_fee_bps(&merchant), 100);
+}
+
+#[test]
+fn test_get_effective_fee_bps_100_percent_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "100% waiver");
+
+    // Grant 100% waiver (zero fee)
+    client.grant_fee_waiver(&admin, &merchant, &10000, &1000000000, &reason);
+
+    // With 100% waiver: 2% * (1 - 1.0) = 0% = 0 bps
+    assert_eq!(client.get_effective_fee_bps(&merchant), 0);
+}
+
+#[test]
+fn test_get_effective_fee_bps_with_tier_and_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Premium merchant waiver");
+
+    // Upgrade merchant to Premium tier (7.5% discount on fees)
+    client.set_merchant_tier(&admin, &merchant, &FeeTier::Premium);
+
+    // Without waiver: 2% * (1 - 0.075) = 1.85% = 185 bps
+    assert_eq!(client.get_effective_fee_bps(&merchant), 185);
+
+    // Grant 50% waiver on top of tier discount
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // With waiver and tier: 2% * (1 - 0.075) * (1 - 0.5) = 0.925% = 92.5 bps (rounded down)
+    assert_eq!(client.get_effective_fee_bps(&merchant), 92);
+}
+
+#[test]
+fn test_calculate_fee_with_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "50% waiver");
+
+    // Grant 50% waiver
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // Calculate fee for 1000 amount
+    // Without waiver: 1000 * 200 / 10000 = 20
+    // With 50% waiver: 1000 * 100 / 10000 = 10
+    let fee = client.calculate_fee(&1000, &merchant);
+    assert_eq!(fee, 10);
+}
+
+#[test]
+fn test_calculate_fee_with_100_percent_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "100% waiver");
+
+    // Grant 100% waiver
+    client.grant_fee_waiver(&admin, &merchant, &10000, &1000000000, &reason);
+
+    // Calculate fee for 1000 amount - should be zero
+    let fee = client.calculate_fee(&1000, &merchant);
+    assert_eq!(fee, 0);
+}
+
+#[test]
+fn test_calculate_fee_respects_min_fee_with_waiver() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "99% waiver");
+
+    // Grant 99% waiver (almost zero fee)
+    client.grant_fee_waiver(&admin, &merchant, &9900, &1000000000, &reason);
+
+    // Calculate fee for small amount that would be below min_fee
+    // 2% * (1 - 0.99) = 0.02% = 2 bps
+    // 100 * 2 / 10000 = 0.02, but min_fee is 100, so fee should be 100
+    let fee = client.calculate_fee(&100, &merchant);
+    assert_eq!(fee, 100); // Min fee still applies
+}
+
+#[test]
+fn test_waiver_with_no_fee_config() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+
+    // Without fee config, effective fee should be 0
+    assert_eq!(client.get_effective_fee_bps(&merchant), 0);
+    
+    // Calculate fee should return 0
+    assert_eq!(client.calculate_fee(&1000, &merchant), 0);
+}
+
+#[test]
+fn test_fee_waiver_events() {
+    let env = Env::default();
+    let (client, admin, _) = setup_fee_waiver_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let reason = String::from_str(&env, "Test waiver");
+
+    // Grant waiver
+    client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
+
+    // Revoke waiver
+    client.revoke_fee_waiver(&admin, &merchant);
+
+    // Check all events
+    let events = env.events().all();
+    
+    let grant_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "FeeWaiverGranted")
+        .collect();
+    assert_eq!(grant_events.len(), 1);
+    
+    let revoke_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "FeeWaiverRevoked")
+        .collect();
+    assert_eq!(revoke_events.len(), 1);
+}

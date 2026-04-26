@@ -50,6 +50,7 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    FeeWaiver(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -512,6 +513,16 @@ pub struct MerchantFeeRecord {
     pub fee_tier: FeeTier,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeWaiver {
+    pub merchant: Address,
+    pub waiver_bps: u32,         // reduction in basis points
+    pub valid_until: u64,
+    pub reason: String,
+    pub granted_by: Address,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionProposed {
@@ -574,6 +585,27 @@ pub struct MerchantTierUpgraded {
     pub merchant: Address,
     pub old_tier: FeeTier,
     pub new_tier: FeeTier,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWaiverGranted {
+    pub merchant: Address,
+    pub waiver_bps: u32,
+    pub valid_until: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWaiverRevoked {
+    pub merchant: Address,
+    pub revoked_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWaiverExpired {
+    pub merchant: Address,
 }
 
 #[contractevent]
@@ -3159,7 +3191,7 @@ impl PaymentContract {
             .ok_or(Error::FeeConfigNotFound)
     }
 
-    /// Calculates the fee for a given amount and merchant (accounting for tier discount).
+    /// Calculates the fee for a given amount and merchant (accounting for tier discount and waivers).
     pub fn calculate_fee(env: Env, amount: i128, merchant: Address) -> i128 {
         let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
         let config = match config {
@@ -3171,20 +3203,14 @@ impl PaymentContract {
             }
             Some(c) => c,
         };
-        let record: MerchantFeeRecord = env
-            .storage()
-            .instance()
-            .get(&DataKey::MerchantFeeRecord(merchant.clone()))
-            .unwrap_or(MerchantFeeRecord {
-                merchant,
-                total_fees_paid: 0,
-                total_volume: 0,
-                fee_tier: FeeTier::Standard,
-            });
+        
+        // Get effective fee BPS including tier discounts and waivers
+        let effective_fee_bps = PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
+        
         PaymentContract::compute_fee_amount(
             amount,
-            config.fee_bps,
-            &record.fee_tier,
+            effective_fee_bps,
+            &FeeTier::Standard, // Tier already applied in get_effective_fee_bps
             config.min_fee,
             config.max_fee,
         )
@@ -3529,6 +3555,137 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::MerchantFeeRecord(merchant), &record);
+    }
+
+    // ── FEE WAIVER FUNCTIONS ───────────────────────────────────────────────────
+
+    pub fn grant_fee_waiver(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        waiver_bps: u32,
+        valid_until: u64,
+        reason: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate waiver_bps is between 0 and 10000 (100%)
+        if waiver_bps > 10000 {
+            return Err(Error::InvalidTierThresholds); // Reuse existing error
+        }
+
+        let waiver = FeeWaiver {
+            merchant: merchant.clone(),
+            waiver_bps,
+            valid_until,
+            reason,
+            granted_by: admin.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeWaiver(merchant.clone()), &waiver);
+
+        (FeeWaiverGranted {
+            merchant,
+            waiver_bps,
+            valid_until,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn revoke_fee_waiver(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if waiver exists
+        let _waiver: FeeWaiver = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeWaiver(merchant.clone()))
+            .ok_or(Error::PaymentNotFound)?; // Reuse existing error
+
+        // Remove the waiver
+        env.storage()
+            .instance()
+            .remove(&DataKey::FeeWaiver(merchant.clone()));
+
+        (FeeWaiverRevoked {
+            merchant,
+            revoked_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_fee_waiver(env: Env, merchant: Address) -> Option<FeeWaiver> {
+        let waiver: Option<FeeWaiver> = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeWaiver(merchant.clone()));
+
+        // Check if waiver is expired
+        if let Some(w) = waiver {
+            if env.ledger().timestamp() > w.valid_until {
+                // Remove expired waiver and publish expiration event
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::FeeWaiver(merchant.clone()));
+                
+                (FeeWaiverExpired { merchant }).publish(&env);
+                None
+            } else {
+                Some(w)
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_effective_fee_bps(env: Env, merchant: Address) -> u32 {
+        // Get base fee configuration
+        let config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        let config = match config {
+            None => return 0,
+            Some(c) if !c.active => return 0,
+            Some(c) => c,
+        };
+
+        // Get merchant's tier discount
+        let record = PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
+        let tier_discount = PaymentContract::get_tier_discount_bps(&record.fee_tier);
+        let tier_adjusted_bps = config.fee_bps - (config.fee_bps * tier_discount) / 10000;
+
+        // Get waiver discount
+        let waiver = PaymentContract::get_fee_waiver(env.clone(), merchant);
+        if let Some(w) = waiver {
+            let waiver_adjusted_bps = tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
+            waiver_adjusted_bps
+        } else {
+            tier_adjusted_bps
+        }
     }
 
     // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────
