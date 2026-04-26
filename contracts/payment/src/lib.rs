@@ -25,6 +25,8 @@ pub enum DataKey {
     MerchantSubscriptionCount(Address),
     RateLimitConfig,
     AddressRateLimit(Address),
+    AddressFlagReason(Address),
+    AddressAllowlist(Address),
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
@@ -152,7 +154,8 @@ pub enum Error {
     BatchPartialFailure = 19,
     RateLimitExceeded = 20,
     DailyVolumeExceeded = 21,
-    AddressFlagged = 22,
+    AddressFlagged = 60,
+    AddressAlreadyFlagged = 61,
     AmountExceedsLimit = 23,
     DunningNotFound = 24,
     SubscriptionNotInDunning = 25,
@@ -1125,6 +1128,13 @@ impl PaymentContract {
         // Validate metadata size
         if metadata.len() > MAX_METADATA_SIZE {
             return Err(Error::MetadataTooLarge);
+        }
+
+        // Enforce sanctions/flag checks at creation entry point.
+        if PaymentContract::is_address_flagged(env.clone(), customer.clone())
+            && !PaymentContract::is_allowlisted(env, &customer)
+        {
+            return Err(Error::AddressFlagged);
         }
 
         // Check rate limits and anti-fraud before processing
@@ -2998,10 +3008,16 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if rate_limit.flagged {
+            return Err(Error::AddressAlreadyFlagged);
+        }
         rate_limit.flagged = true;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressFlagReason(address.clone()), &reason);
         (AddressFlagged { address, reason }).publish(&env);
         Ok(())
     }
@@ -3029,11 +3045,71 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if !rate_limit.flagged {
+            return Err(Error::InvalidStatus);
+        }
         rate_limit.flagged = false;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressFlagReason(address.clone()));
         (AddressUnflagged { address }).publish(&env);
+        Ok(())
+    }
+
+    pub fn is_address_flagged(env: Env, address: Address) -> bool {
+        let rate_limit: AddressRateLimit = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRateLimit(address.clone()))
+            .unwrap_or(AddressRateLimit {
+                address,
+                payment_count: 0,
+                window_start: 0,
+                daily_volume: 0,
+                last_payment_at: 0,
+                flagged: false,
+            });
+        rate_limit.flagged
+    }
+
+    pub fn get_flag_reason(env: Env, address: Address) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressFlagReason(address))
+    }
+
+    pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressAllowlist(address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressAllowlist(address));
         Ok(())
     }
 
@@ -3063,8 +3139,8 @@ impl PaymentContract {
                 flagged: false,
             });
 
-        // Block flagged addresses immediately.
-        if rate_limit.flagged {
+        // Block flagged addresses unless explicitly allowlisted.
+        if rate_limit.flagged && !PaymentContract::is_allowlisted(env, address) {
             return Err(Error::AddressFlagged);
         }
 
@@ -3124,6 +3200,13 @@ impl PaymentContract {
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
 
         Ok(())
+    }
+
+    fn is_allowlisted(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressAllowlist(address.clone()))
+            .unwrap_or(false)
     }
 
     fn invoke_escrow_create(

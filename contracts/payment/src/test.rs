@@ -88,23 +88,13 @@ fn test_flag_address_blocks_payments() {
     let token = Address::generate(&env);
     let meta = String::from_str(&env, "");
 
-    // Set a permissive config so the only gate is the flag.
-    client.set_rate_limit_config(
-        &admin,
-        &(RateLimitConfig {
-            max_payments_per_window: 100,
-            window_duration: 100_000,
-            max_payment_amount: 0,
-            max_daily_volume: 0,
-        })
-    );
-
     // Flag the customer.
     client.flag_address(&admin, &customer, &String::from_str(&env, "velocity attack"));
     let rl = client.get_address_rate_limit(&customer);
     assert!(rl.flagged);
+    assert!(client.is_address_flagged(&customer));
 
-    // Payment must fail because address is flagged.
+    // Payment must fail because address is flagged, even without rate-limit config.
     let result = client.try_create_payment(
         &customer,
         &merchant,
@@ -114,7 +104,7 @@ fn test_flag_address_blocks_payments() {
         &0,
         &meta
     );
-    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::AddressFlagged);
 }
 
 #[test]
@@ -142,9 +132,69 @@ fn test_unflag_address_allows_payments() {
 
     let rl = client.get_address_rate_limit(&customer);
     assert!(!rl.flagged);
+    assert!(!client.is_address_flagged(&customer));
 
     // Payment must succeed after unflag.
     client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+}
+
+#[test]
+fn test_allowlist_bypasses_flag_check() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    client.flag_address(&admin, &customer, &String::from_str(&env, "sanctions review"));
+    client.add_to_allowlist(&admin, &customer);
+
+    // Allowlisted addresses can still initiate new payments even when flagged.
+    client.create_payment(&customer, &merchant, &50, &token, &Currency::USDC, &0, &meta);
+}
+
+#[test]
+fn test_unflag_requires_current_flag() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+
+    let result = client.try_unflag_address(&admin, &customer);
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+}
+
+#[test]
+fn test_flag_reason_stored_and_cleared_on_unflag() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let reason = String::from_str(&env, "regulatory hold");
+
+    client.flag_address(&admin, &customer, &reason);
+    assert_eq!(client.get_flag_reason(&customer), Some(reason));
+
+    client.unflag_address(&admin, &customer);
+    assert_eq!(client.get_flag_reason(&customer), None);
+}
+
+#[test]
+fn test_flag_address_fails_if_already_flagged() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+
+    client.flag_address(&admin, &customer, &String::from_str(&env, "first reason"));
+    let result = client.try_flag_address(
+        &admin,
+        &customer,
+        &String::from_str(&env, "second reason")
+    );
+    assert_eq!(result.unwrap_err().unwrap(), Error::AddressAlreadyFlagged);
 }
 
 #[test]
