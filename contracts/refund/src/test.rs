@@ -26,6 +26,7 @@ fn test_request_refund_with_valid_data() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -57,6 +58,7 @@ fn test_refund_id_increments_correctly() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -68,6 +70,7 @@ fn test_refund_id_increments_correctly() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -97,6 +100,7 @@ fn test_get_refund_by_id() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -143,6 +147,7 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount1,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -154,6 +159,7 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount2,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -165,6 +171,7 @@ fn test_request_multiple_refunds_and_retrieve_each() {
         &amount3,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -200,7 +207,17 @@ fn test_request_refund_with_zero_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
+    client.request_refund(
+        &merchant,
+        &payment_id,
+        &customer,
+        &amount,
+        &amount,
+        &token,
+        &reason,
+        &RefundReasonCode::Other,
+        &0_u64,
+    );
 }
 
 #[test]
@@ -218,7 +235,17 @@ fn test_request_refund_with_negative_amount_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
+    client.request_refund(
+        &merchant,
+        &payment_id,
+        &customer,
+        &amount,
+        &amount,
+        &token,
+        &reason,
+        &RefundReasonCode::Other,
+        &0_u64,
+    );
 }
 
 #[test]
@@ -236,7 +263,17 @@ fn test_request_refund_with_invalid_payment_id_should_fail() {
     let reason = String::from_str(&env, "Test reason");
 
     env.mock_all_auths();
-    client.request_refund(&merchant, &payment_id, &customer, &amount, &amount, &token, &reason, &0_u64);
+    client.request_refund(
+        &merchant,
+        &payment_id,
+        &customer,
+        &amount,
+        &amount,
+        &token,
+        &reason,
+        &RefundReasonCode::Other,
+        &0_u64,
+    );
 }
 
 #[test]
@@ -272,6 +309,7 @@ fn test_refund_requested_event_is_emitted() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -306,6 +344,7 @@ fn test_refund_stored_with_requested_status() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -335,6 +374,7 @@ fn test_request_refund_without_reason() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -365,6 +405,7 @@ fn test_request_refund_with_reason() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -398,6 +439,7 @@ fn test_approve_requested_refund_successfully() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -432,6 +474,7 @@ fn test_reject_requested_refund_successfully() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -495,6 +538,7 @@ fn test_approve_already_approved_refund_should_fail() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -528,6 +572,7 @@ fn test_reject_already_rejected_refund_should_fail() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -561,6 +606,7 @@ fn test_approve_rejected_refund_should_fail() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -594,6 +640,7 @@ fn test_reject_approved_refund_should_fail() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -625,6 +672,7 @@ fn test_refund_approved_event_is_emitted() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -659,6 +707,7 @@ fn test_refund_rejected_event_is_emitted() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -692,6 +741,7 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let refund_id2 = client.request_refund(
@@ -702,6 +752,7 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let refund_id3 = client.request_refund(
@@ -712,6 +763,7 @@ fn test_approve_correct_refund_among_multiple() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -751,6 +803,7 @@ fn test_reject_refund_with_empty_reason() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -785,6 +838,7 @@ fn test_reject_refund_with_detailed_reason() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &env.ledger().timestamp()
     );
 
@@ -817,6 +871,7 @@ fn test_request_partial_refund_half_payment() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -849,6 +904,7 @@ fn test_multiple_partial_refunds_for_same_payment() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.approve_refund(&admin, &refund_id1);
@@ -862,6 +918,7 @@ fn test_multiple_partial_refunds_for_same_payment() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let refund2 = client.get_refund(&refund_id2);
@@ -895,6 +952,7 @@ fn test_request_refund_exceeding_original_payment_should_fail() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 }
@@ -923,6 +981,7 @@ fn test_cumulative_refunds_exceeding_payment_should_fail() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.approve_refund(&admin, &refund_id1);
@@ -936,6 +995,7 @@ fn test_cumulative_refunds_exceeding_payment_should_fail() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 }
@@ -963,6 +1023,7 @@ fn test_status_queries_and_counts() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let r2 = client.request_refund(
@@ -973,6 +1034,7 @@ fn test_status_queries_and_counts() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let r3 = client.request_refund(
@@ -983,6 +1045,7 @@ fn test_status_queries_and_counts() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -1039,6 +1102,7 @@ fn test_pagination_for_status_queries() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let r2 = client.request_refund(
@@ -1049,6 +1113,7 @@ fn test_pagination_for_status_queries() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let r3 = client.request_refund(
@@ -1059,6 +1124,7 @@ fn test_pagination_for_status_queries() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     let r4 = client.request_refund(
@@ -1069,6 +1135,7 @@ fn test_pagination_for_status_queries() {
         &amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -1082,6 +1149,240 @@ fn test_pagination_for_status_queries() {
     assert_eq!(page2.get(0).unwrap().id, r4);
 
     let _ = r1; // keep r1 used to ensure order matches insertion in test
+}
+
+#[test]
+fn test_request_refund_persists_each_reason_code() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "coded reason");
+
+    let reason_codes = [
+        RefundReasonCode::ProductDefect,
+        RefundReasonCode::NonDelivery,
+        RefundReasonCode::DuplicateCharge,
+        RefundReasonCode::Unauthorized,
+        RefundReasonCode::CustomerRequest,
+        RefundReasonCode::Other,
+    ];
+
+    env.mock_all_auths();
+    for (idx, code) in reason_codes.iter().enumerate() {
+        let payment_id = idx as u64 + 1;
+        let refund_id = client.request_refund(
+            &merchant,
+            &payment_id,
+            &customer,
+            &100i128,
+            &100i128,
+            &token,
+            &reason,
+            &code.clone(),
+            &0_u64,
+        );
+        let stored = client.get_refund(&refund_id);
+        assert_eq!(stored.reason_code, code.clone());
+    }
+}
+
+#[test]
+fn test_reason_code_analytics_sorted_by_frequency() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "analytics");
+
+    env.mock_all_auths();
+    client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    client.request_refund(
+        &merchant,
+        &2u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    client.request_refund(
+        &merchant,
+        &3u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    client.request_refund(
+        &merchant,
+        &4u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::CustomerRequest,
+        &0_u64,
+    );
+    client.request_refund(
+        &merchant,
+        &5u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::CustomerRequest,
+        &0_u64,
+    );
+    client.request_refund(
+        &merchant,
+        &6u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::DuplicateCharge,
+        &0_u64,
+    );
+
+    let analytics = client.get_reason_code_analytics();
+    assert_eq!(analytics.len(), 6);
+
+    assert_eq!(
+        analytics.get(0).unwrap(),
+        (RefundReasonCode::ProductDefect, 3u64),
+    );
+    assert_eq!(
+        analytics.get(1).unwrap(),
+        (RefundReasonCode::CustomerRequest, 2u64),
+    );
+    assert_eq!(
+        analytics.get(2).unwrap(),
+        (RefundReasonCode::DuplicateCharge, 1u64),
+    );
+    assert_eq!(
+        analytics.get(3).unwrap(),
+        (RefundReasonCode::NonDelivery, 0u64),
+    );
+    assert_eq!(
+        analytics.get(4).unwrap(),
+        (RefundReasonCode::Unauthorized, 0u64),
+    );
+    assert_eq!(analytics.get(5).unwrap(), (RefundReasonCode::Other, 0u64));
+}
+
+#[test]
+fn test_get_refunds_by_reason_code_with_pagination() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "pagination");
+
+    env.mock_all_auths();
+    let r1 = client.request_refund(
+        &merchant,
+        &11u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::NonDelivery,
+        &0_u64,
+    );
+    let _r2 = client.request_refund(
+        &merchant,
+        &12u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::Other,
+        &0_u64,
+    );
+    let r3 = client.request_refund(
+        &merchant,
+        &13u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::NonDelivery,
+        &0_u64,
+    );
+    let _r4 = client.request_refund(
+        &merchant,
+        &14u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    let r5 = client.request_refund(
+        &merchant,
+        &15u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::NonDelivery,
+        &0_u64,
+    );
+
+    let page = client.get_refunds_by_reason_code(&RefundReasonCode::NonDelivery, &2u64, &1u64);
+    assert_eq!(page.len(), 2);
+    assert_eq!(page.get(0).unwrap().id, r3);
+    assert_eq!(page.get(1).unwrap().id, r5);
+
+    let out_of_range = client.get_refunds_by_reason_code(&RefundReasonCode::NonDelivery, &2u64, &3u64);
+    assert_eq!(out_of_range.len(), 0);
+
+    let zero_limit = client.get_refunds_by_reason_code(&RefundReasonCode::NonDelivery, &0u64, &0u64);
+    assert_eq!(zero_limit.len(), 0);
+
+    let first = client.get_refunds_by_reason_code(&RefundReasonCode::NonDelivery, &1u64, &0u64);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first.get(0).unwrap().id, r1);
 }
 
 #[test]
@@ -1108,6 +1409,7 @@ fn test_refund_for_zero_amount_payment_should_fail() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 }
@@ -1135,6 +1437,7 @@ fn test_full_refund_is_allowed() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
 
@@ -1177,6 +1480,7 @@ fn test_can_refund_payment_helper() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.approve_refund(&admin, &refund_id);
@@ -1210,6 +1514,7 @@ fn test_can_refund_payment_helper_rejects_overflow() {
         &original_payment_amount,
         &token,
         &reason,
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.approve_refund(&admin, &refund_id);
@@ -1249,6 +1554,7 @@ fn test_arbitration_quorum() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
@@ -1300,6 +1606,7 @@ fn test_arbitration_deadline_enforcement() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
@@ -1354,6 +1661,7 @@ fn test_arbitration_success_fee_distribution() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
@@ -1421,6 +1729,7 @@ fn test_arbitration_arbitrator_cannot_vote() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
@@ -1481,6 +1790,7 @@ fn test_arbitration_outcome_execution_approved() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
@@ -1557,6 +1867,7 @@ fn test_arbitration_outcome_execution_rejected() {
         &1000i128,
         &token,
         &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
         &0_u64
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));

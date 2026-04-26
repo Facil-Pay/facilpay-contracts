@@ -1,5 +1,5 @@
 #![cfg(test)]
-use super::{RefundContract, RefundContractClient, RefundStatus};
+use super::{RefundContract, RefundContractClient, RefundReasonCode, RefundStatus};
 use soroban_sdk::{
     testutils::Address as _,
     Address, Env, String,
@@ -45,7 +45,17 @@ fn test_approve_refund() {
 
     env.mock_all_auths();
     let refund_id =
-        client.request_refund(&merchant, &payment_id, &customer, &amount, &1000, &token, &reason, &0_u64);
+        client.request_refund(
+            &merchant,
+            &payment_id,
+            &customer,
+            &amount,
+            &1000,
+            &token,
+            &reason,
+            &RefundReasonCode::Other,
+            &0_u64,
+        );
 
     // Approve
     client.approve_refund(&admin, &refund_id);

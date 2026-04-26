@@ -2,7 +2,7 @@
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
-    BytesN, Env, String, Vec,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -25,6 +25,8 @@ pub enum DataKey {
     MerchantSubscriptionCount(Address),
     RateLimitConfig,
     AddressRateLimit(Address),
+    AddressFlagReason(Address),
+    AddressAllowlist(Address),
     DunningConfig,
     DunningState(u64),
     EscrowedPayment(u64),
@@ -54,6 +56,13 @@ pub enum DataKey {
     LargePaymentProposal(u64),
     LargePaymentThreshold,
     LargePaymentCounter,
+    ScheduledPayment(u64),
+    ScheduledPaymentCounter,
+    OracleRateConfig(Currency),
+    MerchantAnalyticsBucket(Address, u64),
+    PlatformAnalyticsDaily(u64),
+    GlobalMerchantList(u64),
+    GlobalMerchantCount,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,7 +161,8 @@ pub enum Error {
     BatchPartialFailure = 19,
     RateLimitExceeded = 20,
     DailyVolumeExceeded = 21,
-    AddressFlagged = 22,
+    AddressFlagged = 60,
+    AddressAlreadyFlagged = 61,
     AmountExceedsLimit = 23,
     DunningNotFound = 24,
     SubscriptionNotInDunning = 25,
@@ -176,6 +186,13 @@ pub enum Error {
     ContractPaused = 43,
     FunctionPaused = 44,
     InvalidTierThresholds = 45,
+    PaymentNotYetDue = 54,
+    ScheduledPaymentCancelled = 55,
+    OracleFeedStale = 58,
+    OracleNotConfigured = 59,
+    ConditionEvaluationFailed = 62,
+    ConditionRuntimeNotMet = 63,
+    RetryTooEarly = 46,
     PaymentRequiresMultiSig = 64,
     InsufficientPaymentApprovals = 65,
     PaymentProposalExpired = 66,
@@ -359,7 +376,7 @@ pub struct SubscriptionSuspended {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DunningResolved {
     pub subscription_id: u64,
-    pub admin: Address,
+    pub resolved_at: u64,
 }
 
 #[derive(Clone)]
@@ -385,21 +402,19 @@ pub struct AddressRateLimit {
 #[derive(Clone)]
 #[contracttype]
 pub struct DunningConfig {
-    pub grace_period: u64,
-    pub retry_intervals: Vec<u64>,
-    pub max_dunning_attempts: u32,
-    pub suspend_after_attempts: u32,
+    pub initial_backoff_seconds: u64,
+    pub max_retries: u32,
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct DunningState {
     pub subscription_id: u64,
-    pub attempts: u32,
+    pub retry_count: u32,
     pub next_retry_at: u64,
-    pub grace_period_ends_at: u64,
-    pub suspended: bool,
-    pub last_failure_reason: String,
+    pub backoff_seconds: u64,
+    pub max_retries: u32,
+    pub last_failed_at: u64,
 }
 
 #[derive(Clone)]
@@ -435,6 +450,40 @@ pub struct ConditionalPayment {
     pub condition: ConditionType,
     pub condition_met: bool,
     pub evaluated_at: Option<u64>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduledPayment {
+    pub payment_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub scheduled_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct OracleRateConfig {
+    pub oracle_address: Address,
+    pub currency: Currency,
+    pub price_feed_id: BytesN<32>,
+    pub max_staleness_seconds: u64,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AnalyticsBucket {
+    pub bucket_start: u64,
+    pub bucket_end: u64,
+    pub total_payments: u64,
+    pub total_volume: i128,
+    pub total_refunds: i128,
+    pub failed_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1139,6 +1188,119 @@ impl PaymentContract {
         )
     }
 
+    pub fn schedule_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+        scheduled_at: u64,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "schedule_payment")?;
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidStatus);
+        }
+        let now = env.ledger().timestamp();
+        if scheduled_at <= now {
+            return Err(Error::PaymentNotYetDue);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(&contract_address, &customer, &contract_address, &amount);
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScheduledPaymentCounter)
+            .unwrap_or(0);
+        let payment_id = counter + 1;
+        let scheduled = ScheduledPayment {
+            payment_id,
+            customer,
+            merchant,
+            token,
+            amount,
+            scheduled_at,
+            executed: false,
+            cancelled: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduledPayment(payment_id), &scheduled);
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduledPaymentCounter, &payment_id);
+        Ok(payment_id)
+    }
+
+    pub fn execute_scheduled_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "execute_scheduled_payment")?;
+        let mut scheduled: ScheduledPayment = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScheduledPayment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+        if scheduled.cancelled {
+            return Err(Error::ScheduledPaymentCancelled);
+        }
+        if scheduled.executed {
+            return Err(Error::AlreadyProcessed);
+        }
+        if env.ledger().timestamp() < scheduled.scheduled_at {
+            return Err(Error::PaymentNotYetDue);
+        }
+
+        let token_client = token::Client::new(&env, &scheduled.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &scheduled.merchant, &scheduled.amount);
+        scheduled.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduledPayment(payment_id), &scheduled);
+        Ok(())
+    }
+
+    pub fn cancel_scheduled_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "cancel_scheduled_payment")?;
+        caller.require_auth();
+        let mut scheduled: ScheduledPayment = env
+            .storage()
+            .instance()
+            .get(&DataKey::ScheduledPayment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+        if scheduled.executed {
+            return Err(Error::AlreadyProcessed);
+        }
+        if scheduled.cancelled {
+            return Err(Error::ScheduledPaymentCancelled);
+        }
+        if caller != scheduled.customer {
+            return Err(Error::Unauthorized);
+        }
+
+        let token_client = token::Client::new(&env, &scheduled.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &scheduled.customer, &scheduled.amount);
+        scheduled.cancelled = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::ScheduledPayment(payment_id), &scheduled);
+        Ok(())
+    }
+
+    pub fn get_scheduled_payment(env: Env, payment_id: u64) -> Result<ScheduledPayment, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ScheduledPayment(payment_id))
+            .ok_or(Error::PaymentNotFound)
+    }
+
     fn do_create_payment(
         env: &Env,
         customer: Address,
@@ -1157,6 +1319,13 @@ impl PaymentContract {
         // Validate metadata size
         if metadata.len() > MAX_METADATA_SIZE {
             return Err(Error::MetadataTooLarge);
+        }
+
+        // Enforce sanctions/flag checks at creation entry point.
+        if PaymentContract::is_address_flagged(env.clone(), customer.clone())
+            && !PaymentContract::is_allowlisted(env, &customer)
+        {
+            return Err(Error::AddressFlagged);
         }
 
         // Check rate limits and anti-fraud before processing
@@ -1250,6 +1419,18 @@ impl PaymentContract {
         }
         if merchant_count == 0 {
             analytics.unique_merchants += 1;
+            let global_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GlobalMerchantCount)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::GlobalMerchantList(global_count),
+                &payment.merchant.clone(),
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::GlobalMerchantCount, &(global_count + 1));
         }
         env.storage()
             .instance()
@@ -1368,6 +1549,17 @@ impl PaymentContract {
             &DataKey::CustomerAnalytics(payment.customer.clone()),
             &c_analytics,
         );
+
+        PaymentContract::update_merchant_bucket(
+            env,
+            payment.merchant.clone(),
+            current_timestamp,
+            1,
+            amount,
+            0,
+            0,
+        );
+        PaymentContract::update_platform_daily_bucket(env, current_timestamp, amount, 0, 0);
 
         (PaymentCreated {
             payment_id,
@@ -1801,6 +1993,10 @@ impl PaymentContract {
         })
         .publish(env);
 
+        let now = env.ledger().timestamp();
+        PaymentContract::update_merchant_bucket(env, payment.merchant.clone(), now, 0, 0, 0, 0);
+        PaymentContract::update_platform_daily_bucket(env, now, 0, 0, 0);
+
         Ok(())
     }
 
@@ -1908,6 +2104,18 @@ impl PaymentContract {
             amount: payment.amount,
         })
         .publish(env);
+
+        let now = env.ledger().timestamp();
+        PaymentContract::update_merchant_bucket(
+            env,
+            payment.merchant.clone(),
+            now,
+            0,
+            0,
+            payment.amount,
+            0,
+        );
+        PaymentContract::update_platform_daily_bucket(env, now, 0, payment.amount, 0);
 
         Ok(())
     }
@@ -2052,6 +2260,17 @@ impl PaymentContract {
         })
         .publish(env);
 
+        PaymentContract::update_merchant_bucket(
+            env,
+            payment.merchant.clone(),
+            timestamp,
+            0,
+            0,
+            0,
+            1,
+        );
+        PaymentContract::update_platform_daily_bucket(env, timestamp, 0, 0, 1);
+
         Ok(())
     }
 
@@ -2179,6 +2398,64 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::ConversionRate(currency))
             .unwrap_or(1_0000000)
+    }
+
+    pub fn set_oracle_rate_config(
+        env: Env,
+        admin: Address,
+        config: OracleRateConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::OracleRateConfig(config.currency.clone()), &config);
+        Ok(())
+    }
+
+    pub fn get_oracle_rate_config(env: Env, currency: Currency) -> Option<OracleRateConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::OracleRateConfig(currency))
+    }
+
+    pub fn refresh_conversion_rate(env: Env, currency: Currency) -> Result<i128, Error> {
+        let cfg: OracleRateConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleRateConfig(currency.clone()))
+            .ok_or(Error::OracleNotConfigured)?;
+
+        if !cfg.enabled {
+            return Ok(PaymentContract::get_conversion_rate(env, currency));
+        }
+
+        let args = (cfg.price_feed_id.clone(),).into_val(&env);
+        let fetched = env
+            .try_invoke_contract::<(i128, u64), Error>(
+                &cfg.oracle_address,
+                &Symbol::new(&env, "get_price"),
+                args,
+            )
+            .map_err(|_| Error::OracleCallFailed)?
+            .map_err(|_| Error::OracleCallFailed)?;
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(fetched.1) > cfg.max_staleness_seconds {
+            return Err(Error::OracleFeedStale);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ConversionRate(currency), &fetched.0);
+        Ok(fetched.0)
     }
 
     // ── RECURRING / SUBSCRIPTION METHODS ────────────────────────────────────
@@ -2329,12 +2606,100 @@ impl PaymentContract {
             .get(&DataKey::Subscription(subscription_id))
             .unwrap();
 
-        // Must be Active
+        let now = env.ledger().timestamp();
+
+        // InDunning path: enforce on-chain backoff before retrying
+        if sub.status == SubscriptionStatus::InDunning {
+            let mut dunning: DunningState = env
+                .storage()
+                .instance()
+                .get(&DataKey::DunningState(subscription_id))
+                .ok_or(Error::DunningNotFound)?;
+
+            if now < dunning.next_retry_at {
+                return Err(Error::RetryTooEarly);
+            }
+
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            let transfer_ok = token_client
+                .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+                .is_ok();
+
+            if transfer_ok {
+                sub.payment_count += 1;
+                sub.retry_count = 0;
+                sub.next_payment_at = now + sub.interval;
+                sub.status = SubscriptionStatus::Active;
+
+                if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
+                    sub.status = SubscriptionStatus::Expired;
+                }
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Subscription(subscription_id), &sub);
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::DunningState(subscription_id));
+
+                (DunningResolved {
+                    subscription_id,
+                    resolved_at: now,
+                })
+                .publish(&env);
+
+                (RecurringPaymentExecuted {
+                    subscription_id,
+                    payment_count: sub.payment_count,
+                    amount: sub.amount,
+                    next_payment_at: sub.next_payment_at,
+                })
+                .publish(&env);
+            } else {
+                dunning.retry_count += 1;
+                dunning.last_failed_at = now;
+
+                if dunning.retry_count >= dunning.max_retries {
+                    sub.status = SubscriptionStatus::Suspended;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::Subscription(subscription_id), &sub);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::DunningState(subscription_id), &dunning);
+
+                    (SubscriptionSuspended {
+                        subscription_id,
+                        reason: String::from_str(&env, "Maximum retries exceeded"),
+                    })
+                    .publish(&env);
+
+                    return Err(Error::MaxRetriesExceeded);
+                }
+
+                // Exponential backoff: backoff_seconds * 2^retry_count
+                dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::DunningState(subscription_id), &dunning);
+
+                (RecurringPaymentFailed {
+                    subscription_id,
+                    retry_count: dunning.retry_count as u64,
+                })
+                .publish(&env);
+
+                return Err(Error::TransferFailed);
+            }
+
+            return Ok(());
+        }
+
+        // Must be Active for the normal payment path
         if sub.status != SubscriptionStatus::Active {
             return Err(Error::SubscriptionNotActive);
         }
-
-        let now = env.ledger().timestamp();
 
         // Check subscription has not ended
         if sub.ends_at > 0 && now >= sub.ends_at {
@@ -2677,18 +3042,8 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::DunningConfig)
             .unwrap_or(DunningConfig {
-                grace_period: 7 * 24 * 60 * 60, // 7 days
-                retry_intervals: Vec::from_array(
-                    &env,
-                    [
-                        60 * 60,          // 1 hour
-                        6 * 60 * 60,      // 6 hours
-                        24 * 60 * 60,     // 1 day
-                        3 * 24 * 60 * 60, // 3 days
-                    ],
-                ),
-                max_dunning_attempts: 5,
-                suspend_after_attempts: 4,
+                initial_backoff_seconds: 3600, // 1 hour
+                max_retries: 5,
             })
     }
 
@@ -2720,7 +3075,7 @@ impl PaymentContract {
             return Err(Error::SubscriptionNotInDunning);
         }
 
-        let mut dunning_state: DunningState = env
+        let mut dunning: DunningState = env
             .storage()
             .instance()
             .get(&DataKey::DunningState(subscription_id))
@@ -2728,31 +3083,9 @@ impl PaymentContract {
 
         let now = env.ledger().timestamp();
 
-        // Check if retry is due
-        if now < dunning_state.next_retry_at {
-            return Err(Error::RetryNotDue);
-        }
-
-        // Check if grace period has expired
-        if now > dunning_state.grace_period_ends_at {
-            // Move to suspended state
-            sub.status = SubscriptionStatus::Suspended;
-            dunning_state.suspended = true;
-
-            env.storage()
-                .instance()
-                .set(&DataKey::Subscription(subscription_id), &sub);
-            env.storage()
-                .instance()
-                .set(&DataKey::DunningState(subscription_id), &dunning_state);
-
-            (SubscriptionSuspended {
-                subscription_id,
-                reason: String::from_str(&env, "Grace period expired"),
-            })
-            .publish(&env);
-
-            return Err(Error::GracePeriodExpired);
+        // Enforce backoff window
+        if now < dunning.next_retry_at {
+            return Err(Error::RetryTooEarly);
         }
 
         // Attempt the payment
@@ -2764,13 +3097,11 @@ impl PaymentContract {
             .is_ok();
 
         if transfer_ok {
-            // Payment successful - resolve dunning
             sub.payment_count += 1;
             sub.retry_count = 0;
             sub.next_payment_at = now + sub.interval;
             sub.status = SubscriptionStatus::Active;
 
-            // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
             }
@@ -2778,11 +3109,15 @@ impl PaymentContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Subscription(subscription_id), &sub);
-
-            // Remove dunning state
             env.storage()
                 .instance()
                 .remove(&DataKey::DunningState(subscription_id));
+
+            (DunningResolved {
+                subscription_id,
+                resolved_at: now,
+            })
+            .publish(&env);
 
             (RecurringPaymentExecuted {
                 subscription_id,
@@ -2794,59 +3129,46 @@ impl PaymentContract {
 
             Ok(())
         } else {
-            // Payment failed - update dunning state
-            dunning_state.attempts += 1;
+            dunning.retry_count += 1;
+            dunning.last_failed_at = now;
 
-            let config = PaymentContract::get_dunning_config(env.clone());
-
-            if dunning_state.attempts >= config.max_dunning_attempts {
-                // Max attempts reached - suspend subscription
+            if dunning.retry_count >= dunning.max_retries {
                 sub.status = SubscriptionStatus::Suspended;
-                dunning_state.suspended = true;
-
                 env.storage()
                     .instance()
                     .set(&DataKey::Subscription(subscription_id), &sub);
                 env.storage()
                     .instance()
-                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
+                    .set(&DataKey::DunningState(subscription_id), &dunning);
 
                 (SubscriptionSuspended {
                     subscription_id,
-                    reason: String::from_str(&env, "Maximum dunning attempts exceeded"),
+                    reason: String::from_str(&env, "Maximum retries exceeded"),
                 })
                 .publish(&env);
 
                 return Err(Error::MaxRetriesExceeded);
-            } else if dunning_state.attempts >= config.suspend_after_attempts {
-                // Suspend after configured attempts
-                sub.status = SubscriptionStatus::Suspended;
-                dunning_state.suspended = true;
-
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Subscription(subscription_id), &sub);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::DunningState(subscription_id), &dunning_state);
-
-                (SubscriptionSuspended {
-                    subscription_id,
-                    reason: String::from_str(&env, "Suspend threshold reached"),
-                })
-                .publish(&env);
-
-                (DunningRetryScheduled {
-                    subscription_id,
-                    retry_at: dunning_state.next_retry_at,
-                })
-                .publish(&env);
-
-                return Err(Error::TransferFailed);
-            } else {
-                // This should not happen, but handle gracefully
-                return Err(Error::TransferFailed);
             }
+
+            // Exponential backoff: backoff_seconds * 2^retry_count
+            dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
+            env.storage()
+                .instance()
+                .set(&DataKey::DunningState(subscription_id), &dunning);
+
+            (DunningRetryScheduled {
+                subscription_id,
+                retry_at: dunning.next_retry_at,
+            })
+            .publish(&env);
+
+            (RecurringPaymentFailed {
+                subscription_id,
+                retry_count: dunning.retry_count as u64,
+            })
+            .publish(&env);
+
+            Err(Error::TransferFailed)
         }
     }
 
@@ -2899,7 +3221,7 @@ impl PaymentContract {
 
         (DunningResolved {
             subscription_id,
-            admin,
+            resolved_at: env.ledger().timestamp(),
         })
         .publish(&env);
 
@@ -2907,23 +3229,19 @@ impl PaymentContract {
     }
 
     /// Internal function to enter dunning for a subscription.
-    fn enter_dunning(env: &Env, subscription_id: u64, reason: String) {
+    fn enter_dunning(env: &Env, subscription_id: u64, _reason: String) {
         let config = PaymentContract::get_dunning_config(env.clone());
         let now = env.ledger().timestamp();
 
-        let first_interval = if config.retry_intervals.len() > 0 {
-            config.retry_intervals.get(0).unwrap()
-        } else {
-            3600u64
-        };
-
+        // retry_count = 0: first retry uses backoff * 2^0 = backoff (1x)
+        // each subsequent failure increments retry_count, giving backoff * 2^retry_count
         let dunning_state = DunningState {
             subscription_id,
-            attempts: 1,
-            next_retry_at: now + first_interval,
-            grace_period_ends_at: now + config.grace_period,
-            suspended: false,
-            last_failure_reason: reason,
+            retry_count: 0,
+            next_retry_at: now + config.initial_backoff_seconds,
+            backoff_seconds: config.initial_backoff_seconds,
+            max_retries: config.max_retries,
+            last_failed_at: now,
         };
 
         env.storage()
@@ -3030,10 +3348,16 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if rate_limit.flagged {
+            return Err(Error::AddressAlreadyFlagged);
+        }
         rate_limit.flagged = true;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressFlagReason(address.clone()), &reason);
         (AddressFlagged { address, reason }).publish(&env);
         Ok(())
     }
@@ -3061,11 +3385,71 @@ impl PaymentContract {
                 last_payment_at: 0,
                 flagged: false,
             });
+        if !rate_limit.flagged {
+            return Err(Error::InvalidStatus);
+        }
         rate_limit.flagged = false;
         env.storage()
             .instance()
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressFlagReason(address.clone()));
         (AddressUnflagged { address }).publish(&env);
+        Ok(())
+    }
+
+    pub fn is_address_flagged(env: Env, address: Address) -> bool {
+        let rate_limit: AddressRateLimit = env
+            .storage()
+            .instance()
+            .get(&DataKey::AddressRateLimit(address.clone()))
+            .unwrap_or(AddressRateLimit {
+                address,
+                payment_count: 0,
+                window_start: 0,
+                daily_volume: 0,
+                last_payment_at: 0,
+                flagged: false,
+            });
+        rate_limit.flagged
+    }
+
+    pub fn get_flag_reason(env: Env, address: Address) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressFlagReason(address))
+    }
+
+    pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::AddressAllowlist(address), &true);
+        Ok(())
+    }
+
+    pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::AddressAllowlist(address));
         Ok(())
     }
 
@@ -3095,8 +3479,8 @@ impl PaymentContract {
                 flagged: false,
             });
 
-        // Block flagged addresses immediately.
-        if rate_limit.flagged {
+        // Block flagged addresses unless explicitly allowlisted.
+        if rate_limit.flagged && !PaymentContract::is_allowlisted(env, address) {
             return Err(Error::AddressFlagged);
         }
 
@@ -3156,6 +3540,13 @@ impl PaymentContract {
             .set(&DataKey::AddressRateLimit(address.clone()), &rate_limit);
 
         Ok(())
+    }
+
+    fn is_allowlisted(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AddressAllowlist(address.clone()))
+            .unwrap_or(false)
     }
 
     fn invoke_escrow_create(
@@ -4031,11 +4422,16 @@ impl PaymentContract {
                 // For now, return false to indicate oracle call failed
                 return Err(Error::OracleCallFailed);
             }
-            ConditionType::CrossContractState(_target_contract, _expected_state_hash) => {
-                // Mock cross-contract state check
-                // In real implementation, this would call the target contract and compare state
-                // For now, return false to indicate check failed
-                false
+            ConditionType::CrossContractState(target_contract, expected_state_hash) => {
+                let fetched = env
+                    .try_invoke_contract::<BytesN<32>, Error>(
+                        target_contract,
+                        &Symbol::new(&env, "get_state_hash"),
+                        Vec::new(&env),
+                    )
+                    .map_err(|_| Error::ConditionEvaluationFailed)?
+                    .map_err(|_| Error::ConditionEvaluationFailed)?;
+                fetched == *expected_state_hash
             }
         };
 
@@ -4108,6 +4504,29 @@ impl PaymentContract {
         PaymentContract::do_complete_payment(&env, payment_id)?;
 
         Ok(())
+    }
+
+    pub fn execute_if_condition_met(env: Env, payment_id: u64) -> Result<(), Error> {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::ConditionalPayment(payment_id))
+        {
+            return Err(Error::PaymentNotFound);
+        }
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.status == PaymentStatus::Completed {
+            return Ok(());
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        let condition_met = PaymentContract::evaluate_condition(env.clone(), payment_id)?;
+        if !condition_met {
+            return Err(Error::ConditionNotMet);
+        }
+        PaymentContract::do_complete_payment(&env, payment_id)
     }
 
     pub fn get_conditional_payment(env: Env, payment_id: u64) -> Result<ConditionalPayment, Error> {
@@ -4220,6 +4639,162 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::CustomerMonthlyVolume(customer, month_timestamp))
             .unwrap_or(0)
+    }
+
+    pub fn get_merchant_analytics_range(
+        env: Env,
+        merchant: Address,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<AnalyticsBucket>, Error> {
+        if from >= to {
+            return Err(Error::InvalidStatus);
+        }
+        let mut out = Vec::new(&env);
+        let mut bucket_start = PaymentContract::hour_bucket_start(from);
+        while bucket_start < to {
+            if let Some(bucket) = env
+                .storage()
+                .instance()
+                .get::<DataKey, AnalyticsBucket>(&DataKey::MerchantAnalyticsBucket(
+                    merchant.clone(),
+                    bucket_start,
+                ))
+            {
+                out.push_back(bucket);
+            }
+            bucket_start += 3600;
+        }
+        Ok(out)
+    }
+
+    pub fn get_platform_analytics_daily(env: Env, day_timestamp: u64) -> AnalyticsBucket {
+        let day_start = PaymentContract::day_bucket_start(day_timestamp);
+        env.storage()
+            .instance()
+            .get(&DataKey::PlatformAnalyticsDaily(day_start))
+            .unwrap_or(AnalyticsBucket {
+                bucket_start: day_start,
+                bucket_end: day_start + 86400,
+                total_payments: 0,
+                total_volume: 0,
+                total_refunds: 0,
+                failed_count: 0,
+            })
+    }
+
+    pub fn get_top_merchants_by_volume(env: Env, limit: u32) -> Vec<(Address, i128)> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::GlobalMerchantCount)
+            .unwrap_or(0);
+        let mut pairs: Vec<(Address, i128)> = Vec::new(&env);
+        for i in 0..count {
+            if let Some(merchant) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::GlobalMerchantList(i))
+            {
+                let analytics = PaymentContract::get_merchant_analytics(env.clone(), merchant.clone());
+                pairs.push_back((merchant, analytics.total_volume));
+            }
+        }
+
+        let result_len = core::cmp::min(pairs.len(), limit);
+        let mut result: Vec<(Address, i128)> = Vec::new(&env);
+        let mut selected: Vec<bool> = Vec::new(&env);
+        for _ in 0..pairs.len() {
+            selected.push_back(false);
+        }
+        for _ in 0..result_len {
+            let mut best_idx: u32 = 0;
+            let mut best_vol: i128 = i128::MIN;
+            for j in 0..pairs.len() {
+                if !selected.get(j).unwrap_or(true) {
+                    let vol = pairs.get(j).map(|(_, v)| v).unwrap_or(0);
+                    if vol > best_vol {
+                        best_vol = vol;
+                        best_idx = j;
+                    }
+                }
+            }
+            if best_vol != i128::MIN {
+                result.push_back(pairs.get(best_idx).unwrap());
+                selected.set(best_idx, true);
+            }
+        }
+        result
+    }
+
+    fn hour_bucket_start(ts: u64) -> u64 {
+        (ts / 3600) * 3600
+    }
+
+    fn day_bucket_start(ts: u64) -> u64 {
+        (ts / 86400) * 86400
+    }
+
+    fn update_merchant_bucket(
+        env: &Env,
+        merchant: Address,
+        ts: u64,
+        payment_delta: u64,
+        volume_delta: i128,
+        refund_delta: i128,
+        failed_delta: u64,
+    ) {
+        let bucket_start = PaymentContract::hour_bucket_start(ts);
+        let mut bucket: AnalyticsBucket = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantAnalyticsBucket(merchant.clone(), bucket_start))
+            .unwrap_or(AnalyticsBucket {
+                bucket_start,
+                bucket_end: bucket_start + 3600,
+                total_payments: 0,
+                total_volume: 0,
+                total_refunds: 0,
+                failed_count: 0,
+            });
+        bucket.total_payments += payment_delta;
+        bucket.total_volume += volume_delta;
+        bucket.total_refunds += refund_delta;
+        bucket.failed_count += failed_delta;
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantAnalyticsBucket(merchant, bucket_start), &bucket);
+    }
+
+    fn update_platform_daily_bucket(
+        env: &Env,
+        ts: u64,
+        volume_delta: i128,
+        refund_delta: i128,
+        failed_delta: u64,
+    ) {
+        let day_start = PaymentContract::day_bucket_start(ts);
+        let mut bucket: AnalyticsBucket = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformAnalyticsDaily(day_start))
+            .unwrap_or(AnalyticsBucket {
+                bucket_start: day_start,
+                bucket_end: day_start + 86400,
+                total_payments: 0,
+                total_volume: 0,
+                total_refunds: 0,
+                failed_count: 0,
+            });
+        if volume_delta > 0 {
+            bucket.total_payments += 1;
+        }
+        bucket.total_volume += volume_delta;
+        bucket.total_refunds += refund_delta;
+        bucket.failed_count += failed_delta;
+        env.storage()
+            .instance()
+            .set(&DataKey::PlatformAnalyticsDaily(day_start), &bucket);
     }
 
     fn default_customer_analytics() -> CustomerAnalytics {
@@ -4856,3 +5431,4 @@ mod test_trial;
 
 #[cfg(test)]
 mod test_metadata;
+mod test_issue_113_115_119_120;
