@@ -50,6 +50,9 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    LargePaymentProposal(u64),
+    LargePaymentThreshold,
+    LargePaymentCounter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +175,9 @@ pub enum Error {
     ContractPaused = 43,
     FunctionPaused = 44,
     InvalidTierThresholds = 45,
+    PaymentRequiresMultiSig = 64,
+    InsufficientPaymentApprovals = 65,
+    PaymentProposalExpired = 66,
 }
 
 #[contractevent]
@@ -466,6 +472,17 @@ pub struct AdminProposal {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct LargePaymentProposal {
+    pub payment_id: u64,
+    pub approvals: Vec<Address>,
+    pub required: u32,
+    pub proposed_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct BatchPaymentEntry {
     pub customer: Address,
     pub merchant: Address,
@@ -626,6 +643,36 @@ pub struct FunctionPausedEvent {
 pub struct FunctionUnpausedEvent {
     pub function_name: String,
     pub unpaused_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargePaymentProposed {
+    pub payment_id: u64,
+    pub proposer: Address,
+    pub required_approvals: u32,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargePaymentApproved {
+    pub payment_id: u64,
+    pub approver: Address,
+    pub approval_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargePaymentExecuted {
+    pub payment_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargePaymentThresholdUpdated {
+    pub threshold: i128,
+    pub updated_by: Address,
 }
 
 #[derive(Clone)]
@@ -1537,6 +1584,52 @@ impl PaymentContract {
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
+        }
+
+        // Check if payment requires multi-sig approval
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        let threshold = PaymentContract::get_large_payment_threshold(env.clone());
+        
+        if threshold > 0 && payment.amount > threshold {
+            // Check if there's already a proposal for this payment
+            if env
+                .storage()
+                .instance()
+                .get::<DataKey, LargePaymentProposal>(&DataKey::LargePaymentProposal(payment_id))
+                .is_some()
+            {
+                return Err(Error::PaymentRequiresMultiSig);
+            }
+            
+            // Auto-create proposal for large payment
+            let now = env.ledger().timestamp();
+            let expires_at = now + config.proposal_ttl;
+
+            let mut approvals = Vec::new(&env);
+            approvals.push_back(admin.clone());
+
+            let proposal = LargePaymentProposal {
+                payment_id,
+                approvals,
+                required: config.required_signatures,
+                proposed_at: now,
+                expires_at,
+                executed: false,
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::LargePaymentProposal(payment_id), &proposal);
+
+            (LargePaymentProposed {
+                payment_id,
+                proposer: admin,
+                required_approvals: config.required_signatures,
+                expires_at,
+            })
+            .publish(&env);
+
+            return Err(Error::PaymentRequiresMultiSig);
         }
 
         PaymentContract::do_complete_payment(&env, payment_id)
@@ -4235,6 +4328,225 @@ impl PaymentContract {
             }
         }
         Ok(())
+    }
+
+    // ── LARGE PAYMENT MULTI-SIG FUNCTIONS ─────────────────────────────────────
+
+    pub fn set_large_payment_threshold(env: Env, admin: Address, threshold: i128) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LargePaymentThreshold, &threshold);
+
+        (LargePaymentThresholdUpdated {
+            threshold,
+            updated_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_large_payment_threshold(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LargePaymentThreshold)
+            .unwrap_or(0) // Default threshold of 0 disables multi-sig requirement
+    }
+
+    pub fn propose_large_payment(env: Env, merchant: Address, payment_id: u64) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Verify payment exists and belongs to merchant
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if payment amount exceeds threshold
+        let threshold: i128 = PaymentContract::get_large_payment_threshold(env.clone());
+        if threshold == 0 || payment.amount <= threshold {
+            return Err(Error::PaymentRequiresMultiSig);
+        }
+
+        // Check if proposal already exists
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, LargePaymentProposal>(&DataKey::LargePaymentProposal(payment_id))
+            .is_some()
+        {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let now = env.ledger().timestamp();
+        let expires_at = now + config.proposal_ttl;
+
+        let mut approvals = Vec::new(&env);
+        approvals.push_back(merchant.clone());
+
+        let proposal = LargePaymentProposal {
+            payment_id,
+            approvals,
+            required: config.required_signatures,
+            proposed_at: now,
+            expires_at,
+            executed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LargePaymentProposal(payment_id), &proposal);
+
+        (LargePaymentProposed {
+            payment_id,
+            proposer: merchant,
+            required_approvals: config.required_signatures,
+            expires_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn approve_large_payment(env: Env, approver: Address, payment_id: u64) -> Result<(), Error> {
+        approver.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        if !config.admins.contains(&approver) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut proposal: LargePaymentProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::LargePaymentProposal(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::PaymentProposalExpired);
+        }
+
+        if proposal.approvals.contains(&approver) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        proposal.approvals.push_back(approver.clone());
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LargePaymentProposal(payment_id), &proposal);
+
+        (LargePaymentApproved {
+            payment_id,
+            approver,
+            approval_count: proposal.approvals.len() as u32,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn execute_large_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let mut proposal: LargePaymentProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::LargePaymentProposal(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if proposal.executed {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(Error::PaymentProposalExpired);
+        }
+
+        if proposal.approvals.len() < proposal.required as usize {
+            return Err(Error::InsufficientPaymentApprovals);
+        }
+
+        // Get the payment and execute it
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Execute the payment
+        let token_client = token::Client::new(&env, &payment.token);
+        let contract_address = env.current_contract_address();
+        
+        token_client.transfer(&contract_address, &payment.merchant, &payment.amount);
+
+        payment.status = PaymentStatus::Completed;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::LargePaymentProposal(payment_id), &proposal);
+
+        (PaymentCompleted {
+            payment_id,
+            merchant: payment.merchant,
+            amount: payment.amount,
+        })
+        .publish(&env);
+
+        (LargePaymentExecuted { payment_id }).publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_large_payment_proposal(env: Env, payment_id: u64) -> LargePaymentProposal {
+        env.storage()
+            .instance()
+            .get(&DataKey::LargePaymentProposal(payment_id))
+            .expect("Large payment proposal not found")
     }
 }
 

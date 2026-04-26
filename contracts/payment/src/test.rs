@@ -4951,3 +4951,371 @@ fn test_condition_evaluation_caching() {
     assert_eq!(evaluated_at1, evaluated_at2);
     assert_eq!(evaluated_at1, 1000);
 }
+
+// ── LARGE PAYMENT MULTI-SIG TESTS ───────────────────────────────────────────
+
+fn setup_large_payment_contract(env: &Env) -> (PaymentContractClient<'_>, Address, Address, Address) {
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let admin2 = Address::generate(env);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    client.add_admin(&admin, &admin2);
+    client.update_required_signatures(&admin, &2);
+    (client, admin, admin2, contract_id)
+}
+
+#[test]
+fn test_set_large_payment_threshold() {
+    let env = Env::default();
+    let (client, admin, _, _) = setup_large_payment_contract(&env);
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+    
+    // Verify threshold is set
+    assert_eq!(client.get_large_payment_threshold(), 1000);
+
+    // Verify event was published
+    let events = env.events().all();
+    assert_eq!(events.len(), 3); // initialize, add_admin, threshold_updated
+    assert_eq!(events[2].topics[2], Address::from_str(&env, "1000"));
+}
+
+#[test]
+#[should_panic]
+fn test_set_large_payment_threshold_unauthorized() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+    let unauthorized = Address::generate(&env);
+
+    // Unauthorized user should not be able to set threshold
+    client.set_large_payment_threshold(&unauthorized, &1000);
+}
+
+#[test]
+fn test_large_payment_auto_routes_through_multisig() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment (2000 > threshold)
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Attempting to complete payment should auto-create proposal and return error
+    let result = client.try_complete_payment(&admin, &payment_id);
+    assert!(result.is_err());
+    assert_eq!(result.err(), Some(Ok(Error::PaymentRequiresMultiSig)));
+
+    // Verify proposal was created
+    let proposal = client.get_large_payment_proposal(&payment_id);
+    assert_eq!(proposal.payment_id, payment_id);
+    assert_eq!(proposal.required, 2);
+    assert!(!proposal.executed);
+    assert_eq!(proposal.approvals.len(), 1); // admin who tried to complete it
+    assert!(proposal.approvals.contains(&admin));
+}
+
+#[test]
+fn test_small_payment_completes_normally() {
+    let env = Env::default();
+    let (client, admin, _, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a small payment (500 < threshold)
+    let payment_id = client.create_payment(&customer, &merchant, &500, &token, &Currency::USDC, &0, &meta);
+
+    // Small payment should complete normally
+    client.complete_payment(&admin, &payment_id);
+
+    // Verify payment is completed
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+}
+
+#[test]
+fn test_threshold_zero_disables_multisig() {
+    let env = Env::default();
+    let (client, admin, _, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 0 (disabled)
+    client.set_large_payment_threshold(&admin, &0);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &5000, &token, &Currency::USDC, &0, &meta);
+
+    // Should complete normally even though amount is large
+    client.complete_payment(&admin, &payment_id);
+
+    // Verify payment is completed
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+}
+
+#[test]
+fn test_large_payment_approval_flow() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Manually propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Get initial proposal
+    let proposal = client.get_large_payment_proposal(&payment_id);
+    assert_eq!(proposal.approvals.len(), 1); // merchant
+    assert!(proposal.approvals.contains(&merchant));
+
+    // Approve with admin
+    client.approve_large_payment(&admin, &payment_id);
+
+    // Check approval count increased
+    let proposal = client.get_large_payment_proposal(&payment_id);
+    assert_eq!(proposal.approvals.len(), 2);
+    assert!(proposal.approvals.contains(&admin));
+
+    // Should now have enough approvals to execute
+    client.execute_large_payment(&payment_id);
+
+    // Verify payment is completed
+    let payment = client.get_payment(&payment_id);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+
+    // Verify proposal is marked as executed
+    let proposal = client.get_large_payment_proposal(&payment_id);
+    assert!(proposal.executed);
+}
+
+#[test]
+#[should_panic]
+fn test_execute_large_payment_insufficient_approvals() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Try to execute with insufficient approvals (only 1, need 2)
+    client.execute_large_payment(&payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_approve_large_payment_unauthorized() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Unauthorized user tries to approve
+    let unauthorized = Address::generate(&env);
+    client.approve_large_payment(&unauthorized, &payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_approve_large_payment_already_approved() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Admin approves
+    client.approve_large_payment(&admin, &payment_id);
+
+    // Same admin tries to approve again
+    client.approve_large_payment(&admin, &payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_execute_large_payment_expired() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Approve with admin
+    client.approve_large_payment(&admin, &payment_id);
+
+    // Advance time beyond proposal TTL (7 days)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 604800 + 100);
+
+    // Try to execute expired proposal
+    client.execute_large_payment(&payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_propose_large_payment_not_merchant() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Someone other than merchant tries to propose
+    let imposter = Address::generate(&env);
+    client.propose_large_payment(&imposter, &payment_id);
+}
+
+#[test]
+#[should_panic]
+fn test_propose_large_payment_below_threshold() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a small payment (500 < threshold)
+    let payment_id = client.create_payment(&customer, &merchant, &500, &token, &Currency::USDC, &0, &meta);
+
+    // Should not be able to propose small payment
+    client.propose_large_payment(&merchant, &payment_id);
+}
+
+#[test]
+fn test_large_payment_events() {
+    let env = Env::default();
+    let (client, admin, admin2, _) = setup_large_payment_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set threshold to 1000
+    client.set_large_payment_threshold(&admin, &1000);
+
+    // Create a large payment
+    let payment_id = client.create_payment(&customer, &merchant, &2000, &token, &Currency::USDC, &0, &meta);
+
+    // Propose large payment
+    client.propose_large_payment(&merchant, &payment_id);
+
+    // Approve with admin
+    client.approve_large_payment(&admin, &payment_id);
+
+    // Execute
+    client.execute_large_payment(&payment_id);
+
+    // Verify all events were published
+    let events = env.events().all();
+    
+    // Should have events for: initialize, add_admin, update_required_signatures, 
+    // set_threshold, create_payment, propose_large_payment, approve_large_payment, 
+    // payment_completed, large_payment_executed
+    assert!(events.len() >= 9);
+    
+    // Check specific events
+    let threshold_updated_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "LargePaymentThresholdUpdated")
+        .collect();
+    assert_eq!(threshold_updated_events.len(), 1);
+    
+    let proposed_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "LargePaymentProposed")
+        .collect();
+    assert_eq!(proposed_events.len(), 1);
+    
+    let approved_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "LargePaymentApproved")
+        .collect();
+    assert_eq!(approved_events.len(), 1);
+    
+    let executed_events: Vec<_> = events.iter()
+        .filter(|e| e.topics[0] == "LargePaymentExecuted")
+        .collect();
+    assert_eq!(executed_events.len(), 1);
+}
