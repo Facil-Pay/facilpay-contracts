@@ -586,7 +586,7 @@ pub struct MerchantFeeRecord {
 #[contracttype]
 pub struct FeeWaiver {
     pub merchant: Address,
-    pub waiver_bps: u32,         // reduction in basis points
+    pub waiver_bps: u32, // reduction in basis points
     pub valid_until: u64,
     pub reason: String,
     pub granted_by: Address,
@@ -781,8 +781,8 @@ pub struct PaymentMetadataUpdated {
 #[contracttype]
 pub struct PaymentMetadata {
     pub payment_id: u64,
-    pub content_ref: String,        // IPFS CID or similar
-    pub content_hash: BytesN<32>,   // SHA-256 of plaintext for verification
+    pub content_ref: String,      // IPFS CID or similar
+    pub content_hash: BytesN<32>, // SHA-256 of plaintext for verification
     pub encrypted: bool,
     pub updated_at: u64,
     pub version: u32,
@@ -1474,7 +1474,8 @@ impl PaymentContract {
             });
         c_analytics.total_payments += 1;
         c_analytics.total_volume += amount;
-        c_analytics.avg_transaction_size = c_analytics.total_volume / (c_analytics.total_payments as i128);
+        c_analytics.avg_transaction_size =
+            c_analytics.total_volume / (c_analytics.total_payments as i128);
         if c_analytics.first_payment_at == 0 {
             c_analytics.first_payment_at = current_timestamp;
         }
@@ -1495,9 +1496,14 @@ impl PaymentContract {
         let peak_hour_count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::CustomerHourCount(payment.customer.clone(), c_analytics.peak_hour))
+            .get(&DataKey::CustomerHourCount(
+                payment.customer.clone(),
+                c_analytics.peak_hour,
+            ))
             .unwrap_or(0);
-        if hour_count > peak_hour_count || (hour_count == peak_hour_count && hour == c_analytics.peak_hour) {
+        if hour_count > peak_hour_count
+            || (hour_count == peak_hour_count && hour == c_analytics.peak_hour)
+        {
             c_analytics.peak_hour = hour;
         }
 
@@ -1505,7 +1511,10 @@ impl PaymentContract {
         let prev_merchant_vol: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::CustomerMerchantVolume(payment.customer.clone(), payment.merchant.clone()))
+            .get(&DataKey::CustomerMerchantVolume(
+                payment.customer.clone(),
+                payment.merchant.clone(),
+            ))
             .unwrap_or(0);
         if prev_merchant_vol == 0 {
             // New merchant for this customer — add to list
@@ -1538,7 +1547,10 @@ impl PaymentContract {
         let prev_monthly: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::CustomerMonthlyVolume(payment.customer.clone(), month_bucket))
+            .get(&DataKey::CustomerMonthlyVolume(
+                payment.customer.clone(),
+                month_bucket,
+            ))
             .unwrap_or(0);
         env.storage().instance().set(
             &DataKey::CustomerMonthlyVolume(payment.customer.clone(), month_bucket),
@@ -1582,10 +1594,7 @@ impl PaymentContract {
     /// Used by the refund contract for cross-contract ownership verification (#143).
     /// Returns true if the payment exists, belongs to `customer`, and is Completed.
     pub fn check_payment_customer(env: Env, payment_id: u64, customer: Address) -> bool {
-        let payment: Option<Payment> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Payment(payment_id));
+        let payment: Option<Payment> = env.storage().instance().get(&DataKey::Payment(payment_id));
         match payment {
             Some(p) => p.customer == customer && p.status == PaymentStatus::Completed,
             None => false,
@@ -1845,7 +1854,7 @@ impl PaymentContract {
         // Check if payment requires multi-sig approval
         let payment = PaymentContract::get_payment(&env, payment_id);
         let threshold = PaymentContract::get_large_payment_threshold(env.clone());
-        
+
         if threshold > 0 && payment.amount > threshold {
             // Check if there's already a proposal for this payment
             if env
@@ -1856,7 +1865,7 @@ impl PaymentContract {
             {
                 return Err(Error::PaymentRequiresMultiSig);
             }
-            
+
             // Auto-create proposal for large payment
             let now = env.ledger().timestamp();
             let expires_at = now + config.proposal_ttl;
@@ -3719,10 +3728,11 @@ impl PaymentContract {
             }
             Some(c) => c,
         };
-        
+
         // Get effective fee BPS including tier discounts and waivers
-        let effective_fee_bps = PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
-        
+        let effective_fee_bps =
+            PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
+
         PaymentContract::compute_fee_amount(
             amount,
             effective_fee_bps,
@@ -3759,7 +3769,8 @@ impl PaymentContract {
             return Err(Error::Unauthorized);
         }
 
-        let mut record = PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
+        let mut record =
+            PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
         record.fee_tier = tier;
         env.storage()
             .instance()
@@ -4058,7 +4069,8 @@ impl PaymentContract {
         // Automatic tier changes are monotonic upgrades only.
         let old_tier = record.fee_tier.clone();
         let computed_tier = PaymentContract::calculate_tier(env, record.total_volume);
-        if PaymentContract::tier_rank(&computed_tier) > PaymentContract::tier_rank(&record.fee_tier) {
+        if PaymentContract::tier_rank(&computed_tier) > PaymentContract::tier_rank(&record.fee_tier)
+        {
             record.fee_tier = computed_tier.clone();
             (MerchantTierUpgraded {
                 merchant: merchant.clone(),
@@ -4169,7 +4181,7 @@ impl PaymentContract {
                 env.storage()
                     .instance()
                     .remove(&DataKey::FeeWaiver(merchant.clone()));
-                
+
                 (FeeWaiverExpired { merchant }).publish(&env);
                 None
             } else {
@@ -4197,7 +4209,8 @@ impl PaymentContract {
         // Get waiver discount
         let waiver = PaymentContract::get_fee_waiver(env.clone(), merchant);
         if let Some(w) = waiver {
-            let waiver_adjusted_bps = tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
+            let waiver_adjusted_bps =
+                tier_adjusted_bps - (tier_adjusted_bps * w.waiver_bps) / 10000;
             waiver_adjusted_bps
         } else {
             tier_adjusted_bps
@@ -4596,7 +4609,10 @@ impl PaymentContract {
                 let vol: i128 = env
                     .storage()
                     .instance()
-                    .get(&DataKey::CustomerMerchantVolume(customer.clone(), merchant.clone()))
+                    .get(&DataKey::CustomerMerchantVolume(
+                        customer.clone(),
+                        merchant.clone(),
+                    ))
                     .unwrap_or(0);
                 pairs.push_back((merchant, vol));
             }
@@ -4630,11 +4646,7 @@ impl PaymentContract {
         result
     }
 
-    pub fn get_customer_monthly_volume(
-        env: Env,
-        customer: Address,
-        month_timestamp: u64,
-    ) -> i128 {
+    pub fn get_customer_monthly_volume(env: Env, customer: Address, month_timestamp: u64) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::CustomerMonthlyVolume(customer, month_timestamp))
@@ -4653,14 +4665,9 @@ impl PaymentContract {
         let mut out = Vec::new(&env);
         let mut bucket_start = PaymentContract::hour_bucket_start(from);
         while bucket_start < to {
-            if let Some(bucket) = env
-                .storage()
-                .instance()
-                .get::<DataKey, AnalyticsBucket>(&DataKey::MerchantAnalyticsBucket(
-                    merchant.clone(),
-                    bucket_start,
-                ))
-            {
+            if let Some(bucket) = env.storage().instance().get::<DataKey, AnalyticsBucket>(
+                &DataKey::MerchantAnalyticsBucket(merchant.clone(), bucket_start),
+            ) {
                 out.push_back(bucket);
             }
             bucket_start += 3600;
@@ -4696,7 +4703,8 @@ impl PaymentContract {
                 .instance()
                 .get::<DataKey, Address>(&DataKey::GlobalMerchantList(i))
             {
-                let analytics = PaymentContract::get_merchant_analytics(env.clone(), merchant.clone());
+                let analytics =
+                    PaymentContract::get_merchant_analytics(env.clone(), merchant.clone());
                 pairs.push_back((merchant, analytics.total_volume));
             }
         }
@@ -4748,7 +4756,10 @@ impl PaymentContract {
         let mut bucket: AnalyticsBucket = env
             .storage()
             .instance()
-            .get(&DataKey::MerchantAnalyticsBucket(merchant.clone(), bucket_start))
+            .get(&DataKey::MerchantAnalyticsBucket(
+                merchant.clone(),
+                bucket_start,
+            ))
             .unwrap_or(AnalyticsBucket {
                 bucket_start,
                 bucket_end: bucket_start + 3600,
@@ -4761,9 +4772,10 @@ impl PaymentContract {
         bucket.total_volume += volume_delta;
         bucket.total_refunds += refund_delta;
         bucket.failed_count += failed_delta;
-        env.storage()
-            .instance()
-            .set(&DataKey::MerchantAnalyticsBucket(merchant, bucket_start), &bucket);
+        env.storage().instance().set(
+            &DataKey::MerchantAnalyticsBucket(merchant, bucket_start),
+            &bucket,
+        );
     }
 
     fn update_platform_daily_bucket(
@@ -5096,9 +5108,13 @@ impl PaymentContract {
 
     // ── LARGE PAYMENT MULTI-SIG FUNCTIONS ─────────────────────────────────────
 
-    pub fn set_large_payment_threshold(env: Env, admin: Address, threshold: i128) -> Result<(), Error> {
+    pub fn set_large_payment_threshold(
+        env: Env,
+        admin: Address,
+        threshold: i128,
+    ) -> Result<(), Error> {
         admin.require_auth();
-        
+
         let config: MultiSigConfig = env
             .storage()
             .instance()
@@ -5129,7 +5145,11 @@ impl PaymentContract {
             .unwrap_or(0) // Default threshold of 0 disables multi-sig requirement
     }
 
-    pub fn propose_large_payment(env: Env, merchant: Address, payment_id: u64) -> Result<(), Error> {
+    pub fn propose_large_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
         merchant.require_auth();
 
         // Verify payment exists and belongs to merchant
@@ -5195,7 +5215,11 @@ impl PaymentContract {
         Ok(())
     }
 
-    pub fn approve_large_payment(env: Env, approver: Address, payment_id: u64) -> Result<(), Error> {
+    pub fn approve_large_payment(
+        env: Env,
+        approver: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
         approver.require_auth();
 
         let config: MultiSigConfig = env
@@ -5281,7 +5305,7 @@ impl PaymentContract {
         // Execute the payment
         let token_client = token::Client::new(&env, &payment.token);
         let contract_address = env.current_contract_address();
-        
+
         token_client.transfer(&contract_address, &payment.merchant, &payment.amount);
 
         payment.status = PaymentStatus::Completed;
@@ -5429,6 +5453,9 @@ mod test_analytics;
 #[cfg(test)]
 mod test_trial;
 
+mod test_issue_113_115_119_120;
 #[cfg(test)]
 mod test_metadata;
-mod test_issue_113_115_119_120;
+
+#[cfg(test)]
+mod test_cross_contract_escrow_verification;

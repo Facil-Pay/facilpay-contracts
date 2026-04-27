@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 fn setup(env: &Env) -> (PaymentContractClient, Address) {
     let id = env.register(PaymentContract, ());
@@ -12,11 +15,7 @@ fn setup(env: &Env) -> (PaymentContractClient, Address) {
     (client, admin)
 }
 
-fn make_sub(
-    client: &PaymentContractClient,
-    env: &Env,
-    trial_secs: u64,
-) -> u64 {
+fn make_sub(client: &PaymentContractClient, env: &Env, trial_secs: u64) -> u64 {
     let customer = Address::generate(env);
     let merchant = Address::generate(env);
     let token = Address::generate(env);
@@ -26,9 +25,9 @@ fn make_sub(
         &1000i128,
         &token,
         &Currency::USDC,
-        &3600u64,  // interval: 1 hour
-        &0u64,     // duration: indefinite
-        &3u64,     // max_retries
+        &3600u64, // interval: 1 hour
+        &0u64,    // duration: indefinite
+        &3u64,    // max_retries
         &String::from_str(env, ""),
         &trial_secs,
     )

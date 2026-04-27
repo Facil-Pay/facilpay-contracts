@@ -1,12 +1,12 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, BytesN, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, BytesN, Env, String};
 
-fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+fn create_token_contract<'a>(
+    env: &Env,
+    admin: &Address,
+) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
     let contract = env.register_stellar_asset_contract_v2(admin.clone());
     let contract_address = contract.address();
     (
@@ -56,13 +56,7 @@ fn test_set_payment_metadata_by_merchant() {
     let content_ref = String::from_str(&env, "QmXYZ123...");
     let content_hash = BytesN::from_array(&env, &[1u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &payment_id,
-        &content_ref,
-        &content_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &payment_id, &content_ref, &content_hash, &true);
 
     // Verify metadata was set
     let metadata = client.get_payment_metadata(&payment_id);
@@ -97,13 +91,7 @@ fn test_set_payment_metadata_by_customer() {
     let content_ref = String::from_str(&env, "QmABC456...");
     let content_hash = BytesN::from_array(&env, &[2u8; 32]);
 
-    client.set_payment_metadata(
-        &customer,
-        &payment_id,
-        &content_ref,
-        &content_hash,
-        &false,
-    );
+    client.set_payment_metadata(&customer, &payment_id, &content_ref, &content_hash, &false);
 
     // Verify metadata was set
     let metadata = client.get_payment_metadata(&payment_id);
@@ -134,13 +122,7 @@ fn test_set_payment_metadata_by_admin() {
     let content_ref = String::from_str(&env, "QmDEF789...");
     let content_hash = BytesN::from_array(&env, &[3u8; 32]);
 
-    client.set_payment_metadata(
-        &admin,
-        &payment_id,
-        &content_ref,
-        &content_hash,
-        &true,
-    );
+    client.set_payment_metadata(&admin, &payment_id, &content_ref, &content_hash, &true);
 
     // Verify metadata was set
     let metadata = client.get_payment_metadata(&payment_id);
@@ -197,13 +179,7 @@ fn test_set_payment_metadata_nonexistent_payment() {
     let content_ref = String::from_str(&env, "QmNONE...");
     let content_hash = BytesN::from_array(&env, &[5u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &999u64,
-        &content_ref,
-        &content_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &999u64, &content_ref, &content_hash, &true);
 }
 
 #[test]
@@ -228,25 +204,13 @@ fn test_update_payment_metadata_keeps_original_hash() {
     let content_ref1 = String::from_str(&env, "QmVER1...");
     let original_hash = BytesN::from_array(&env, &[10u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &payment_id,
-        &content_ref1,
-        &original_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &payment_id, &content_ref1, &original_hash, &true);
 
     // Update metadata with new content ref but different hash
     let content_ref2 = String::from_str(&env, "QmVER2...");
     let new_hash = BytesN::from_array(&env, &[20u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &payment_id,
-        &content_ref2,
-        &new_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &payment_id, &content_ref2, &new_hash, &true);
 
     // Verify original hash is preserved
     let metadata = client.get_payment_metadata(&payment_id);
@@ -279,13 +243,7 @@ fn test_verify_metadata_integrity_success() {
     let content_ref = String::from_str(&env, "QmHASH...");
     let content_hash = BytesN::from_array(&env, &[42u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &payment_id,
-        &content_ref,
-        &content_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &payment_id, &content_ref, &content_hash, &true);
 
     // Verify with correct hash
     let is_valid = client.verify_metadata_integrity(&payment_id, &content_hash);
@@ -314,13 +272,7 @@ fn test_verify_metadata_integrity_failure() {
     let content_ref = String::from_str(&env, "QmHASH...");
     let content_hash = BytesN::from_array(&env, &[42u8; 32]);
 
-    client.set_payment_metadata(
-        &merchant,
-        &payment_id,
-        &content_ref,
-        &content_hash,
-        &true,
-    );
+    client.set_payment_metadata(&merchant, &payment_id, &content_ref, &content_hash, &true);
 
     // Verify with incorrect hash
     let wrong_hash = BytesN::from_array(&env, &[99u8; 32]);

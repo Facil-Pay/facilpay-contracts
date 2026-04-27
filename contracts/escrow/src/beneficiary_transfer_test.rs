@@ -4,7 +4,14 @@ use super::*;
 use soroban_sdk::testutils::Ledger;
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
-fn setup() -> (Env, EscrowContractClient<'static>, Address, Address, Address, Address) {
+fn setup() -> (
+    Env,
+    EscrowContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
     let env = Env::default();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);

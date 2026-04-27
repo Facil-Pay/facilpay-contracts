@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, token};
 use soroban_sdk::testutils::Ledger;
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 #[test]
 fn test_dispute_collateral_deposit_and_return() {
@@ -21,13 +21,17 @@ fn test_dispute_collateral_deposit_and_return() {
     env.ledger().set_timestamp(1000);
 
     // Setup collateral config
-    client.set_dispute_config(&admin, &DisputeConfig {
-        collateral_token: token.clone(),
-        collateral_amount: 100,
-        collateral_enabled: true,
-    });
+    client.set_dispute_config(
+        &admin,
+        &DisputeConfig {
+            collateral_token: token.clone(),
+            collateral_amount: 100,
+            collateral_enabled: true,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
 
     // Mint and transfer escrow amount to contract
     token_admin_client.mint(&customer, &1000);
@@ -35,7 +39,7 @@ fn test_dispute_collateral_deposit_and_return() {
 
     // Mint collateral to customer
     token_admin_client.mint(&customer, &100);
-    
+
     // Dispute requires collateral
     client.dispute_escrow(&customer, &escrow_id);
 
@@ -70,13 +74,17 @@ fn test_dispute_collateral_forfeiture() {
 
     env.ledger().set_timestamp(1000);
 
-    client.set_dispute_config(&admin, &DisputeConfig {
-        collateral_token: token.clone(),
-        collateral_amount: 50,
-        collateral_enabled: true,
-    });
+    client.set_dispute_config(
+        &admin,
+        &DisputeConfig {
+            collateral_token: token.clone(),
+            collateral_amount: 50,
+            collateral_enabled: true,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
 
     // Mint and transfer escrow amount to contract
     token_admin_client.mint(&customer, &1000);
@@ -109,20 +117,24 @@ fn test_dispute_without_collateral_when_disabled() {
     env.ledger().set_timestamp(1000);
 
     // Collateral disabled
-    client.set_dispute_config(&admin, &DisputeConfig {
-        collateral_token: token.clone(),
-        collateral_amount: 100,
-        collateral_enabled: false,
-    });
+    client.set_dispute_config(
+        &admin,
+        &DisputeConfig {
+            collateral_token: token.clone(),
+            collateral_amount: 100,
+            collateral_enabled: false,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &9999_u64, &0_u64);
 
     // Dispute without having any collateral token
     client.dispute_escrow(&customer, &escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Disputed);
-    
+
     // get_dispute_collateral should fail
     let res = client.try_get_dispute_collateral(&escrow_id);
     assert!(res.is_err());

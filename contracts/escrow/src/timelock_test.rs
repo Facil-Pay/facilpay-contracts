@@ -29,12 +29,7 @@ mod timelock_tests {
         let token = Address::generate(&env);
         client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
 
-        let action_id = client.queue_action(
-            &admin,
-            &escrow_id,
-            &action_type,
-            &data,
-        );
+        let action_id = client.queue_action(&admin, &escrow_id, &action_type, &data);
 
         assert_eq!(action_id, 1);
 
@@ -60,12 +55,7 @@ mod timelock_tests {
         client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
         client.dispute_escrow(&customer, &escrow_id);
 
-        let action_id = client.queue_action(
-            &admin,
-            &escrow_id,
-            &action_type,
-            &data,
-        );
+        let action_id = client.queue_action(&admin, &escrow_id, &action_type, &data);
 
         // Try to execute immediately - should fail
         let result = client.try_execute_queued_action(&action_id);
@@ -87,12 +77,7 @@ mod timelock_tests {
         let token = Address::generate(&env);
         client.create_escrow(&customer, &merchant, &1000_i128, &token, &5000_u64, &0_u64);
 
-        let action_id = client.queue_action(
-            &admin,
-            &escrow_id,
-            &action_type,
-            &data,
-        );
+        let action_id = client.queue_action(&admin, &escrow_id, &action_type, &data);
 
         client.cancel_queued_action(&admin, &action_id);
 
@@ -107,7 +92,7 @@ mod timelock_tests {
         let (client, admin) = setup_test(&env);
 
         let config = TimeLockConfig {
-            delay: 7200,      // 2 hours
+            delay: 7200,        // 2 hours
             grace_period: 3600, // 1 hour
         };
 
@@ -135,7 +120,7 @@ mod timelock_tests {
         assert_eq!(result, Err(Ok(Error::InvalidStatus)));
         // Test delay too long (more than 7 days)
         let config = TimeLockConfig {
-            delay: 700000,    // > 7 days
+            delay: 700000, // > 7 days
             grace_period: 3600,
         };
 
@@ -143,4 +128,3 @@ mod timelock_tests {
         assert_eq!(result, Err(Ok(Error::InvalidStatus)));
     }
 }
-

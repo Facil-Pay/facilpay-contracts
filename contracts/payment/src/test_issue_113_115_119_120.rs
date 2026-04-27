@@ -130,7 +130,9 @@ fn test_oracle_refresh_and_manual_fallback() {
     client
         .set_conversion_rate(&admin, &Currency::USDC, &1_0000000)
         .unwrap();
-    client.set_oracle_rate_config(&admin, &disabled_cfg).unwrap();
+    client
+        .set_oracle_rate_config(&admin, &disabled_cfg)
+        .unwrap();
     let fallback = client.refresh_conversion_rate(&Currency::USDC).unwrap();
     assert_eq!(fallback, 1_0000000);
 }
@@ -166,7 +168,8 @@ fn test_cross_contract_condition_success_and_failure() {
         .expect("idempotent re-execution should succeed");
 
     let bad_target = Address::generate(&env);
-    let bad_cond = ConditionType::CrossContractState(bad_target, BytesN::from_array(&env, &[9; 32]));
+    let bad_cond =
+        ConditionType::CrossContractState(bad_target, BytesN::from_array(&env, &[9; 32]));
     let payment_id2 = client
         .create_conditional_payment(
             &customer,
@@ -196,13 +199,29 @@ fn test_analytics_range_and_top_merchants() {
 
     env.ledger().set_timestamp(3_600);
     let p1 = client
-        .create_payment(&customer, &merchant_a, &1_000, &token, &Currency::USDC, &0, &meta)
+        .create_payment(
+            &customer,
+            &merchant_a,
+            &1_000,
+            &token,
+            &Currency::USDC,
+            &0,
+            &meta,
+        )
         .unwrap();
     let _ = client.cancel_payment(&customer, &p1);
 
     env.ledger().set_timestamp(7_200);
     let _ = client
-        .create_payment(&customer, &merchant_b, &5_000, &token, &Currency::USDC, &0, &meta)
+        .create_payment(
+            &customer,
+            &merchant_b,
+            &5_000,
+            &token,
+            &Currency::USDC,
+            &0,
+            &meta,
+        )
         .unwrap();
 
     let range = client

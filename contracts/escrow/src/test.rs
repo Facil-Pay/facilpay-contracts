@@ -2371,7 +2371,8 @@ fn test_multisig_resolve_dispute_via_proposal() {
 
 fn setup_token(env: &Env) -> Address {
     let token_admin = Address::generate(env);
-    env.register_stellar_asset_contract_v2(token_admin).address()
+    env.register_stellar_asset_contract_v2(token_admin)
+        .address()
 }
 
 #[test]
@@ -2395,8 +2396,14 @@ fn test_create_multi_token_escrow_success() {
     token_b_admin.mint(&customer, &500);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
-    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 1000,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_b.clone(),
+        amount: 500,
+    });
 
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
 
@@ -2442,8 +2449,14 @@ fn test_create_multi_token_escrow_duplicate_token() {
     token_a_admin.mint(&customer, &2000);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 500,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 500,
+    });
 
     let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
     assert_eq!(result, Err(Ok(Error::DuplicateToken)));
@@ -2464,7 +2477,10 @@ fn test_create_multi_token_escrow_too_many_tokens() {
         let tok = setup_token(&env);
         let admin = token::StellarAssetClient::new(&env, &tok);
         admin.mint(&customer, &10);
-        tokens.push_back(TokenEntry { token: tok, amount: 10 });
+        tokens.push_back(TokenEntry {
+            token: tok,
+            amount: 10,
+        });
     }
 
     let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2486,13 +2502,14 @@ fn test_insurance_system() {
     client.initialize(&admin);
 
     let config = InsuranceConfig {
-        premium_bps: 100, // 1%
+        premium_bps: 100,       // 1%
         max_coverage_bps: 5000, // 50%
         enabled: true,
     };
     client.set_insurance_config(&admin, &config);
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
     client.opt_into_insurance(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -2502,12 +2519,12 @@ fn test_insurance_system() {
     assert_eq!(pool.balance, 100);
 
     client.refund_escrow(&customer, &escrow_id);
-    
+
     let claim_id = client.file_insurance_claim(&admin, &escrow_id, &100_i128);
     assert_eq!(claim_id, 1);
 
     client.approve_claim(&admin, &claim_id);
-    
+
     let final_pool = client.get_insurance_pool();
     assert_eq!(final_pool.balance, 0);
     assert_eq!(final_pool.total_claims_paid, 100);
@@ -2540,9 +2557,18 @@ fn test_timelock_execute_after_expiry_returns_error() {
     token_c_admin.mint(&customer, &250);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
-    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
-    tokens.push_back(TokenEntry { token: token_c.clone(), amount: 250 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 1000,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_b.clone(),
+        amount: 500,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_c.clone(),
+        amount: 250,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2577,7 +2603,10 @@ fn test_release_multi_token_escrow_before_timestamp() {
     token_a_admin.mint(&customer, &100);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 100,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2603,9 +2632,16 @@ fn test_release_multi_token_escrow_double_release() {
     client.initialize(&admin);
 
     // Set a short timelock (1 hour delay, 1 hour grace)
-    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 3600 });
+    client.set_timelock_config(
+        &admin,
+        &TimeLockConfig {
+            delay: 3600,
+            grace_period: 3600,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     let action_id = client.queue_action(
@@ -2637,7 +2673,10 @@ fn test_timelock_execute_after_delay_succeeds() {
     token_a_admin.mint(&customer, &100);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 100,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2670,11 +2709,17 @@ fn test_get_multi_token_escrow_not_found() {
     env.ledger().set_timestamp(1000);
     client.initialize(&admin);
 
-
     // Set a 1-hour timelock, 24-hour grace period
-    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 86400 });
+    client.set_timelock_config(
+        &admin,
+        &TimeLockConfig {
+            delay: 3600,
+            grace_period: 86400,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     let action_id = client.queue_action(
@@ -2708,13 +2753,12 @@ fn test_single_token_escrow_still_works_after_multi_token_addition() {
 
     client.initialize(&admin);
     env.ledger().set_timestamp(500);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
     env.ledger().set_timestamp(1001);
     client.release_escrow(&admin, &escrow_id, &false);
 
-    let escrow = env.as_contract(&contract_id, || {
-        EscrowContract::get_escrow(&env, escrow_id)
-    });
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
     assert_eq!(escrow.status, EscrowStatus::Released);
 }
 
@@ -3354,20 +3398,24 @@ fn test_insurance_underfunded() {
     env.mock_all_auths();
     client.initialize(&admin);
 
-    client.set_insurance_config(&admin, &InsuranceConfig {
-        premium_bps: 10,
-        max_coverage_bps: 1000,
-        enabled: true,
-    });
+    client.set_insurance_config(
+        &admin,
+        &InsuranceConfig {
+            premium_bps: 10,
+            max_coverage_bps: 1000,
+            enabled: true,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
     client.opt_into_insurance(&escrow_id);
 
     client.refund_escrow(&customer, &escrow_id);
-    
+
     let claim_id = client.file_insurance_claim(&admin, &escrow_id, &50_i128);
     let result = client.try_approve_claim(&admin, &claim_id);
-    
+
     assert!(result.is_err());
 }
 
@@ -3412,21 +3460,25 @@ fn test_release_milestone_success() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
-    
+
     env.mock_all_auths();
-    
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: false, // releases to merchant
-    });
+
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: false, // releases to merchant
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
 
     // After release_timestamp (1100) + inactivity (100) = 1200
     env.ledger().set_timestamp(1201);
-    
+
     assert!(client.is_watchdog_eligible(&escrow_id));
     client.trigger_watchdog_release(&escrow_id);
 
@@ -3556,18 +3608,22 @@ fn test_release_unapproved_milestone_fails() {
     // Attempt release without approval
     env.ledger().set_timestamp(2500);
     let result = client.try_release_milestone(&escrow_id, &1_u64);
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: false,
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: false,
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     env.ledger().set_timestamp(1201);
-    
+
     assert!(!client.is_watchdog_eligible(&escrow_id));
     let result = client.try_trigger_watchdog_release(&escrow_id);
     assert!(result.is_err());
@@ -3607,18 +3663,22 @@ fn test_watchdog_premature_trigger() {
 
     // Duplicate release attempt must fail
     let result = client.try_release_milestone(&escrow_id, &1_u64);
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 1000,
-        enabled: true,
-        favor_customer_on_release: false,
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 1000,
+            enabled: true,
+            favor_customer_on_release: false,
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
 
     // Before inactivity window (2000 + 1000 = 3000)
     env.ledger().set_timestamp(2500);
-    
+
     assert!(!client.is_watchdog_eligible(&escrow_id));
     let result = client.try_trigger_watchdog_release(&escrow_id);
     assert!(result.is_err());
@@ -3819,17 +3879,21 @@ fn test_non_admin_cannot_approve_milestone() {
 
     let result = client.try_approve_milestone(&non_admin, &escrow_id, &1_u64);
     assert!(result.is_err());
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: true, // releases to customer
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: true, // releases to customer
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
 
     env.ledger().set_timestamp(1201);
-    
+
     client.trigger_watchdog_release(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -3846,14 +3910,16 @@ fn test_escrow_fee_deduction_and_withdrawal() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    
+
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_asset_client = token::StellarAssetClient::new(&env, &token_id);
     let token_user_client = token::Client::new(&env, &token_id);
 
     client.initialize(&admin);
-    
+
     token_asset_client.mint(&contract_id, &10000);
 
     let config = EscrowFeeConfig {
@@ -3864,7 +3930,14 @@ fn test_escrow_fee_deduction_and_withdrawal() {
     client.set_escrow_fee_config(&admin, &config);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token_id, &2000_u64, &0_u64);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token_id,
+        &2000_u64,
+        &0_u64,
+    );
 
     env.ledger().set_timestamp(2500);
     client.release_escrow(&admin, &escrow_id, &false);
@@ -3876,7 +3949,7 @@ fn test_escrow_fee_deduction_and_withdrawal() {
 
     let external_wallet = Address::generate(&env);
     let withdrawn = client.withdraw_escrow_fees(&admin, &token_id, &external_wallet);
-    
+
     assert_eq!(withdrawn, 500);
     assert_eq!(client.get_accumulated_escrow_fees(&token_id), 0);
     assert_eq!(token_user_client.balance(&external_wallet), 500);
@@ -3892,21 +3965,34 @@ fn test_escrow_fee_zero_bps_path() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    
+
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_asset_client = token::StellarAssetClient::new(&env, &token_id);
     let token_user_client = token::Client::new(&env, &token_id);
 
     client.initialize(&admin);
-    
+
     token_asset_client.mint(&contract_id, &10000);
 
-    let config = EscrowFeeConfig { fee_bps: 0, fee_recipient: contract_id.clone(), enabled: false };
+    let config = EscrowFeeConfig {
+        fee_bps: 0,
+        fee_recipient: contract_id.clone(),
+        enabled: false,
+    };
     client.set_escrow_fee_config(&admin, &config);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token_id, &2000_u64, &0_u64);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token_id,
+        &2000_u64,
+        &0_u64,
+    );
 
     env.ledger().set_timestamp(2500);
     client.release_escrow(&admin, &escrow_id, &false);
@@ -3929,15 +4015,25 @@ fn test_fee_config_snapshot_isolation() {
 
     client.initialize(&admin);
 
-    let config_initial = EscrowFeeConfig { fee_bps: 0, fee_recipient: contract_id.clone(), enabled: false };
+    let config_initial = EscrowFeeConfig {
+        fee_bps: 0,
+        fee_recipient: contract_id.clone(),
+        enabled: false,
+    };
     client.set_escrow_fee_config(&admin, &config_initial);
 
-    let escrow_id_before = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id_before =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
 
-    let config_new = EscrowFeeConfig { fee_bps: 1000, fee_recipient: contract_id.clone(), enabled: true };
+    let config_new = EscrowFeeConfig {
+        fee_bps: 1000,
+        fee_recipient: contract_id.clone(),
+        enabled: true,
+    };
     client.set_escrow_fee_config(&admin, &config_new);
 
-    let escrow_id_after = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id_after =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
 
     let escrow_1 = client.get_escrow(&escrow_id_before);
     let escrow_2 = client.get_escrow(&escrow_id_after);
@@ -4068,8 +4164,14 @@ fn test_batch_escrow_creation_partial_failure() {
     assert_eq!(results.get(1).unwrap().escrow_id, 0);
     assert_eq!(results.get(2).unwrap().escrow_id, 0);
     assert_eq!(results.get(0).unwrap().error_code, 0);
-    assert_eq!(results.get(1).unwrap().error_code, Error::InvalidStatus as u32);
-    assert_eq!(results.get(2).unwrap().error_code, Error::ReleaseNotYetAvailable as u32);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Error::InvalidStatus as u32
+    );
+    assert_eq!(
+        results.get(2).unwrap().error_code,
+        Error::ReleaseNotYetAvailable as u32
+    );
 }
 
 #[test]
@@ -4113,7 +4215,10 @@ fn test_batch_escrow_creation_too_large() {
 
     assert_eq!(results.len(), 1);
     assert!(!results.get(0).unwrap().success);
-    assert_eq!(results.get(0).unwrap().error_code, Error::BatchTooLarge as u32);
+    assert_eq!(
+        results.get(0).unwrap().error_code,
+        Error::BatchTooLarge as u32
+    );
 }
 
 #[test]
@@ -4203,8 +4308,7 @@ fn test_dispute_recommendation_favors_merchant() {
     );
 
     // Seed reputations: merchant wins a dispute → merchant=8000, customer=2000.
-    let seed_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &seed_id);
     client.resolve_dispute(&admin, &seed_id, &true);
 
@@ -4244,8 +4348,7 @@ fn test_dispute_recommendation_favors_customer() {
     );
 
     // Seed reputations: customer wins → customer=8000, merchant=2000.
-    let seed_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&merchant, &seed_id);
     client.resolve_dispute(&admin, &seed_id, &false);
 
@@ -4308,8 +4411,7 @@ fn test_dispute_recommendation_does_not_enforce_resolution() {
     );
 
     // Seed: merchant=8000, customer=2000.
-    let seed_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
     client.dispute_escrow(&customer, &seed_id);
     client.resolve_dispute(&admin, &seed_id, &true);
 
