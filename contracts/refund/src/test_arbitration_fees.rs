@@ -140,6 +140,7 @@ fn test_fee_distribution_equal_split() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
 
@@ -217,6 +218,7 @@ fn test_fee_distribution_majority_only() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
 
@@ -293,6 +295,7 @@ fn test_withdraw_treasury_fees() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
 
@@ -370,6 +373,7 @@ fn test_fee_distribution_without_config() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
 
@@ -441,6 +445,7 @@ fn test_fee_distribution_100_percent_treasury() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
 
