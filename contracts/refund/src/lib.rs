@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address,
-    BytesN, Env, String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -39,6 +39,8 @@ pub enum DataKey {
     RefundPolicyVersionCount(Address),
     // Payment contract address (#143)
     PaymentContractAddress,
+    AutoRefundTrigger(u64),
+    AutoRefundTriggerCounter,
     // Batch refund limit (#135)
     BatchRefundLimit,
     // Analytics
@@ -106,6 +108,8 @@ pub enum Error {
     StakeAlreadyReturned = 33,
     ArbitratorNotFound = 34,
     InvalidScoreThreshold = 35,
+    AutoRefundTriggerNotFound = 36,
+    DuplicateAutoRefundTrigger = 37,
 }
 
 #[contractevent]
@@ -128,6 +132,21 @@ pub struct RefundProcessed {
     pub amount: i128,
     pub token: Address,
     pub processed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoRefundTriggered {
+    pub trigger_id: u64,
+    pub payment_id: u64,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerRegistered {
+    pub trigger_id: u64,
+    pub payment_id: u64,
 }
 
 #[contractevent]
@@ -312,6 +331,74 @@ pub struct RefundPolicy {
     pub requires_admin_approval: bool,
     pub auto_approve_below: i128,
     pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct AutoRefundTrigger {
+    pub trigger_id: u64,
+    pub payment_id: u64,
+    pub condition: AutoRefundCondition,
+    pub refund_bps: u32,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct FulfillmentTimeoutCondition {
+    pub fulfillment_deadline: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ContractStateMatchCondition {
+    pub contract: Address,
+    pub key: BytesN<32>,
+    pub expected: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AutoRefundCondition {
+    FulfillmentTimeout(FulfillmentTimeoutCondition),
+    ContractStateMatch(ContractStateMatchCondition),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+enum ExternalPaymentStatus {
+    Pending,
+    Completed,
+    Refunded,
+    PartialRefunded,
+    Cancelled,
+}
+
+#[derive(Clone)]
+#[contracttype]
+enum ExternalCurrency {
+    XLM,
+    USDC,
+    USDT,
+    BTC,
+    ETH,
+}
+
+#[derive(Clone)]
+#[contracttype]
+struct ExternalPayment {
+    pub id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub currency: ExternalCurrency,
+    pub status: ExternalPaymentStatus,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub metadata: String,
+    pub notes: String,
+    pub refunded_amount: i128,
 }
 
 // ── Issue #134: Policy versioning struct ──────────────────────────────────
@@ -508,155 +595,19 @@ impl RefundContract {
         // Require merchant authentication
         merchant.require_auth();
 
-        // Validate amount is positive
-        if amount <= 0 {
-            return Err(Error::InvalidAmount);
-        }
-
-        if amount > original_payment_amount {
-            return Err(Error::RefundExceedsPayment);
-        }
-
-        // Validate payment_id is valid (greater than 0)
-        if payment_id == 0 {
-            return Err(Error::InvalidPaymentId);
-        }
-
-        // ── Issue #143: Cross-contract verification (if payment contract is set) ──
-        if let Some(_payment_contract_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::PaymentContractAddress)
-        {
-            // Verify ownership via cross-contract call; skip if call fails (backward-compatible)
-            let owned = Self::verify_payment_ownership(
-                env.clone(),
-                payment_id,
-                customer.clone(),
-            );
-            if !owned {
-                return Err(Error::PaymentOwnershipMismatch);
-            }
-        }
-
-        Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
-
-        // Circuit breaker check
-        Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
-
-        // Validate against refund policy
-        Self::validate_against_policy(
-            &env,
-            &merchant,
-            amount,
-            original_payment_amount,
-            payment_created_at
-        )?;
-
-        // Get and increment refund counter
-        let counter: u64 = env.storage().instance().get(&DataKey::RefundCounter).unwrap_or(0);
-        let refund_id = counter + 1;
-
-        // Determine initial status based on policy (merchant → global default → Requested)
-        let initial_status = {
-            let policy_opt = Self::get_refund_policy(&env, merchant.clone())
-                .or_else(|| Self::get_default_refund_policy_inner(&env));
-            if let Some(policy) = policy_opt {
-                if !policy.requires_admin_approval && amount <= policy.auto_approve_below {
-                    RefundStatus::Approved
-                } else {
-                    RefundStatus::Requested
-                }
-            } else {
-                RefundStatus::Requested
-            }
-        };
-
-        // Create Refund struct
-        let refund = Refund {
-            id: refund_id,
-            payment_id,
-            merchant: merchant.clone(),
-            customer: customer.clone(),
-            amount,
-            original_payment_amount,
-            token: token.clone(),
-            status: initial_status.clone(),
-            requested_at: env.ledger().timestamp(),
-            reason,
-            reason_code,
-        };
-
-        // Store refund in contract storage
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
-        env.storage().instance().set(&DataKey::RefundCounter, &refund_id);
-        Self::add_to_status_index(&env, initial_status.clone(), refund_id);
-
-        // Index refund by merchant
-        let merchant_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MerchantRefundCount(merchant.clone()))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::MerchantRefunds(merchant.clone(), merchant_count),
-            &refund_id,
-        );
-        env.storage().instance().set(
-            &DataKey::MerchantRefundCount(merchant.clone()),
-            &(merchant_count + 1),
-        );
-
-        // Index refund by customer
-        let customer_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CustomerRefundCount(customer.clone()))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::CustomerRefunds(customer.clone(), customer_count),
-            &refund_id,
-        );
-        env.storage().instance().set(
-            &DataKey::CustomerRefundCount(customer.clone()),
-            &(customer_count + 1),
-        );
-
-        // Index refund by payment
-        let payment_count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PaymentRefundCount(payment_id))
-            .unwrap_or(0);
-        env.storage().instance().set(
-            &DataKey::PaymentRefunds(payment_id, payment_count),
-            &refund_id,
-        );
-        env.storage().instance().set(
-            &DataKey::PaymentRefundCount(payment_id),
-            &(payment_count + 1),
-        );
-
-        // Emit RefundRequested event
-        (RefundRequested {
-            refund_id,
-            payment_id,
+        Self::create_refund(
+            env,
             merchant,
+            payment_id,
             customer,
             amount,
+            original_payment_amount,
             token,
-        }).publish(&env);
-
-        // Emit AutoApproved event if applicable
-        if initial_status == RefundStatus::Approved {
-            (AutoApproved {
-                refund_id,
-                amount,
-            }).publish(&env);
-        }
-
-        // Return the new refund ID
-        Ok(refund_id)
+            reason,
+            reason_code,
+            payment_created_at,
+            false,
+        )
     }
 
     pub fn get_refund(env: &Env, refund_id: u64) -> Result<Refund, Error> {
@@ -668,35 +619,7 @@ impl RefundContract {
         // Require admin authentication
         admin.require_auth();
 
-        // Retrieve refund from storage
-        let mut refund: Refund = env
-            .storage()
-            .instance()
-            .get(&DataKey::Refund(refund_id))
-            .ok_or(Error::RefundNotFound)?;
-
-        // Check refund status is Requested
-        if refund.status != RefundStatus::Requested {
-            return Err(Error::InvalidStatus);
-        }
-
-        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
-
-        // Update refund status to Approved
-        refund.status = RefundStatus::Approved;
-
-        // Store updated refund back to storage
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
-        Self::add_to_status_index(&env, RefundStatus::Approved, refund_id);
-
-        // Emit RefundApproved event
-        (RefundApproved {
-            refund_id,
-            approved_by: admin,
-            approved_at: env.ledger().timestamp(),
-        }).publish(&env);
-
-        Ok(())
+        Self::approve_refund_internal(&env, admin, refund_id)
     }
 
     pub fn reject_refund(
@@ -743,30 +666,134 @@ impl RefundContract {
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
         admin.require_auth();
 
-        let mut refund: Refund = env
-            .storage()
-            .instance()
-            .get(&DataKey::Refund(refund_id))
-            .ok_or(Error::RefundNotFound)?;
+        Self::process_refund_internal(&env, admin, refund_id)
+    }
 
-        if refund.status != RefundStatus::Approved {
-            return Err(Error::InvalidStatus);
+    pub fn register_auto_refund_trigger(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        condition: AutoRefundCondition,
+        refund_bps: u32,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+
+        if payment_id == 0 {
+            return Err(Error::InvalidPaymentId);
+        }
+        if refund_bps == 0 || refund_bps > 10000 {
+            return Err(Error::RefundExceedsPolicy);
         }
 
-        Self::can_refund_payment(
-            &env,
-            refund.payment_id,
-            refund.amount,
-            refund.original_payment_amount
+        let payment = Self::get_external_payment(&env, payment_id)?;
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        let trigger_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AutoRefundTriggerCounter)
+            .unwrap_or(0);
+
+        let mut trigger_id = 1u64;
+        while trigger_id <= trigger_count {
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<DataKey, AutoRefundTrigger>(&DataKey::AutoRefundTrigger(trigger_id))
+            {
+                if existing.active
+                    && existing.payment_id == payment_id
+                    && existing.condition == condition
+                {
+                    return Err(Error::DuplicateAutoRefundTrigger);
+                }
+            }
+            trigger_id += 1;
+        }
+
+        let new_trigger_id = trigger_count + 1;
+        let trigger = AutoRefundTrigger {
+            trigger_id: new_trigger_id,
+            payment_id,
+            condition,
+            refund_bps,
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoRefundTrigger(new_trigger_id), &trigger);
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoRefundTriggerCounter, &new_trigger_id);
+
+        (TriggerRegistered {
+            trigger_id: new_trigger_id,
+            payment_id,
+        })
+        .publish(&env);
+
+        Ok(new_trigger_id)
+    }
+
+    pub fn evaluate_auto_refund(env: Env, trigger_id: u64) -> Result<bool, Error> {
+        let mut trigger = Self::get_auto_refund_trigger(env.clone(), trigger_id)?;
+        if !trigger.active {
+            return Ok(false);
+        }
+
+        let condition_met = Self::evaluate_auto_refund_condition(&env, &trigger.condition)?;
+        if !condition_met {
+            return Ok(false);
+        }
+
+        let payment = Self::get_external_payment(&env, trigger.payment_id)?;
+        let refund_amount = payment
+            .amount
+            .checked_mul(trigger.refund_bps as i128)
+            .and_then(|value| value.checked_div(10000))
+            .ok_or(Error::InvalidAmount)?;
+        if refund_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let refund_id = Self::create_refund(
+            env.clone(),
+            payment.merchant.clone(),
+            payment.id,
+            payment.customer.clone(),
+            refund_amount,
+            payment.amount,
+            payment.token.clone(),
+            String::from_str(&env, "Automatic refund trigger executed"),
+            RefundReasonCode::Other,
+            payment.created_at,
+            true,
         )?;
+        Self::process_refund_internal(&env, env.current_contract_address(), refund_id)?;
 
-        Self::remove_from_status_index(&env, RefundStatus::Approved, refund_id)?;
-        refund.status = RefundStatus::Processed;
+        trigger.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoRefundTrigger(trigger_id), &trigger);
 
-        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
-        Self::add_to_status_index(&env, RefundStatus::Processed, refund_id);
+        (AutoRefundTriggered {
+            trigger_id,
+            payment_id: payment.id,
+            amount: refund_amount,
+        })
+        .publish(&env);
 
-        Ok(())
+        Ok(true)
+    }
+
+    pub fn get_auto_refund_trigger(env: Env, trigger_id: u64) -> Result<AutoRefundTrigger, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoRefundTrigger(trigger_id))
+            .ok_or(Error::AutoRefundTriggerNotFound)
     }
 
     pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), Error> {
@@ -2075,7 +2102,7 @@ impl RefundContract {
 
         let mut results = Vec::new(&env);
         for refund_id in refund_ids.iter() {
-            let result = Self::approve_refund(env.clone(), admin.clone(), refund_id);
+            let result = Self::approve_refund_internal(&env, admin.clone(), refund_id);
             match result {
                 Ok(()) => {
                     let amount = env
@@ -2130,7 +2157,7 @@ impl RefundContract {
                 .get::<DataKey, Refund>(&DataKey::Refund(refund_id))
                 .map(|r| r.amount)
                 .unwrap_or(0);
-            let result = Self::process_refund(env.clone(), admin.clone(), refund_id);
+            let result = Self::process_refund_internal(&env, admin.clone(), refund_id);
             match result {
                 Ok(()) => {
                     results.push_back(BatchRefundResult {
@@ -2196,13 +2223,263 @@ impl RefundContract {
         };
         // Cross-contract call to payment_contract.check_payment_customer(payment_id, customer).
         // That function returns bool: true if payment exists, belongs to customer, and is Completed.
-        use soroban_sdk::{Symbol, IntoVal};
         let func = Symbol::new(&env, "check_payment_customer");
         let args = (payment_id, customer).into_val(&env);
-        match env.try_invoke_contract::<bool, Error>(&payment_contract, &func, args) {
         match env.try_invoke_contract::<bool, soroban_sdk::InvokeError>(&payment_contract, &func, args) {
             Ok(Ok(result)) => result,
             _ => false,
+        }
+    }
+
+    fn create_refund(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        customer: Address,
+        amount: i128,
+        original_payment_amount: i128,
+        token: Address,
+        reason: String,
+        reason_code: RefundReasonCode,
+        payment_created_at: u64,
+        force_approved: bool,
+    ) -> Result<u64, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if amount > original_payment_amount {
+            return Err(Error::RefundExceedsPayment);
+        }
+
+        if payment_id == 0 {
+            return Err(Error::InvalidPaymentId);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::PaymentContractAddress)
+            .is_some()
+        {
+            let owned = Self::verify_payment_ownership(
+                env.clone(),
+                payment_id,
+                customer.clone(),
+            );
+            if !owned {
+                return Err(Error::PaymentOwnershipMismatch);
+            }
+        }
+
+        Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
+        Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
+        if env.storage().instance().has(&DataKey::Admin) {
+            Self::validate_against_policy(
+                &env,
+                &merchant,
+                amount,
+                original_payment_amount,
+                payment_created_at,
+            )?;
+        }
+
+        let counter: u64 = env.storage().instance().get(&DataKey::RefundCounter).unwrap_or(0);
+        let refund_id = counter + 1;
+
+        let initial_status = if force_approved {
+            RefundStatus::Approved
+        } else {
+            let policy_opt = Self::get_refund_policy(&env, merchant.clone())
+                .or_else(|| Self::get_default_refund_policy_inner(&env));
+            if let Some(policy) = policy_opt {
+                if !policy.requires_admin_approval && amount <= policy.auto_approve_below {
+                    RefundStatus::Approved
+                } else {
+                    RefundStatus::Requested
+                }
+            } else {
+                RefundStatus::Requested
+            }
+        };
+
+        let refund = Refund {
+            id: refund_id,
+            payment_id,
+            merchant: merchant.clone(),
+            customer: customer.clone(),
+            amount,
+            original_payment_amount,
+            token: token.clone(),
+            status: initial_status.clone(),
+            requested_at: env.ledger().timestamp(),
+            reason,
+            reason_code,
+        };
+
+        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        env.storage().instance().set(&DataKey::RefundCounter, &refund_id);
+        Self::add_to_status_index(&env, initial_status.clone(), refund_id);
+
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRefundCount(merchant.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::MerchantRefunds(merchant.clone(), merchant_count),
+            &refund_id,
+        );
+        env.storage().instance().set(
+            &DataKey::MerchantRefundCount(merchant.clone()),
+            &(merchant_count + 1),
+        );
+
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerRefundCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::CustomerRefunds(customer.clone(), customer_count),
+            &refund_id,
+        );
+        env.storage().instance().set(
+            &DataKey::CustomerRefundCount(customer.clone()),
+            &(customer_count + 1),
+        );
+
+        let payment_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCount(payment_id))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::PaymentRefunds(payment_id, payment_count),
+            &refund_id,
+        );
+        env.storage().instance().set(
+            &DataKey::PaymentRefundCount(payment_id),
+            &(payment_count + 1),
+        );
+
+        (RefundRequested {
+            refund_id,
+            payment_id,
+            merchant,
+            customer,
+            amount,
+            token,
+        })
+        .publish(&env);
+
+        if initial_status == RefundStatus::Approved {
+            (AutoApproved { refund_id, amount }).publish(&env);
+        }
+
+        Ok(refund_id)
+    }
+
+    fn approve_refund_internal(env: &Env, approved_by: Address, refund_id: u64) -> Result<(), Error> {
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::InvalidStatus);
+        }
+
+        Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+        refund.status = RefundStatus::Approved;
+        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(env, RefundStatus::Approved, refund_id);
+
+        (RefundApproved {
+            refund_id,
+            approved_by,
+            approved_at: env.ledger().timestamp(),
+        })
+        .publish(env);
+
+        Ok(())
+    }
+
+    fn process_refund_internal(env: &Env, processed_by: Address, refund_id: u64) -> Result<(), Error> {
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.status != RefundStatus::Approved {
+            return Err(Error::InvalidStatus);
+        }
+
+        Self::can_refund_payment(
+            env,
+            refund.payment_id,
+            refund.amount,
+            refund.original_payment_amount,
+        )?;
+
+        Self::remove_from_status_index(env, RefundStatus::Approved, refund_id)?;
+        refund.status = RefundStatus::Processed;
+        env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
+
+        (RefundProcessed {
+            refund_id,
+            processed_by,
+            customer: refund.customer,
+            amount: refund.amount,
+            token: refund.token,
+            processed_at: env.ledger().timestamp(),
+        })
+        .publish(env);
+
+        Ok(())
+    }
+
+    fn get_external_payment(env: &Env, payment_id: u64) -> Result<ExternalPayment, Error> {
+        let payment_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+            .ok_or(Error::PaymentContractNotSet)?;
+        let args = (payment_id,).into_val(env);
+        let func = Symbol::new(env, "get_payment");
+        match env.try_invoke_contract::<ExternalPayment, soroban_sdk::InvokeError>(
+            &payment_contract,
+            &func,
+            args,
+        ) {
+            Ok(Ok(payment)) => Ok(payment),
+            _ => Err(Error::InvalidPaymentId),
+        }
+    }
+
+    fn evaluate_auto_refund_condition(
+        env: &Env,
+        condition: &AutoRefundCondition,
+    ) -> Result<bool, Error> {
+        match condition {
+            AutoRefundCondition::FulfillmentTimeout(config) => {
+                Ok(env.ledger().timestamp() >= config.fulfillment_deadline)
+            }
+            AutoRefundCondition::ContractStateMatch(config) => {
+                let args = (config.key.clone(),).into_val(env);
+                let func = Symbol::new(env, "get_contract_state");
+                match env.try_invoke_contract::<Bytes, soroban_sdk::InvokeError>(
+                    &config.contract,
+                    &func,
+                    args,
+                ) {
+                    Ok(Ok(actual)) => Ok(actual == config.expected),
+                    _ => Ok(false),
+                }
+            }
         }
     }
 
@@ -2641,3 +2918,6 @@ mod test_arbitration_stake;
 
 #[cfg(test)]
 mod test_arbitrator_reputation;
+
+#[cfg(test)]
+mod test_auto_refund;

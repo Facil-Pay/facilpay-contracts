@@ -66,6 +66,7 @@ fn create_and_escalate_refund(
         &5000,
         &token_client.address,
         &String::from_str(env, "Test refund"),
+        &RefundReasonCode::Other,
         &(env.ledger().timestamp() - 100),
     );
 

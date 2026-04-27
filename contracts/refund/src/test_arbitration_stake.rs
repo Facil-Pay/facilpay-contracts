@@ -131,6 +131,7 @@ fn test_stake_deposit_on_escalation() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
@@ -202,6 +203,7 @@ fn test_stake_returned_on_win() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
@@ -286,6 +288,7 @@ fn test_stake_forfeited_on_loss() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
@@ -351,6 +354,7 @@ fn test_escalation_without_stake_config() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
@@ -413,6 +417,7 @@ fn test_escalation_with_disabled_stake() {
         &10000i128,
         &token_client.address,
         &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
         &1000u64,
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
