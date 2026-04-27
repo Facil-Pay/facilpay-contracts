@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
+use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, BytesN, Env, String};
 
 // ── REPUTATION SYSTEM TESTS ──────────────────────────────────────────────────
 
@@ -4426,4 +4426,141 @@ fn test_dispute_recommendation_does_not_enforce_resolution() {
     client.resolve_dispute(&admin, &escrow_id, &false);
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+// ── CONDITIONAL ESCROW (ON-CHAIN STATE) TESTS ────────────────────────────────
+
+#[contract]
+pub struct MockStateContract;
+
+#[contractimpl]
+impl MockStateContract {
+    pub fn set_state(env: Env, key: BytesN<32>, value: Bytes) {
+        env.storage().instance().set(&key, &value);
+    }
+
+    pub fn get_state(env: Env, key: BytesN<32>) -> Bytes {
+        env.storage()
+            .instance()
+            .get::<BytesN<32>, Bytes>(&key)
+            .unwrap_or(Bytes::new(&env))
+    }
+}
+
+#[test]
+fn test_conditional_escrow_release_on_condition_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[1u8; 32]);
+    let expected = Bytes::from_slice(&env, b"delivered");
+    state_client.set_state(&state_key, &expected);
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id,
+        state_key,
+        expected_value: expected,
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    let met = client.evaluate_and_release(&escrow_id);
+    assert!(met);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+
+    let conditional = client.get_conditional_escrow(&escrow_id);
+    assert!(conditional.evaluated);
+    assert!(conditional.result);
+}
+
+#[test]
+fn test_conditional_escrow_no_release_on_condition_not_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[2u8; 32]);
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"pending"));
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id,
+        state_key,
+        expected_value: Bytes::from_slice(&env, b"delivered"),
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    let met = client.evaluate_and_release(&escrow_id);
+    assert!(!met);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+
+    let conditional = client.get_conditional_escrow(&escrow_id);
+    assert!(conditional.evaluated);
+    assert!(!conditional.result);
+}
+
+#[test]
+fn test_conditional_escrow_re_evaluation_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[3u8; 32]);
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"pending"));
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id.clone(),
+        state_key: state_key.clone(),
+        expected_value: Bytes::from_slice(&env, b"delivered"),
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    // First evaluation: not met.
+    let first = client.evaluate_and_release(&escrow_id);
+    assert!(!first);
+
+    // Even if state changes to a matching value, re-evaluation is rejected.
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"delivered"));
+
+    let result = client.try_evaluate_and_release(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::ConditionAlreadyEvaluated)));
 }

@@ -57,6 +57,8 @@ pub enum DataKey {
     BeneficiaryTransferCount(u64),
     // Multi-party dispute
     MultiPartyDisputeKey(u64),
+    // Conditional escrow (on-chain state)
+    ConditionalEscrow(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +174,8 @@ pub enum Error {
     MilestoneOverflow = 49,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
+    ConditionalEscrowNotFound = 50,
+    ConditionAlreadyEvaluated = 51,
 }
 
 #[contractevent]
@@ -831,6 +835,37 @@ pub struct BeneficiaryTransferred {
     pub escrow_id: u64,
     pub old_merchant: Address,
     pub new_merchant: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct OnChainCondition {
+    pub contract_address: Address,
+    pub state_key: BytesN<32>,
+    pub expected_value: Bytes,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ConditionalEscrow {
+    pub escrow_id: u64,
+    pub condition: OnChainCondition,
+    pub evaluated: bool,
+    pub result: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionEvaluated {
+    pub escrow_id: u64,
+    pub met: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConditionalReleaseExecuted {
+    pub escrow_id: u64,
+    pub released_to: Address,
 }
 
 #[contractevent]
@@ -4411,6 +4446,179 @@ impl EscrowContract {
         };
 
         Self::internal_resolve_dispute(env, escrow.customer.clone(), escrow_id, release_to_merchant)
+    }
+
+    // ── CONDITIONAL ESCROW (ON-CHAIN STATE) ───────────────────────────────
+
+    pub fn create_conditional_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+        condition: OnChainCondition,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+        let escrow_id = counter + 1;
+
+        let current_timestamp = env.ledger().timestamp();
+
+        let fee_config = Self::get_escrow_fee_config(env.clone());
+        let fee_bps = if fee_config.enabled {
+            fee_config.fee_bps
+        } else {
+            0
+        };
+
+        let escrow = Escrow {
+            id: escrow_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount,
+            token: token.clone(),
+            status: EscrowStatus::Locked,
+            created_at: current_timestamp,
+            release_timestamp: u64::MAX,
+            dispute_started_at: 0,
+            last_activity_at: current_timestamp,
+            escalation_level: 0,
+            min_hold_period: 0,
+            fee_bps,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowCounter, &escrow_id);
+
+        let conditional = ConditionalEscrow {
+            escrow_id,
+            condition,
+            evaluated: false,
+            result: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalEscrow(escrow_id), &conditional);
+
+        EscrowCreated {
+            escrow_id,
+            customer,
+            merchant,
+            amount,
+            token,
+            release_timestamp: u64::MAX,
+        }
+        .publish(&env);
+
+        Ok(escrow_id)
+    }
+
+    pub fn evaluate_and_release(env: Env, escrow_id: u64) -> Result<bool, Error> {
+        let mut conditional: ConditionalEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConditionalEscrow(escrow_id))
+            .ok_or(Error::ConditionalEscrowNotFound)?;
+
+        if conditional.evaluated {
+            return Err(Error::ConditionAlreadyEvaluated);
+        }
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
+        args.push_back(conditional.condition.state_key.clone().into());
+        let actual_value: Bytes = env.invoke_contract(
+            &conditional.condition.contract_address,
+            &Symbol::new(&env, "get_state"),
+            args,
+        );
+
+        let met = actual_value == conditional.condition.expected_value;
+
+        conditional.evaluated = true;
+        conditional.result = met;
+        env.storage()
+            .instance()
+            .set(&DataKey::ConditionalEscrow(escrow_id), &conditional);
+
+        ConditionEvaluated { escrow_id, met }.publish(&env);
+
+        if met {
+            escrow.status = EscrowStatus::Released;
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(escrow_id), &escrow);
+
+            let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+            let merchant_amount = escrow.amount - fee_amount;
+
+            if fee_amount > 0 {
+                let fee_config = Self::get_escrow_fee_config(env.clone());
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &fee_config.fee_recipient,
+                    fee_amount,
+                )?;
+
+                if fee_config.fee_recipient == env.current_contract_address() {
+                    let mut acc: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::AccumulatedEscrowFees(escrow.token.clone()))
+                        .unwrap_or(0);
+                    acc += fee_amount;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::AccumulatedEscrowFees(escrow.token.clone()), &acc);
+                }
+
+                EscrowFeeCollected {
+                    escrow_id,
+                    fee_amount,
+                    recipient: fee_config.fee_recipient.clone(),
+                }
+                .publish(&env);
+            }
+
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                merchant_amount,
+            )?;
+
+            ConditionalReleaseExecuted {
+                escrow_id,
+                released_to: escrow.merchant.clone(),
+            }
+            .publish(&env);
+        }
+
+        Ok(met)
+    }
+
+    pub fn get_conditional_escrow(env: Env, escrow_id: u64) -> Result<ConditionalEscrow, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConditionalEscrow(escrow_id))
+            .ok_or(Error::ConditionalEscrowNotFound)
     }
 
     // ── BENEFICIARY TRANSFER ──────────────────────────────────────────────
