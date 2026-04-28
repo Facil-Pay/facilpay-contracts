@@ -114,6 +114,22 @@ pub enum PriceComparison {
     EqualTo,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionTrialData {
+    pub period_seconds: u64,
+    pub ends_at: u64,
+    pub converted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionPauseData {
+    pub last_paused_at: u64,
+    pub total_pause_duration: u64,
+    pub proration_enabled: bool,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct Subscription {
@@ -133,9 +149,8 @@ pub struct Subscription {
     pub retry_count: u64,   // consecutive failed attempts on current cycle
     pub max_retries: u64,   // max retries before marking failed cycle skipped
     pub metadata: String,
-    pub trial_period_seconds: u64, // 0 = no trial
-    pub trial_ends_at: u64,        // 0 = no trial
-    pub converted: bool,           // true after first post-trial charge
+    pub trial_data: SubscriptionTrialData,
+    pub pause_data: SubscriptionPauseData,
 }
 
 #[contracterror]
@@ -310,6 +325,15 @@ pub struct SubscriptionPaused {
 pub struct SubscriptionResumed {
     pub subscription_id: u64,
     pub next_payment_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionResumedWithProration {
+    pub subscription_id: u64,
+    pub pause_duration: u64,
+    pub new_next_billing_date: u64,
+    pub prorated_amount: i128,
 }
 
 #[contractevent]
@@ -2551,9 +2575,16 @@ impl PaymentContract {
             retry_count: 0,
             max_retries: retries,
             metadata,
-            trial_period_seconds,
-            trial_ends_at,
-            converted: false,
+            trial_data: SubscriptionTrialData {
+                period_seconds: trial_period_seconds,
+                ends_at: trial_ends_at,
+                converted: false,
+            },
+            pause_data: SubscriptionPauseData {
+                last_paused_at: 0,
+                total_pause_duration: 0,
+                proration_enabled: false,
+            },
         };
 
         env.storage()
@@ -2603,10 +2634,10 @@ impl PaymentContract {
         .publish(&env);
 
         // Emit TrialStarted if trial is active
-        if sub.trial_ends_at > 0 {
+        if sub.trial_data.ends_at > 0 {
             (TrialStarted {
                 subscription_id: sub_id,
-                trial_ends_at: sub.trial_ends_at,
+                trial_ends_at: sub.trial_data.ends_at,
             })
             .publish(&env);
         }
@@ -2742,7 +2773,7 @@ impl PaymentContract {
         }
 
         // Skip charge if still within trial period
-        if sub.trial_ends_at > 0 && now < sub.trial_ends_at {
+        if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             sub.next_payment_at = now + sub.interval;
             env.storage()
                 .instance()
@@ -2760,8 +2791,8 @@ impl PaymentContract {
 
         if transfer_ok {
             // Mark converted on first post-trial charge
-            if sub.trial_ends_at > 0 && !sub.converted {
-                sub.converted = true;
+            if sub.trial_data.ends_at > 0 && !sub.trial_data.converted {
+                sub.trial_data.converted = true;
                 (TrialConverted {
                     subscription_id,
                     converted_at: now,
@@ -2853,7 +2884,7 @@ impl PaymentContract {
 
         // Emit TrialCancelled if cancelled during trial
         let now = env.ledger().timestamp();
-        if sub.trial_ends_at > 0 && now < sub.trial_ends_at {
+        if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             (TrialCancelled {
                 subscription_id,
                 cancelled_at: now,
@@ -2901,6 +2932,7 @@ impl PaymentContract {
         }
 
         sub.status = SubscriptionStatus::Paused;
+        sub.pause_data.last_paused_at = env.ledger().timestamp();
         env.storage()
             .instance()
             .set(&DataKey::Subscription(subscription_id), &sub);
@@ -2941,8 +2973,38 @@ impl PaymentContract {
         }
 
         let now = env.ledger().timestamp();
-        sub.next_payment_at = now + sub.interval;
+        let pause_duration = now - sub.pause_data.last_paused_at;
+        sub.pause_data.total_pause_duration += pause_duration;
+
+        // Shift next billing date by pause duration
+        sub.next_payment_at += pause_duration;
+
+        // Shift ends_at if it's a fixed-duration subscription
+        if sub.ends_at > 0 {
+            sub.ends_at += pause_duration;
+        }
+
         sub.status = SubscriptionStatus::Active;
+
+        if sub.pause_data.proration_enabled {
+            // Proration formula: (Full Amount * Remaining Time in Cycle) / Cycle Duration
+            let remaining_time = sub.next_payment_at - now;
+            let prorated_amount = (sub.amount * remaining_time as i128) / sub.interval as i128;
+
+            (SubscriptionResumedWithProration {
+                subscription_id,
+                pause_duration,
+                new_next_billing_date: sub.next_payment_at,
+                prorated_amount,
+            })
+            .publish(&env);
+        } else {
+            (SubscriptionResumed {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+            })
+            .publish(&env);
+        }
 
         env.storage()
             .instance()
@@ -5865,6 +5927,41 @@ impl PaymentContract {
             Some(meta) => meta.content_hash == plaintext_hash,
             None => false,
         }
+    }
+
+    /// Toggle proration for a subscription. Only the customer can change this.
+    pub fn set_subscription_proration(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Subscription(subscription_id))
+        {
+            return Err(Error::SubscriptionNotFound);
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(subscription_id))
+            .unwrap();
+
+        if sub.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+
+        sub.pause_data.proration_enabled = enabled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Subscription(subscription_id), &sub);
+
+        Ok(())
     }
 }
 
