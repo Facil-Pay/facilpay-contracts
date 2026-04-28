@@ -109,6 +109,7 @@ pub enum Error {
     ContractPaused = 17,
     FunctionPaused = 18,
     BatchRefundTooLarge = 20,
+    RefundRateLimitExceeded = 26,
     PaymentContractNotSet = 27,
     PaymentOwnershipMismatch = 28,
     CircuitBreakerTripped = 29,
@@ -463,6 +464,23 @@ pub struct BatchRefundResult {
     pub success: bool,
     pub error_code: u32,
     pub amount_refunded: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct CustomerRefundRateLimit {
+    pub customer: Address,
+    pub window_start: u64,
+    pub request_count: u32,
+    pub max_requests_per_window: u32,
+    pub window_seconds: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct GlobalRefundRateLimit {
+    pub max_requests_per_window: u32,
+    pub window_seconds: u64,
 }
 
 #[contractevent]
@@ -1040,6 +1058,59 @@ impl RefundContract {
             .instance()
             .get(&DataKey::AutoRefundTrigger(trigger_id))
             .ok_or(Error::AutoRefundTriggerNotFound)
+    }
+
+    pub fn set_customer_rate_limit(
+        env: Env,
+        admin: Address,
+        customer: Address,
+        max_per_window: u32,
+        window_seconds: u64
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let mut limit = env.storage().instance().get(&DataKey::CustomerRefundRateLimit(customer.clone()))
+            .unwrap_or(CustomerRefundRateLimit {
+                customer: customer.clone(),
+                window_start: env.ledger().timestamp(),
+                request_count: 0,
+                max_requests_per_window: max_per_window,
+                window_seconds,
+            });
+            
+        limit.max_requests_per_window = max_per_window;
+        limit.window_seconds = window_seconds;
+        
+        env.storage().instance().set(&DataKey::CustomerRefundRateLimit(customer), &limit);
+        Ok(())
+    }
+
+    pub fn get_customer_rate_limit_status(env: Env, customer: Address) -> CustomerRefundRateLimit {
+        env.storage().instance().get(&DataKey::CustomerRefundRateLimit(customer.clone()))
+            .unwrap_or(CustomerRefundRateLimit {
+                customer,
+                window_start: 0,
+                request_count: 0,
+                max_requests_per_window: 0,
+                window_seconds: 0,
+            })
+    }
+
+    pub fn set_global_refund_rate_limit(
+        env: Env,
+        admin: Address,
+        max_per_window: u32,
+        window_seconds: u64
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        
+        let limit = GlobalRefundRateLimit {
+            max_requests_per_window: max_per_window,
+            window_seconds,
+        };
+        
+        env.storage().instance().set(&DataKey::GlobalRefundRateLimit, &limit);
+        Ok(())
     }
 
     pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), Error> {
@@ -3323,6 +3394,7 @@ impl RefundContract {
 mod test;
 mod test_process;
 mod test_policy;
+mod test_rate_limit;
 
 #[cfg(test)]
 mod test_circuit_breaker;
