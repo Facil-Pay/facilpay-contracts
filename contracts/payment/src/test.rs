@@ -3263,6 +3263,183 @@ fn test_partial_refund_cumulative_exceeds_payment() {
     assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
 }
 
+#[test]
+fn test_set_merchant_rate_limit() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 10,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    let retrieved = client.get_merchant_rate_limit(&merchant);
+    assert!(retrieved.is_some());
+    assert_eq!(retrieved.unwrap().max_transactions_per_hour, 10);
+}
+
+#[test]
+fn test_merchant_rate_limit_enforcement() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set merchant limit: 1 transaction per hour
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    env.ledger().set_timestamp(1000);
+    // First payment should succeed
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+
+    // Second payment should fail
+    let result = client.try_create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::MerchantRateLimitExceeded);
+}
+
+#[test]
+fn test_merchant_rate_limit_window_reset() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set merchant limit: 1 transaction per hour
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    env.ledger().set_timestamp(1000);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+
+    // Advance time by 1 hour + 1 second
+    env.ledger().set_timestamp(1000 + 3600 + 1);
+
+    // Should succeed now
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+}
+
+#[test]
+fn test_merchant_rate_limit_global_fallback() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set global limit: max amount 50
+    client.set_rate_limit_config(
+        &admin,
+        &(RateLimitConfig {
+            max_payments_per_window: 0,
+            window_duration: 0,
+            max_payment_amount: 50,
+            max_daily_volume: 0,
+        }),
+    );
+
+    // No merchant limit set, should use global
+    let result = client.try_create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::AmountExceedsLimit);
+}
+
+#[test]
+fn test_check_rate_limit_read_only() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let merchant = Address::generate(&env);
+
+    // Set merchant limit
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 100,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    // Check should pass (read-only)
+    assert!(client.check_rate_limit(&merchant, &50));
+
+    // State should not change
+    let retrieved = client.get_merchant_rate_limit(&merchant);
+    assert_eq!(retrieved.unwrap().current_transactions, 0);
+}
+
 // ── DUNNING MANAGEMENT TESTS ─────────────────────────────────────────
 
 fn setup_dunning_contract(
