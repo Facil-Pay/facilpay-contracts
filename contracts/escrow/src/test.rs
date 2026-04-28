@@ -909,6 +909,162 @@ fn test_multiple_escrows() {
     assert_eq!(escrow2.amount, 2000_i128);
 }
 
+fn merkle_leaf_keccak<const N: usize>(env: &Env, payload: &[u8; N]) -> BytesN<32> {
+    let b = Bytes::from_array(env, payload);
+    env.crypto().keccak256(&b).into()
+}
+
+fn merkle_root_two_leaves(env: &Env, left: BytesN<32>, right: BytesN<32>) -> BytesN<32> {
+    let la = left.to_array();
+    let ra = right.to_array();
+    let mut raw = [0u8; 64];
+    raw[..32].copy_from_slice(&la);
+    raw[32..].copy_from_slice(&ra);
+    let bytes = Bytes::from_array(env, &raw);
+    env.crypto().keccak256(&bytes).into()
+}
+
+#[test]
+fn test_commit_root_recommit_guard() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[7_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let result = client.try_commit_evidence_root(&merchant, &escrow_id, &root);
+    assert_eq!(result, Err(Ok(Error::RootAlreadyCommitted)));
+}
+
+#[test]
+fn test_get_evidence_commitment_returns_committed_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[8_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let commitment = client.try_get_evidence_commitment(&escrow_id).unwrap().unwrap();
+    assert_eq!(commitment.escrow_id, escrow_id);
+    assert_eq!(commitment.merkle_root, root);
+    assert_eq!(commitment.committed_at, 1000);
+    assert_eq!(commitment.committed_by, customer);
+}
+
+#[test]
+fn test_submit_evidence_with_valid_merkle_proof() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0.clone(), leaf1.clone());
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut proof = Vec::new(&env);
+    proof.push_back(leaf1);
+    client.submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &proof,
+        &0_u32,
+    );
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_submit_evidence_with_invalid_merkle_proof_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0, leaf1);
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut bad_proof = Vec::new(&env);
+    bad_proof.push_back(BytesN::from_array(&env, &[9_u8; 32]));
+    let result = client.try_submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &bad_proof,
+        &0_u32,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
+
+    // Invalid proof should not store evidence
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_submit_evidence_with_proof_falls_back_without_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence = Bytes::from_array(&env, b"ipfs://fallback-path");
+    let empty_proof = Vec::new(&env);
+    client.submit_evidence_with_proof(&customer, &escrow_id, &evidence, &empty_proof, &0_u32);
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
 #[test]
 fn test_submit_evidence_by_both_parties() {
     let env = Env::default();

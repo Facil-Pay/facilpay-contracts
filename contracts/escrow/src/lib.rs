@@ -17,6 +17,7 @@ pub enum DataKey {
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
     EscrowEvidenceCount(u64),
+    EvidenceCommitment(u64),
     ReputationScore(Address),
     ReputationConfig,
     VestingSchedule(u64),
@@ -165,10 +166,8 @@ pub enum Error {
     Underfunded = 32,
     NotClaimable = 33,
     OracleStalePriceFeed = 44,
-    OracleConditionNotMet = 45,
     NoOracleCondition = 46,
     BatchTooLarge = 40,
-    BatchPartialFailure = 41,
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
@@ -176,6 +175,10 @@ pub enum Error {
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
     ConditionAlreadyEvaluated = 51,
+    // Merkle evidence (use free slots; contracterror has a max variant count)
+    InvalidMerkleProof = 34,
+    RootAlreadyCommitted = 38,
+    NoEvidenceRoot = 39,
 }
 
 #[contractevent]
@@ -504,6 +507,16 @@ pub struct Evidence {
     pub submitter: Address,
     pub ipfs_hash: String,
     pub submitted_at: u64,
+}
+
+/// Pre-committed Merkle root for dispute evidence integrity (one per escrow).
+#[derive(Clone)]
+#[contracttype]
+pub struct EvidenceCommitment {
+    pub escrow_id: u64,
+    pub merkle_root: BytesN<32>,
+    pub committed_at: u64,
+    pub committed_by: Address,
 }
 
 #[derive(Clone)]
@@ -2036,13 +2049,167 @@ impl EscrowContract {
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
             return Err(Error::EscrowNotFound);
         }
-        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
         if escrow.status != EscrowStatus::Disputed {
             return Err(Error::NotDisputed);
         }
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
+    }
+
+    /// One-time commitment of the evidence Merkle root for an escrow (must be disputed).
+    pub fn commit_evidence_root(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        merkle_root: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::EvidenceCommitment(escrow_id))
+        {
+            return Err(Error::RootAlreadyCommitted);
+        }
+        let commitment = EvidenceCommitment {
+            escrow_id,
+            merkle_root,
+            committed_at: env.ledger().timestamp(),
+            committed_by: caller,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::EvidenceCommitment(escrow_id), &commitment);
+        Ok(())
+    }
+
+    /// Submit evidence bytes with a Keccak Merkle proof against the committed root.
+    ///
+    /// Leaf hash is `keccak256(evidence)`. If no root was committed for this escrow,
+    /// behaves like [`Self::submit_evidence`] using the UTF-8-safe prefix of `evidence`
+    /// as the stored reference string (same unverified path as legacy submissions).
+    ///
+    /// Invalid proofs return [`Error::InvalidMerkleProof`] and emit **no** event.
+    pub fn submit_evidence_with_proof(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        evidence: Bytes,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let escrow_check = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow_check.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow_check.customer != caller && escrow_check.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let commitment_opt = env
+            .storage()
+            .instance()
+            .get::<DataKey, EvidenceCommitment>(&DataKey::EvidenceCommitment(escrow_id));
+
+        if commitment_opt.is_none() {
+            let ipfs_hash = EscrowContract::evidence_bytes_to_label_string(&env, evidence);
+            return EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash);
+        }
+
+        let commitment = commitment_opt.unwrap();
+        let leaf_hash: BytesN<32> = env.crypto().keccak256(&evidence).into();
+        if !EscrowContract::verify_keccak_merkle_proof(
+            &env,
+            leaf_hash,
+            proof,
+            leaf_index,
+            commitment.merkle_root,
+        ) {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        let ipfs_hash = EscrowContract::evidence_bytes_to_label_string(&env, evidence);
+        EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
+    }
+
+    pub fn get_evidence_commitment(env: Env, escrow_id: u64) -> Result<EvidenceCommitment, Error> {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        env.storage()
+            .instance()
+            .get::<DataKey, EvidenceCommitment>(&DataKey::EvidenceCommitment(escrow_id))
+            .ok_or(Error::NoEvidenceRoot)
+    }
+
+    fn verify_keccak_merkle_proof(
+        env: &Env,
+        leaf_hash: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+        root: BytesN<32>,
+    ) -> bool {
+        let mut computed = leaf_hash;
+        let mut idx = leaf_index as u64;
+        let mut i = 0u32;
+        while i < proof.len() {
+            let sibling = proof.get(i).unwrap();
+            computed = if idx % 2 == 0 {
+                EscrowContract::hash_keccak_pair(env, computed, sibling)
+            } else {
+                EscrowContract::hash_keccak_pair(env, sibling.clone(), computed)
+            };
+            idx /= 2;
+            i += 1;
+        }
+        computed == root
+    }
+
+    fn hash_keccak_pair(env: &Env, left: BytesN<32>, right: BytesN<32>) -> BytesN<32> {
+        let la = left.to_array();
+        let ra = right.to_array();
+        let mut raw = [0u8; 64];
+        raw[..32].copy_from_slice(&la);
+        raw[32..].copy_from_slice(&ra);
+        let buf = Bytes::from_array(env, &raw);
+        env.crypto().keccak256(&buf).into()
+    }
+
+    fn evidence_bytes_to_label_string(env: &Env, evidence: Bytes) -> String {
+        const CAP: u32 = 160;
+        let n = core::cmp::min(evidence.len(), CAP);
+        let mut tmp = [0u8; 160];
+        let mut j = 0u32;
+        while j < n {
+            tmp[j as usize] = evidence.get(j).unwrap();
+            j += 1;
+        }
+        String::from_bytes(env, &tmp[..n as usize])
+    }
+
+    fn append_evidence_entry(
+        env: &Env,
+        escrow_id: u64,
+        caller: Address,
+        ipfs_hash: String,
+    ) -> Result<(), Error> {
         let count: u64 = env
             .storage()
             .instance()
@@ -2059,6 +2226,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::EscrowEvidenceCount(escrow_id), &(count + 1));
+        let mut escrow = EscrowContract::get_escrow(env, escrow_id);
         escrow.last_activity_at = env.ledger().timestamp();
         env.storage()
             .instance()
@@ -2068,7 +2236,7 @@ impl EscrowContract {
             submitter: caller,
             ipfs_hash,
         }
-        .publish(&env);
+        .publish(env);
         Ok(())
     }
 
