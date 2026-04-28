@@ -1912,3 +1912,154 @@ fn test_arbitration_outcome_execution_rejected() {
     assert_eq!(refund.token, token);
     assert_eq!(refund.status, RefundStatus::Rejected);
 }
+
+#[test]
+fn test_file_and_resolve_appeal_upheld_processes_refund() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &1000i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "original"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "challenge"));
+    let appeal = client.get_appeal(&appeal_id);
+    assert_eq!(appeal.resolved, false);
+
+    client.resolve_appeal(&admin, &appeal_id, &true);
+
+    let resolved = client.get_appeal(&appeal_id);
+    assert_eq!(resolved.resolved, true);
+    assert_eq!(resolved.outcome, Some(true));
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Processed);
+}
+
+#[test]
+#[should_panic]
+fn test_file_appeal_after_window_expires_should_fail() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &2u64,
+        &customer,
+        &500i128,
+        &500i128,
+        &token,
+        &String::from_str(&env, "request"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
+
+    env.ledger().set_timestamp(1_000 + 72 * 60 * 60 + 1);
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "late challenge"));
+}
+
+#[test]
+#[should_panic]
+fn test_file_duplicate_appeal_should_fail() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &3u64,
+        &customer,
+        &250i128,
+        &250i128,
+        &token,
+        &String::from_str(&env, "request"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
+
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "first"));
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "second"));
+}
+
+#[test]
+fn test_resolve_appeal_rejected_keeps_refund_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &4u64,
+        &customer,
+        &300i128,
+        &300i128,
+        &token,
+        &String::from_str(&env, "request"),
+        &RefundReasonCode::Other,
+        &env.ledger().timestamp(),
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
+
+    let appeal_id = client.file_appeal(&customer, &refund_id, &String::from_str(&env, "challenge"));
+    client.resolve_appeal(&admin, &appeal_id, &false);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Rejected);
+
+    let resolved = client.get_appeal(&appeal_id);
+    assert_eq!(resolved.resolved, true);
+    assert_eq!(resolved.outcome, Some(false));
+}
