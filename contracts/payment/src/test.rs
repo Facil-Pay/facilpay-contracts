@@ -4061,6 +4061,134 @@ fn test_batch_payment_events_emitted() {
     assert_eq!(payment.amount, 100_i128);
 }
 
+#[test]
+fn test_create_payment_batch_optimized_same_token_grouping() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer1.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer2.clone(),
+            merchant: merchant.clone(),
+            amount: 200_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let results = client.create_payment_batch_optimized(&admin, &entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+    assert_eq!(results.get(0).unwrap().payment_id, 1);
+    assert_eq!(results.get(1).unwrap().payment_id, 2);
+
+    // Check payments are completed
+    let p1 = client.get_payment(&1);
+    assert_eq!(p1.status, PaymentStatus::Completed);
+    let p2 = client.get_payment(&2);
+    assert_eq!(p2.status, PaymentStatus::Completed);
+}
+
+#[test]
+fn test_create_payment_batch_optimized_cross_token_isolation() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token1 = Address::generate(&env);
+    let token2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant1.clone(),
+            amount: 100_i128,
+            token: token1.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant2.clone(),
+            amount: 200_i128,
+            token: token2.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let results = client.create_payment_batch_optimized(&admin, &entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+}
+
+#[test]
+fn test_get_batch_gas_estimate() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 200_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let estimate = client.get_batch_gas_estimate(&entries);
+    assert!(estimate > 0);
+}
+
 // ── FEE MANAGEMENT TESTS ─────────────────────────────────────────────────────
 
 fn setup_fee_contract(
