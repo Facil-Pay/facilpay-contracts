@@ -60,6 +60,7 @@ pub enum DataKey {
     MultiPartyDisputeKey(u64),
     // Conditional escrow (on-chain state)
     ConditionalEscrow(u64),
+    SuccessionPlan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -175,6 +176,9 @@ pub enum Error {
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
     ConditionAlreadyEvaluated = 51,
+    SuccessionPlanExists = 52,
+    SuccessionPlanNotFound = 53,
+    SuccessionAlreadyActivated = 54,
     // Merkle evidence (use free slots; contracterror has a max variant count)
     InvalidMerkleProof = 34,
     RootAlreadyCommitted = 38,
@@ -576,6 +580,16 @@ pub struct MultiSigConfig {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct SuccessionPlan {
+    pub successor: Address,
+    pub designated_by: Address,
+    pub designated_at: u64,
+    pub activatable_after: u64,
+    pub activated: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct AdminProposal {
     pub id: String,
     pub proposer: Address,
@@ -712,6 +726,26 @@ pub struct AdminAdded {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminRemoved {
     pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessorDesignated {
+    pub successor: Address,
+    pub activatable_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessionActivated {
+    pub new_admin: Address,
+    pub activated_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessionRevoked {
+    pub revoked_by: Address,
 }
 
 #[contractevent]
@@ -1290,6 +1324,128 @@ impl EscrowContract {
             .set(&DataKey::MultiSigConfig, &config);
 
         Ok(())
+    }
+
+    pub fn designate_successor(
+        env: Env,
+        admin: Address,
+        successor: Address,
+        delay_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, SuccessionPlan>(&DataKey::SuccessionPlan)
+        {
+            if !existing.activated {
+                return Err(Error::SuccessionPlanExists);
+            }
+        }
+
+        let designated_at = env.ledger().timestamp();
+        let activatable_after = designated_at.saturating_add(delay_seconds);
+        let plan = SuccessionPlan {
+            successor: successor.clone(),
+            designated_by: admin,
+            designated_at,
+            activatable_after,
+            activated: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SuccessionPlan, &plan);
+
+        SuccessorDesignated {
+            successor,
+            activatable_after,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn activate_succession(env: Env, successor: Address) -> Result<(), Error> {
+        successor.require_auth();
+
+        let mut plan: SuccessionPlan = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuccessionPlan)
+            .ok_or(Error::SuccessionPlanNotFound)?;
+
+        if plan.activated {
+            return Err(Error::SuccessionAlreadyActivated);
+        }
+        if plan.successor != successor {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < plan.activatable_after {
+            return Err(Error::ActionNotReady);
+        }
+
+        let mut config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&successor) {
+            config.admins.push_back(successor.clone());
+            config.total_admins += 1;
+            env.storage()
+                .instance()
+                .set(&DataKey::MultiSigConfig, &config);
+            AdminAdded {
+                admin: successor.clone(),
+            }
+            .publish(&env);
+        }
+
+        plan.activated = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::SuccessionPlan, &plan);
+
+        SuccessionActivated {
+            new_admin: successor,
+            activated_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn revoke_succession(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let plan: SuccessionPlan = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuccessionPlan)
+            .ok_or(Error::SuccessionPlanNotFound)?;
+
+        if plan.activated {
+            return Err(Error::SuccessionAlreadyActivated);
+        }
+
+        env.storage().instance().remove(&DataKey::SuccessionPlan);
+        SuccessionRevoked { revoked_by: admin }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_succession_plan(env: Env) -> Option<SuccessionPlan> {
+        env.storage().instance().get(&DataKey::SuccessionPlan)
     }
 
     pub fn create_escrow(
@@ -5421,3 +5577,6 @@ mod beneficiary_transfer_test;
 
 #[cfg(test)]
 mod multi_party_dispute_test;
+
+#[cfg(test)]
+mod succession_test;
