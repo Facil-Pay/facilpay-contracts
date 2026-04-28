@@ -41,6 +41,7 @@ pub enum DataKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
+    ActivePauseIndex(String),
     // Multi-token escrow
     MultiTokenEscrow(u64),
     MultiTokenEscrowCounter,
@@ -179,6 +180,7 @@ pub enum Error {
     InvalidMerkleProof = 34,
     RootAlreadyCommitted = 38,
     NoEvidenceRoot = 39,
+    EmptyPauseReason = 52,
 }
 
 #[contractevent]
@@ -823,11 +825,11 @@ pub struct PauseState {
 #[derive(Clone)]
 #[contracttype]
 pub struct PauseHistory {
-    pub index: u64,
     pub function_name: String,
-    pub paused: bool,
-    pub changed_by: Address,
-    pub changed_at: u64,
+    pub paused_by: Address,
+    pub paused_at: u64,
+    pub unpaused_by: Option<Address>,
+    pub unpaused_at: Option<u64>,
     pub reason: String,
 }
 
@@ -3945,6 +3947,14 @@ impl EscrowContract {
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
         }
+        let global_key = String::from_str(&env, "global");
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::ActivePauseIndex(global_key.clone()))
+        {
+            return Ok(());
+        }
         let now = env.ledger().timestamp();
         let pause_state = if let Some(mut state) = env
             .storage()
@@ -3974,11 +3984,11 @@ impl EscrowContract {
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
-            index: history_count,
-            function_name: String::from_str(&env, "global"),
-            paused: true,
-            changed_by: admin.clone(),
-            changed_at: now,
+            function_name: global_key.clone(),
+            paused_by: admin.clone(),
+            paused_at: now,
+            unpaused_by: None,
+            unpaused_at: None,
             reason: reason.clone(),
         };
         env.storage()
@@ -3987,6 +3997,9 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::ActivePauseIndex(global_key), &history_count);
         (ContractPausedEvent {
             paused_by: admin,
             reason,
@@ -4017,25 +4030,27 @@ impl EscrowContract {
                 .set(&DataKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
-        let history_count: u64 = env
+        let global_key = String::from_str(&env, "global");
+        if let Some(active_idx) = env
             .storage()
             .instance()
-            .get(&DataKey::PauseHistoryCount)
-            .unwrap_or(0);
-        let entry = PauseHistory {
-            index: history_count,
-            function_name: String::from_str(&env, "global"),
-            paused: false,
-            changed_by: admin.clone(),
-            changed_at: now,
-            reason: String::from_str(&env, ""),
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage()
-            .instance()
-            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+            .get::<DataKey, u64>(&DataKey::ActivePauseIndex(global_key.clone()))
+        {
+            if let Some(mut entry) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PauseHistory>(&DataKey::PauseHistoryEntry(active_idx))
+            {
+                entry.unpaused_by = Some(admin.clone());
+                entry.unpaused_at = Some(now);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PauseHistoryEntry(active_idx), &entry);
+            }
+            env.storage()
+                .instance()
+                .remove(&DataKey::ActivePauseIndex(global_key));
+        }
         (ContractUnpausedEvent {
             unpaused_by: admin,
             unpaused_at: now,
@@ -4058,6 +4073,16 @@ impl EscrowContract {
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
+        }
+        if reason.len() == 0 {
+            return Err(Error::EmptyPauseReason);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::ActivePauseIndex(function_name.clone()))
+        {
+            return Ok(());
         }
         let now = env.ledger().timestamp();
         let mut pause_state = if let Some(state) = env
@@ -4089,11 +4114,11 @@ impl EscrowContract {
             .get(&DataKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
-            index: history_count,
             function_name: function_name.clone(),
-            paused: true,
-            changed_by: admin.clone(),
-            changed_at: now,
+            paused_by: admin.clone(),
+            paused_at: now,
+            unpaused_by: None,
+            unpaused_at: None,
             reason: reason.clone(),
         };
         env.storage()
@@ -4102,6 +4127,9 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::ActivePauseIndex(function_name.clone()), &history_count);
         (FunctionPausedEvent {
             function_name,
             paused_by: admin,
@@ -4138,31 +4166,81 @@ impl EscrowContract {
                 .set(&DataKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
-        let history_count: u64 = env
+        if let Some(active_idx) = env
             .storage()
             .instance()
-            .get(&DataKey::PauseHistoryCount)
-            .unwrap_or(0);
-        let entry = PauseHistory {
-            index: history_count,
-            function_name: function_name.clone(),
-            paused: false,
-            changed_by: admin.clone(),
-            changed_at: now,
-            reason: String::from_str(&env, ""),
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage()
-            .instance()
-            .set(&DataKey::PauseHistoryCount, &(history_count + 1));
+            .get::<DataKey, u64>(&DataKey::ActivePauseIndex(function_name.clone()))
+        {
+            if let Some(mut entry) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PauseHistory>(&DataKey::PauseHistoryEntry(active_idx))
+            {
+                entry.unpaused_by = Some(admin.clone());
+                entry.unpaused_at = Some(now);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PauseHistoryEntry(active_idx), &entry);
+            }
+            env.storage()
+                .instance()
+                .remove(&DataKey::ActivePauseIndex(function_name.clone()));
+        }
         (FunctionUnpausedEvent {
             function_name,
             unpaused_by: admin,
         })
         .publish(&env);
         Ok(())
+    }
+
+    pub fn get_pause_history(env: Env, limit: u32, offset: u32) -> Vec<PauseHistory> {
+        let mut result = Vec::new(&env);
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        if limit == 0 || (offset as u64) >= total {
+            return result;
+        }
+        let start = offset as u64;
+        let end = core::cmp::min(start.saturating_add(limit as u64), total);
+        let mut i = start;
+        while i < end {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PauseHistory>(&DataKey::PauseHistoryEntry(i))
+            {
+                result.push_back(entry);
+            }
+            i += 1;
+        }
+        result
+    }
+
+    pub fn get_function_pause_history(env: Env, function_name: String) -> Vec<PauseHistory> {
+        let mut result = Vec::new(&env);
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseHistoryCount)
+            .unwrap_or(0);
+        let mut i = 0u64;
+        while i < total {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PauseHistory>(&DataKey::PauseHistoryEntry(i))
+            {
+                if entry.function_name == function_name {
+                    result.push_back(entry);
+                }
+            }
+            i += 1;
+        }
+        result
     }
 
     pub fn get_pause_state(env: Env) -> PauseState {
@@ -5421,3 +5499,6 @@ mod beneficiary_transfer_test;
 
 #[cfg(test)]
 mod multi_party_dispute_test;
+
+#[cfg(test)]
+mod pause_history_test;
