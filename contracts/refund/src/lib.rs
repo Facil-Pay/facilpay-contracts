@@ -55,6 +55,12 @@ pub enum DataKey {
     WindowStart,
     WindowRefundVolume,
     WindowPaymentVolume,
+    RefundRejectedAt(u64),
+    Appeal(u64),
+    AppealCounter,
+    AppealByRefund(u64),
+    AppealByCustomer(Address, u64),
+    AppealByCustomerCount(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +116,9 @@ pub enum Error {
     InvalidScoreThreshold = 35,
     AutoRefundTriggerNotFound = 36,
     DuplicateAutoRefundTrigger = 37,
+    RefundNotRejected = 23,
+    AppealWindowExpired = 24,
+    AppealAlreadyFiled = 25,
 }
 
 #[contractevent]
@@ -164,6 +173,22 @@ pub struct RefundRejected {
     pub rejected_by: Address,
     pub rejected_at: u64,
     pub rejection_reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealFiled {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub appellant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealResolved {
+    pub appeal_id: u64,
+    pub upheld: bool,
+    pub resolved_at: u64,
 }
 
 #[contractevent]
@@ -290,6 +315,18 @@ pub struct Refund {
     pub requested_at: u64,
     pub reason: String,
     pub reason_code: RefundReasonCode,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundAppeal {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub appellant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+    pub resolved: bool,
+    pub outcome: Option<bool>,
 }
 
 #[contracttype]
@@ -651,6 +688,7 @@ impl RefundContract {
         // Store updated refund back to storage
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+        env.storage().instance().set(&DataKey::RefundRejectedAt(refund_id), &env.ledger().timestamp());
 
         // Emit RefundRejected event
         (RefundRejected {
@@ -661,6 +699,173 @@ impl RefundContract {
         }).publish(&env);
 
         Ok(())
+    }
+
+    pub fn file_appeal(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+        reason: String,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+        if refund.status != RefundStatus::Rejected {
+            return Err(Error::RefundNotRejected);
+        }
+        if env.storage().instance().has(&DataKey::AppealByRefund(refund_id)) {
+            return Err(Error::AppealAlreadyFiled);
+        }
+
+        let rejected_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundRejectedAt(refund_id))
+            .ok_or(Error::RefundNotRejected)?;
+        let now = env.ledger().timestamp();
+        if now > rejected_at.saturating_add(72 * 60 * 60) {
+            return Err(Error::AppealWindowExpired);
+        }
+
+        let counter: u64 = env.storage().instance().get(&DataKey::AppealCounter).unwrap_or(0);
+        let appeal_id = counter + 1;
+        let appeal = RefundAppeal {
+            appeal_id,
+            refund_id,
+            appellant: customer.clone(),
+            reason,
+            filed_at: now,
+            resolved: false,
+            outcome: None,
+        };
+        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
+        env.storage().instance().set(&DataKey::AppealCounter, &appeal_id);
+        env.storage().instance().set(&DataKey::AppealByRefund(refund_id), &appeal_id);
+
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::AppealByCustomer(customer.clone(), customer_count),
+            &appeal_id,
+        );
+        env.storage().instance().set(
+            &DataKey::AppealByCustomerCount(customer.clone()),
+            &(customer_count + 1),
+        );
+
+        (AppealFiled {
+            appeal_id,
+            refund_id,
+            appellant: customer,
+        })
+        .publish(&env);
+
+        Ok(appeal_id)
+    }
+
+    pub fn resolve_appeal(
+        env: Env,
+        admin: Address,
+        appeal_id: u64,
+        uphold: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut appeal: RefundAppeal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Appeal(appeal_id))
+            .ok_or(Error::RefundNotFound)?;
+        if appeal.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        if uphold {
+            let mut refund: Refund = env
+                .storage()
+                .instance()
+                .get(&DataKey::Refund(appeal.refund_id))
+                .ok_or(Error::RefundNotFound)?;
+            if refund.status != RefundStatus::Rejected {
+                return Err(Error::RefundNotRejected);
+            }
+
+            Self::remove_from_status_index(&env, RefundStatus::Rejected, refund.id)?;
+            refund.status = RefundStatus::Approved;
+            env.storage().instance().set(&DataKey::Refund(refund.id), &refund);
+            Self::add_to_status_index(&env, RefundStatus::Approved, refund.id);
+
+            Self::process_refund_internal(&env, admin.clone(), refund.id)?;
+        }
+
+        appeal.resolved = true;
+        appeal.outcome = Some(uphold);
+        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
+
+        (AppealResolved {
+            appeal_id,
+            upheld: uphold,
+            resolved_at: env.ledger().timestamp(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_appeal(env: Env, appeal_id: u64) -> Result<RefundAppeal, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Appeal(appeal_id))
+            .ok_or(Error::RefundNotFound)
+    }
+
+    pub fn get_appeals_by_customer(env: Env, customer: Address) -> Vec<RefundAppeal> {
+        let mut appeals = Vec::new(&env);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .unwrap_or(0);
+
+        let mut index = 0u64;
+        while index < count {
+            if let Some(appeal_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::AppealByCustomer(customer.clone(), index))
+            {
+                if let Some(appeal) = env
+                    .storage()
+                    .instance()
+                    .get::<_, RefundAppeal>(&DataKey::Appeal(appeal_id))
+                {
+                    appeals.push_back(appeal);
+                }
+            }
+            index += 1;
+        }
+
+        appeals
     }
 
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
