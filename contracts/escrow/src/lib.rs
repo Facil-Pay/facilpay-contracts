@@ -180,11 +180,10 @@ pub enum Error {
     SuccessionPlanExists = 52,
     SuccessionPlanNotFound = 53,
     SuccessionAlreadyActivated = 54,
-    // Merkle evidence (use free slots; contracterror has a max variant count)
     InvalidMerkleProof = 34,
     RootAlreadyCommitted = 38,
     NoEvidenceRoot = 39,
-    EmptyPauseReason = 52,
+    EmptyPauseReason = 55,
 }
 
 #[contractevent]

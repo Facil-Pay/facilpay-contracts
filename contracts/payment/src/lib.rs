@@ -41,6 +41,9 @@ pub enum DataKey {
     OutstandingBalance(u64),
     // Oracle data
     OracleRateConfig(Currency),
+    // Payment Channel support (#125)
+    PaymentChannel(u64),
+    PaymentChannelCounter,
 }
 
 // Customer-specific data keys
@@ -246,6 +249,14 @@ pub enum Error {
     PartialPaymentNotFound = 70,
     MerchantRateLimitExceeded = 50,
     AmountRateLimitExceeded = 51,
+    InvalidFeeConfig = 71,
+    InvalidAmount = 72,
+    ChannelNotFound = 73,
+    InvalidSignature = 74,
+    InvalidNonce = 75,
+    ChannelClosed = 76,
+    ChannelExpired = 77,
+    ChannelNotExpired = 78,
 }
 
 #[contractevent]
@@ -385,6 +396,44 @@ pub struct RiskFeeApplied {
     pub base_fee_bps: u32,
     pub risk_surcharge_bps: u32,
     pub total_fee_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentChannel {
+    pub channel_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub deposited: i128,
+    pub settled: i128,
+    pub nonce: u64,
+    pub open: bool,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelOpened {
+    pub channel_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelSettled {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub customer_refund: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelExpiredClosed {
+    pub channel_id: u64,
+    pub refunded_to: Address,
 }
 
 #[contractevent]
@@ -6497,6 +6546,9 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::RiskFeeConfig, &config);
+        Ok(())
+    }
+
     /// Toggle proration for a subscription. Only the customer can change this.
     pub fn set_subscription_proration(
         env: Env,
@@ -6531,6 +6583,183 @@ impl PaymentContract {
 
         Ok(())
     }
+
+    // ── PAYMENT CHANNEL METHODS (#125) ──────────────────────────────────────
+
+    pub fn open_channel(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+        expires_at: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&customer, &contract_address, &amount);
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentChannelCounter)
+            .unwrap_or(0);
+        let channel_id = counter + 1;
+
+        let channel = PaymentChannel {
+            channel_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            token,
+            deposited: amount,
+            settled: 0,
+            nonce: 0,
+            open: true,
+            expires_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentChannel(channel_id), &channel);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentChannelCounter, &channel_id);
+
+        (ChannelOpened {
+            channel_id,
+            customer,
+            merchant,
+            amount,
+        })
+        .publish(&env);
+
+        Ok(channel_id)
+    }
+
+    pub fn settle_channel(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentChannel(channel_id))
+            .ok_or(Error::ChannelNotFound)?;
+
+        if !channel.open {
+            return Err(Error::ChannelClosed);
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::ChannelExpired);
+        }
+
+        if nonce <= channel.nonce {
+            return Err(Error::InvalidNonce);
+        }
+
+        if merchant_amount > channel.deposited {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+
+        let pk = Self::extract_public_key(&env, &channel.customer);
+        env.crypto().ed25519_verify(&pk, &msg, &signature);
+
+        let customer_refund = channel.deposited - merchant_amount;
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if merchant_amount > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &merchant_amount);
+        }
+        if customer_refund > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &customer_refund);
+        }
+
+        channel.settled = merchant_amount;
+        channel.nonce = nonce;
+        channel.open = false;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentChannel(channel_id), &channel);
+
+        (ChannelSettled {
+            channel_id,
+            merchant_amount,
+            customer_refund,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn close_channel_expired(env: Env, channel_id: u64) -> Result<(), Error> {
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentChannel(channel_id))
+            .ok_or(Error::ChannelNotFound)?;
+
+        if !channel.open {
+            return Err(Error::ChannelClosed);
+        }
+
+        if channel.expires_at == 0 || env.ledger().timestamp() <= channel.expires_at {
+            return Err(Error::ChannelNotExpired);
+        }
+
+        let refund_amount = channel.deposited;
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if refund_amount > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &refund_amount);
+        }
+
+        channel.open = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentChannel(channel_id), &channel);
+
+        (ChannelExpiredClosed {
+            channel_id,
+            refunded_to: channel.customer.clone(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_channel(env: Env, channel_id: u64) -> Result<PaymentChannel, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentChannel(channel_id))
+            .ok_or(Error::ChannelNotFound)
+    }
+
+    fn extract_public_key(env: &Env, address: &Address) -> BytesN<32> {
+        let xdr = address.to_xdr(env);
+        // Ed25519 Account Address XDR: 0 (ScAddress Account) + 0 (AccountId Ed25519) + 32 bytes PK
+        let mut pk = [0u8; 32];
+        for i in 0..32 {
+            pk[i] = xdr.get(8 + (i as u32)).unwrap();
+        }
+        BytesN::from_array(env, &pk)
+    }
 }
 
 mod test;
@@ -6544,6 +6773,9 @@ mod test_trial;
 mod test_issue_113_115_119_120;
 #[cfg(test)]
 mod test_metadata;
+
+#[cfg(test)]
+mod test_payment_channel;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
