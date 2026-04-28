@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 
 #[derive(Clone)]
-#[contracttype]
+#[contracttype(export = false)]
 pub enum DataKey {
     Admin,
     Refund(u64),
@@ -43,6 +43,8 @@ pub enum DataKey {
     AutoRefundTriggerCounter,
     // Batch refund limit (#135)
     BatchRefundLimit,
+    CustomerRefundRateLimit(Address),
+    GlobalRefundRateLimit,
     // Analytics
     RefundAnalyticsKey,
     // Pause system
@@ -323,6 +325,17 @@ pub struct Refund {
     pub requested_at: u64,
     pub reason: String,
     pub reason_code: RefundReasonCode,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRefundSummary {
+    pub total_requests: u64,
+    pub total_approved: u64,
+    pub total_rejected: u64,
+    pub total_amount_refunded: i128,
+    pub pending_count: u64,
+    pub pending_amount: i128,
 }
 
 #[derive(Clone)]
@@ -1915,6 +1928,101 @@ impl RefundContract {
         results
     }
 
+    pub fn get_merchant_refunds(env: Env, merchant: Address, limit: u64, offset: u64) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(&env);
+        let total = Self::get_merchant_refund_count(&env, &merchant);
+
+        if limit == 0 || offset >= total {
+            return results;
+        }
+
+        let end = core::cmp::min(total, offset.saturating_add(limit));
+        let mut index = offset;
+        while index < end {
+            if
+                let Some(refund_id) = env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(refund_id)) {
+                    results.push_back(refund);
+                }
+            }
+            index += 1;
+        }
+
+        results
+    }
+
+    pub fn get_merchant_refunds_by_status(
+        env: Env,
+        merchant: Address,
+        status: RefundStatus,
+        limit: u64,
+        offset: u64
+    ) -> Vec<Refund> {
+        Self::get_merchant_refunds_by_status_internal(&env, &merchant, status, limit, offset)
+    }
+
+    pub fn get_merchant_pending_refunds(env: Env, merchant: Address) -> Vec<Refund> {
+        let total = Self::get_merchant_refund_count(&env, &merchant);
+        Self::get_merchant_refunds_by_status_internal(
+            &env,
+            &merchant,
+            RefundStatus::Requested,
+            total,
+            0,
+        )
+    }
+
+    pub fn get_merchant_refund_summary(env: Env, merchant: Address) -> MerchantRefundSummary {
+        let total_requests = Self::get_merchant_refund_count(&env, &merchant);
+        let mut total_approved = 0u64;
+        let mut total_rejected = 0u64;
+        let mut total_amount_refunded = 0i128;
+        let mut pending_count = 0u64;
+        let mut pending_amount = 0i128;
+
+        let mut index = 0u64;
+        while index < total_requests {
+            if
+                let Some(refund_id) = env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(refund_id)) {
+                    match refund.status {
+                        RefundStatus::Approved => {
+                            total_approved += 1;
+                        }
+                        RefundStatus::Rejected => {
+                            total_rejected += 1;
+                        }
+                        RefundStatus::Processed => {
+                            total_amount_refunded += refund.amount;
+                        }
+                        RefundStatus::Requested => {
+                            pending_count += 1;
+                            pending_amount += refund.amount;
+                        }
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        MerchantRefundSummary {
+            total_requests,
+            total_approved,
+            total_rejected,
+            total_amount_refunded,
+            pending_count,
+            pending_amount,
+        }
+    }
+
     pub fn get_refunds_by_reason_code(
         env: &Env,
         code: RefundReasonCode,
@@ -3246,8 +3354,8 @@ impl RefundContract {
         }
 
         // Calculate refund rate
-        let refund_rate_bps = if total_payments > 0 {
-            (total_refunds * 10000) / total_payments
+        let refund_rate_bps: u32 = if total_payments > 0 {
+            ((total_refunds * 10000) / total_payments) as u32
         } else {
             0
         };
@@ -3267,7 +3375,7 @@ impl RefundContract {
                     signal.total_refunds = total_refunds;
                     env.storage()
                         .instance()
-                        .set(&DataKey::FraudSignal(address), &signal);
+                        .set(&DataKey::FraudSignal(address.clone()), &signal);
                     Some(signal)
                 }
                 None => {
@@ -3282,17 +3390,17 @@ impl RefundContract {
                     };
                     env.storage()
                         .instance()
-                        .set(&DataKey::FraudSignal(address), &signal);
+                        .set(&DataKey::FraudSignal(address.clone()), &signal);
 
                     // Add to flagged addresses index
-                    let mut flagged_count: u64 = env
+                    let flagged_count: u64 = env
                         .storage()
                         .instance()
                         .get(&DataKey::FlaggedAddressesIndex)
                         .unwrap_or(0);
                     env.storage()
                         .instance()
-                        .set(&DataKey::FlaggedAddressesIndex, &flagged_count + 1);
+                        .set(&DataKey::FlaggedAddressesIndex, &(flagged_count + 1));
 
                     // Emit fraud signal raised event
                     (FraudSignalRaised {
@@ -3341,7 +3449,7 @@ impl RefundContract {
         signal.reviewed = true;
         env.storage()
             .instance()
-            .set(&DataKey::FraudSignal(address), &signal);
+            .set(&DataKey::FraudSignal(address.clone()), &signal);
 
         // Emit fraud signal reviewed event
         (FraudSignalReviewed {
@@ -3389,6 +3497,50 @@ impl RefundContract {
             .unwrap_or(0);
         refund_count
     }
+
+    fn get_merchant_refund_count(env: &Env, merchant: &Address) -> u64 {
+        env.storage().instance().get(&DataKey::MerchantRefundCount(merchant.clone())).unwrap_or(0)
+    }
+
+    fn get_merchant_refunds_by_status_internal(
+        env: &Env,
+        merchant: &Address,
+        status: RefundStatus,
+        limit: u64,
+        offset: u64
+    ) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(env);
+        if limit == 0 {
+            return results;
+        }
+
+        let total = Self::get_merchant_refund_count(env, merchant);
+        let mut matched = 0u64;
+        let mut collected = 0u64;
+        let mut index = 0u64;
+
+        while index < total && collected < limit {
+            if
+                let Some(refund_id) = env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(refund_id)) {
+                    if refund.status == status {
+                        if matched >= offset {
+                            results.push_back(refund);
+                            collected += 1;
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+
+        results
+    }
 }
 
 mod test;
@@ -3419,3 +3571,6 @@ mod test_arbitrator_reputation;
 
 #[cfg(test)]
 mod test_auto_refund;
+
+#[cfg(test)]
+mod test_merchant_refunds;
