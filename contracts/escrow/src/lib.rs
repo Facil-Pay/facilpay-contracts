@@ -530,6 +530,16 @@ pub struct VestingSchedule {
     pub milestones: Vec<VestingMilestone>,
 }
 
+/// Snapshot of vesting cliff progress for a given escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct CliffStatus {
+    pub cliff_timestamp: u64,
+    pub cliff_passed: bool,
+    /// Seconds until the cliff is reached; `0` once `cliff_passed` is true.
+    pub seconds_remaining: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum ActionType {
@@ -2640,7 +2650,8 @@ impl EscrowContract {
     /// * `token` - The token address for the payment
     /// * `cliff_timestamp` - Timestamp before which no vesting occurs
     /// * `end_timestamp` - Timestamp when vesting completes
-    /// * `milestones` - Optional vector of VestingMilestone for milestone-based vesting
+    /// * `milestones` - Optional vector of VestingMilestone for milestone-based vesting.
+    ///   Each milestone's `unlock_timestamp` must be `>= cliff_timestamp` and `<= end_timestamp`.
     ///
     /// # Returns
     /// The escrow ID for the created vesting schedule
@@ -2805,6 +2816,33 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::VestingSchedule(escrow_id))
             .ok_or(Error::EscrowNotFound)
+    }
+
+    /// Returns cliff timing and whether the ledger time has reached the cliff.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    pub fn get_cliff_status(env: Env, escrow_id: u64) -> Result<CliffStatus, Error> {
+        let vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let now = env.ledger().timestamp();
+        let cliff_ts = vesting_schedule.cliff_timestamp;
+        let cliff_passed = now >= cliff_ts;
+        let seconds_remaining = if cliff_passed {
+            0_u64
+        } else {
+            cliff_ts.saturating_sub(now)
+        };
+
+        Ok(CliffStatus {
+            cliff_timestamp: cliff_ts,
+            cliff_passed,
+            seconds_remaining,
+        })
     }
 
     /// Calculates the total vested amount that has been unlocked based on the current timestamp.
@@ -3169,6 +3207,13 @@ impl EscrowContract {
 
         if existing_total.saturating_add(milestone.amount) > vesting_schedule.total_amount {
             return Err(Error::MilestoneOverflow);
+        }
+
+        if milestone.unlock_timestamp < vesting_schedule.cliff_timestamp {
+            return Err(Error::InvalidVestingSchedule);
+        }
+        if milestone.unlock_timestamp > vesting_schedule.end_timestamp {
+            return Err(Error::InvalidVestingSchedule);
         }
 
         // Auto-assign milestone_id if not provided

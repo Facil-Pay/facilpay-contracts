@@ -1332,6 +1332,100 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
     );
 }
 
+#[test]
+fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Cliff at 2000; first milestone unlocks at 1500 — invalid schedule
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            milestone_id: 1,
+            unlock_timestamp: 1500,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Too early"),
+            approved_by: None,
+            approved_at: None,
+        },
+        VestingMilestone {
+            milestone_id: 2,
+            unlock_timestamp: 3000,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Ok"),
+            approved_by: None,
+            approved_at: None,
+        },
+    ];
+
+    let result = client.try_create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &4000_u64,
+        &milestones,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidVestingSchedule)));
+}
+
+#[test]
+fn test_get_cliff_status_seconds_remaining_and_passed_flag() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let cliff_ts = 5000_u64;
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &cliff_ts,
+        &10_000_u64,
+        &milestones,
+    );
+
+    env.ledger().set_timestamp(2000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert_eq!(s.cliff_timestamp, cliff_ts);
+    assert!(!s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 3000);
+
+    env.ledger().set_timestamp(5000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+
+    // Mid vesting window: linear schedule has releasable amount > 0
+    env.ledger().set_timestamp(7500);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+    let released = client.release_vested_amount(&admin, &escrow_id);
+    assert!(released > 0);
+}
+
 // ── MULTI-PARTY ESCROW TESTS ────────────────────────────────────────────────
 
 #[test]
@@ -1730,8 +1824,7 @@ fn test_release_vested_amount_milestone() {
 }
 
 #[test]
-#[should_panic]
-fn test_release_vested_amount_before_cliff() {
+fn test_release_vested_amount_before_cliff_returns_cliff_error() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);
     let contract_id = env.register(EscrowContract, ());
@@ -1755,9 +1848,9 @@ fn test_release_vested_amount_before_cliff() {
         &milestones,
     );
 
-    // Try to release before cliff
     env.ledger().set_timestamp(1500);
-    client.release_vested_amount(&admin, &escrow_id);
+    let result = client.try_release_vested_amount(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::CliffPeriodNotPassed)));
 }
 
 #[test]
@@ -3820,33 +3913,32 @@ fn test_add_milestone_success() {
     env.mock_all_auths();
     client.initialize(&admin);
 
-    // Create with milestones summing to 8000 (leaving 2000 headroom)
-    let milestones = vec![
-        &env,
-        VestingMilestone {
-            milestone_id: 1,
-            unlock_timestamp: 2000,
-            amount: 8000,
-            released: false,
-            description: String::from_str(&env, "Main deliverable"),
-            approved_by: None,
-            approved_at: None,
-        },
-    ];
+    // Time-linear shell (no milestones at create); amounts are added via add_milestone
+    let milestones = Vec::new(&env);
     let escrow_id = client.create_vesting_escrow(
         &customer,
         &merchant,
         &10000_i128,
         &token,
         &1500_u64,
-        &3000_u64,
+        &5000_u64,
         &milestones,
     );
 
-    // Add a new milestone for the remaining 2000
+    let first = VestingMilestone {
+        milestone_id: 1,
+        unlock_timestamp: 2000,
+        amount: 8000,
+        released: false,
+        description: String::from_str(&env, "Main deliverable"),
+        approved_by: None,
+        approved_at: None,
+    };
+    client.add_milestone(&admin, &escrow_id, &first);
+
     let new_milestone = VestingMilestone {
         milestone_id: 0, // auto-assigned
-        unlock_timestamp: 3000,
+        unlock_timestamp: 4500,
         amount: 2000,
         released: false,
         description: String::from_str(&env, "Bonus deliverable"),
