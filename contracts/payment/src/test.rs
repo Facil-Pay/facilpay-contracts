@@ -3813,6 +3813,295 @@ fn test_cancel_escrowed_payment_refunds_customer() {
     assert_eq!(token_user_client.balance(&customer), amount);
 }
 
+#[test]
+fn test_dispute_escrowed_payment_by_customer_marks_escrow_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    let reason = String::from_str(&env, "item not delivered");
+    payment_client.dispute_escrowed_payment(&customer, &ids.0, &reason);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert_eq!(dispute.payment_id, ids.0);
+    assert_eq!(dispute.raised_by, customer);
+    assert_eq!(dispute.reason, reason);
+    assert_eq!(dispute.raised_at, 1234);
+    assert!(!dispute.resolved);
+    assert_eq!(dispute.resolved_at, None);
+    assert_eq!(dispute.favor_customer, None);
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Disputed);
+}
+
+#[test]
+fn test_dispute_escrowed_payment_rejects_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    let result = payment_client.try_dispute_escrowed_payment(
+        &attacker,
+        &ids.0,
+        &String::from_str(&env, "unauthorized"),
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_disputed_escrowed_payment_cannot_be_completed_or_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    payment_client.dispute_escrowed_payment(
+        &customer,
+        &ids.0,
+        &String::from_str(&env, "hold funds"),
+    );
+
+    let complete_result = payment_client.try_complete_escrowed_payment(&admin, &ids.0);
+    assert_eq!(complete_result, Err(Ok(Error::InvalidStatus)));
+
+    let cancel_result = payment_client.try_cancel_escrowed_payment(&customer, &ids.0);
+    assert_eq!(cancel_result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_resolve_escrowed_payment_dispute_in_favor_of_customer_refunds_customer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    payment_client.dispute_escrowed_payment(
+        &customer,
+        &ids.0,
+        &String::from_str(&env, "refund requested"),
+    );
+
+    env.ledger().set_timestamp(2345);
+    payment_client.resolve_escrowed_payment_dispute(&admin, &ids.0, &true);
+
+    let payment = payment_client.get_payment(&ids.0);
+    assert_eq!(payment.status, PaymentStatus::Refunded);
+    assert_eq!(payment.refunded_amount, amount);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert!(dispute.resolved);
+    assert_eq!(dispute.resolved_at, Some(2345));
+    assert_eq!(dispute.favor_customer, Some(true));
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+    assert_eq!(token_user_client.balance(&customer), amount);
+    assert_eq!(token_user_client.balance(&merchant), 0);
+    assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
+}
+
+#[test]
+fn test_resolve_escrowed_payment_dispute_in_favor_of_merchant_releases_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    payment_client.dispute_escrowed_payment(
+        &merchant,
+        &ids.0,
+        &String::from_str(&env, "merchant evidence"),
+    );
+
+    env.ledger().set_timestamp(2345);
+    payment_client.resolve_escrowed_payment_dispute(&admin, &ids.0, &false);
+
+    let payment = payment_client.get_payment(&ids.0);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert!(dispute.resolved);
+    assert_eq!(dispute.resolved_at, Some(2345));
+    assert_eq!(dispute.favor_customer, Some(false));
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(token_user_client.balance(&customer), 0);
+    assert_eq!(token_user_client.balance(&merchant), amount);
+    assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
+}
+
 // ── MULTI-SIG ADMIN TESTS (PAYMENT CONTRACT) ─────────────────────────────────
 
 #[test]
