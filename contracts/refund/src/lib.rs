@@ -55,8 +55,16 @@ pub enum DataKey {
     WindowStart,
     WindowRefundVolume,
     WindowPaymentVolume,
-    CustomerRefundRateLimit(Address),
-    GlobalRefundRateLimit,
+    // Fraud detection (#137)
+    FraudSignal(Address),
+    FraudConfig,
+    FlaggedAddressesIndex,
+    RefundRejectedAt(u64),
+    Appeal(u64),
+    AppealCounter,
+    AppealByRefund(u64),
+    AppealByCustomer(Address, u64),
+    AppealByCustomerCount(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -113,6 +121,12 @@ pub enum Error {
     InvalidScoreThreshold = 35,
     AutoRefundTriggerNotFound = 36,
     DuplicateAutoRefundTrigger = 37,
+    AddressFlaggedForFraud = 38,
+    FraudConfigNotSet = 39,
+    FraudSignalNotFound = 40,
+    RefundNotRejected = 23,
+    AppealWindowExpired = 24,
+    AppealAlreadyFiled = 25,
 }
 
 #[contractevent]
@@ -167,6 +181,22 @@ pub struct RefundRejected {
     pub rejected_by: Address,
     pub rejected_at: u64,
     pub rejection_reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealFiled {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub appellant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealResolved {
+    pub appeal_id: u64,
+    pub upheld: bool,
+    pub resolved_at: u64,
 }
 
 #[contractevent]
@@ -293,6 +323,18 @@ pub struct Refund {
     pub requested_at: u64,
     pub reason: String,
     pub reason_code: RefundReasonCode,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundAppeal {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub appellant: Address,
+    pub reason: String,
+    pub filed_at: u64,
+    pub resolved: bool,
+    pub outcome: Option<bool>,
 }
 
 #[contracttype]
@@ -577,6 +619,40 @@ pub struct CircuitBreakerResetEvent {
     pub reset_at: u64,
 }
 
+// Fraud detection structures (#137)
+#[derive(Clone)]
+#[contracttype]
+pub struct FraudSignal {
+    pub address: Address,
+    pub refund_rate_bps: u32,
+    pub total_payments: u64,
+    pub total_refunds: u64,
+    pub flagged_at: u64,
+    pub reviewed: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FraudConfig {
+    pub max_refund_rate_bps: u32,
+    pub min_transactions_for_check: u64,
+    pub enabled: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudSignalRaised {
+    pub address: Address,
+    pub refund_rate_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FraudSignalReviewed {
+    pub address: Address,
+    pub reviewed_by: Address,
+}
+
 #[contract]
 pub struct RefundContract;
 
@@ -671,6 +747,7 @@ impl RefundContract {
         // Store updated refund back to storage
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+        env.storage().instance().set(&DataKey::RefundRejectedAt(refund_id), &env.ledger().timestamp());
 
         // Emit RefundRejected event
         (RefundRejected {
@@ -681,6 +758,173 @@ impl RefundContract {
         }).publish(&env);
 
         Ok(())
+    }
+
+    pub fn file_appeal(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+        reason: String,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+        if refund.status != RefundStatus::Rejected {
+            return Err(Error::RefundNotRejected);
+        }
+        if env.storage().instance().has(&DataKey::AppealByRefund(refund_id)) {
+            return Err(Error::AppealAlreadyFiled);
+        }
+
+        let rejected_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundRejectedAt(refund_id))
+            .ok_or(Error::RefundNotRejected)?;
+        let now = env.ledger().timestamp();
+        if now > rejected_at.saturating_add(72 * 60 * 60) {
+            return Err(Error::AppealWindowExpired);
+        }
+
+        let counter: u64 = env.storage().instance().get(&DataKey::AppealCounter).unwrap_or(0);
+        let appeal_id = counter + 1;
+        let appeal = RefundAppeal {
+            appeal_id,
+            refund_id,
+            appellant: customer.clone(),
+            reason,
+            filed_at: now,
+            resolved: false,
+            outcome: None,
+        };
+        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
+        env.storage().instance().set(&DataKey::AppealCounter, &appeal_id);
+        env.storage().instance().set(&DataKey::AppealByRefund(refund_id), &appeal_id);
+
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::AppealByCustomer(customer.clone(), customer_count),
+            &appeal_id,
+        );
+        env.storage().instance().set(
+            &DataKey::AppealByCustomerCount(customer.clone()),
+            &(customer_count + 1),
+        );
+
+        (AppealFiled {
+            appeal_id,
+            refund_id,
+            appellant: customer,
+        })
+        .publish(&env);
+
+        Ok(appeal_id)
+    }
+
+    pub fn resolve_appeal(
+        env: Env,
+        admin: Address,
+        appeal_id: u64,
+        uphold: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut appeal: RefundAppeal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Appeal(appeal_id))
+            .ok_or(Error::RefundNotFound)?;
+        if appeal.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        if uphold {
+            let mut refund: Refund = env
+                .storage()
+                .instance()
+                .get(&DataKey::Refund(appeal.refund_id))
+                .ok_or(Error::RefundNotFound)?;
+            if refund.status != RefundStatus::Rejected {
+                return Err(Error::RefundNotRejected);
+            }
+
+            Self::remove_from_status_index(&env, RefundStatus::Rejected, refund.id)?;
+            refund.status = RefundStatus::Approved;
+            env.storage().instance().set(&DataKey::Refund(refund.id), &refund);
+            Self::add_to_status_index(&env, RefundStatus::Approved, refund.id);
+
+            Self::process_refund_internal(&env, admin.clone(), refund.id)?;
+        }
+
+        appeal.resolved = true;
+        appeal.outcome = Some(uphold);
+        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
+
+        (AppealResolved {
+            appeal_id,
+            upheld: uphold,
+            resolved_at: env.ledger().timestamp(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_appeal(env: Env, appeal_id: u64) -> Result<RefundAppeal, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Appeal(appeal_id))
+            .ok_or(Error::RefundNotFound)
+    }
+
+    pub fn get_appeals_by_customer(env: Env, customer: Address) -> Vec<RefundAppeal> {
+        let mut appeals = Vec::new(&env);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .unwrap_or(0);
+
+        let mut index = 0u64;
+        while index < count {
+            if let Some(appeal_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::AppealByCustomer(customer.clone(), index))
+            {
+                if let Some(appeal) = env
+                    .storage()
+                    .instance()
+                    .get::<_, RefundAppeal>(&DataKey::Appeal(appeal_id))
+                {
+                    appeals.push_back(appeal);
+                }
+            }
+            index += 1;
+        }
+
+        appeals
     }
 
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
@@ -2347,7 +2591,13 @@ impl RefundContract {
 
         Self::can_refund_payment(&env, payment_id, amount, original_payment_amount)?;
         Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
-        Self::check_and_update_customer_refund_rate_limit(&env, customer.clone())?;
+        
+        // Check for fraud signals (#137)
+        if let Some(fraud_signal) = Self::check_fraud_signals(env.clone(), customer.clone()) {
+            if !fraud_signal.reviewed {
+                return Err(Error::AddressFlaggedForFraud);
+            }
+        }
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
                 &env,
@@ -2967,45 +3217,177 @@ impl RefundContract {
         Ok(())
     }
 
-    fn check_and_update_customer_refund_rate_limit(
-        env: &Env,
-        customer: Address,
-    ) -> Result<(), Error> {
-        let global_limit_opt = env.storage().instance().get::<DataKey, GlobalRefundRateLimit>(&DataKey::GlobalRefundRateLimit);
-        let customer_limit_opt = env.storage().instance().get::<DataKey, CustomerRefundRateLimit>(&DataKey::CustomerRefundRateLimit(customer.clone()));
+    // Fraud detection functions (#137)
+    pub fn check_fraud_signals(env: Env, address: Address) -> Option<FraudSignal> {
+        // Get fraud config
+        let config: FraudConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudConfig)
+            .unwrap_or(FraudConfig {
+                max_refund_rate_bps: 2000, // 20%
+                min_transactions_for_check: 5,
+                enabled: true,
+            });
 
-        if global_limit_opt.is_none() && customer_limit_opt.is_none() {
-            return Ok(());
+        if !config.enabled {
+            return None;
         }
 
-        let mut limit = match customer_limit_opt {
-            Some(l) => l,
-            None => {
-                let g = global_limit_opt.unwrap();
-                CustomerRefundRateLimit {
-                    customer: customer.clone(),
-                    window_start: env.ledger().timestamp(),
-                    request_count: 0,
-                    max_requests_per_window: g.max_requests_per_window,
-                    window_seconds: g.window_seconds,
-                }
-            }
+        // Get customer's payment and refund statistics from payment contract
+        // For now, we'll use a simplified approach - in production, this would
+        // query the payment contract for actual statistics
+        let total_payments = Self::get_customer_payment_count(&env, &address);
+        let total_refunds = Self::get_customer_refund_count(&env, &address);
+
+        // Skip if below minimum transaction threshold
+        if total_payments < config.min_transactions_for_check {
+            return None;
+        }
+
+        // Calculate refund rate
+        let refund_rate_bps = if total_payments > 0 {
+            (total_refunds * 10000) / total_payments
+        } else {
+            0
         };
 
-        let now = env.ledger().timestamp();
-        if now >= limit.window_start + limit.window_seconds {
-            limit.window_start = now;
-            limit.request_count = 0;
+        // Check if refund rate exceeds threshold
+        if refund_rate_bps > config.max_refund_rate_bps {
+            let existing_signal: Option<FraudSignal> = env
+                .storage()
+                .instance()
+                .get(&DataKey::FraudSignal(address.clone()));
+
+            match existing_signal {
+                Some(mut signal) if !signal.reviewed => {
+                    // Update existing signal
+                    signal.refund_rate_bps = refund_rate_bps;
+                    signal.total_payments = total_payments;
+                    signal.total_refunds = total_refunds;
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::FraudSignal(address), &signal);
+                    Some(signal)
+                }
+                None => {
+                    // Create new fraud signal
+                    let signal = FraudSignal {
+                        address: address.clone(),
+                        refund_rate_bps,
+                        total_payments,
+                        total_refunds,
+                        flagged_at: env.ledger().timestamp(),
+                        reviewed: false,
+                    };
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::FraudSignal(address), &signal);
+
+                    // Add to flagged addresses index
+                    let mut flagged_count: u64 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::FlaggedAddressesIndex)
+                        .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::FlaggedAddressesIndex, &flagged_count + 1);
+
+                    // Emit fraud signal raised event
+                    (FraudSignalRaised {
+                        address,
+                        refund_rate_bps,
+                    })
+                    .publish(&env);
+
+                    Some(signal)
+                }
+                _ => None, // Already reviewed or exists
+            }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_flagged_addresses(env: Env) -> Vec<FraudSignal> {
+        let mut flagged = Vec::new(&env);
+        
+        // In a real implementation, we'd iterate through all addresses
+        // For now, we'll return an empty vector as this is a placeholder
+        // In production, this would use an index to efficiently retrieve flagged addresses
+        flagged
+    }
+
+    pub fn mark_fraud_reviewed(env: Env, admin: Address, address: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Verify admin is the contract admin
+        let stored_admin = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
         }
 
-        if limit.request_count >= limit.max_requests_per_window {
-            return Err(Error::RefundRateLimitExceeded);
-        }
+        let mut signal: FraudSignal = env
+            .storage()
+            .instance()
+            .get(&DataKey::FraudSignal(address.clone()))
+            .ok_or(Error::FraudSignalNotFound)?;
 
-        limit.request_count += 1;
-        env.storage().instance().set(&DataKey::CustomerRefundRateLimit(customer), &limit);
+        signal.reviewed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudSignal(address), &signal);
+
+        // Emit fraud signal reviewed event
+        (FraudSignalReviewed {
+            address,
+            reviewed_by: admin,
+        })
+        .publish(&env);
 
         Ok(())
+    }
+
+    pub fn set_fraud_config(env: Env, admin: Address, config: FraudConfig) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Verify admin is the contract admin
+        let stored_admin = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::FraudConfig, &config);
+
+        Ok(())
+    }
+
+    // Helper functions for fraud detection
+    fn get_customer_payment_count(env: &Env, address: &Address) -> u64 {
+        // This would typically call the payment contract to get actual statistics
+        // For now, return a placeholder value
+        10
+    }
+
+    fn get_customer_refund_count(env: &Env, address: &Address) -> u64 {
+        // Count refunds for this address
+        let refund_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerRefundCount(address.clone()))
+            .unwrap_or(0);
+        refund_count
     }
 }
 

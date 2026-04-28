@@ -909,6 +909,162 @@ fn test_multiple_escrows() {
     assert_eq!(escrow2.amount, 2000_i128);
 }
 
+fn merkle_leaf_keccak<const N: usize>(env: &Env, payload: &[u8; N]) -> BytesN<32> {
+    let b = Bytes::from_array(env, payload);
+    env.crypto().keccak256(&b).into()
+}
+
+fn merkle_root_two_leaves(env: &Env, left: BytesN<32>, right: BytesN<32>) -> BytesN<32> {
+    let la = left.to_array();
+    let ra = right.to_array();
+    let mut raw = [0u8; 64];
+    raw[..32].copy_from_slice(&la);
+    raw[32..].copy_from_slice(&ra);
+    let bytes = Bytes::from_array(env, &raw);
+    env.crypto().keccak256(&bytes).into()
+}
+
+#[test]
+fn test_commit_root_recommit_guard() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[7_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let result = client.try_commit_evidence_root(&merchant, &escrow_id, &root);
+    assert_eq!(result, Err(Ok(Error::RootAlreadyCommitted)));
+}
+
+#[test]
+fn test_get_evidence_commitment_returns_committed_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[8_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let commitment = client.try_get_evidence_commitment(&escrow_id).unwrap().unwrap();
+    assert_eq!(commitment.escrow_id, escrow_id);
+    assert_eq!(commitment.merkle_root, root);
+    assert_eq!(commitment.committed_at, 1000);
+    assert_eq!(commitment.committed_by, customer);
+}
+
+#[test]
+fn test_submit_evidence_with_valid_merkle_proof() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0.clone(), leaf1.clone());
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut proof = Vec::new(&env);
+    proof.push_back(leaf1);
+    client.submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &proof,
+        &0_u32,
+    );
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_submit_evidence_with_invalid_merkle_proof_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0, leaf1);
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut bad_proof = Vec::new(&env);
+    bad_proof.push_back(BytesN::from_array(&env, &[9_u8; 32]));
+    let result = client.try_submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &bad_proof,
+        &0_u32,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
+
+    // Invalid proof should not store evidence
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_submit_evidence_with_proof_falls_back_without_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence = Bytes::from_array(&env, b"ipfs://fallback-path");
+    let empty_proof = Vec::new(&env);
+    client.submit_evidence_with_proof(&customer, &escrow_id, &evidence, &empty_proof, &0_u32);
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
 #[test]
 fn test_submit_evidence_by_both_parties() {
     let env = Env::default();
@@ -1332,6 +1488,100 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
     );
 }
 
+#[test]
+fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Cliff at 2000; first milestone unlocks at 1500 — invalid schedule
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            milestone_id: 1,
+            unlock_timestamp: 1500,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Too early"),
+            approved_by: None,
+            approved_at: None,
+        },
+        VestingMilestone {
+            milestone_id: 2,
+            unlock_timestamp: 3000,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Ok"),
+            approved_by: None,
+            approved_at: None,
+        },
+    ];
+
+    let result = client.try_create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &4000_u64,
+        &milestones,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidVestingSchedule)));
+}
+
+#[test]
+fn test_get_cliff_status_seconds_remaining_and_passed_flag() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let cliff_ts = 5000_u64;
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &cliff_ts,
+        &10_000_u64,
+        &milestones,
+    );
+
+    env.ledger().set_timestamp(2000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert_eq!(s.cliff_timestamp, cliff_ts);
+    assert!(!s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 3000);
+
+    env.ledger().set_timestamp(5000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+
+    // Mid vesting window: linear schedule has releasable amount > 0
+    env.ledger().set_timestamp(7500);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+    let released = client.release_vested_amount(&admin, &escrow_id);
+    assert!(released > 0);
+}
+
 // ── MULTI-PARTY ESCROW TESTS ────────────────────────────────────────────────
 
 #[test]
@@ -1730,8 +1980,7 @@ fn test_release_vested_amount_milestone() {
 }
 
 #[test]
-#[should_panic]
-fn test_release_vested_amount_before_cliff() {
+fn test_release_vested_amount_before_cliff_returns_cliff_error() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);
     let contract_id = env.register(EscrowContract, ());
@@ -1755,9 +2004,9 @@ fn test_release_vested_amount_before_cliff() {
         &milestones,
     );
 
-    // Try to release before cliff
     env.ledger().set_timestamp(1500);
-    client.release_vested_amount(&admin, &escrow_id);
+    let result = client.try_release_vested_amount(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::CliffPeriodNotPassed)));
 }
 
 #[test]
@@ -3820,33 +4069,32 @@ fn test_add_milestone_success() {
     env.mock_all_auths();
     client.initialize(&admin);
 
-    // Create with milestones summing to 8000 (leaving 2000 headroom)
-    let milestones = vec![
-        &env,
-        VestingMilestone {
-            milestone_id: 1,
-            unlock_timestamp: 2000,
-            amount: 8000,
-            released: false,
-            description: String::from_str(&env, "Main deliverable"),
-            approved_by: None,
-            approved_at: None,
-        },
-    ];
+    // Time-linear shell (no milestones at create); amounts are added via add_milestone
+    let milestones = Vec::new(&env);
     let escrow_id = client.create_vesting_escrow(
         &customer,
         &merchant,
         &10000_i128,
         &token,
         &1500_u64,
-        &3000_u64,
+        &5000_u64,
         &milestones,
     );
 
-    // Add a new milestone for the remaining 2000
+    let first = VestingMilestone {
+        milestone_id: 1,
+        unlock_timestamp: 2000,
+        amount: 8000,
+        released: false,
+        description: String::from_str(&env, "Main deliverable"),
+        approved_by: None,
+        approved_at: None,
+    };
+    client.add_milestone(&admin, &escrow_id, &first);
+
     let new_milestone = VestingMilestone {
         milestone_id: 0, // auto-assigned
-        unlock_timestamp: 3000,
+        unlock_timestamp: 4500,
         amount: 2000,
         released: false,
         description: String::from_str(&env, "Bonus deliverable"),

@@ -17,6 +17,7 @@ pub enum DataKey {
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
     EscrowEvidenceCount(u64),
+    EvidenceCommitment(u64),
     ReputationScore(Address),
     ReputationConfig,
     VestingSchedule(u64),
@@ -59,6 +60,7 @@ pub enum DataKey {
     MultiPartyDisputeKey(u64),
     // Conditional escrow (on-chain state)
     ConditionalEscrow(u64),
+    SuccessionPlan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -165,10 +167,8 @@ pub enum Error {
     Underfunded = 32,
     NotClaimable = 33,
     OracleStalePriceFeed = 44,
-    OracleConditionNotMet = 45,
     NoOracleCondition = 46,
     BatchTooLarge = 40,
-    BatchPartialFailure = 41,
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
@@ -176,6 +176,13 @@ pub enum Error {
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
     ConditionAlreadyEvaluated = 51,
+    SuccessionPlanExists = 52,
+    SuccessionPlanNotFound = 53,
+    SuccessionAlreadyActivated = 54,
+    // Merkle evidence (use free slots; contracterror has a max variant count)
+    InvalidMerkleProof = 34,
+    RootAlreadyCommitted = 38,
+    NoEvidenceRoot = 39,
 }
 
 #[contractevent]
@@ -506,6 +513,16 @@ pub struct Evidence {
     pub submitted_at: u64,
 }
 
+/// Pre-committed Merkle root for dispute evidence integrity (one per escrow).
+#[derive(Clone)]
+#[contracttype]
+pub struct EvidenceCommitment {
+    pub escrow_id: u64,
+    pub merkle_root: BytesN<32>,
+    pub committed_at: u64,
+    pub committed_by: Address,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct VestingMilestone {
@@ -530,6 +547,16 @@ pub struct VestingSchedule {
     pub milestones: Vec<VestingMilestone>,
 }
 
+/// Snapshot of vesting cliff progress for a given escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct CliffStatus {
+    pub cliff_timestamp: u64,
+    pub cliff_passed: bool,
+    /// Seconds until the cliff is reached; `0` once `cliff_passed` is true.
+    pub seconds_remaining: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum ActionType {
@@ -549,6 +576,16 @@ pub struct MultiSigConfig {
     pub required_signatures: u32,
     pub total_admins: u32,
     pub proposal_ttl: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SuccessionPlan {
+    pub successor: Address,
+    pub designated_by: Address,
+    pub designated_at: u64,
+    pub activatable_after: u64,
+    pub activated: bool,
 }
 
 #[derive(Clone)]
@@ -689,6 +726,26 @@ pub struct AdminAdded {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminRemoved {
     pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessorDesignated {
+    pub successor: Address,
+    pub activatable_after: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessionActivated {
+    pub new_admin: Address,
+    pub activated_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuccessionRevoked {
+    pub revoked_by: Address,
 }
 
 #[contractevent]
@@ -1267,6 +1324,128 @@ impl EscrowContract {
             .set(&DataKey::MultiSigConfig, &config);
 
         Ok(())
+    }
+
+    pub fn designate_successor(
+        env: Env,
+        admin: Address,
+        successor: Address,
+        delay_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, SuccessionPlan>(&DataKey::SuccessionPlan)
+        {
+            if !existing.activated {
+                return Err(Error::SuccessionPlanExists);
+            }
+        }
+
+        let designated_at = env.ledger().timestamp();
+        let activatable_after = designated_at.saturating_add(delay_seconds);
+        let plan = SuccessionPlan {
+            successor: successor.clone(),
+            designated_by: admin,
+            designated_at,
+            activatable_after,
+            activated: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SuccessionPlan, &plan);
+
+        SuccessorDesignated {
+            successor,
+            activatable_after,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn activate_succession(env: Env, successor: Address) -> Result<(), Error> {
+        successor.require_auth();
+
+        let mut plan: SuccessionPlan = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuccessionPlan)
+            .ok_or(Error::SuccessionPlanNotFound)?;
+
+        if plan.activated {
+            return Err(Error::SuccessionAlreadyActivated);
+        }
+        if plan.successor != successor {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < plan.activatable_after {
+            return Err(Error::ActionNotReady);
+        }
+
+        let mut config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&successor) {
+            config.admins.push_back(successor.clone());
+            config.total_admins += 1;
+            env.storage()
+                .instance()
+                .set(&DataKey::MultiSigConfig, &config);
+            AdminAdded {
+                admin: successor.clone(),
+            }
+            .publish(&env);
+        }
+
+        plan.activated = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::SuccessionPlan, &plan);
+
+        SuccessionActivated {
+            new_admin: successor,
+            activated_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn revoke_succession(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let plan: SuccessionPlan = env
+            .storage()
+            .instance()
+            .get(&DataKey::SuccessionPlan)
+            .ok_or(Error::SuccessionPlanNotFound)?;
+
+        if plan.activated {
+            return Err(Error::SuccessionAlreadyActivated);
+        }
+
+        env.storage().instance().remove(&DataKey::SuccessionPlan);
+        SuccessionRevoked { revoked_by: admin }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_succession_plan(env: Env) -> Option<SuccessionPlan> {
+        env.storage().instance().get(&DataKey::SuccessionPlan)
     }
 
     pub fn create_escrow(
@@ -2026,13 +2205,167 @@ impl EscrowContract {
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
             return Err(Error::EscrowNotFound);
         }
-        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
         if escrow.status != EscrowStatus::Disputed {
             return Err(Error::NotDisputed);
         }
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
+    }
+
+    /// One-time commitment of the evidence Merkle root for an escrow (must be disputed).
+    pub fn commit_evidence_root(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        merkle_root: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::EvidenceCommitment(escrow_id))
+        {
+            return Err(Error::RootAlreadyCommitted);
+        }
+        let commitment = EvidenceCommitment {
+            escrow_id,
+            merkle_root,
+            committed_at: env.ledger().timestamp(),
+            committed_by: caller,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::EvidenceCommitment(escrow_id), &commitment);
+        Ok(())
+    }
+
+    /// Submit evidence bytes with a Keccak Merkle proof against the committed root.
+    ///
+    /// Leaf hash is `keccak256(evidence)`. If no root was committed for this escrow,
+    /// behaves like [`Self::submit_evidence`] using the UTF-8-safe prefix of `evidence`
+    /// as the stored reference string (same unverified path as legacy submissions).
+    ///
+    /// Invalid proofs return [`Error::InvalidMerkleProof`] and emit **no** event.
+    pub fn submit_evidence_with_proof(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        evidence: Bytes,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        let escrow_check = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow_check.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow_check.customer != caller && escrow_check.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        let commitment_opt = env
+            .storage()
+            .instance()
+            .get::<DataKey, EvidenceCommitment>(&DataKey::EvidenceCommitment(escrow_id));
+
+        if commitment_opt.is_none() {
+            let ipfs_hash = EscrowContract::evidence_bytes_to_label_string(&env, evidence);
+            return EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash);
+        }
+
+        let commitment = commitment_opt.unwrap();
+        let leaf_hash: BytesN<32> = env.crypto().keccak256(&evidence).into();
+        if !EscrowContract::verify_keccak_merkle_proof(
+            &env,
+            leaf_hash,
+            proof,
+            leaf_index,
+            commitment.merkle_root,
+        ) {
+            return Err(Error::InvalidMerkleProof);
+        }
+
+        let ipfs_hash = EscrowContract::evidence_bytes_to_label_string(&env, evidence);
+        EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
+    }
+
+    pub fn get_evidence_commitment(env: Env, escrow_id: u64) -> Result<EvidenceCommitment, Error> {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+        env.storage()
+            .instance()
+            .get::<DataKey, EvidenceCommitment>(&DataKey::EvidenceCommitment(escrow_id))
+            .ok_or(Error::NoEvidenceRoot)
+    }
+
+    fn verify_keccak_merkle_proof(
+        env: &Env,
+        leaf_hash: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+        leaf_index: u32,
+        root: BytesN<32>,
+    ) -> bool {
+        let mut computed = leaf_hash;
+        let mut idx = leaf_index as u64;
+        let mut i = 0u32;
+        while i < proof.len() {
+            let sibling = proof.get(i).unwrap();
+            computed = if idx % 2 == 0 {
+                EscrowContract::hash_keccak_pair(env, computed, sibling)
+            } else {
+                EscrowContract::hash_keccak_pair(env, sibling.clone(), computed)
+            };
+            idx /= 2;
+            i += 1;
+        }
+        computed == root
+    }
+
+    fn hash_keccak_pair(env: &Env, left: BytesN<32>, right: BytesN<32>) -> BytesN<32> {
+        let la = left.to_array();
+        let ra = right.to_array();
+        let mut raw = [0u8; 64];
+        raw[..32].copy_from_slice(&la);
+        raw[32..].copy_from_slice(&ra);
+        let buf = Bytes::from_array(env, &raw);
+        env.crypto().keccak256(&buf).into()
+    }
+
+    fn evidence_bytes_to_label_string(env: &Env, evidence: Bytes) -> String {
+        const CAP: u32 = 160;
+        let n = core::cmp::min(evidence.len(), CAP);
+        let mut tmp = [0u8; 160];
+        let mut j = 0u32;
+        while j < n {
+            tmp[j as usize] = evidence.get(j).unwrap();
+            j += 1;
+        }
+        String::from_bytes(env, &tmp[..n as usize])
+    }
+
+    fn append_evidence_entry(
+        env: &Env,
+        escrow_id: u64,
+        caller: Address,
+        ipfs_hash: String,
+    ) -> Result<(), Error> {
         let count: u64 = env
             .storage()
             .instance()
@@ -2049,6 +2382,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::EscrowEvidenceCount(escrow_id), &(count + 1));
+        let mut escrow = EscrowContract::get_escrow(env, escrow_id);
         escrow.last_activity_at = env.ledger().timestamp();
         env.storage()
             .instance()
@@ -2058,7 +2392,7 @@ impl EscrowContract {
             submitter: caller,
             ipfs_hash,
         }
-        .publish(&env);
+        .publish(env);
         Ok(())
     }
 
@@ -2640,7 +2974,8 @@ impl EscrowContract {
     /// * `token` - The token address for the payment
     /// * `cliff_timestamp` - Timestamp before which no vesting occurs
     /// * `end_timestamp` - Timestamp when vesting completes
-    /// * `milestones` - Optional vector of VestingMilestone for milestone-based vesting
+    /// * `milestones` - Optional vector of VestingMilestone for milestone-based vesting.
+    ///   Each milestone's `unlock_timestamp` must be `>= cliff_timestamp` and `<= end_timestamp`.
     ///
     /// # Returns
     /// The escrow ID for the created vesting schedule
@@ -2805,6 +3140,33 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::VestingSchedule(escrow_id))
             .ok_or(Error::EscrowNotFound)
+    }
+
+    /// Returns cliff timing and whether the ledger time has reached the cliff.
+    ///
+    /// # Errors
+    /// * `EscrowNotFound` - No vesting schedule for this escrow
+    pub fn get_cliff_status(env: Env, escrow_id: u64) -> Result<CliffStatus, Error> {
+        let vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        let now = env.ledger().timestamp();
+        let cliff_ts = vesting_schedule.cliff_timestamp;
+        let cliff_passed = now >= cliff_ts;
+        let seconds_remaining = if cliff_passed {
+            0_u64
+        } else {
+            cliff_ts.saturating_sub(now)
+        };
+
+        Ok(CliffStatus {
+            cliff_timestamp: cliff_ts,
+            cliff_passed,
+            seconds_remaining,
+        })
     }
 
     /// Calculates the total vested amount that has been unlocked based on the current timestamp.
@@ -3169,6 +3531,13 @@ impl EscrowContract {
 
         if existing_total.saturating_add(milestone.amount) > vesting_schedule.total_amount {
             return Err(Error::MilestoneOverflow);
+        }
+
+        if milestone.unlock_timestamp < vesting_schedule.cliff_timestamp {
+            return Err(Error::InvalidVestingSchedule);
+        }
+        if milestone.unlock_timestamp > vesting_schedule.end_timestamp {
+            return Err(Error::InvalidVestingSchedule);
         }
 
         // Auto-assign milestone_id if not provided
@@ -5208,3 +5577,6 @@ mod beneficiary_transfer_test;
 
 #[cfg(test)]
 mod multi_party_dispute_test;
+
+#[cfg(test)]
+mod succession_test;

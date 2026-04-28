@@ -3263,6 +3263,183 @@ fn test_partial_refund_cumulative_exceeds_payment() {
     assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
 }
 
+#[test]
+fn test_set_merchant_rate_limit() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let merchant = Address::generate(&env);
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 10,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    let retrieved = client.get_merchant_rate_limit(&merchant);
+    assert!(retrieved.is_some());
+    assert_eq!(retrieved.unwrap().max_transactions_per_hour, 10);
+}
+
+#[test]
+fn test_merchant_rate_limit_enforcement() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set merchant limit: 1 transaction per hour
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    env.ledger().set_timestamp(1000);
+    // First payment should succeed
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+
+    // Second payment should fail
+    let result = client.try_create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::MerchantRateLimitExceeded);
+}
+
+#[test]
+fn test_merchant_rate_limit_window_reset() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set merchant limit: 1 transaction per hour
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 1000,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    env.ledger().set_timestamp(1000);
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+
+    // Advance time by 1 hour + 1 second
+    env.ledger().set_timestamp(1000 + 3600 + 1);
+
+    // Should succeed now
+    client.create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+}
+
+#[test]
+fn test_merchant_rate_limit_global_fallback() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let meta = String::from_str(&env, "");
+
+    // Set global limit: max amount 50
+    client.set_rate_limit_config(
+        &admin,
+        &(RateLimitConfig {
+            max_payments_per_window: 0,
+            window_duration: 0,
+            max_payment_amount: 50,
+            max_daily_volume: 0,
+        }),
+    );
+
+    // No merchant limit set, should use global
+    let result = client.try_create_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().unwrap(), Error::AmountExceedsLimit);
+}
+
+#[test]
+fn test_check_rate_limit_read_only() {
+    let env = Env::default();
+    let (client, admin, _) = setup_rate_limit_contract(&env);
+
+    let merchant = Address::generate(&env);
+
+    // Set merchant limit
+    let limit = MerchantRateLimit {
+        merchant: merchant.clone(),
+        max_transactions_per_hour: 1,
+        max_amount_per_hour: 100,
+        current_transactions: 0,
+        current_amount: 0,
+        window_start: 0,
+    };
+    client.set_merchant_rate_limit(&admin, &merchant, &limit);
+
+    // Check should pass (read-only)
+    assert!(client.check_rate_limit(&merchant, &50));
+
+    // State should not change
+    let retrieved = client.get_merchant_rate_limit(&merchant);
+    assert_eq!(retrieved.unwrap().current_transactions, 0);
+}
+
 // ── DUNNING MANAGEMENT TESTS ─────────────────────────────────────────
 
 fn setup_dunning_contract(
@@ -3634,6 +3811,295 @@ fn test_cancel_escrowed_payment_refunds_customer() {
     assert_eq!(escrow.status, EscrowStatus::Resolved);
     assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
     assert_eq!(token_user_client.balance(&customer), amount);
+}
+
+#[test]
+fn test_dispute_escrowed_payment_by_customer_marks_escrow_disputed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    let reason = String::from_str(&env, "item not delivered");
+    payment_client.dispute_escrowed_payment(&customer, &ids.0, &reason);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert_eq!(dispute.payment_id, ids.0);
+    assert_eq!(dispute.raised_by, customer);
+    assert_eq!(dispute.reason, reason);
+    assert_eq!(dispute.raised_at, 1234);
+    assert!(!dispute.resolved);
+    assert_eq!(dispute.resolved_at, None);
+    assert_eq!(dispute.favor_customer, None);
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Disputed);
+}
+
+#[test]
+fn test_dispute_escrowed_payment_rejects_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    let result = payment_client.try_dispute_escrowed_payment(
+        &attacker,
+        &ids.0,
+        &String::from_str(&env, "unauthorized"),
+    );
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_disputed_escrowed_payment_cannot_be_completed_or_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    payment_client.dispute_escrowed_payment(
+        &customer,
+        &ids.0,
+        &String::from_str(&env, "hold funds"),
+    );
+
+    let complete_result = payment_client.try_complete_escrowed_payment(&admin, &ids.0);
+    assert_eq!(complete_result, Err(Ok(Error::InvalidStatus)));
+
+    let cancel_result = payment_client.try_cancel_escrowed_payment(&customer, &ids.0);
+    assert_eq!(cancel_result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn test_resolve_escrowed_payment_dispute_in_favor_of_customer_refunds_customer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    payment_client.dispute_escrowed_payment(
+        &customer,
+        &ids.0,
+        &String::from_str(&env, "refund requested"),
+    );
+
+    env.ledger().set_timestamp(2345);
+    payment_client.resolve_escrowed_payment_dispute(&admin, &ids.0, &true);
+
+    let payment = payment_client.get_payment(&ids.0);
+    assert_eq!(payment.status, PaymentStatus::Refunded);
+    assert_eq!(payment.refunded_amount, amount);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert!(dispute.resolved);
+    assert_eq!(dispute.resolved_at, Some(2345));
+    assert_eq!(dispute.favor_customer, Some(true));
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+    assert_eq!(token_user_client.balance(&customer), amount);
+    assert_eq!(token_user_client.balance(&merchant), 0);
+    assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
+}
+
+#[test]
+fn test_resolve_escrowed_payment_dispute_in_favor_of_merchant_releases_merchant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let payment_contract_id = env.register(PaymentContract, ());
+    let payment_client = PaymentContractClient::new(&env, &payment_contract_id);
+    let escrow_contract_id = env.register(EscrowContract, ());
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1_000_i128;
+
+    payment_client.initialize(&admin);
+    token_admin_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
+
+    let ids = payment_client.create_escrowed_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &escrow_contract_id,
+        &1000_u64,
+        &0_u64,
+        &String::from_str(&env, "bridge"),
+        &true,
+    );
+
+    env.ledger().set_timestamp(1234);
+    payment_client.dispute_escrowed_payment(
+        &merchant,
+        &ids.0,
+        &String::from_str(&env, "merchant evidence"),
+    );
+
+    env.ledger().set_timestamp(2345);
+    payment_client.resolve_escrowed_payment_dispute(&admin, &ids.0, &false);
+
+    let payment = payment_client.get_payment(&ids.0);
+    assert_eq!(payment.status, PaymentStatus::Completed);
+
+    let dispute = payment_client
+        .get_escrowed_payment_dispute(&ids.0)
+        .expect("dispute should exist");
+    assert!(dispute.resolved);
+    assert_eq!(dispute.resolved_at, Some(2345));
+    assert_eq!(dispute.favor_customer, Some(false));
+
+    let escrow = escrow_client.get_escrow(&ids.1);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(token_user_client.balance(&customer), 0);
+    assert_eq!(token_user_client.balance(&merchant), amount);
+    assert_eq!(token_user_client.balance(&escrow_contract_id), 0);
 }
 
 // ── MULTI-SIG ADMIN TESTS (PAYMENT CONTRACT) ─────────────────────────────────
@@ -4059,6 +4525,134 @@ fn test_batch_payment_events_emitted() {
     let payment = client.get_payment(&results.get(0).unwrap().payment_id);
     assert_eq!(payment.customer, customer);
     assert_eq!(payment.amount, 100_i128);
+}
+
+#[test]
+fn test_create_payment_batch_optimized_same_token_grouping() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer1.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer2.clone(),
+            merchant: merchant.clone(),
+            amount: 200_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let results = client.create_payment_batch_optimized(&admin, &entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+    assert_eq!(results.get(0).unwrap().payment_id, 1);
+    assert_eq!(results.get(1).unwrap().payment_id, 2);
+
+    // Check payments are completed
+    let p1 = client.get_payment(&1);
+    assert_eq!(p1.status, PaymentStatus::Completed);
+    let p2 = client.get_payment(&2);
+    assert_eq!(p2.status, PaymentStatus::Completed);
+}
+
+#[test]
+fn test_create_payment_batch_optimized_cross_token_isolation() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant1 = Address::generate(&env);
+    let merchant2 = Address::generate(&env);
+    let token1 = Address::generate(&env);
+    let token2 = Address::generate(&env);
+    env.mock_all_auths();
+
+    client.initialize(&admin);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant1.clone(),
+            amount: 100_i128,
+            token: token1.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant2.clone(),
+            amount: 200_i128,
+            token: token2.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let results = client.create_payment_batch_optimized(&admin, &entries);
+    assert_eq!(results.len(), 2);
+    assert!(results.get(0).unwrap().success);
+    assert!(results.get(1).unwrap().success);
+}
+
+#[test]
+fn test_get_batch_gas_estimate() {
+    let env = Env::default();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let entries = soroban_sdk::vec![
+        &env,
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 100_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry1"),
+        },
+        BatchPaymentEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount: 200_i128,
+            token: token.clone(),
+            currency: Currency::USDC,
+            expiration_duration: 0,
+            metadata: String::from_str(&env, "entry2"),
+        }
+    ];
+
+    let estimate = client.get_batch_gas_estimate(&entries);
+    assert!(estimate > 0);
 }
 
 // ── FEE MANAGEMENT TESTS ─────────────────────────────────────────────────────
