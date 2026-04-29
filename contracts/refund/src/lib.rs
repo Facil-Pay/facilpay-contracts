@@ -4,7 +4,16 @@ use soroban_sdk::{
     BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
-#[derive(Clone)]
+// Issue #138 workaround: Using tuple-based storage keys with Symbol
+// to avoid LengthExceedsMax error from large #[contracttype] enums
+pub type StorageKey = (Symbol, Option<Address>, Option<u64>, Option<u32>);
+
+pub fn make_key(prefix: &str, addr: Option<Address>, id: Option<u64>, sub_id: Option<u32>) -> StorageKey {
+    (Symbol::new(&Env::default(), prefix), addr, id, sub_id)
+}
+
+// Legacy DataKey - split into functional groups to avoid LengthExceedsMax
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -19,43 +28,54 @@ pub enum DataKey {
     CustomerRefundCount(Address),
     PaymentRefunds(u64, u64),
     PaymentRefundCount(u64),
+    PoolToken(u64),
+    DefaultRefundPolicy,
+    RefundPolicy(Address),
+    PaymentContractAddress,
+    BatchRefundLimit,
+    RefundAnalyticsKey,
+    // Rate limiting
+    CustomerRefundRateLimit(Address),
+    GlobalRefundRateLimit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ArbitrationKey {
     ArbitrationCase(u64),
     ArbitrationCounter,
     ArbitratorList,
-    ArbitratorsVoted(u64),        // case_id -> Vec<Address>
-    ArbitratorVote(u64, Address), // case_id, arbitrator
-    PoolToken(u64),
+    ArbitratorsVoted(u64),
+    ArbitratorVote(u64, Address),
     ArbitrationFeeConfig,
     AccumulatedTreasuryFees,
     ArbitrationStakeConfig,
-    ArbitrationStake(u64), // case_id -> ArbitrationStake
-    ArbitratorReputation(Address), // arbitrator -> ArbitratorReputation
-    ArbitratorScoreIndex(i128, u64), // score -> index for sorting
+    ArbitrationStake(u64),
+    ArbitratorReputation(Address),
+    ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
-    DefaultRefundPolicy,
-    RefundPolicy(Address),
-    // Policy versioning (#134)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum PolicyKey {
     RefundPolicyVersion(Address, u32),
     RefundPolicyVersionCount(Address),
-    // Payment contract address (#143)
-    PaymentContractAddress,
     AutoRefundTrigger(u64),
     AutoRefundTriggerCounter,
-    // Batch refund limit (#135)
-    BatchRefundLimit,
-    // Analytics
-    RefundAnalyticsKey,
-    // Pause system
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum SystemKey {
     PauseStateKey,
     PauseHistoryEntry(u64),
     PauseHistoryCount,
-    // Circuit breaker
     CircuitBreakerConfigKey,
     CircuitBreakerStateKey,
     WindowStart,
     WindowRefundVolume,
     WindowPaymentVolume,
-    // Fraud detection (#137)
     FraudSignal(Address),
     FraudConfig,
     FlaggedAddressesIndex,
@@ -124,6 +144,9 @@ pub enum Error {
     AddressFlaggedForFraud = 38,
     FraudConfigNotSet = 39,
     FraudSignalNotFound = 40,
+    // Issue #138: Refund policy inheritance errors
+    CircularInheritance = 21,
+    MaxInheritanceDepth = 22,
     RefundNotRejected = 23,
     AppealWindowExpired = 24,
     AppealAlreadyFiled = 25,
@@ -369,6 +392,16 @@ pub struct ArbitratorVote {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct RefundTier {
+    pub tier_id: u32,
+    pub min_amount: i128,
+    pub max_amount: i128,
+    pub refund_percentage_bps: u32,
+    pub description: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct RefundPolicy {
     pub merchant: Address,
     pub refund_window: u64,
@@ -376,6 +409,10 @@ pub struct RefundPolicy {
     pub requires_admin_approval: bool,
     pub auto_approve_below: i128,
     pub active: bool,
+    // Issue #138: Policy inheritance fields
+    pub parent_merchant: Option<Address>,
+    pub tiers: Vec<RefundTier>,
+    pub inherit_from_parent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -672,6 +709,10 @@ impl RefundContract {
             requires_admin_approval: true,
             auto_approve_below: 0, // No auto-approve by default
             active: true,
+            // Issue #138: Default values for inheritance
+            parent_merchant: None,
+            tiers: Vec::new(&env),
+            inherit_from_parent: false,
         };
         env.storage().instance().set(&DataKey::DefaultRefundPolicy, &default_policy);
     }
@@ -747,7 +788,7 @@ impl RefundContract {
         // Store updated refund back to storage
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
-        env.storage().instance().set(&DataKey::RefundRejectedAt(refund_id), &env.ledger().timestamp());
+        env.storage().instance().set(&SystemKey::RefundRejectedAt(refund_id), &env.ledger().timestamp());
 
         // Emit RefundRejected event
         (RefundRejected {
@@ -780,21 +821,21 @@ impl RefundContract {
         if refund.status != RefundStatus::Rejected {
             return Err(Error::RefundNotRejected);
         }
-        if env.storage().instance().has(&DataKey::AppealByRefund(refund_id)) {
+        if env.storage().instance().has(&SystemKey::AppealByRefund(refund_id)) {
             return Err(Error::AppealAlreadyFiled);
         }
 
         let rejected_at: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::RefundRejectedAt(refund_id))
+            .get(&SystemKey::RefundRejectedAt(refund_id))
             .ok_or(Error::RefundNotRejected)?;
         let now = env.ledger().timestamp();
         if now > rejected_at.saturating_add(72 * 60 * 60) {
             return Err(Error::AppealWindowExpired);
         }
 
-        let counter: u64 = env.storage().instance().get(&DataKey::AppealCounter).unwrap_or(0);
+        let counter: u64 = env.storage().instance().get(&SystemKey::AppealCounter).unwrap_or(0);
         let appeal_id = counter + 1;
         let appeal = RefundAppeal {
             appeal_id,
@@ -805,21 +846,21 @@ impl RefundContract {
             resolved: false,
             outcome: None,
         };
-        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
-        env.storage().instance().set(&DataKey::AppealCounter, &appeal_id);
-        env.storage().instance().set(&DataKey::AppealByRefund(refund_id), &appeal_id);
+        env.storage().instance().set(&SystemKey::Appeal(appeal_id), &appeal);
+        env.storage().instance().set(&SystemKey::AppealCounter, &appeal_id);
+        env.storage().instance().set(&SystemKey::AppealByRefund(refund_id), &appeal_id);
 
         let customer_count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .get(&SystemKey::AppealByCustomerCount(customer.clone()))
             .unwrap_or(0);
         env.storage().instance().set(
-            &DataKey::AppealByCustomer(customer.clone(), customer_count),
+            &SystemKey::AppealByCustomer(customer.clone(), customer_count),
             &appeal_id,
         );
         env.storage().instance().set(
-            &DataKey::AppealByCustomerCount(customer.clone()),
+            &SystemKey::AppealByCustomerCount(customer.clone()),
             &(customer_count + 1),
         );
 
@@ -853,7 +894,7 @@ impl RefundContract {
         let mut appeal: RefundAppeal = env
             .storage()
             .instance()
-            .get(&DataKey::Appeal(appeal_id))
+            .get(&SystemKey::Appeal(appeal_id))
             .ok_or(Error::RefundNotFound)?;
         if appeal.resolved {
             return Err(Error::AlreadyProcessed);
@@ -879,7 +920,7 @@ impl RefundContract {
 
         appeal.resolved = true;
         appeal.outcome = Some(uphold);
-        env.storage().instance().set(&DataKey::Appeal(appeal_id), &appeal);
+        env.storage().instance().set(&SystemKey::Appeal(appeal_id), &appeal);
 
         (AppealResolved {
             appeal_id,
@@ -894,7 +935,7 @@ impl RefundContract {
     pub fn get_appeal(env: Env, appeal_id: u64) -> Result<RefundAppeal, Error> {
         env.storage()
             .instance()
-            .get(&DataKey::Appeal(appeal_id))
+            .get(&SystemKey::Appeal(appeal_id))
             .ok_or(Error::RefundNotFound)
     }
 
@@ -903,7 +944,7 @@ impl RefundContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::AppealByCustomerCount(customer.clone()))
+            .get(&SystemKey::AppealByCustomerCount(customer.clone()))
             .unwrap_or(0);
 
         let mut index = 0u64;
@@ -911,12 +952,12 @@ impl RefundContract {
             if let Some(appeal_id) = env
                 .storage()
                 .instance()
-                .get::<_, u64>(&DataKey::AppealByCustomer(customer.clone(), index))
+                .get::<_, u64>(&SystemKey::AppealByCustomer(customer.clone(), index))
             {
                 if let Some(appeal) = env
                     .storage()
                     .instance()
-                    .get::<_, RefundAppeal>(&DataKey::Appeal(appeal_id))
+                    .get::<_, RefundAppeal>(&SystemKey::Appeal(appeal_id))
                 {
                     appeals.push_back(appeal);
                 }
@@ -957,7 +998,7 @@ impl RefundContract {
         let trigger_count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::AutoRefundTriggerCounter)
+            .get(&PolicyKey::AutoRefundTriggerCounter)
             .unwrap_or(0);
 
         let mut trigger_id = 1u64;
@@ -965,7 +1006,7 @@ impl RefundContract {
             if let Some(existing) = env
                 .storage()
                 .instance()
-                .get::<DataKey, AutoRefundTrigger>(&DataKey::AutoRefundTrigger(trigger_id))
+                .get::<PolicyKey, AutoRefundTrigger>(&PolicyKey::AutoRefundTrigger(trigger_id))
             {
                 if existing.active
                     && existing.payment_id == payment_id
@@ -988,10 +1029,10 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::AutoRefundTrigger(new_trigger_id), &trigger);
+            .set(&PolicyKey::AutoRefundTrigger(new_trigger_id), &trigger);
         env.storage()
             .instance()
-            .set(&DataKey::AutoRefundTriggerCounter, &new_trigger_id);
+            .set(&PolicyKey::AutoRefundTriggerCounter, &new_trigger_id);
 
         (TriggerRegistered {
             trigger_id: new_trigger_id,
@@ -1041,7 +1082,7 @@ impl RefundContract {
         trigger.active = false;
         env.storage()
             .instance()
-            .set(&DataKey::AutoRefundTrigger(trigger_id), &trigger);
+            .set(&PolicyKey::AutoRefundTrigger(trigger_id), &trigger);
 
         (AutoRefundTriggered {
             trigger_id,
@@ -1056,7 +1097,7 @@ impl RefundContract {
     pub fn get_auto_refund_trigger(env: Env, trigger_id: u64) -> Result<AutoRefundTrigger, Error> {
         env.storage()
             .instance()
-            .get(&DataKey::AutoRefundTrigger(trigger_id))
+            .get(&PolicyKey::AutoRefundTrigger(trigger_id))
             .ok_or(Error::AutoRefundTriggerNotFound)
     }
 
@@ -1126,7 +1167,7 @@ impl RefundContract {
         let mut list: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorList)
+            .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
         if list.contains(&arbitrator) {
             return Err(Error::Unauthorized);
@@ -1134,7 +1175,7 @@ impl RefundContract {
         list.push_back(arbitrator.clone());
         env.storage()
             .instance()
-            .set(&DataKey::ArbitratorList, &list);
+            .set(&ArbitrationKey::ArbitratorList, &list);
 
         // Initialize reputation for new arbitrator
         let reputation = ArbitratorReputation {
@@ -1148,7 +1189,7 @@ impl RefundContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::ArbitratorReputation(arbitrator), &reputation);
+            .set(&ArbitrationKey::ArbitratorReputation(arbitrator), &reputation);
 
         Ok(())
     }
@@ -1177,14 +1218,14 @@ impl RefundContract {
         let counter: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitrationCounter)
+            .get(&ArbitrationKey::ArbitrationCounter)
             .unwrap_or(0);
         let case_id = counter + 1;
 
         let arbitrators = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorList)
+            .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
         if arbitrators.len() < 3 {
             return Err(Error::QuorumNotReached);
@@ -1194,7 +1235,7 @@ impl RefundContract {
         let stake_config: Option<ArbitrationStakeConfig> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitrationStakeConfig);
+            .get(&ArbitrationKey::ArbitrationStakeConfig);
 
         if let Some(config) = stake_config {
             if config.enabled {
@@ -1216,7 +1257,7 @@ impl RefundContract {
                 };
                 env.storage()
                     .instance()
-                    .set(&DataKey::ArbitrationStake(case_id), &stake);
+                    .set(&ArbitrationKey::ArbitrationStake(case_id), &stake);
 
                 StakeDeposited {
                     case_id,
@@ -1247,10 +1288,10 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationCase(case_id), &case);
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationCounter, &case_id);
+            .set(&ArbitrationKey::ArbitrationCounter, &case_id);
 
         RefundEscalatedToArbitration {
             refund_id,
@@ -1274,7 +1315,7 @@ impl RefundContract {
         let mut case: ArbitrationCase = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitrationCase(case_id))
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
             .ok_or(Error::RefundNotFound)?;
         if case.status != ArbitrationStatus::Open {
             return Err(Error::InvalidStatus);
@@ -1288,7 +1329,7 @@ impl RefundContract {
         if env
             .storage()
             .instance()
-            .has(&DataKey::ArbitratorVote(case_id, arbitrator.clone()))
+            .has(&ArbitrationKey::ArbitratorVote(case_id, arbitrator.clone()))
         {
             return Err(Error::AlreadyProcessed);
         }
@@ -1310,18 +1351,18 @@ impl RefundContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::ArbitratorVote(case_id, arbitrator.clone()), &vote);
+            .set(&ArbitrationKey::ArbitratorVote(case_id, arbitrator.clone()), &vote);
 
         let mut voted: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorsVoted(case_id))
+            .get(&ArbitrationKey::ArbitratorsVoted(case_id))
             .unwrap_or_else(|| Vec::new(&env));
         if !voted.contains(&arbitrator) {
             voted.push_back(arbitrator.clone());
             env.storage()
                 .instance()
-                .set(&DataKey::ArbitratorsVoted(case_id), &voted);
+                .set(&ArbitrationKey::ArbitratorsVoted(case_id), &voted);
         }
 
         if vote_for_refund {
@@ -1331,7 +1372,7 @@ impl RefundContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationCase(case_id), &case);
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
 
         ArbitrationVoteCast {
             case_id,
@@ -1347,7 +1388,7 @@ impl RefundContract {
         let mut case: ArbitrationCase = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitrationCase(case_id))
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
             .ok_or(Error::RefundNotFound)?;
         if case.status != ArbitrationStatus::Open {
             return Err(Error::InvalidStatus);
@@ -1363,7 +1404,7 @@ impl RefundContract {
         case.status = ArbitrationStatus::Decided;
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationCase(case_id), &case);
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
 
         // Update refund status if approved
         if approved {
@@ -1385,7 +1426,7 @@ impl RefundContract {
         let all_voters: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorsVoted(case_id))
+            .get(&ArbitrationKey::ArbitratorsVoted(case_id))
             .unwrap_or_else(|| Vec::new(&env));
         
         if num_voters > 0 {
@@ -1400,7 +1441,7 @@ impl RefundContract {
             let fee_config: Option<ArbitrationFeeConfig> = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbitrationFeeConfig);
+                .get(&ArbitrationKey::ArbitrationFeeConfig);
 
             let (arbitrator_share, treasury_share, treasury_address) = if let Some(ref config) = fee_config {
                 // Calculate shares based on basis points
@@ -1418,7 +1459,7 @@ impl RefundContract {
                 let vote: ArbitratorVote = env
                     .storage()
                     .instance()
-                    .get(&DataKey::ArbitratorVote(case_id, voter.clone()))
+                    .get(&ArbitrationKey::ArbitratorVote(case_id, voter.clone()))
                     .unwrap();
                 
                 // Check if this voter was in the majority
@@ -1457,11 +1498,11 @@ impl RefundContract {
                     let accumulated: i128 = env
                         .storage()
                         .instance()
-                        .get(&DataKey::AccumulatedTreasuryFees)
+                        .get(&ArbitrationKey::AccumulatedTreasuryFees)
                         .unwrap_or(0);
                     env.storage()
                         .instance()
-                        .set(&DataKey::AccumulatedTreasuryFees, &(accumulated + treasury_share));
+                        .set(&ArbitrationKey::AccumulatedTreasuryFees, &(accumulated + treasury_share));
                 }
             }
 
@@ -1477,7 +1518,7 @@ impl RefundContract {
         let stake_opt: Option<ArbitrationStake> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitrationStake(case_id));
+            .get(&ArbitrationKey::ArbitrationStake(case_id));
 
         if let Some(mut stake) = stake_opt {
             if !stake.returned {
@@ -1490,7 +1531,7 @@ impl RefundContract {
                 let stake_config: Option<ArbitrationStakeConfig> = env
                     .storage()
                     .instance()
-                    .get(&DataKey::ArbitrationStakeConfig);
+                    .get(&ArbitrationKey::ArbitrationStakeConfig);
 
                 if let Some(stake_cfg) = stake_config {
                     let stake_token_client = token::Client::new(&env, &stake_cfg.token);
@@ -1499,7 +1540,7 @@ impl RefundContract {
                     let fee_config: Option<ArbitrationFeeConfig> = env
                         .storage()
                         .instance()
-                        .get(&DataKey::ArbitrationFeeConfig);
+                        .get(&ArbitrationKey::ArbitrationFeeConfig);
 
                     // Determine if staker won or lost
                     // Staker is the one who escalated (usually merchant after rejection)
@@ -1548,7 +1589,7 @@ impl RefundContract {
                     stake.returned = true;
                     env.storage()
                         .instance()
-                        .set(&DataKey::ArbitrationStake(case_id), &stake);
+                        .set(&ArbitrationKey::ArbitrationStake(case_id), &stake);
                 }
             }
         }
@@ -1561,7 +1602,7 @@ impl RefundContract {
             let vote: ArbitratorVote = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbitratorVote(case_id, voter.clone()))
+                .get(&ArbitrationKey::ArbitratorVote(case_id, voter.clone()))
                 .unwrap();
 
             // Check if this voter was in the majority
@@ -1575,7 +1616,7 @@ impl RefundContract {
             let mut reputation: ArbitratorReputation = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbitratorReputation(voter.clone()))
+                .get(&ArbitrationKey::ArbitratorReputation(voter.clone()))
                 .unwrap_or(ArbitratorReputation {
                     arbitrator: voter.clone(),
                     total_cases: 0,
@@ -1615,7 +1656,7 @@ impl RefundContract {
             // Store updated reputation
             env.storage()
                 .instance()
-                .set(&DataKey::ArbitratorReputation(voter.clone()), &reputation);
+                .set(&ArbitrationKey::ArbitratorReputation(voter.clone()), &reputation);
 
             // Emit score update event
             ArbitratorScoreUpdated {
@@ -1635,7 +1676,7 @@ impl RefundContract {
     pub fn get_arbitrator_reputation(env: Env, arbitrator: Address) -> Option<ArbitratorReputation> {
         env.storage()
             .instance()
-            .get(&DataKey::ArbitratorReputation(arbitrator))
+            .get(&ArbitrationKey::ArbitratorReputation(arbitrator))
     }
 
     /// Get the top arbitrators sorted by score (highest first)
@@ -1647,7 +1688,7 @@ impl RefundContract {
         let arbitrators: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorList)
+            .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
 
         if arbitrators.len() == 0 {
@@ -1660,7 +1701,7 @@ impl RefundContract {
             if let Some(reputation) = env
                 .storage()
                 .instance()
-                .get::<DataKey, ArbitratorReputation>(&DataKey::ArbitratorReputation(arbitrator.clone()))
+                .get::<ArbitrationKey, ArbitratorReputation>(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()))
             {
                 reputations.push_back(reputation);
             }
@@ -1714,7 +1755,7 @@ impl RefundContract {
         let mut arbitrators: Vec<Address> = env
             .storage()
             .instance()
-            .get(&DataKey::ArbitratorList)
+            .get(&ArbitrationKey::ArbitratorList)
             .unwrap_or(Vec::new(&env));
 
         let mut removed_count: u32 = 0;
@@ -1724,7 +1765,7 @@ impl RefundContract {
             let reputation: Option<ArbitratorReputation> = env
                 .storage()
                 .instance()
-                .get(&DataKey::ArbitratorReputation(arbitrator.clone()));
+                .get(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
 
             let should_remove = if let Some(rep) = reputation {
                 rep.score < min_score
@@ -1736,7 +1777,7 @@ impl RefundContract {
                 // Remove reputation data
                 env.storage()
                     .instance()
-                    .remove(&DataKey::ArbitratorReputation(arbitrator.clone()));
+                    .remove(&ArbitrationKey::ArbitratorReputation(arbitrator.clone()));
 
                 // Emit deregistration event
                 ArbitratorDeregistered {
@@ -1755,7 +1796,7 @@ impl RefundContract {
         // Update the arbitrator list
         env.storage()
             .instance()
-            .set(&DataKey::ArbitratorList, &new_arbitrators);
+            .set(&ArbitrationKey::ArbitratorList, &new_arbitrators);
 
         Ok(removed_count)
     }
@@ -1763,7 +1804,7 @@ impl RefundContract {
     pub fn get_arbitration_case(env: Env, case_id: u64) -> Result<ArbitrationCase, Error> {
         env.storage()
             .instance()
-            .get(&DataKey::ArbitrationCase(case_id))
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
             .ok_or(Error::RefundNotFound)
     }
 
@@ -1789,7 +1830,7 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationFeeConfig, &config);
+            .set(&ArbitrationKey::ArbitrationFeeConfig, &config);
 
         Ok(())
     }
@@ -1798,14 +1839,14 @@ impl RefundContract {
     pub fn get_arbitration_fee_config(env: Env) -> Option<ArbitrationFeeConfig> {
         env.storage()
             .instance()
-            .get(&DataKey::ArbitrationFeeConfig)
+            .get(&ArbitrationKey::ArbitrationFeeConfig)
     }
 
     /// Get the accumulated treasury fees from arbitration cases
     pub fn get_accumulated_arbitration_fees(env: Env) -> i128 {
         env.storage()
             .instance()
-            .get(&DataKey::AccumulatedTreasuryFees)
+            .get(&ArbitrationKey::AccumulatedTreasuryFees)
             .unwrap_or(0)
     }
 
@@ -1823,7 +1864,7 @@ impl RefundContract {
         let accumulated: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::AccumulatedTreasuryFees)
+            .get(&ArbitrationKey::AccumulatedTreasuryFees)
             .unwrap_or(0);
 
         if accumulated <= 0 {
@@ -1833,7 +1874,7 @@ impl RefundContract {
         // Reset accumulated fees
         env.storage()
             .instance()
-            .set(&DataKey::AccumulatedTreasuryFees, &0i128);
+            .set(&ArbitrationKey::AccumulatedTreasuryFees, &0i128);
 
         Ok(accumulated)
     }
@@ -1859,7 +1900,7 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::ArbitrationStakeConfig, &config);
+            .set(&ArbitrationKey::ArbitrationStakeConfig, &config);
 
         Ok(())
     }
@@ -1868,14 +1909,14 @@ impl RefundContract {
     pub fn get_arbitration_stake_config(env: Env) -> Option<ArbitrationStakeConfig> {
         env.storage()
             .instance()
-            .get(&DataKey::ArbitrationStakeConfig)
+            .get(&ArbitrationKey::ArbitrationStakeConfig)
     }
 
     /// Get the stake information for a specific arbitration case
     pub fn get_arbitration_stake(env: Env, case_id: u64) -> Option<ArbitrationStake> {
         env.storage()
             .instance()
-            .get(&DataKey::ArbitrationStake(case_id))
+            .get(&ArbitrationKey::ArbitrationStake(case_id))
     }
 
     pub fn get_refunds_by_status(
@@ -2067,6 +2108,10 @@ impl RefundContract {
             requires_admin_approval,
             auto_approve_below,
             active: true,
+            // Issue #138: Default values for inheritance - use existing parent if any
+            parent_merchant: Self::get_merchant_parent(&env, merchant.clone()),
+            tiers: Vec::new(&env),
+            inherit_from_parent: true, // Default to true for new policies
         };
 
         env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
@@ -2075,7 +2120,7 @@ impl RefundContract {
         let version_count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .get(&PolicyKey::RefundPolicyVersionCount(merchant.clone()))
             .unwrap_or(0);
         let new_version = version_count + 1;
         let versioned = RefundPolicyVersion {
@@ -2085,11 +2130,11 @@ impl RefundContract {
             created_by: merchant.clone(),
         };
         env.storage().instance().set(
-            &DataKey::RefundPolicyVersion(merchant.clone(), new_version),
+            &PolicyKey::RefundPolicyVersion(merchant.clone(), new_version),
             &versioned,
         );
         env.storage().instance().set(
-            &DataKey::RefundPolicyVersionCount(merchant.clone()),
+            &PolicyKey::RefundPolicyVersionCount(merchant.clone()),
             &new_version,
         );
 
@@ -2111,7 +2156,7 @@ impl RefundContract {
     ) -> Option<RefundPolicyVersion> {
         env.storage()
             .instance()
-            .get(&DataKey::RefundPolicyVersion(merchant, version))
+            .get(&PolicyKey::RefundPolicyVersion(merchant, version))
     }
 
     pub fn get_refund_policy_at_time(
@@ -2122,7 +2167,7 @@ impl RefundContract {
         let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .get(&PolicyKey::RefundPolicyVersionCount(merchant.clone()))
             .unwrap_or(0);
         if count == 0 {
             return None;
@@ -2133,7 +2178,7 @@ impl RefundContract {
             if let Some(pv) = env
                 .storage()
                 .instance()
-                .get::<DataKey, RefundPolicyVersion>(&DataKey::RefundPolicyVersion(merchant.clone(), v))
+                .get::<PolicyKey, RefundPolicyVersion>(&PolicyKey::RefundPolicyVersion(merchant.clone(), v))
             {
                 if pv.created_at <= timestamp {
                     result = Some(pv);
@@ -2150,14 +2195,14 @@ impl RefundContract {
         let count: u32 = env
             .storage()
             .instance()
-            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .get(&PolicyKey::RefundPolicyVersionCount(merchant.clone()))
             .unwrap_or(0);
         let mut history = Vec::new(&env);
         for v in 1..=count {
             if let Some(pv) = env
                 .storage()
                 .instance()
-                .get::<DataKey, RefundPolicyVersion>(&DataKey::RefundPolicyVersion(merchant.clone(), v))
+                .get::<PolicyKey, RefundPolicyVersion>(&PolicyKey::RefundPolicyVersion(merchant.clone(), v))
             {
                 history.push_back(pv);
             }
@@ -2286,6 +2331,183 @@ impl RefundContract {
         }).publish(&env);
 
         Ok(())
+    }
+
+    // ── Issue #138: Refund policy inheritance for merchant hierarchies ────────
+
+    /// Maximum depth allowed for policy inheritance chain
+    const MAX_INHERITANCE_DEPTH: u32 = 5;
+
+    /// Set the parent merchant for a child merchant to enable policy inheritance.
+    /// Requires admin authorization.
+    /// Validates against self-parent, circular references, and max depth.
+    pub fn set_merchant_parent(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        parent: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        // Verify admin authorization
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Prevent self-parent
+        if merchant == parent {
+            return Err(Error::CircularInheritance);
+        }
+
+        // Check for circular reference by traversing up from parent
+        // If we encounter the merchant in the parent's chain, it would create a cycle
+        let mut visited = Vec::new(&env);
+        visited.push_back(merchant.clone());
+
+        let mut current = parent.clone();
+        let mut depth: u32 = 1;
+
+        while depth <= Self::MAX_INHERITANCE_DEPTH {
+            if current == merchant {
+                return Err(Error::CircularInheritance);
+            }
+
+            // Check if we've seen this address before (shouldn't happen but safety check)
+            if visited.contains(&current) {
+                return Err(Error::CircularInheritance);
+            }
+            visited.push_back(current.clone());
+
+            // Move to next parent
+            match Self::get_merchant_parent(&env, current.clone()) {
+                Some(next_parent) => {
+                    current = next_parent;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        // Validate max depth constraint (>= to prevent exceeding max, including the new merchant)
+        if depth >= Self::MAX_INHERITANCE_DEPTH {
+            return Err(Error::MaxInheritanceDepth);
+        }
+
+        // Store the parent relationship using Symbol-based key
+        let key = Symbol::new(&env, "parent_of");
+        let composite_key: (Symbol, Address) = (key, merchant.clone());
+        env.storage().instance().set(&composite_key, &parent);
+
+        // Update existing policy to reflect new parent if one exists
+        if let Some(mut policy) = Self::get_refund_policy(&env, merchant.clone()) {
+            policy.parent_merchant = Some(parent);
+            env.storage()
+                .instance()
+                .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
+        }
+
+        Ok(())
+    }
+
+    /// Get the direct parent merchant of a given merchant.
+    pub fn get_merchant_parent(env: &Env, merchant: Address) -> Option<Address> {
+        let key = Symbol::new(env, "parent_of");
+        let composite_key: (Symbol, Address) = (key, merchant);
+        env.storage().instance().get(&composite_key)
+    }
+
+    /// Get the effective refund policy for a merchant, traversing the inheritance chain.
+    /// Returns the first active explicit policy found, respecting inherit_from_parent flag.
+    pub fn get_effective_refund_policy(env: Env, merchant: Address) -> Option<RefundPolicy> {
+        let mut current = merchant.clone();
+        let mut depth: u32 = 0;
+        let mut visited = Vec::new(&env);
+
+        while depth < Self::MAX_INHERITANCE_DEPTH {
+            // Prevent infinite loops
+            if visited.contains(&current) {
+                return None; // Circular reference detected
+            }
+            visited.push_back(current.clone());
+
+            // Try to get explicit policy for current merchant
+            if let Some(policy) = Self::get_refund_policy(&env, current.clone()) {
+                if policy.active {
+                    // If this is the starting merchant, always return their own active policy
+                    // A merchant's explicit policy always takes precedence for themselves
+                    if current == merchant {
+                        return Some(policy);
+                    }
+                    // We're at a parent in the chain - their policy is inheritable
+                    return Some(policy);
+                }
+                // Policy is inactive - check if we should continue to parent
+                if current == merchant && !policy.inherit_from_parent {
+                    // Starting merchant has disabled inheritance and their policy is inactive
+                    // Return None to indicate no valid policy (caller may handle or fall back)
+                    // For now, continue to parent to find an active policy
+                }
+                // Continue to parent (either inactive policy or merchant wants to inherit)
+            }
+
+            // Move to parent
+            match Self::get_merchant_parent(&env, current.clone()) {
+                Some(parent) => {
+                    current = parent;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        // If we reached max depth, return None to indicate failure
+        if depth >= Self::MAX_INHERITANCE_DEPTH {
+            return None;
+        }
+
+        // No explicit policy found in chain, fall back to default
+        Self::get_default_refund_policy_inner(&env)
+    }
+
+    /// Get the inheritance chain for a merchant (ancestry path).
+    /// Returns vector from merchant → parent → grandparent → ... → root.
+    /// Returns error if circular reference or max depth exceeded.
+    pub fn get_policy_inheritance_chain(
+        env: Env,
+        merchant: Address,
+    ) -> Result<Vec<Address>, Error> {
+        let mut chain = Vec::new(&env);
+        let mut current = merchant.clone();
+        let mut depth: u32 = 0;
+
+        chain.push_back(current.clone());
+
+        while depth < Self::MAX_INHERITANCE_DEPTH {
+            match Self::get_merchant_parent(&env, current.clone()) {
+                Some(parent) => {
+                    // Check for circular reference
+                    if chain.contains(&parent) {
+                        return Err(Error::CircularInheritance);
+                    }
+                    chain.push_back(parent.clone());
+                    current = parent;
+                    depth += 1;
+                }
+                None => break,
+            }
+        }
+
+        // Check if we hit max depth
+        if depth >= Self::MAX_INHERITANCE_DEPTH {
+            return Err(Error::MaxInheritanceDepth);
+        }
+
+        Ok(chain)
     }
 
     fn validate_against_policy(
@@ -2831,7 +3053,7 @@ impl RefundContract {
         }
         let now = env.ledger().timestamp();
         let pause_state = if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             state.globally_paused = true;
             state.paused_at = now;
             state.paused_by = admin.clone();
@@ -2846,9 +3068,9 @@ impl RefundContract {
                 pause_reason: reason.clone(),
             }
         };
-        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
+        env.storage().instance().set(&SystemKey::PauseStateKey, &pause_state);
         let history_count: u64 = env.storage().instance()
-            .get(&DataKey::PauseHistoryCount)
+            .get(&SystemKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
             index: history_count,
@@ -2858,8 +3080,8 @@ impl RefundContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage().instance().set(&SystemKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&SystemKey::PauseHistoryCount, &(history_count + 1));
         (ContractPausedEvent { paused_by: admin, reason, paused_at: now }).publish(&env);
         Ok(())
     }
@@ -2873,13 +3095,13 @@ impl RefundContract {
             return Err(Error::Unauthorized);
         }
         if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             state.globally_paused = false;
-            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+            env.storage().instance().set(&SystemKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
         let history_count: u64 = env.storage().instance()
-            .get(&DataKey::PauseHistoryCount)
+            .get(&SystemKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
             index: history_count,
@@ -2889,8 +3111,8 @@ impl RefundContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage().instance().set(&SystemKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&SystemKey::PauseHistoryCount, &(history_count + 1));
         (ContractUnpausedEvent { unpaused_by: admin, unpaused_at: now }).publish(&env);
         Ok(())
     }
@@ -2910,7 +3132,7 @@ impl RefundContract {
         }
         let now = env.ledger().timestamp();
         let mut pause_state = if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             state
         } else {
             PauseState {
@@ -2924,9 +3146,9 @@ impl RefundContract {
         if !pause_state.paused_functions.contains(&function_name) {
             pause_state.paused_functions.push_back(function_name.clone());
         }
-        env.storage().instance().set(&DataKey::PauseStateKey, &pause_state);
+        env.storage().instance().set(&SystemKey::PauseStateKey, &pause_state);
         let history_count: u64 = env.storage().instance()
-            .get(&DataKey::PauseHistoryCount)
+            .get(&SystemKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
             index: history_count,
@@ -2936,8 +3158,8 @@ impl RefundContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage().instance().set(&SystemKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&SystemKey::PauseHistoryCount, &(history_count + 1));
         (FunctionPausedEvent { function_name, paused_by: admin, reason }).publish(&env);
         Ok(())
     }
@@ -2955,7 +3177,7 @@ impl RefundContract {
             return Err(Error::Unauthorized);
         }
         if let Some(mut state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             let mut new_paused = Vec::new(&env);
             for fn_name in state.paused_functions.iter() {
                 if fn_name != function_name {
@@ -2963,11 +3185,11 @@ impl RefundContract {
                 }
             }
             state.paused_functions = new_paused;
-            env.storage().instance().set(&DataKey::PauseStateKey, &state);
+            env.storage().instance().set(&SystemKey::PauseStateKey, &state);
         }
         let now = env.ledger().timestamp();
         let history_count: u64 = env.storage().instance()
-            .get(&DataKey::PauseHistoryCount)
+            .get(&SystemKey::PauseHistoryCount)
             .unwrap_or(0);
         let entry = PauseHistory {
             index: history_count,
@@ -2977,15 +3199,15 @@ impl RefundContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(&DataKey::PauseHistoryEntry(history_count), &entry);
-        env.storage().instance().set(&DataKey::PauseHistoryCount, &(history_count + 1));
+        env.storage().instance().set(&SystemKey::PauseHistoryEntry(history_count), &entry);
+        env.storage().instance().set(&SystemKey::PauseHistoryCount, &(history_count + 1));
         (FunctionUnpausedEvent { function_name, unpaused_by: admin }).publish(&env);
         Ok(())
     }
 
     pub fn get_pause_state(env: Env) -> PauseState {
         env.storage().instance()
-            .get(&DataKey::PauseStateKey)
+            .get(&SystemKey::PauseStateKey)
             .unwrap_or(PauseState {
                 globally_paused: false,
                 paused_functions: Vec::new(&env),
@@ -2997,7 +3219,7 @@ impl RefundContract {
 
     pub fn is_function_paused(env: Env, function_name: String) -> bool {
         if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             if state.globally_paused { return true; }
             for fn_name in state.paused_functions.iter() {
                 if fn_name == function_name { return true; }
@@ -3019,7 +3241,7 @@ impl RefundContract {
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
         if let Some(state) = env.storage().instance()
-            .get::<DataKey, PauseState>(&DataKey::PauseStateKey) {
+            .get::<SystemKey, PauseState>(&SystemKey::PauseStateKey) {
             if state.globally_paused {
                 return Err(Error::ContractPaused);
             }
@@ -3051,14 +3273,14 @@ impl RefundContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::CircuitBreakerConfigKey, &config);
+            .set(&SystemKey::CircuitBreakerConfigKey, &config);
         Ok(())
     }
 
     pub fn get_circuit_breaker_state(env: Env) -> CircuitBreakerState {
         env.storage()
             .instance()
-            .get(&DataKey::CircuitBreakerStateKey)
+            .get::<SystemKey, CircuitBreakerState>(&SystemKey::CircuitBreakerStateKey)
             .unwrap_or(CircuitBreakerState {
                 tripped: false,
                 tripped_at: None,
@@ -3084,7 +3306,7 @@ impl RefundContract {
         state.resets_at = None;
         env.storage()
             .instance()
-            .set(&DataKey::CircuitBreakerStateKey, &state);
+            .set(&SystemKey::CircuitBreakerStateKey, &state);
         let now = env.ledger().timestamp();
         CircuitBreakerResetEvent {
             reset_by: admin,
@@ -3098,7 +3320,7 @@ impl RefundContract {
         let config: CircuitBreakerConfig = match env
             .storage()
             .instance()
-            .get(&DataKey::CircuitBreakerConfigKey)
+            .get(&SystemKey::CircuitBreakerConfigKey)
         {
             Some(c) => c,
             None => return false,
@@ -3126,7 +3348,7 @@ impl RefundContract {
         let config: CircuitBreakerConfig = match env
             .storage()
             .instance()
-            .get(&DataKey::CircuitBreakerConfigKey)
+            .get(&SystemKey::CircuitBreakerConfigKey)
         {
             Some(c) => c,
             None => return Ok(()),
@@ -3148,7 +3370,7 @@ impl RefundContract {
                     state.resets_at = None;
                     env.storage()
                         .instance()
-                        .set(&DataKey::CircuitBreakerStateKey, &state);
+                        .set(&SystemKey::CircuitBreakerStateKey, &state);
                 } else {
                     return Err(Error::CircuitBreakerTripped);
                 }
@@ -3161,26 +3383,26 @@ impl RefundContract {
         let window_start: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::WindowStart)
+            .get(&SystemKey::WindowStart)
             .unwrap_or(0);
 
         if now >= window_start + config.measurement_window_seconds || window_start == 0 {
-            env.storage().instance().set(&DataKey::WindowStart, &now);
-            env.storage().instance().set(&DataKey::WindowRefundVolume, &0i128);
-            env.storage().instance().set(&DataKey::WindowPaymentVolume, &0i128);
+            env.storage().instance().set(&SystemKey::WindowStart, &now);
+            env.storage().instance().set(&SystemKey::WindowRefundVolume, &0i128);
+            env.storage().instance().set(&SystemKey::WindowPaymentVolume, &0i128);
         }
 
         let new_refund_vol: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::WindowRefundVolume)
+            .get(&SystemKey::WindowRefundVolume)
             .unwrap_or(0)
             + refund_amount;
 
         let new_payment_vol: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::WindowPaymentVolume)
+            .get(&SystemKey::WindowPaymentVolume)
             .unwrap_or(0)
             + payment_amount;
 
@@ -3198,7 +3420,7 @@ impl RefundContract {
             state.resets_at = Some(now + config.cooldown_seconds);
             env.storage()
                 .instance()
-                .set(&DataKey::CircuitBreakerStateKey, &state);
+                .set(&SystemKey::CircuitBreakerStateKey, &state);
             CircuitBreakerTrippedEvent {
                 refund_rate_bps: rate_bps,
                 tripped_at: now,
@@ -3209,10 +3431,10 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::WindowRefundVolume, &new_refund_vol);
+            .set(&SystemKey::WindowRefundVolume, &new_refund_vol);
         env.storage()
             .instance()
-            .set(&DataKey::WindowPaymentVolume, &new_payment_vol);
+            .set(&SystemKey::WindowPaymentVolume, &new_payment_vol);
 
         Ok(())
     }
@@ -3223,7 +3445,7 @@ impl RefundContract {
         let config: FraudConfig = env
             .storage()
             .instance()
-            .get(&DataKey::FraudConfig)
+            .get(&SystemKey::FraudConfig)
             .unwrap_or(FraudConfig {
                 max_refund_rate_bps: 2000, // 20%
                 min_transactions_for_check: 5,
@@ -3253,28 +3475,28 @@ impl RefundContract {
         };
 
         // Check if refund rate exceeds threshold
-        if refund_rate_bps > config.max_refund_rate_bps {
+        if refund_rate_bps > config.max_refund_rate_bps as u64 {
             let existing_signal: Option<FraudSignal> = env
                 .storage()
                 .instance()
-                .get(&DataKey::FraudSignal(address.clone()));
+                .get(&SystemKey::FraudSignal(address.clone()));
 
             match existing_signal {
                 Some(mut signal) if !signal.reviewed => {
                     // Update existing signal
-                    signal.refund_rate_bps = refund_rate_bps;
+                    signal.refund_rate_bps = refund_rate_bps as u32;
                     signal.total_payments = total_payments;
                     signal.total_refunds = total_refunds;
                     env.storage()
                         .instance()
-                        .set(&DataKey::FraudSignal(address), &signal);
+                        .set(&SystemKey::FraudSignal(address), &signal);
                     Some(signal)
                 }
                 None => {
                     // Create new fraud signal
                     let signal = FraudSignal {
                         address: address.clone(),
-                        refund_rate_bps,
+                        refund_rate_bps: refund_rate_bps as u32,
                         total_payments,
                         total_refunds,
                         flagged_at: env.ledger().timestamp(),
@@ -3282,22 +3504,22 @@ impl RefundContract {
                     };
                     env.storage()
                         .instance()
-                        .set(&DataKey::FraudSignal(address), &signal);
+                        .set(&SystemKey::FraudSignal(address.clone()), &signal);
 
                     // Add to flagged addresses index
                     let mut flagged_count: u64 = env
                         .storage()
                         .instance()
-                        .get(&DataKey::FlaggedAddressesIndex)
+                        .get(&SystemKey::FlaggedAddressesIndex)
                         .unwrap_or(0);
                     env.storage()
                         .instance()
-                        .set(&DataKey::FlaggedAddressesIndex, &flagged_count + 1);
+                        .set(&SystemKey::FlaggedAddressesIndex, &(flagged_count + 1));
 
                     // Emit fraud signal raised event
                     (FraudSignalRaised {
                         address,
-                        refund_rate_bps,
+                        refund_rate_bps: refund_rate_bps as u32,
                     })
                     .publish(&env);
 
@@ -3335,13 +3557,13 @@ impl RefundContract {
         let mut signal: FraudSignal = env
             .storage()
             .instance()
-            .get(&DataKey::FraudSignal(address.clone()))
+            .get(&SystemKey::FraudSignal(address.clone()))
             .ok_or(Error::FraudSignalNotFound)?;
 
         signal.reviewed = true;
         env.storage()
             .instance()
-            .set(&DataKey::FraudSignal(address), &signal);
+            .set(&SystemKey::FraudSignal(address.clone()), &signal);
 
         // Emit fraud signal reviewed event
         (FraudSignalReviewed {
@@ -3368,7 +3590,7 @@ impl RefundContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::FraudConfig, &config);
+            .set(&SystemKey::FraudConfig, &config);
 
         Ok(())
     }
@@ -3419,3 +3641,6 @@ mod test_arbitrator_reputation;
 
 #[cfg(test)]
 mod test_auto_refund;
+
+#[cfg(test)]
+mod test_inheritance;
