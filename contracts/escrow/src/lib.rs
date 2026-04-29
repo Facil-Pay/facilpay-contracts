@@ -184,6 +184,10 @@ pub enum Error {
     RootAlreadyCommitted = 38,
     NoEvidenceRoot = 39,
     EmptyPauseReason = 55,
+    InvalidWeightSum = 56,
+    InvalidThreshold = 57,
+    WeightUpdateLocked = 58,
+    ParticipantNotFound = 59,
 }
 
 #[contractevent]
@@ -247,6 +251,21 @@ pub struct ParticipantApproved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiPartyEscrowReleased {
     pub escrow_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightUpdated {
+    pub escrow_id: u64,
+    pub participant: Address,
+    pub weight_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ThresholdUpdated {
+    pub escrow_id: u64,
+    pub threshold_bps: u32,
 }
 
 #[contractevent]
@@ -468,9 +487,11 @@ pub enum ParticipantRole {
 #[contracttype]
 pub struct Participant {
     pub address: Address,
-    pub share_bps: u32, // basis points out of 10000
     pub role: ParticipantRole,
-    pub required_approval: bool,
+    pub share_bps: u32,  // payout share in basis points (out of 10000)
+    pub weight_bps: u32, // voting weight in basis points (out of 10000)
+    pub approved: bool,
+    pub approved_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -482,7 +503,7 @@ pub struct MultiPartyEscrow {
     pub token: Address,
     pub status: EscrowStatus,
     pub approvals: Vec<Address>,
-    pub required_approvals: u32,
+    pub threshold_bps: u32, // cumulative approved weight needed for release
     pub created_at: u64,
     pub release_timestamp: u64,
 }
@@ -947,6 +968,16 @@ pub struct MultiPartyDisputeResolved {
     pub escrow_id: u64,
     pub favor_merchant: bool,
     pub resolved_at: u64,
+}
+
+fn sum_approved_weight(participants: &Vec<Participant>) -> u32 {
+    let mut total: u32 = 0;
+    for p in participants.iter() {
+        if p.approved {
+            total += p.weight_bps;
+        }
+    }
+    total
 }
 
 #[contract]
@@ -1581,19 +1612,29 @@ impl EscrowContract {
 
         // Ensure shares sum to 10000 bps
         let mut total_shares: u32 = 0;
+        let mut total_weights: u32 = 0;
         for p in participants.iter() {
             total_shares += p.share_bps;
+            total_weights += p.weight_bps;
         }
         if total_shares != 10000 {
             return Err(Error::InvalidSharesSum);
         }
+        if total_weights != 10000 {
+            return Err(Error::InvalidWeightSum);
+        }
 
-        // Count required approvals
-        let mut required_approvals: u32 = 0;
+        // Normalize participants (ensure approved=false, approved_at=None at creation)
+        let mut normalized = Vec::new(&env);
         for p in participants.iter() {
-            if p.required_approval {
-                required_approvals += 1;
-            }
+            normalized.push_back(Participant {
+                address: p.address.clone(),
+                role: p.role.clone(),
+                share_bps: p.share_bps,
+                weight_bps: p.weight_bps,
+                approved: false,
+                approved_at: None,
+            });
         }
 
         // Transfer funds from customer to contract
@@ -1611,14 +1652,15 @@ impl EscrowContract {
 
         let current_timestamp = env.ledger().timestamp();
 
+        // Default threshold: full weight (100%). Adjustable via update_approval_threshold_bps.
         let escrow = MultiPartyEscrow {
             id: escrow_id,
-            participants,
+            participants: normalized,
             total_amount,
             token,
             status: EscrowStatus::Locked,
             approvals: Vec::new(&env),
-            required_approvals,
+            threshold_bps: 10000,
             created_at: current_timestamp,
             release_timestamp,
         };
@@ -1660,30 +1702,37 @@ impl EscrowContract {
             return Err(Error::InvalidStatus);
         }
 
-        // Check if caller is a participant and needs to approve
-        let mut is_participant = false;
-        let mut needs_approval = false;
+        // Locate caller in participants. Only participants with weight_bps > 0 may vote.
+        let now = env.ledger().timestamp();
+        let mut updated_participants = Vec::new(&env);
+        let mut found_voter = false;
         for p in escrow.participants.iter() {
             if p.address == caller {
-                is_participant = true;
-                if p.required_approval {
-                    needs_approval = true;
+                if p.weight_bps == 0 {
+                    return Err(Error::Unauthorized);
                 }
-                break;
+                if p.approved {
+                    return Err(Error::DuplicateApproval);
+                }
+                found_voter = true;
+                updated_participants.push_back(Participant {
+                    address: p.address.clone(),
+                    role: p.role.clone(),
+                    share_bps: p.share_bps,
+                    weight_bps: p.weight_bps,
+                    approved: true,
+                    approved_at: Some(now),
+                });
+            } else {
+                updated_participants.push_back(p.clone());
             }
         }
 
-        if !is_participant || !needs_approval {
+        if !found_voter {
             return Err(Error::Unauthorized);
         }
 
-        // Check if already approved
-        for addr in escrow.approvals.iter() {
-            if addr == caller {
-                return Err(Error::DuplicateApproval);
-            }
-        }
-
+        escrow.participants = updated_participants;
         escrow.approvals.push_back(caller.clone());
         env.storage()
             .instance()
@@ -1717,8 +1766,9 @@ impl EscrowContract {
             return Err(Error::InvalidStatus);
         }
 
-        // Check if all required approvals are met
-        if escrow.approvals.len() < escrow.required_approvals {
+        // Check if cumulative approved weight meets the threshold
+        let approved_weight = sum_approved_weight(&escrow.participants);
+        if approved_weight < escrow.threshold_bps {
             return Err(Error::ApprovalsThresholdNotMet);
         }
 
@@ -1763,6 +1813,133 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::MultiPartyEscrow(escrow_id))
             .unwrap())
+    }
+
+    /// Returns (current cumulative approved weight, required threshold) in basis points.
+    pub fn get_approval_weight(env: Env, escrow_id: u64) -> Result<(u32, u32), Error> {
+        let escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+        let approved = sum_approved_weight(&escrow.participants);
+        Ok((approved, escrow.threshold_bps))
+    }
+
+    /// Admin updates a participant's voting weight. Blocked once any participant has approved.
+    /// The total participant weight must still sum to 10000 bps after the update.
+    pub fn set_participant_weight(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        participant: Address,
+        weight_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Block weight updates once any participant has already approved.
+        for p in escrow.participants.iter() {
+            if p.approved {
+                return Err(Error::WeightUpdateLocked);
+            }
+        }
+
+        let mut updated = Vec::new(&env);
+        let mut found = false;
+        let mut new_total: u32 = 0;
+        for p in escrow.participants.iter() {
+            if p.address == participant {
+                found = true;
+                new_total += weight_bps;
+                updated.push_back(Participant {
+                    address: p.address.clone(),
+                    role: p.role.clone(),
+                    share_bps: p.share_bps,
+                    weight_bps,
+                    approved: p.approved,
+                    approved_at: p.approved_at,
+                });
+            } else {
+                new_total += p.weight_bps;
+                updated.push_back(p.clone());
+            }
+        }
+
+        if !found {
+            return Err(Error::ParticipantNotFound);
+        }
+        if new_total != 10000 {
+            return Err(Error::InvalidWeightSum);
+        }
+
+        escrow.participants = updated;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
+
+        WeightUpdated {
+            escrow_id,
+            participant,
+            weight_bps,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Admin updates the approval threshold. Must be in the range (0, 10000].
+    pub fn update_approval_threshold_bps(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        threshold_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if threshold_bps == 0 || threshold_bps > 10000 {
+            return Err(Error::InvalidThreshold);
+        }
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        escrow.threshold_bps = threshold_bps;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
+
+        ThresholdUpdated {
+            escrow_id,
+            threshold_bps,
+        }
+        .publish(&env);
+
+        Ok(())
     }
 
     pub fn create_multi_token_escrow(

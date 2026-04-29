@@ -1609,21 +1609,27 @@ fn test_create_multi_party_escrow_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 3000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p3.clone(),
-        share_bps: 2000,
         role: ParticipantRole::Arbitrator,
-        required_approval: false,
+        share_bps: 2000,
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
     });
 
     let release_timestamp = 1000_u64;
@@ -1638,7 +1644,7 @@ fn test_create_multi_party_escrow_success() {
     let escrow = client.get_multi_party_escrow(&escrow_id);
     assert_eq!(escrow.id, 1);
     assert_eq!(escrow.total_amount, amount);
-    assert_eq!(escrow.required_approvals, 2);
+    assert_eq!(escrow.threshold_bps, 10000);
     assert_eq!(escrow.status, EscrowStatus::Locked);
 
     // Verify tokens were transferred to contract
@@ -2022,15 +2028,19 @@ fn test_create_multi_party_escrow_invalid_shares() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: Address::generate(&env),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: Address::generate(&env),
-        share_bps: 4000, // Sum is 9000, should fail
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 4000, // Sum is 9000, should fail
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
     });
 
     client.create_multi_party_escrow(&customer, &participants, &1000, &token_id, &1000);
@@ -2057,15 +2067,19 @@ fn test_approve_release_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 5000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
 
     let escrow_id =
@@ -2105,21 +2119,27 @@ fn test_release_multi_party_escrow_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000, // 5000
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000, // 5000
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 3000, // 3000
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 3000, // 3000
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p3.clone(),
-        share_bps: 2000, // 2000
         role: ParticipantRole::Arbitrator,
-        required_approval: false,
+        share_bps: 2000, // 2000
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
     });
 
     env.ledger().set_timestamp(500);
@@ -2355,15 +2375,19 @@ fn test_release_multi_party_escrow_threshold_not_met() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 5000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
 
     let escrow_id =
@@ -2374,6 +2398,232 @@ fn test_release_multi_party_escrow_threshold_not_met() {
 
     env.ledger().set_timestamp(1001);
     client.release_multi_party_escrow(&escrow_id);
+}
+
+// ── WEIGHTED VOTING TESTS ───────────────────────────────────────────────────
+
+fn make_weighted_escrow(
+    env: &Env,
+    client: &EscrowContractClient,
+    customer: &Address,
+    p_merchant: &Address,
+    p_investor: &Address,
+    token: &Address,
+) -> u64 {
+    // 60% merchant / 40% investor — both share and voting weight
+    let mut participants = Vec::new(env);
+    participants.push_back(Participant {
+        address: p_merchant.clone(),
+        role: ParticipantRole::Merchant,
+        share_bps: 6000,
+        weight_bps: 6000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p_investor.clone(),
+        role: ParticipantRole::Custom(String::from_str(env, "investor")),
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+    client.create_multi_party_escrow(customer, &participants, &10000_i128, token, &1000_u64)
+}
+
+#[test]
+fn test_weighted_threshold_met_releases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_user_client = token::Client::new(&env, &token_id);
+    token::StellarAssetClient::new(&env, &token_id).mint(&Address::generate(&env), &0); // touch
+
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Lower threshold to 60% — merchant alone can authorize release.
+    client.update_approval_threshold_bps(&admin, &escrow_id, &6000);
+
+    client.approve_release(&merchant, &escrow_id);
+
+    let (current, required) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 6000);
+    assert_eq!(required, 6000);
+
+    env.ledger().set_timestamp(1001);
+    client.release_multi_party_escrow(&escrow_id);
+
+    let escrow = client.get_multi_party_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(token_user_client.balance(&merchant), 6000);
+    assert_eq!(token_user_client.balance(&investor), 4000);
+}
+
+#[test]
+fn test_weighted_threshold_unmet_holds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Default threshold is 10000 (full weight). Only 60% approves — release must hold.
+    client.approve_release(&merchant, &escrow_id);
+
+    let (current, required) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 6000);
+    assert_eq!(required, 10000);
+
+    env.ledger().set_timestamp(1001);
+    let result = client.try_release_multi_party_escrow(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::ApprovalsThresholdNotMet)));
+
+    let escrow = client.get_multi_party_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+}
+
+#[test]
+fn test_create_multi_party_escrow_invalid_weight_sum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let token_id = Address::generate(&env);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: Address::generate(&env),
+        role: ParticipantRole::Merchant,
+        share_bps: 6000,
+        weight_bps: 5000, // weights sum to 9000 — should fail
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: Address::generate(&env),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+
+    let result =
+        client.try_create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+    assert_eq!(result, Err(Ok(Error::InvalidWeightSum)));
+}
+
+#[test]
+fn test_set_participant_weight_blocked_after_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Admin can adjust weights pre-approval, as long as the new total is still 10000.
+    client.set_participant_weight(&admin, &escrow_id, &merchant, &7000);
+    client.set_participant_weight(&admin, &escrow_id, &investor, &3000);
+
+    // Once any participant approves, weight updates are locked.
+    client.approve_release(&merchant, &escrow_id);
+    let result = client.try_set_participant_weight(&admin, &escrow_id, &merchant, &8000);
+    assert_eq!(result, Err(Ok(Error::WeightUpdateLocked)));
+}
+
+#[test]
+fn test_set_participant_weight_must_keep_sum_10000() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Bumping merchant alone breaks the 10000 invariant.
+    let result = client.try_set_participant_weight(&admin, &escrow_id, &merchant, &7000);
+    assert_eq!(result, Err(Ok(Error::InvalidWeightSum)));
+}
+
+#[test]
+fn test_update_approval_threshold_invalid_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    let too_low = client.try_update_approval_threshold_bps(&admin, &escrow_id, &0);
+    assert_eq!(too_low, Err(Ok(Error::InvalidThreshold)));
+
+    let too_high = client.try_update_approval_threshold_bps(&admin, &escrow_id, &10001);
+    assert_eq!(too_high, Err(Ok(Error::InvalidThreshold)));
 }
 
 // ── MULTI-SIG ADMIN TESTS ────────────────────────────────────────────────────
