@@ -15,21 +15,27 @@ fn make_3_party_escrow(
     let mut participants = soroban_sdk::Vec::new(env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 4000,
         role: ParticipantRole::Customer,
-        required_approval: true,
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 3000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p3.clone(),
-        share_bps: 3000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: false,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     client.create_multi_party_escrow(p1, &participants, &1000_i128, token, &9999_u64)
 }
