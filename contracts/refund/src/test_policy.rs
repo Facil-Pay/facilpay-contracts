@@ -432,6 +432,9 @@ fn test_set_default_refund_policy_by_admin_succeeds() {
         requires_admin_approval: true,
         auto_approve_below: 0,
         active: true,
+        parent_merchant: None,
+        tiers: Vec::new(&env),
+        inherit_from_parent: false,
     };
 
     client.set_default_refund_policy(&admin, &policy);
@@ -462,6 +465,9 @@ fn test_set_default_refund_policy_by_non_admin_fails() {
         requires_admin_approval: true,
         auto_approve_below: 0,
         active: true,
+        parent_merchant: None,
+        tiers: Vec::new(&env),
+        inherit_from_parent: false,
     };
 
     // attacker != stored admin → should panic with Unauthorized
@@ -522,6 +528,9 @@ fn test_request_refund_uses_global_default_when_no_merchant_policy() {
         requires_admin_approval: false,
         auto_approve_below: 200,
         active: true,
+        parent_merchant: None,
+        tiers: Vec::new(&env),
+        inherit_from_parent: false,
     };
     client.set_default_refund_policy(&admin, &default_policy);
 
@@ -613,6 +622,9 @@ fn test_default_policy_change_does_not_affect_pending_refunds() {
         requires_admin_approval: false,
         auto_approve_below: 1000,
         active: true,
+        parent_merchant: None,
+        tiers: Vec::new(&env),
+        inherit_from_parent: false,
     };
     client.set_default_refund_policy(&admin, &new_default);
 
