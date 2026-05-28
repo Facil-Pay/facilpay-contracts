@@ -54,6 +54,7 @@ pub enum ArbitrationKey {
     ArbitratorReputation(Address),
     ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
+    ArbitrationTimeoutConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,6 +136,7 @@ pub enum Error {
     NotArbitrator = 16,
     ContractPaused = 17,
     FunctionPaused = 18,
+    CaseNotTimedOut = 19,
     BatchRefundTooLarge = 20,
     RefundRateLimitExceeded = 26,
     PaymentContractNotSet = 27,
@@ -254,6 +256,14 @@ pub struct ArbitrationVoteCast {
 pub struct ArbitrationCaseDecided {
     pub case_id: u64,
     pub approved: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitrationTimedOut {
+    pub case_id: u64,
+    pub default_outcome: bool,
+    pub triggered_at: u64,
 }
 
 #[contractevent]
@@ -452,6 +462,8 @@ pub struct ArbitrationCase {
     pub created_at: u64,
     pub deadline: u64,
     pub fee_pool: i128,
+    pub timeout_at: u64,
+    pub default_favor_customer: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1370,6 +1382,15 @@ impl RefundContract {
             created_at: env.ledger().timestamp(),
             deadline: env.ledger().timestamp() + 86400 * 7, // 7 days example
             fee_pool: fee_amount,
+            timeout_at: {
+                let timeout_secs: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&ArbitrationKey::ArbitrationTimeoutConfig)
+                    .unwrap_or(86400 * 14); // default 14 days
+                env.ledger().timestamp() + timeout_secs
+            },
+            default_favor_customer: true,
         };
 
         env.storage()
@@ -1755,6 +1776,70 @@ impl RefundContract {
             }
             .publish(&env);
         }
+
+        ArbitrationCaseDecided { case_id, approved }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn set_arbitration_timeout(env: Env, admin: Address, timeout_seconds: u64) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage().instance().set(&ArbitrationKey::ArbitrationTimeoutConfig, &timeout_seconds);
+        Ok(())
+    }
+
+    pub fn get_arbitration_timeout_config(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationTimeoutConfig)
+            .unwrap_or(86400 * 14)
+    }
+
+    pub fn trigger_arbitration_timeout(env: Env, case_id: u64) -> Result<(), Error> {
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Block if quorum already reached
+        let total_votes = case.votes_for_refund + case.votes_against_refund;
+        if total_votes >= 3 {
+            return Err(Error::QuorumNotReached);
+        }
+
+        if env.ledger().timestamp() < case.timeout_at {
+            return Err(Error::CaseNotTimedOut);
+        }
+
+        let approved = case.default_favor_customer;
+        case.status = ArbitrationStatus::Decided;
+        env.storage().instance().set(&ArbitrationKey::ArbitrationCase(case_id), &case);
+
+        if approved {
+            let mut refund: Refund = env
+                .storage()
+                .instance()
+                .get(&DataKey::Refund(case.refund_id))
+                .unwrap();
+            refund.status = RefundStatus::Approved;
+            env.storage().instance().set(&DataKey::Refund(case.refund_id), &refund);
+        }
+
+        ArbitrationTimedOut {
+            case_id,
+            default_outcome: approved,
+            triggered_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         ArbitrationCaseDecided { case_id, approved }.publish(&env);
 
@@ -4258,3 +4343,6 @@ mod test_inheritance;
 #[cfg(test)]
 mod test_notification_hooks;
 mod test_customer_history;
+
+#[cfg(test)]
+mod test_arbitration_timeout;
