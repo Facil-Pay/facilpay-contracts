@@ -85,6 +85,13 @@ pub enum SystemKey {
     AppealByRefund(u64),
     AppealByCustomer(Address, u64),
     AppealByCustomerCount(Address),
+    // Notification hooks
+    NotificationHook(u64),
+    NotificationHookCounter,
+    HooksByEvent(RefundEventType, u64),
+    HooksByEventCount(RefundEventType),
+    SubscriberHooks(Address, u64),
+    SubscriberHookCount(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +157,10 @@ pub enum Error {
     RefundNotRejected = 23,
     AppealWindowExpired = 24,
     AppealAlreadyFiled = 25,
+    // Issue #144: Notification hook errors
+    HookNotFound = 41,
+    MaxHooksPerEventReached = 42,
+    HookNotOwnedBySubscriber = 43,
 }
 
 #[contractevent]
@@ -331,6 +342,51 @@ pub struct ArbitratorDeregistered {
     pub arbitrator: Address,
     pub reason: String,
 }
+
+// Issue #144: Notification hook structures
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum RefundEventType {
+    Requested,
+    Approved,
+    Rejected,
+    Processed,
+    Escalated,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct NotificationHook {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub events: Vec<RefundEventType>,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookRegistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookDeregistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HookInvocationFailed {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_type: RefundEventType,
+    pub refund_id: u64,
+}
+
 
 #[derive(Clone)]
 #[contracttype]
@@ -824,6 +880,9 @@ impl RefundContract {
             rejected_at: env.ledger().timestamp(),
             rejection_reason,
         }).publish(&env);
+
+        // Issue #144: Invoke notification hooks
+        Self::invoke_hooks(&env, RefundEventType::Rejected, refund_id);
 
         Ok(())
     }
@@ -1326,6 +1385,9 @@ impl RefundContract {
             fee_pool: fee_amount,
         }
         .publish(&env);
+
+        // Issue #144: Invoke notification hooks for Escalated event
+        Self::invoke_hooks(&env, RefundEventType::Escalated, refund_id);
 
         Ok(case_id)
     }
@@ -3049,6 +3111,9 @@ impl RefundContract {
         })
         .publish(&env);
 
+        // Issue #144: Invoke notification hooks for Requested event
+        Self::invoke_hooks(&env, RefundEventType::Requested, refund_id);
+
         if initial_status == RefundStatus::Approved {
             (AutoApproved { refund_id, amount }).publish(&env);
         }
@@ -3080,6 +3145,9 @@ impl RefundContract {
             approved_at: env.ledger().timestamp(),
         })
         .publish(env);
+
+        // Issue #144: Invoke notification hooks
+        Self::invoke_hooks(env, RefundEventType::Approved, refund_id);
 
         Ok(())
     }
@@ -3118,6 +3186,9 @@ impl RefundContract {
             processed_at: env.ledger().timestamp(),
         })
         .publish(env);
+
+        // Issue #144: Invoke notification hooks
+        Self::invoke_hooks(env, RefundEventType::Processed, refund_id);
 
         Ok(())
     }
@@ -3862,6 +3933,255 @@ impl RefundContract {
         env.storage().instance().get(&DataKey::MerchantRefundCount(merchant.clone())).unwrap_or(0)
     }
 
+    // Issue #144: Notification hook functions
+    const MAX_HOOKS_PER_EVENT: u32 = 10;
+
+    /// Register a notification hook for specific refund events
+    pub fn register_notification_hook(
+        env: Env,
+        subscriber: Address,
+        events: Vec<RefundEventType>,
+    ) -> Result<u64, Error> {
+        subscriber.require_auth();
+
+        // Check that at least one event is specified
+        if events.is_empty() {
+            return Err(Error::InvalidAmount); // Reusing error for invalid input
+        }
+
+        // Check max hooks per event type
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::HooksByEventCount(event_type.clone()))
+                .unwrap_or(0);
+            
+            if count >= Self::MAX_HOOKS_PER_EVENT {
+                return Err(Error::MaxHooksPerEventReached);
+            }
+        }
+
+        // Generate hook ID
+        let hook_id: u64 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::NotificationHookCounter)
+            .unwrap_or(0)
+            + 1;
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::NotificationHookCounter, &hook_id);
+
+        // Create hook
+        let hook = NotificationHook {
+            hook_id,
+            subscriber: subscriber.clone(),
+            events: events.clone(),
+            active: true,
+        };
+
+        // Store hook
+        env.storage()
+            .instance()
+            .set(&SystemKey::NotificationHook(hook_id), &hook);
+
+        // Index by event type
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::HooksByEventCount(event_type.clone()))
+                .unwrap_or(0);
+            
+            env.storage()
+                .instance()
+                .set(&SystemKey::HooksByEvent(event_type.clone(), count as u64), &hook_id);
+            
+            env.storage()
+                .instance()
+                .set(&SystemKey::HooksByEventCount(event_type.clone()), &(count + 1));
+        }
+
+        // Index by subscriber
+        let subscriber_count: u32 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::SubscriberHookCount(subscriber.clone()))
+            .unwrap_or(0);
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::SubscriberHooks(subscriber.clone(), subscriber_count as u64), &hook_id);
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::SubscriberHookCount(subscriber.clone()), &(subscriber_count + 1));
+
+        // Emit event
+        (HookRegistered {
+            hook_id,
+            subscriber,
+            event_count: events.len(),
+        })
+        .publish(&env);
+
+        Ok(hook_id)
+    }
+
+    /// Deregister a notification hook
+    pub fn deregister_hook(
+        env: Env,
+        subscriber: Address,
+        hook_id: u64,
+    ) -> Result<(), Error> {
+        subscriber.require_auth();
+
+        // Get hook
+        let hook: NotificationHook = env
+            .storage()
+            .instance()
+            .get(&SystemKey::NotificationHook(hook_id))
+            .ok_or(Error::HookNotFound)?;
+
+        // Verify ownership
+        if hook.subscriber != subscriber {
+            return Err(Error::HookNotOwnedBySubscriber);
+        }
+
+        // Mark as inactive
+        let mut updated_hook = hook.clone();
+        updated_hook.active = false;
+        
+        env.storage()
+            .instance()
+            .set(&SystemKey::NotificationHook(hook_id), &updated_hook);
+
+        // Emit event
+        (HookDeregistered {
+            hook_id,
+            subscriber,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get all hooks registered for a specific event type
+    pub fn get_hooks_for_event(
+        env: Env,
+        event_type: RefundEventType,
+    ) -> Vec<NotificationHook> {
+        let mut hooks: Vec<NotificationHook> = Vec::new(&env);
+        
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::HooksByEventCount(event_type.clone()))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&SystemKey::HooksByEvent(event_type.clone(), i as u64))
+            {
+                if let Some(hook) = env
+                    .storage()
+                    .instance()
+                    .get::<_, NotificationHook>(&SystemKey::NotificationHook(hook_id))
+                {
+                    if hook.active {
+                        hooks.push_back(hook);
+                    }
+                }
+            }
+        }
+
+        hooks
+    }
+
+    /// Get all hooks for a subscriber
+    pub fn get_subscriber_hooks(
+        env: Env,
+        subscriber: Address,
+    ) -> Vec<NotificationHook> {
+        let mut hooks: Vec<NotificationHook> = Vec::new(&env);
+        
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::SubscriberHookCount(subscriber.clone()))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&SystemKey::SubscriberHooks(subscriber.clone(), i as u64))
+            {
+                if let Some(hook) = env
+                    .storage()
+                    .instance()
+                    .get::<_, NotificationHook>(&SystemKey::NotificationHook(hook_id))
+                {
+                    hooks.push_back(hook);
+                }
+            }
+        }
+
+        hooks
+    }
+
+    /// Internal function to invoke hooks for a specific event
+    fn invoke_hooks(
+        env: &Env,
+        event_type: RefundEventType,
+        refund_id: u64,
+    ) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::HooksByEventCount(event_type.clone()))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&SystemKey::HooksByEvent(event_type.clone(), i as u64))
+            {
+                if let Some(hook) = env
+                    .storage()
+                    .instance()
+                    .get::<_, NotificationHook>(&SystemKey::NotificationHook(hook_id))
+                {
+                    if hook.active && hook.events.contains(&event_type) {
+                        // Attempt to invoke the subscriber contract
+                        // Using try_invoke_contract to isolate failures
+                        let result = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                            &hook.subscriber,
+                            &Symbol::new(env, "on_refund_event"),
+                            (event_type.clone(), refund_id).into_val(env),
+                        );
+
+                        // If hook invocation fails, emit failure event but don't revert
+                        if result.is_err() {
+                            (HookInvocationFailed {
+                                hook_id: hook.hook_id,
+                                subscriber: hook.subscriber.clone(),
+                                event_type: event_type.clone(),
+                                refund_id,
+                            })
+                            .publish(env);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn get_merchant_refunds_by_status_internal(
         env: &Env,
         merchant: &Address,
@@ -3936,4 +4256,5 @@ mod test_auto_refund;
 mod test_inheritance;
 
 #[cfg(test)]
+mod test_notification_hooks;
 mod test_customer_history;
