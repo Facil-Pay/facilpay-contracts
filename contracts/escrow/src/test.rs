@@ -4305,6 +4305,164 @@ fn test_get_pending_milestones() {
 }
 
 #[test]
+fn test_set_vesting_acceleration_config_and_single_acceleration() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &3500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &2000_u32, &4000_u32)
+        .unwrap();
+
+    env.ledger().set_timestamp(2500);
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    assert_eq!(client.calculate_accelerated_amount(&escrow_id), 1000);
+    assert_eq!(client.get_vested_amount(&escrow_id), 6000);
+
+    let config = client.get_acceleration_config(&escrow_id).unwrap();
+    assert_eq!(config.total_accelerated_bps, 2000);
+}
+
+#[test]
+fn test_calculate_accelerated_amount_returns_expected_amount() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &1000_u32, &3000_u32)
+        .unwrap();
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    env.ledger().set_timestamp(2500);
+
+    // Base vested at 2500 = 2500/3000 of 10000 = 8333 (integer division)
+    let base_vested = client.get_vested_amount(&escrow_id) - client.calculate_accelerated_amount(&escrow_id);
+    let remaining = 10000_i128.saturating_sub(base_vested);
+    let expected = remaining.saturating_mul(1000_i128) / 10000;
+
+    assert_eq!(client.calculate_accelerated_amount(&escrow_id), expected);
+}
+
+#[test]
+fn test_mark_milestone_complete_enforces_cumulative_cap() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &3000_u32, &5000_u32)
+        .unwrap();
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    let result = client.try_mark_milestone_complete(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::AccelerationLimitExceeded)));
+}
+
+#[test]
+fn test_mark_milestone_complete_duplicate_milestone_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &5000_u32, &5000_u32)
+        .unwrap();
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    let result = client.try_mark_milestone_complete(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::MilestoneAlreadyCompleted)));
+}
+
+#[test]
 fn test_add_milestone_success() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);

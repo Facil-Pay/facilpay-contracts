@@ -21,6 +21,7 @@ pub enum DataKey {
     ReputationScore(Address),
     ReputationConfig,
     VestingSchedule(u64),
+    VestingAccelerationConfig(u64),
     MultiSigConfig,
     AdminProposal(String),
     ProposalCounter,
@@ -186,6 +187,9 @@ pub enum Error {
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
+    AccelerationLimitExceeded = 66,
+    AccelerationConfigNotFound = 67,
+    MilestoneAlreadyCompleted = 68,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
@@ -590,6 +594,15 @@ pub struct VestingSchedule {
     pub cliff_timestamp: u64,
     pub end_timestamp: u64,
     pub milestones: Vec<VestingMilestone>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct VestingAccelerationConfig {
+    pub schedule_id: u64,
+    pub milestone_bps: u32,
+    pub max_acceleration_bps: u32,
+    pub total_accelerated_bps: u32,
 }
 
 /// Snapshot of vesting cliff progress for a given escrow.
@@ -3561,6 +3574,188 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::VestingSchedule(escrow_id))
             .ok_or(Error::EscrowNotFound)
+    }
+
+    fn get_base_vested_amount(env: &Env, escrow_id: u64) -> i128 {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(schedule) => schedule,
+            None => return 0,
+        };
+
+        let current_timestamp = env.ledger().timestamp();
+
+        // Before cliff - nothing is vested
+        if current_timestamp < vesting_schedule.cliff_timestamp {
+            return 0;
+        }
+
+        // After end - everything is vested
+        if current_timestamp >= vesting_schedule.end_timestamp {
+            return vesting_schedule.total_amount;
+        }
+
+        // If milestones exist, use milestone-based vesting
+        if !vesting_schedule.milestones.is_empty() {
+            let mut vested_amount: i128 = 0;
+            for milestone in vesting_schedule.milestones.iter() {
+                if current_timestamp >= milestone.unlock_timestamp {
+                    vested_amount = vested_amount.saturating_add(milestone.amount);
+                }
+            }
+            vested_amount
+        } else {
+            // Time-linear vesting (proportional to time elapsed since cliff)
+            let total_duration = vesting_schedule
+                .end_timestamp
+                .saturating_sub(vesting_schedule.cliff_timestamp);
+            let elapsed = current_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
+
+            if total_duration == 0 {
+                return 0;
+            }
+
+            let vested_portion = (elapsed as i128).saturating_mul(vesting_schedule.total_amount);
+            vested_portion / total_duration as i128
+        }
+    }
+
+    pub fn get_vested_amount(env: Env, escrow_id: u64) -> i128 {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
+        {
+            Some(schedule) => schedule,
+            None => return 0,
+        };
+
+        let base_vested = Self::get_base_vested_amount(&env, escrow_id);
+        let accelerated_amount = Self::calculate_accelerated_amount(env.clone(), escrow_id);
+        let total_vested = base_vested.saturating_add(accelerated_amount);
+
+        if total_vested > vesting_schedule.total_amount {
+            vesting_schedule.total_amount
+        } else {
+            total_vested
+        }
+    }
+
+    pub fn set_vesting_acceleration_config(
+        env: Env,
+        admin: Address,
+        schedule_id: u64,
+        milestone_bps: u32,
+        max_acceleration_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if milestone_bps == 0 || milestone_bps > max_acceleration_bps || max_acceleration_bps > 10000 {
+            return Err(Error::InvalidVestingSchedule);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(schedule_id))
+            .is_none()
+        {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let acceleration_config = VestingAccelerationConfig {
+            schedule_id,
+            milestone_bps,
+            max_acceleration_bps,
+            total_accelerated_bps: 0,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingAccelerationConfig(schedule_id), &acceleration_config);
+
+        Ok(())
+    }
+
+    pub fn mark_milestone_complete(
+        env: Env,
+        admin: Address,
+        schedule_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut acceleration_config = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&DataKey::VestingAccelerationConfig(schedule_id))
+            .ok_or(Error::AccelerationConfigNotFound)?;
+
+        if acceleration_config.total_accelerated_bps >= acceleration_config.max_acceleration_bps {
+            return Err(Error::MilestoneAlreadyCompleted);
+        }
+
+        let next_total = acceleration_config
+            .total_accelerated_bps
+            .saturating_add(acceleration_config.milestone_bps);
+        if next_total > acceleration_config.max_acceleration_bps {
+            return Err(Error::AccelerationLimitExceeded);
+        }
+
+        acceleration_config.total_accelerated_bps = next_total;
+        env.storage()
+            .instance()
+            .set(&DataKey::VestingAccelerationConfig(schedule_id), &acceleration_config);
+
+        Ok(())
+    }
+
+    pub fn get_acceleration_config(
+        env: Env,
+        schedule_id: u64,
+    ) -> Option<VestingAccelerationConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VestingAccelerationConfig(schedule_id))
+    }
+
+    pub fn calculate_accelerated_amount(env: Env, schedule_id: u64) -> i128 {
+        let vesting_schedule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(schedule_id))
+        {
+            Some(schedule) => schedule,
+            None => return 0,
+        };
+
+        let acceleration_config = match env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingAccelerationConfig>(&DataKey::VestingAccelerationConfig(schedule_id))
+        {
+            Some(config) => config,
+            None => return 0,
+        };
+
+        let base_vested = Self::get_base_vested_amount(&env, schedule_id);
+        let remaining_unvested = vesting_schedule
+            .total_amount
+            .saturating_sub(base_vested);
+
+        remaining_unvested
+            .saturating_mul(acceleration_config.total_accelerated_bps as i128)
+            / 10000
     }
 
     /// Returns cliff timing and whether the ledger time has reached the cliff.
