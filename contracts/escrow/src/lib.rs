@@ -76,6 +76,11 @@ pub enum DataKey {
     EscrowTemplateCounter,
     // Escrow health / stale detection
     StaleThresholdConfigKey,
+    // Multi-round dispute appeals
+    DisputeAppeal(u64),
+    DisputeAppealCounter,
+    DisputeRoundKey(u64),
+    AppealsByEscrow(u64, u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -250,6 +255,9 @@ pub enum Error {
     RollbackNotYetAvailable = 72,
     // 63 is already taken by MigrationNotStarted; use next free code.
     StaleThresholdNotConfigured = 66,
+    AppealWindowClosed = 73,
+    AppealAlreadyFiled = 74,
+    MaxDisputeRoundsReached = 75,
 }
 
 #[contractevent]
@@ -402,6 +410,25 @@ pub struct DisputeRecommendationGenerated {
     pub confidence_bps: u32,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeAppealFiled {
+    pub appeal_id: u64,
+    pub escrow_id: u64,
+    pub appellant: Address,
+    pub filed_at: u64,
+    pub appeal_deadline: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealResolved {
+    pub appeal_id: u64,
+    pub escrow_id: u64,
+    pub in_favor_of: Address,
+    pub resolved_at: u64,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct DisputeConfig {
@@ -436,6 +463,27 @@ pub struct DisputeRecommendation {
     pub merchant_score: i128,
     pub recommendation: DisputeOutcome,
     pub confidence_bps: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum DisputeRound {
+    Initial,
+    Appeal,
+    Final,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct DisputeAppeal {
+    pub appeal_id: u64,
+    pub escrow_id: u64,
+    pub round: DisputeRound,
+    pub appellant: Address,
+    pub reason_hash: BytesN<32>,
+    pub filed_at: u64,
+    pub appeal_deadline: u64,
+    pub resolved: bool,
 }
 
 #[contractevent]
@@ -3381,6 +3429,253 @@ impl EscrowContract {
             recommendation,
             confidence_bps,
         }
+    }
+
+    pub fn file_dispute_appeal(
+        env: Env,
+        appellant: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        appellant.require_auth();
+
+        // Check if escrow exists and is in Resolved or Released status from initial dispute
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Appellant must be one of the parties
+        if appellant != escrow.customer && appellant != escrow.merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Get current dispute round
+        let current_round = EscrowContract::get_dispute_round(&env, escrow_id);
+
+        // Maximum of two rounds (Initial + Appeal); third appeal not allowed
+        if current_round == DisputeRound::Final {
+            return Err(Error::MaxDisputeRoundsReached);
+        }
+
+        // Check if appeal window is open (72 hours = 259200 seconds)
+        let now = env.ledger().timestamp();
+        let dispute_time = escrow.dispute_started_at;
+        let appeal_window: u64 = 259200; // 72 hours
+
+        if now.saturating_sub(dispute_time) > appeal_window {
+            return Err(Error::AppealWindowClosed);
+        }
+
+        // Check if an appeal has already been filed for this round
+        let appeals_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeAppealCounter)
+            .unwrap_or(0);
+
+        for i in 0..appeals_count {
+            if let Some(appeal) = env
+                .storage()
+                .instance()
+                .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(i))
+            {
+                if appeal.escrow_id == escrow_id && !appeal.resolved {
+                    return Err(Error::AppealAlreadyFiled);
+                }
+            }
+        }
+
+        // Create new appeal
+        let appeal_id = appeals_count;
+        let appeal_deadline = now.saturating_add(appeal_window);
+
+        let appeal = DisputeAppeal {
+            appeal_id,
+            escrow_id,
+            round: DisputeRound::Appeal,
+            appellant: appellant.clone(),
+            reason_hash,
+            filed_at: now,
+            appeal_deadline,
+            resolved: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeAppeal(appeal_id), &appeal);
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeAppealCounter, &(appeals_count + 1));
+
+        // Update dispute round to Appeal
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeRoundKey(escrow_id), &DisputeRound::Appeal);
+
+        DisputeAppealFiled {
+            appeal_id,
+            escrow_id,
+            appellant,
+            filed_at: now,
+            appeal_deadline,
+        }
+        .publish(&env);
+
+        Ok(appeal_id)
+    }
+
+    pub fn get_dispute_round(env: Env, escrow_id: u64) -> DisputeRound {
+        env.storage()
+            .instance()
+            .get(&DataKey::DisputeRoundKey(escrow_id))
+            .unwrap_or(DisputeRound::Initial)
+    }
+
+    pub fn resolve_appeal(
+        env: Env,
+        admin: Address,
+        appeal_id: u64,
+        in_favour_of: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "resolve_appeal")?;
+
+        // Check multisig admin authorization
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig)
+        {
+            if !config.admins.contains(&admin) {
+                return Err(Error::NotAnAdmin);
+            }
+        }
+
+        // Get the appeal
+        let mut appeal = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(appeal_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if appeal.resolved {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        let escrow_id = appeal.escrow_id;
+
+        // Get the escrow
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Verify that in_favour_of is one of the parties
+        if in_favour_of != escrow.customer && in_favour_of != escrow.merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Determine the loser
+        let loser = if in_favour_of == escrow.customer {
+            escrow.merchant.clone()
+        } else {
+            escrow.customer.clone()
+        };
+
+        // Resolve appeal
+        appeal.resolved = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeAppeal(appeal_id), &appeal);
+
+        // Update dispute round to Final
+        env.storage()
+            .instance()
+            .set(&DataKey::DisputeRoundKey(escrow_id), &DisputeRound::Final);
+
+        // Call internal resolution logic with senior arbitrators
+        let now = env.ledger().timestamp();
+
+        // Update reputation scores based on appeal outcome
+        EscrowContract::update_reputation_on_dispute_outcome(&env, &in_favour_of, &loser);
+
+        // Update escrow status
+        let mut escrow_mut = escrow;
+        escrow_mut.status = EscrowStatus::Resolved;
+        escrow_mut.last_activity_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow_mut);
+
+        // Transfer funds to the party in favor
+        Self::transfer_if_token_contract(&env, &escrow_mut.token, &in_favour_of, escrow_mut.amount)?;
+
+        // Handle collateral distribution if any
+        if let Some(collateral) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeCollateral>(&DataKey::DisputeCollateral(escrow_id))
+        {
+            let token_client = token::Client::new(&env, &collateral.token);
+            token_client.transfer(&env.current_contract_address(), &in_favour_of, &collateral.amount);
+
+            if in_favour_of == collateral.disputing_party {
+                CollateralReturned {
+                    escrow_id,
+                    party: collateral.disputing_party,
+                    amount: collateral.amount,
+                }
+                .publish(&env);
+            } else {
+                CollateralForfeited {
+                    escrow_id,
+                    party: collateral.disputing_party,
+                    amount: collateral.amount,
+                }
+                .publish(&env);
+            }
+            env.storage()
+                .instance()
+                .remove(&DataKey::DisputeCollateral(escrow_id));
+        }
+
+        // Update analytics
+        let mut analytics: EscrowAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowAnalyticsKey)
+            .unwrap_or(EscrowAnalytics::default_value());
+        analytics.total_resolutions += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowAnalyticsKey, &analytics);
+
+        // Update per-address analytics
+        EscrowContract::update_customer_analytics(&env, &escrow_mut.customer, |a| {
+            a.total_resolutions += 1;
+        });
+        EscrowContract::update_merchant_analytics(&env, &escrow_mut.merchant, |a| {
+            a.total_resolutions += 1;
+        });
+
+        AppealResolved {
+            appeal_id,
+            escrow_id,
+            in_favor_of,
+            resolved_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_appeal(env: Env, appeal_id: u64) -> Option<DisputeAppeal> {
+        env.storage()
+            .instance()
+            .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(appeal_id))
     }
 
     pub fn get_escrows_by_customer(
@@ -7065,6 +7360,9 @@ impl EscrowAnalytics {
 }
 
 mod test;
+
+#[cfg(test)]
+mod dispute_appeal_test;
 
 #[cfg(test)]
 mod verification_test;
