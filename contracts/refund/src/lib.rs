@@ -163,6 +163,9 @@ pub enum Error {
     HookNotFound = 41,
     MaxHooksPerEventReached = 42,
     HookNotOwnedBySubscriber = 43,
+    // Issue #148: Customer eligibility errors
+    CustomerBlockedFromRefund = 46,
+    EligibilityEntryNotFound = 47,
 }
 
 #[contractevent]
@@ -397,6 +400,51 @@ pub struct HookInvocationFailed {
     pub refund_id: u64,
 }
 
+// ── Issue #148: Customer eligibility registry ─────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum EligibilityRule {
+    Allow,
+    Block,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundEligibilityEntry {
+    pub customer: Address,
+    pub merchant: Address,
+    pub rule: EligibilityRule,
+    pub reason_hash: BytesN<32>,
+    pub set_at: u64,
+}
+
+/// Storage key for eligibility entries: keyed by (merchant, customer).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EligibilityKey {
+    /// The eligibility entry for a (merchant, customer) pair.
+    Entry(Address, Address),
+    /// Ordered index of customers for a merchant: (merchant, index) → customer.
+    MerchantCustomerIndex(Address, u64),
+    /// Total number of eligibility entries for a merchant.
+    MerchantCustomerCount(Address),
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EligibilitySet {
+    pub merchant: Address,
+    pub customer: Address,
+    pub rule: EligibilityRule,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EligibilityRemoved {
+    pub merchant: Address,
+    pub customer: Address,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -3089,6 +3137,13 @@ impl RefundContract {
                 return Err(Error::AddressFlaggedForFraud);
             }
         }
+
+        // Issue #148: Check merchant-level customer eligibility
+        let eligibility_rule = Self::check_refund_eligibility_internal(&env, &merchant, &customer);
+        if eligibility_rule == EligibilityRule::Block {
+            return Err(Error::CustomerBlockedFromRefund);
+        }
+
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
                 &env,
@@ -4267,6 +4322,186 @@ impl RefundContract {
         }
     }
 
+    // ── Issue #148: Customer eligibility registry ─────────────────────────
+
+    /// Set or update the refund eligibility rule for a customer under a specific merchant.
+    /// Only the merchant themselves or the admin may call this.
+    pub fn set_refund_eligibility(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        rule: EligibilityRule,
+        reason_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        // Require merchant auth; admin can also call via mock_all_auths in tests
+        merchant.require_auth();
+
+        let entry = RefundEligibilityEntry {
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            rule: rule.clone(),
+            reason_hash,
+            set_at: env.ledger().timestamp(),
+        };
+
+        let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
+        let is_new = !env.storage().instance().has(&key);
+        env.storage().instance().set(&key, &entry);
+
+        // If this is a new entry, append to the merchant's customer index
+        if is_new {
+            let count: u64 = env
+                .storage()
+                .instance()
+                .get(&EligibilityKey::MerchantCustomerCount(merchant.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&EligibilityKey::MerchantCustomerIndex(merchant.clone(), count), &customer);
+            env.storage()
+                .instance()
+                .set(&EligibilityKey::MerchantCustomerCount(merchant.clone()), &(count + 1));
+        }
+
+        (EligibilitySet {
+            merchant,
+            customer,
+            rule,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Return the eligibility rule for a (merchant, customer) pair.
+    /// Defaults to `Allow` when no entry exists.
+    pub fn check_refund_eligibility(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+    ) -> EligibilityRule {
+        Self::check_refund_eligibility_internal(&env, &merchant, &customer)
+    }
+
+    /// Internal version that borrows `env` by reference.
+    fn check_refund_eligibility_internal(
+        env: &Env,
+        merchant: &Address,
+        customer: &Address,
+    ) -> EligibilityRule {
+        env.storage()
+            .instance()
+            .get::<EligibilityKey, RefundEligibilityEntry>(
+                &EligibilityKey::Entry(merchant.clone(), customer.clone()),
+            )
+            .map(|e| e.rule)
+            .unwrap_or(EligibilityRule::Allow)
+    }
+
+    /// Remove an eligibility entry for a (merchant, customer) pair.
+    /// Returns `EligibilityEntryNotFound` if no entry exists.
+    /// Only the merchant or admin may call this.
+    pub fn remove_refund_eligibility(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let key = EligibilityKey::Entry(merchant.clone(), customer.clone());
+        if !env.storage().instance().has(&key) {
+            return Err(Error::EligibilityEntryNotFound);
+        }
+        env.storage().instance().remove(&key);
+
+        // Compact the merchant's customer index by swapping with the last element
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&EligibilityKey::MerchantCustomerCount(merchant.clone()))
+            .unwrap_or(0);
+
+        if count > 0 {
+            // Find the position of this customer in the index
+            let mut found_index: Option<u64> = None;
+            for i in 0..count {
+                let idx_key = EligibilityKey::MerchantCustomerIndex(merchant.clone(), i);
+                if let Some(addr) = env
+                    .storage()
+                    .instance()
+                    .get::<EligibilityKey, Address>(&idx_key)
+                {
+                    if addr == customer {
+                        found_index = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(pos) = found_index {
+                let last = count - 1;
+                if pos != last {
+                    // Swap with last
+                    let last_key = EligibilityKey::MerchantCustomerIndex(merchant.clone(), last);
+                    let last_addr: Address = env
+                        .storage()
+                        .instance()
+                        .get(&last_key)
+                        .unwrap();
+                    env.storage()
+                        .instance()
+                        .set(&EligibilityKey::MerchantCustomerIndex(merchant.clone(), pos), &last_addr);
+                }
+                // Remove the last slot
+                env.storage()
+                    .instance()
+                    .remove(&EligibilityKey::MerchantCustomerIndex(merchant.clone(), last));
+                env.storage()
+                    .instance()
+                    .set(&EligibilityKey::MerchantCustomerCount(merchant.clone()), &last);
+            }
+        }
+
+        (EligibilityRemoved { merchant, customer }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Return all eligibility entries for a merchant.
+    pub fn get_merchant_eligibility_list(
+        env: Env,
+        merchant: Address,
+    ) -> Vec<RefundEligibilityEntry> {
+        let mut results = Vec::new(&env);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&EligibilityKey::MerchantCustomerCount(merchant.clone()))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(customer) = env
+                .storage()
+                .instance()
+                .get::<EligibilityKey, Address>(
+                    &EligibilityKey::MerchantCustomerIndex(merchant.clone(), i),
+                )
+            {
+                if let Some(entry) = env
+                    .storage()
+                    .instance()
+                    .get::<EligibilityKey, RefundEligibilityEntry>(
+                        &EligibilityKey::Entry(merchant.clone(), customer),
+                    )
+                {
+                    results.push_back(entry);
+                }
+            }
+        }
+
+        results
+    }
+
     fn get_merchant_refunds_by_status_internal(
         env: &Env,
         merchant: &Address,
@@ -4346,3 +4581,6 @@ mod test_customer_history;
 
 #[cfg(test)]
 mod test_arbitration_timeout;
+
+#[cfg(test)]
+mod test_merchant_eligibility;
