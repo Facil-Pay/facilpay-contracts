@@ -23,6 +23,7 @@ pub enum DataKey {
     RefundStatusCount(RefundStatus),
     RefundStatusIndex(u64),
     MerchantRefunds(Address, u64),
+    MerchantRefundQuota(Address),
     MerchantRefundCount(Address),
     CustomerRefunds(Address, u64),
     CustomerRefundCount(Address),
@@ -31,6 +32,12 @@ pub enum DataKey {
     PoolToken(u64),
     DefaultRefundPolicy,
     RefundPolicy(Address),
+    // Policy versioning (#134)
+    RefundPolicyVersion(Address, u32),
+    RefundPolicyVersionCount(Address),
+    RefundPolicyTemplate(u64),
+    RefundPolicyTemplateCount,
+    // Payment contract address (#143)
     PaymentContractAddress,
     BatchRefundLimit,
     RefundAnalyticsKey,
@@ -142,6 +149,8 @@ pub enum Error {
     PaymentContractNotSet = 27,
     PaymentOwnershipMismatch = 28,
     CircuitBreakerTripped = 29,
+    TemplateNotFound = 33,
+    TemplateInactive = 34,
     InvalidFeeConfig = 30,
     InsufficientTreasuryFees = 31,
     StakeRequired = 32,
@@ -477,6 +486,16 @@ pub struct MerchantRefundSummary {
     pub pending_amount: i128,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRefundQuota {
+    pub merchant: Address,
+    pub limit: i128,
+    pub period_seconds: u64,
+    pub used: i128,
+    pub period_start: u64,
+}
+
 // Issue #147: Customer refund summary
 #[derive(Clone)]
 #[contracttype]
@@ -632,6 +651,38 @@ pub struct RefundPolicyVersion {
     pub policy: RefundPolicy,
     pub created_at: u64,
     pub created_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundPolicyTemplate {
+    pub template_id: u64,
+    pub name: String,
+    pub tiers: Vec<(u32, i128)>,
+    pub default_window_seconds: u64,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyTemplateCreated {
+    pub template_id: u64,
+    pub created_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyTemplateDeactivated {
+    pub template_id: u64,
+    pub deactivated_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyTemplateApplied {
+    pub template_id: u64,
+    pub merchant: Address,
+    pub applied_by: Address,
 }
 
 // ── Issue #135: Batch refund result struct ─────────────────────────────────
@@ -1245,6 +1296,66 @@ impl RefundContract {
             .instance()
             .get(&PolicyKey::AutoRefundTrigger(trigger_id))
             .ok_or(Error::AutoRefundTriggerNotFound)
+    }
+
+    pub fn set_merchant_refund_quota(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        limit: i128,
+        period_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let quota = MerchantRefundQuota {
+            merchant: merchant.clone(),
+            limit,
+            period_seconds,
+            used: 0,
+            period_start: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefundQuota(merchant), &quota);
+        Ok(())
+    }
+
+    pub fn get_merchant_refund_quota(env: Env, merchant: Address) -> Option<MerchantRefundQuota> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantRefundQuota(merchant))
+    }
+
+    pub fn reset_merchant_quota(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut quota: MerchantRefundQuota = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRefundQuota(merchant.clone()))
+            .ok_or(Error::QuotaNotConfigured)?;
+        quota.used = 0;
+        quota.period_start = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefundQuota(merchant), &quota);
+        Ok(())
     }
 
     pub fn set_customer_rate_limit(
@@ -1864,6 +1975,205 @@ impl RefundContract {
             return Err(Error::QuorumNotReached);
         }
 
+        Self::store_refund_policy(&env, merchant.clone(), policy, merchant.clone());
+
+        Ok(())
+    }
+
+    fn store_refund_policy(
+        env: &Env,
+        merchant: Address,
+        policy: RefundPolicy,
+        created_by: Address,
+    ) {
+        env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
+
+        let version_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyVersionCount(merchant.clone()))
+            .unwrap_or(0);
+        let new_version = version_count + 1;
+        let versioned = RefundPolicyVersion {
+            version: new_version,
+            policy: policy.clone(),
+            created_at: env.ledger().timestamp(),
+            created_by,
+        };
+        env.storage().instance().set(
+            &DataKey::RefundPolicyVersion(merchant.clone(), new_version),
+            &versioned,
+        );
+        env.storage().instance().set(
+            &DataKey::RefundPolicyVersionCount(merchant.clone()),
+            &new_version,
+        );
+
+        // Emit RefundPolicySet event
+        (RefundPolicySet {
+            merchant,
+            refund_window: policy.refund_window,
+        }).publish(env);
+    }
+
+    pub fn create_policy_template(
+        env: Env,
+        admin: Address,
+        name: String,
+        tiers: Vec<(u32, i128)>,
+        window: u64,
+    ) -> Result<u64, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let template_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyTemplateCount)
+            .unwrap_or(0);
+        let template_id = template_count + 1;
+        let template = RefundPolicyTemplate {
+            template_id,
+            name,
+            tiers,
+            default_window_seconds: window,
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicyTemplate(template_id), &template);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicyTemplateCount, &template_id);
+
+        (RefundPolicyTemplateCreated {
+            template_id,
+            created_by: admin,
+        })
+        .publish(&env);
+
+        Ok(template_id)
+    }
+
+    pub fn apply_template_to_merchant(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        template_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let template: RefundPolicyTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyTemplate(template_id))
+            .ok_or(Error::TemplateNotFound)?;
+
+        if !template.active {
+            return Err(Error::TemplateInactive);
+        }
+
+        let policy = RefundPolicy {
+            merchant: merchant.clone(),
+            refund_window: template.default_window_seconds,
+            max_refund_percentage: 10000,
+            requires_admin_approval: true,
+            auto_approve_below: 0,
+            active: true,
+        };
+
+        Self::store_refund_policy(&env, merchant.clone(), policy, admin.clone());
+        (RefundPolicyTemplateApplied {
+            template_id,
+            merchant,
+            applied_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_policy_template(
+        env: Env,
+        template_id: u64,
+    ) -> Option<RefundPolicyTemplate> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RefundPolicyTemplate(template_id))
+    }
+
+    pub fn list_policy_templates(env: Env) -> Vec<RefundPolicyTemplate> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyTemplateCount)
+            .unwrap_or(0);
+        let mut templates = Vec::new(&env);
+        for id in 1..=count {
+            if let Some(template) = env
+                .storage()
+                .instance()
+                .get::<_, RefundPolicyTemplate>(&DataKey::RefundPolicyTemplate(id))
+            {
+                if template.active {
+                    templates.push_back(template);
+                }
+            }
+        }
+        templates
+    }
+
+    pub fn deactivate_policy_template(
+        env: Env,
+        admin: Address,
+        template_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut template: RefundPolicyTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicyTemplate(template_id))
+            .ok_or(Error::TemplateNotFound)?;
+
+        if !template.active {
+            return Err(Error::TemplateInactive);
+        }
+
+        template.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicyTemplate(template_id), &template);
+
+        (RefundPolicyTemplateDeactivated {
+            template_id,
+            deactivated_by: admin,
+        })
+        .publish(&env);
         if env.ledger().timestamp() < case.timeout_at {
             return Err(Error::CaseNotTimedOut);
         }
@@ -3309,6 +3619,31 @@ impl RefundContract {
             refund.amount,
             refund.original_payment_amount,
         )?;
+
+        // Enforce merchant refund quota if configured
+        if let Some(mut quota) = env
+            .storage()
+            .instance()
+            .get::<_, MerchantRefundQuota>(&DataKey::MerchantRefundQuota(refund.merchant.clone()))
+        {
+            let now = env.ledger().timestamp();
+            // auto-reset if period elapsed
+            if now > quota.period_start.saturating_add(quota.period_seconds) {
+                quota.used = 0;
+                quota.period_start = now;
+            }
+            let new_used = quota
+                .used
+                .checked_add(refund.amount)
+                .ok_or(Error::InvalidAmount)?;
+            if new_used > quota.limit {
+                return Err(Error::MerchantQuotaExceeded);
+            }
+            quota.used = new_used;
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantRefundQuota(refund.merchant.clone()), &quota);
+        }
 
         Self::remove_from_status_index(env, RefundStatus::Approved, refund_id)?;
         refund.status = RefundStatus::Processed;
