@@ -30,6 +30,9 @@ pub enum DataKey {
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
     EscrowEvidenceCount(u64),
+    // Observer list per-escrow: indexed entries and a count
+    EscrowObserver(u64, u64),
+    EscrowObserverCount(u64),
     EvidenceCommitment(u64),
     ReputationScore(Address),
     ReputationConfig,
@@ -282,6 +285,9 @@ pub enum Error {
     AppealWindowClosed = 73,
     AppealAlreadyFiled = 74,
     MaxDisputeRoundsReached = 75,
+    ObserverAlreadyAdded = 200,
+    ObserverNotFound = 201,
+    ObserverAccessExpired = 202,
 }
 
 #[contractevent]
@@ -701,6 +707,16 @@ pub struct Evidence {
     pub submitter: Address,
     pub ipfs_hash: String,
     pub submitted_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowObserver {
+    pub escrow_id: u64,
+    pub observer: Address,
+    pub granted_by: Address,
+    pub granted_at: u64,
+    pub expires_at: u64,
 }
 
 /// Pre-committed Merkle root for dispute evidence integrity (one per escrow).
@@ -3968,6 +3984,181 @@ impl EscrowContract {
             .get::<DataKey, Escrow>(&DataKey::Escrow(escrow_id))
             .map(|e| e.customer == address || e.merchant == address)
             .unwrap_or(false)
+    }
+
+    /// Grants a time-limited observer role for an escrow. Only the escrow
+    /// customer, merchant, or an admin can grant.
+    pub fn add_observer(
+        env: Env,
+        granter: Address,
+        escrow_id: u64,
+        observer: Address,
+        duration_seconds: u64,
+    ) -> Result<(), Error> {
+        granter.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut allowed = EscrowContract::verify_escrow_participant(env.clone(), escrow_id, granter.clone());
+        if !allowed {
+            if let Some(cfg) = env.storage().instance().get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig) {
+                allowed = cfg.admins.contains(&granter);
+            }
+        }
+        if !allowed {
+            return Err(Error::Unauthorized);
+        }
+
+        let now = env.ledger().timestamp();
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .unwrap_or(0);
+
+        let mut i = 0u64;
+        while i < count {
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+            {
+                if existing.observer == observer && existing.expires_at > now {
+                    return Err(Error::ObserverAlreadyAdded);
+                }
+            }
+            i += 1;
+        }
+
+        let obs = EscrowObserver {
+            escrow_id,
+            observer: observer.clone(),
+            granted_by: granter.clone(),
+            granted_at: now,
+            expires_at: now.saturating_add(duration_seconds),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowObserver(escrow_id, count), &obs);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowObserverCount(escrow_id), &(count + 1));
+
+        Ok(())
+    }
+
+    /// Removes an observer entry. Only the escrow customer, merchant, or admin may remove.
+    pub fn remove_observer(
+        env: Env,
+        granter: Address,
+        escrow_id: u64,
+        observer: Address,
+    ) -> Result<(), Error> {
+        granter.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut allowed = EscrowContract::verify_escrow_participant(env.clone(), escrow_id, granter.clone());
+        if !allowed {
+            if let Some(cfg) = env.storage().instance().get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig) {
+                allowed = cfg.admins.contains(&granter);
+            }
+        }
+        if !allowed {
+            return Err(Error::Unauthorized);
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .unwrap_or(0);
+
+        let mut i = 0u64;
+        while i < count {
+            if let Some(existing) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+            {
+                if existing.observer == observer {
+                    let last_index = count.saturating_sub(1);
+                    if i != last_index {
+                        if let Some(last) = env
+                            .storage()
+                            .instance()
+                            .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, last_index))
+                        {
+                            env.storage()
+                                .instance()
+                                .set(&DataKey::EscrowObserver(escrow_id, i), &last);
+                        }
+                    }
+                    env.storage()
+                        .instance()
+                        .remove(&DataKey::EscrowObserver(escrow_id, last_index));
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::EscrowObserverCount(escrow_id), &last_index);
+                    return Ok(());
+                }
+            }
+            i += 1;
+        }
+
+        Err(Error::ObserverNotFound)
+    }
+
+    /// Returns all observers (including expired ones) for an escrow.
+    pub fn get_observers(env: Env, escrow_id: u64) -> Vec<EscrowObserver> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .unwrap_or(0);
+        let mut items: Vec<EscrowObserver> = Vec::new(&env);
+        let mut i = 0u64;
+        while i < total {
+            if let Some(o) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+            {
+                items.push_back(o);
+            }
+            i += 1;
+        }
+        items
+    }
+
+    /// Verifies whether `observer` currently has access to `escrow_id`.
+    /// Returns false for expired observers without removing them.
+    pub fn verify_observer_access(env: Env, escrow_id: u64, observer: Address) -> bool {
+        let now = env.ledger().timestamp();
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .unwrap_or(0);
+        let mut i = 0u64;
+        while i < total {
+            if let Some(o) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+            {
+                if o.observer == observer {
+                    return o.expires_at > now;
+                }
+            }
+            i += 1;
+        }
+        false
     }
 
     // ── REPUTATION METHODS ───────────────────────────────────────────────────
