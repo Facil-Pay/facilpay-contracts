@@ -66,6 +66,7 @@ pub enum DataKey {
     SettlementFinalized(u64),
     AccumulatedFees,
     MerchantFeeRecord(Address),
+    PayoutSchedule(Address),
     FeeWaiver(Address),
     MerchantAnalytics(Address),
     CustomerAnalytics(Address),
@@ -158,6 +159,25 @@ pub enum Currency {
     USDT,
     BTC,
     ETH,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum PayoutFrequency {
+    Immediate,
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PayoutSchedule {
+    pub merchant: Address,
+    pub token: Address,
+    pub frequency: PayoutFrequency,
+    pub next_payout_at: u64,
+    pub accumulated: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -340,6 +360,9 @@ pub enum Error {
     RebateThresholdNotMet = 106,
     RebateAlreadyClaimed = 107,
     RebateConfigNotFound = 108,
+    PayoutScheduleNotFound = 89,
+    PayoutNotYetDue = 90,
+    NothingToSettle = 91,
 }
 
 #[contractevent]
@@ -1825,9 +1848,7 @@ impl PaymentContract {
             return Err(Error::PaymentNotYetDue);
         }
 
-        let token_client = token::Client::new(&env, &scheduled.token);
-        let contract_address = env.current_contract_address();
-        token_client.transfer(&contract_address, &scheduled.merchant, &scheduled.amount);
+        Self::settle_or_accumulate(&env, scheduled.merchant.clone(), scheduled.token.clone(), scheduled.amount)?;
         scheduled.executed = true;
         env.storage()
             .instance()
@@ -1872,6 +1893,99 @@ impl PaymentContract {
             .instance()
             .get(&StateDataKey::ScheduledPayment(payment_id))
             .ok_or(Error::PaymentNotFound)
+    }
+
+    fn settle_or_accumulate(env: &Env, merchant: Address, token: Address, amount: i128) -> Result<(), Error> {
+        // If merchant has a payout schedule for this token and it's not Immediate, accumulate
+        if let Some(mut schedule) = env
+            .storage()
+            .instance()
+            .get::<PayoutSchedule>(&DataKey::PayoutSchedule(merchant.clone()))
+        {
+            if schedule.token == token && schedule.frequency != PayoutFrequency::Immediate {
+                schedule.accumulated += amount;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PayoutSchedule(merchant.clone()), &schedule);
+                return Ok(());
+            }
+        }
+
+        // Otherwise perform immediate transfer
+        let token_client = token::Client::new(env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &merchant, &amount);
+        Ok(())
+    }
+
+    pub fn set_payout_schedule(
+        env: Env,
+        merchant: Address,
+        frequency: PayoutFrequency,
+        token: Address,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let now = env.ledger().timestamp();
+        let next = match frequency {
+            PayoutFrequency::Immediate => now,
+            PayoutFrequency::Daily => now + SECONDS_PER_DAY,
+            PayoutFrequency::Weekly => now + SECONDS_PER_DAY * 7,
+            PayoutFrequency::Monthly => now + SECONDS_PER_DAY * 30,
+        };
+        let schedule = PayoutSchedule {
+            merchant: merchant.clone(),
+            token: token.clone(),
+            frequency,
+            next_payout_at: next,
+            accumulated: 0,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutSchedule(merchant), &schedule);
+        Ok(())
+    }
+
+    pub fn get_payout_schedule(env: Env, merchant: Address) -> Option<PayoutSchedule> {
+        env.storage().instance().get(&DataKey::PayoutSchedule(merchant))
+    }
+
+    pub fn trigger_scheduled_payout(env: Env, merchant: Address) -> Result<(), Error> {
+        merchant.require_auth();
+        let mut schedule: PayoutSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::PayoutSchedule(merchant.clone()))
+            .ok_or(Error::PayoutScheduleNotFound)?;
+        let now = env.ledger().timestamp();
+        if now < schedule.next_payout_at {
+            return Err(Error::PayoutNotYetDue);
+        }
+        if schedule.accumulated == 0 {
+            return Err(Error::NothingToSettle);
+        }
+        let token_client = token::Client::new(&env, &schedule.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &merchant, &schedule.accumulated);
+        schedule.accumulated = 0;
+        let period = match schedule.frequency {
+            PayoutFrequency::Immediate => SECONDS_PER_DAY,
+            PayoutFrequency::Daily => SECONDS_PER_DAY,
+            PayoutFrequency::Weekly => SECONDS_PER_DAY * 7,
+            PayoutFrequency::Monthly => SECONDS_PER_DAY * 30,
+        };
+        schedule.next_payout_at = schedule.next_payout_at + period;
+        env.storage()
+            .instance()
+            .set(&DataKey::PayoutSchedule(merchant), &schedule);
+        Ok(())
+    }
+
+    pub fn get_accumulated_balance(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get::<PayoutSchedule>(&DataKey::PayoutSchedule(merchant))
+            .map(|s| s.accumulated)
+            .unwrap_or(0)
     }
 
     fn do_create_payment(
@@ -3136,12 +3250,8 @@ impl PaymentContract {
             .instance()
             .set(&DataKey::Payment(payment_id), &payment);
 
-        // Transfer all collected funds to merchant
-        let token_client = token::Client::new(&env, &payment.token);
-        let contract_address = env.current_contract_address();
-        
-        // Calculate total amount held by contract (should equal payment amount)
-        token_client.transfer(&contract_address, &payment.merchant, &payment.amount);
+        // Transfer or accumulate all collected funds to merchant
+        Self::settle_or_accumulate(&env, payment.merchant.clone(), payment.token.clone(), payment.amount)?;
 
         // Emit payment fully paid event
         (PaymentFullyPaid {
@@ -7376,10 +7486,7 @@ impl PaymentContract {
         }
 
         // Execute the payment
-        let token_client = token::Client::new(&env, &payment.token);
-        let contract_address = env.current_contract_address();
-
-        token_client.transfer(&contract_address, &payment.merchant, &payment.amount);
+        Self::settle_or_accumulate(&env, payment.merchant.clone(), payment.token.clone(), payment.amount)?;
 
         payment.status = PaymentStatus::Completed;
         env.storage()
