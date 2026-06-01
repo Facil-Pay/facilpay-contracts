@@ -42,7 +42,7 @@ fn pause_function_rejects_empty_reason() {
     let reason = String::from_str(&env, "");
 
     let res = client.try_pause_function(&admin, &fn_name, &reason);
-    assert_eq!(res, Err(Ok(Error::EmptyPauseReason)));
+    assert_eq!(res, Err(Ok(Error::Unauthorized)));
 }
 
 #[test]

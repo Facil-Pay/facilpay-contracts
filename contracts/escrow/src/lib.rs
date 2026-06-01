@@ -30,9 +30,6 @@ pub enum DataKey {
     MerchantEscrowCount(Address),
     EscrowEvidence(u64, u64),
     EscrowEvidenceCount(u64),
-    // Observer list per-escrow: indexed entries and a count
-    EscrowObserver(u64, u64),
-    EscrowObserverCount(u64),
     EvidenceCommitment(u64),
     ReputationScore(Address),
     ReputationConfig,
@@ -79,19 +76,29 @@ pub enum DataKey {
     EscalationConfig,
     EscrowEvidencePage(u64, u32),
     EscrowEvidencePageCount(u64),
-    // Migration
+}
+
+/// Secondary storage keys (keeps `DataKey` within Soroban's 50-variant limit).
+#[derive(Clone)]
+#[contracttype]
+pub enum EscrowAuxKey {
     MigrationStatusKey,
     EscrowMigrated(u64),
-    // Issue #78: Escrow templates
     EscrowTemplate(u64),
     EscrowTemplateCounter,
-    // Escrow health / stale detection
     StaleThresholdConfigKey,
-    // Multi-round dispute appeals
     DisputeAppeal(u64),
     DisputeAppealCounter,
     DisputeRoundKey(u64),
     AppealsByEscrow(u64, u64),
+}
+
+/// Observer storage keys (separate enum to stay within Soroban symbol limits).
+#[derive(Clone)]
+#[contracttype]
+pub enum ObserverKey {
+    Entry(u64, u64),
+    Count(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,7 +111,7 @@ pub enum EscrowStatus {
     Cancelled,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum AutoResolveFavor {
     Customer,
@@ -201,7 +208,7 @@ pub struct InsuranceClaim {
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-pub enum SuccessionError {
+pub enum SuccessionCode {
     Exists = 0,
     NotFound = 1,
     AlreadyActivated = 2,
@@ -209,13 +216,14 @@ pub enum SuccessionError {
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-pub enum ClawbackError {
+pub enum ClawbackCode {
     DelayNotMet = 0,
     AlreadyExecuted = 1,
     AlreadyInitiated = 2,
     Cancelled = 3,
 }
 
+#[repr(u32)]
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -230,64 +238,36 @@ pub enum Error {
     InvalidVestingSchedule = 9,
     CliffPeriodNotPassed = 10,
     MilestoneAlreadyReleased = 11,
-    InvalidParticipantCount = 14,
-    InvalidSharesSum = 15,
     DuplicateApproval = 16,
     ApprovalsThresholdNotMet = 17,
     MultiSigNotInitialized = 18,
-    ProposalNotFound = 19,
-    ProposalExpired = 20,
-    ProposalAlreadyExecuted = 21,
-    MultiSigThresholdNotMet = 22,
-    InsufficientAdmins = 23,
     NotAnAdmin = 24,
     AlreadyApproved = 25,
     ActionNotReady = 26,
     ContractPaused = 30,
-    FunctionPaused = 31,
-    EmptyTokenList = 35,
-    DuplicateToken = 36,
-    TokenTransferPartialFailure = 37,
-    BatchTooLarge = 40,
-    MilestoneNotFound = 47,
-    MilestoneNotApproved = 48,
-    MilestoneOverflow = 49,
+    ObserverAlreadyAdded = 47,
+    ObserverNotFound = 48,
+    ObserverAccessExpired = 49,
     AccelerationLimitExceeded = 66,
-    AccelerationConfigNotFound = 67,
-    MilestoneAlreadyCompleted = 68,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
     ConditionAlreadyEvaluated = 51,
-    SuccessionError(SuccessionError) = 52,
     InvalidMerkleProof = 34,
     RootAlreadyCommitted = 38,
-    NoEvidenceRoot = 39,
-    EmptyPauseReason = 55,
-    InvalidWeightSum = 56,
-    InvalidThreshold = 57,
-    ClawbackError(ClawbackError) = 59,
     MigrationNotStarted = 63,
-    MigrationAlreadyComplete = 64,
     AlreadyMigrated = 65,
-    ParticipantNotFound = 66,
-    EscrowNotExpired = 67,
-    EscrowAlreadyExpired = 68,
-    ExpiryBeforeRelease = 69,
-    TemplateNotFound = 70,
-    TemplateInactive = 71,
-    InitiationDeadlinePassed = 69,
-    EscrowAlreadyFullyAccepted = 70,
-    RollbackAlreadyExecuted = 71,
-    RollbackNotYetAvailable = 72,
-    // 63 is already taken by MigrationNotStarted; use next free code.
-    StaleThresholdNotConfigured = 66,
-    AppealWindowClosed = 73,
-    AppealAlreadyFiled = 74,
-    MaxDisputeRoundsReached = 75,
-    ObserverAlreadyAdded = 200,
-    ObserverNotFound = 201,
-    ObserverAccessExpired = 202,
+    ParticipantNotFound = 84,
+    EscrowNotExpired = 85,
+    EscrowAlreadyExpired = 86,
+    ExpiryBeforeRelease = 87,
+    TemplateNotFound = 88,
+    TemplateInactive = 89,
+    InitiationDeadlinePassed = 90,
+    EscrowAlreadyFullyAccepted = 91,
+    RollbackAlreadyExecuted = 92,
+    RollbackNotYetAvailable = 93,
+    StaleThresholdNotConfigured = 94,
 }
 
 #[contractevent]
@@ -1434,14 +1414,14 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&AdminKey::AdminProposal(proposal_id.clone()))
-            .ok_or(Error::ProposalNotFound)?;
+            .ok_or(Error::Unauthorized)?;
 
         if proposal.executed || proposal.rejected {
-            return Err(Error::ProposalAlreadyExecuted);
+            return Err(Error::InvalidStatus);
         }
 
         if env.ledger().timestamp() > proposal.expires_at {
-            return Err(Error::ProposalExpired);
+            return Err(Error::InvalidStatus);
         }
 
         if proposal.approvals.contains(&approver) {
@@ -1476,18 +1456,18 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&AdminKey::AdminProposal(proposal_id.clone()))
-            .ok_or(Error::ProposalNotFound)?;
+            .ok_or(Error::Unauthorized)?;
 
         if proposal.executed || proposal.rejected {
-            return Err(Error::ProposalAlreadyExecuted);
+            return Err(Error::InvalidStatus);
         }
 
         if env.ledger().timestamp() > proposal.expires_at {
-            return Err(Error::ProposalExpired);
+            return Err(Error::InvalidStatus);
         }
 
         if proposal.approval_count < config.required_signatures {
-            return Err(Error::MultiSigThresholdNotMet);
+            return Err(Error::InvalidStatus);
         }
 
         proposal.executed = true;
@@ -1519,10 +1499,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&AdminKey::AdminProposal(proposal_id.clone()))
-            .ok_or(Error::ProposalNotFound)?;
+            .ok_or(Error::Unauthorized)?;
 
         if proposal.executed || proposal.rejected {
-            return Err(Error::ProposalAlreadyExecuted);
+            return Err(Error::InvalidStatus);
         }
 
         proposal.rejected = true;
@@ -1578,7 +1558,7 @@ impl EscrowContract {
         }
 
         if config.total_admins <= config.required_signatures {
-            return Err(Error::InsufficientAdmins);
+            return Err(Error::InvalidStatus);
         }
 
         let mut new_admins = Vec::new(&env);
@@ -1632,7 +1612,7 @@ impl EscrowContract {
             .get::<AdminKey, SuccessionPlan>(&AdminKey::SuccessionPlan)
         {
             if !existing.activated {
-                return Err(Error::SuccessionError(SuccessionError::Exists));
+                return Err(Error::InvalidStatus);
             }
         }
 
@@ -1666,10 +1646,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&AdminKey::SuccessionPlan)
-            .ok_or(Error::SuccessionError(SuccessionError::NotFound))?;
+            .ok_or(Error::Unauthorized)?;
 
         if plan.activated {
-            return Err(Error::SuccessionError(SuccessionError::AlreadyActivated));
+            return Err(Error::AlreadyProcessed);
         }
         if plan.successor != successor {
             return Err(Error::Unauthorized);
@@ -1719,10 +1699,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&AdminKey::SuccessionPlan)
-            .ok_or(Error::SuccessionError(SuccessionError::NotFound))?;
+            .ok_or(Error::Unauthorized)?;
 
         if plan.activated {
-            return Err(Error::SuccessionError(SuccessionError::AlreadyActivated));
+            return Err(Error::AlreadyProcessed);
         }
 
         env.storage().instance().remove(&AdminKey::SuccessionPlan);
@@ -1760,7 +1740,7 @@ impl EscrowContract {
         if let Some(request_id) = env.storage().instance().get::<AdminKey, u64>(&AdminKey::EscrowClawback(escrow_id)) {
             if let Some(request) = env.storage().instance().get::<AdminKey, ClawbackRequest>(&AdminKey::ClawbackRequest(request_id)) {
                 if !request.executed && !request.cancelled {
-                    return Err(Error::ClawbackError(ClawbackError::AlreadyInitiated));
+                    return Err(Error::AlreadyProcessed);
                 }
             }
         }
@@ -1796,15 +1776,15 @@ impl EscrowContract {
         let mut request: ClawbackRequest = env.storage().instance().get(&AdminKey::ClawbackRequest(request_id)).ok_or(Error::Unauthorized)?;
 
         if request.executed {
-            return Err(Error::ClawbackError(ClawbackError::AlreadyExecuted));
+            return Err(Error::AlreadyProcessed);
         }
         if request.cancelled {
-            return Err(Error::ClawbackError(ClawbackError::Cancelled));
+            return Err(Error::InvalidStatus);
         }
 
         let now = env.ledger().timestamp();
         if now < request.execute_after {
-            return Err(Error::ClawbackError(ClawbackError::DelayNotMet));
+            return Err(Error::ActionNotReady);
         }
 
         let escrow = EscrowContract::get_escrow(&env, request.escrow_id);
@@ -1834,10 +1814,10 @@ impl EscrowContract {
         let mut request: ClawbackRequest = env.storage().instance().get(&AdminKey::ClawbackRequest(request_id)).ok_or(Error::Unauthorized)?;
 
         if request.executed {
-            return Err(Error::ClawbackError(ClawbackError::AlreadyExecuted));
+            return Err(Error::AlreadyProcessed);
         }
         if request.cancelled {
-            return Err(Error::ClawbackError(ClawbackError::Cancelled));
+            return Err(Error::InvalidStatus);
         }
 
         request.cancelled = true;
@@ -1867,7 +1847,7 @@ impl EscrowContract {
         if let Some(status) = env
             .storage()
             .instance()
-            .get::<DataKey, MigrationStatus>(&DataKey::MigrationStatusKey)
+            .get::<EscrowAuxKey, MigrationStatus>(&EscrowAuxKey::MigrationStatusKey)
         {
             if status.in_progress {
                 return Err(Error::ContractPaused);
@@ -2009,7 +1989,7 @@ impl EscrowContract {
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
-            return Err(Error::InvalidParticipantCount);
+            return Err(Error::InvalidStatus);
         }
 
         // Ensure shares sum to 10000 bps
@@ -2020,10 +2000,10 @@ impl EscrowContract {
             total_weights += p.weight_bps;
         }
         if total_shares != 10000 {
-            return Err(Error::InvalidSharesSum);
+            return Err(Error::InvalidStatus);
         }
         if total_weights != 10000 {
-            return Err(Error::InvalidWeightSum);
+            return Err(Error::InvalidStatus);
         }
 
         // Normalize participants (ensure approved=false, approved_at=None at creation)
@@ -2462,7 +2442,7 @@ impl EscrowContract {
             return Err(Error::ParticipantNotFound);
         }
         if new_total != 10000 {
-            return Err(Error::InvalidWeightSum);
+            return Err(Error::InvalidStatus);
         }
 
         escrow.participants = updated;
@@ -2494,7 +2474,7 @@ impl EscrowContract {
         }
 
         if threshold_bps == 0 || threshold_bps > 10000 {
-            return Err(Error::InvalidThreshold);
+            return Err(Error::InvalidStatus);
         }
 
         let mut escrow: MultiPartyEscrow = env
@@ -2531,10 +2511,10 @@ impl EscrowContract {
         customer.require_auth();
 
         if tokens.len() == 0 {
-            return Err(Error::EmptyTokenList);
+            return Err(Error::InvalidStatus);
         }
         if tokens.len() > 10 {
-            return Err(Error::InvalidParticipantCount);
+            return Err(Error::InvalidStatus);
         }
 
         // Reject duplicate token addresses
@@ -2544,7 +2524,7 @@ impl EscrowContract {
             for j in (i + 1)..len {
                 let entry_j = tokens.get(j).unwrap();
                 if entry_i.token == entry_j.token {
-                    return Err(Error::DuplicateToken);
+                    return Err(Error::InvalidStatus);
                 }
             }
         }
@@ -2617,10 +2597,10 @@ impl EscrowContract {
             let token_client = token::Client::new(&env, &entry.token);
             let balance = match token_client.try_balance(&contract_address) {
                 Ok(Ok(b)) => b,
-                _ => return Err(Error::TokenTransferPartialFailure),
+                _ => return Err(Error::InvalidStatus),
             };
             if balance < entry.amount {
-                return Err(Error::TokenTransferPartialFailure);
+                return Err(Error::InvalidStatus);
             }
         }
 
@@ -2630,7 +2610,7 @@ impl EscrowContract {
                 .try_transfer(&contract_address, &escrow.merchant, &entry.amount)
                 .is_err()
             {
-                return Err(Error::TokenTransferPartialFailure);
+                return Err(Error::InvalidStatus);
             }
         }
 
@@ -3069,7 +3049,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .get::<DataKey, EvidenceCommitment>(&DataKey::EvidenceCommitment(escrow_id))
-            .ok_or(Error::NoEvidenceRoot)
+            .ok_or(Error::RootAlreadyCommitted)
     }
 
     fn verify_keccak_merkle_proof(
@@ -3203,7 +3183,7 @@ impl EscrowContract {
 
         const MAX_BATCH: u32 = 10;
         if evidence_items.len() > MAX_BATCH {
-            return Err(Error::BatchTooLarge);
+            return Err(Error::InvalidStatus);
         }
 
         let now = env.ledger().timestamp();
@@ -3619,11 +3599,11 @@ impl EscrowContract {
         }
 
         // Get current dispute round
-        let current_round = EscrowContract::get_dispute_round(&env, escrow_id);
+        let current_round = EscrowContract::get_dispute_round(env.clone(), escrow_id);
 
         // Maximum of two rounds (Initial + Appeal); third appeal not allowed
         if current_round == DisputeRound::Final {
-            return Err(Error::MaxDisputeRoundsReached);
+            return Err(Error::InvalidStatus);
         }
 
         // Check if appeal window is open (72 hours = 259200 seconds)
@@ -3632,24 +3612,24 @@ impl EscrowContract {
         let appeal_window: u64 = 259200; // 72 hours
 
         if now.saturating_sub(dispute_time) > appeal_window {
-            return Err(Error::AppealWindowClosed);
+            return Err(Error::InvalidStatus);
         }
 
         // Check if an appeal has already been filed for this round
         let appeals_count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::DisputeAppealCounter)
+            .get(&EscrowAuxKey::DisputeAppealCounter)
             .unwrap_or(0);
 
         for i in 0..appeals_count {
             if let Some(appeal) = env
                 .storage()
                 .instance()
-                .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(i))
+                .get::<EscrowAuxKey, DisputeAppeal>(&EscrowAuxKey::DisputeAppeal(i))
             {
                 if appeal.escrow_id == escrow_id && !appeal.resolved {
-                    return Err(Error::AppealAlreadyFiled);
+                    return Err(Error::InvalidStatus);
                 }
             }
         }
@@ -3671,15 +3651,15 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::DisputeAppeal(appeal_id), &appeal);
+            .set(&EscrowAuxKey::DisputeAppeal(appeal_id), &appeal);
         env.storage()
             .instance()
-            .set(&DataKey::DisputeAppealCounter, &(appeals_count + 1));
+            .set(&EscrowAuxKey::DisputeAppealCounter, &(appeals_count + 1));
 
         // Update dispute round to Appeal
         env.storage()
             .instance()
-            .set(&DataKey::DisputeRoundKey(escrow_id), &DisputeRound::Appeal);
+            .set(&EscrowAuxKey::DisputeRoundKey(escrow_id), &DisputeRound::Appeal);
 
         DisputeAppealFiled {
             appeal_id,
@@ -3696,7 +3676,7 @@ impl EscrowContract {
     pub fn get_dispute_round(env: Env, escrow_id: u64) -> DisputeRound {
         env.storage()
             .instance()
-            .get(&DataKey::DisputeRoundKey(escrow_id))
+            .get(&EscrowAuxKey::DisputeRoundKey(escrow_id))
             .unwrap_or(DisputeRound::Initial)
     }
 
@@ -3713,7 +3693,7 @@ impl EscrowContract {
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig)
+            .get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig)
         {
             if !config.admins.contains(&admin) {
                 return Err(Error::NotAnAdmin);
@@ -3724,7 +3704,7 @@ impl EscrowContract {
         let mut appeal = env
             .storage()
             .instance()
-            .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(appeal_id))
+            .get::<EscrowAuxKey, DisputeAppeal>(&EscrowAuxKey::DisputeAppeal(appeal_id))
             .ok_or(Error::EscrowNotFound)?;
 
         if appeal.resolved {
@@ -3756,12 +3736,12 @@ impl EscrowContract {
         appeal.resolved = true;
         env.storage()
             .instance()
-            .set(&DataKey::DisputeAppeal(appeal_id), &appeal);
+            .set(&EscrowAuxKey::DisputeAppeal(appeal_id), &appeal);
 
         // Update dispute round to Final
         env.storage()
             .instance()
-            .set(&DataKey::DisputeRoundKey(escrow_id), &DisputeRound::Final);
+            .set(&EscrowAuxKey::DisputeRoundKey(escrow_id), &DisputeRound::Final);
 
         // Call internal resolution logic with senior arbitrators
         let now = env.ledger().timestamp();
@@ -3831,7 +3811,7 @@ impl EscrowContract {
         AppealResolved {
             appeal_id,
             escrow_id,
-            in_favor_of,
+            in_favor_of: in_favour_of,
             resolved_at: now,
         }
         .publish(&env);
@@ -3842,7 +3822,7 @@ impl EscrowContract {
     pub fn get_appeal(env: Env, appeal_id: u64) -> Option<DisputeAppeal> {
         env.storage()
             .instance()
-            .get::<DataKey, DisputeAppeal>(&DataKey::DisputeAppeal(appeal_id))
+            .get::<EscrowAuxKey, DisputeAppeal>(&EscrowAuxKey::DisputeAppeal(appeal_id))
     }
 
     pub fn get_escrows_by_customer(
@@ -4015,7 +3995,7 @@ impl EscrowContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .get(&ObserverKey::Count(escrow_id))
             .unwrap_or(0);
 
         let mut i = 0u64;
@@ -4023,7 +4003,7 @@ impl EscrowContract {
             if let Some(existing) = env
                 .storage()
                 .instance()
-                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+                .get::<ObserverKey, EscrowObserver>(&ObserverKey::Entry(escrow_id, i))
             {
                 if existing.observer == observer && existing.expires_at > now {
                     return Err(Error::ObserverAlreadyAdded);
@@ -4042,10 +4022,10 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowObserver(escrow_id, count), &obs);
+            .set(&ObserverKey::Entry(escrow_id, count), &obs);
         env.storage()
             .instance()
-            .set(&DataKey::EscrowObserverCount(escrow_id), &(count + 1));
+            .set(&ObserverKey::Count(escrow_id), &(count + 1));
 
         Ok(())
     }
@@ -4076,7 +4056,7 @@ impl EscrowContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .get(&ObserverKey::Count(escrow_id))
             .unwrap_or(0);
 
         let mut i = 0u64;
@@ -4084,7 +4064,7 @@ impl EscrowContract {
             if let Some(existing) = env
                 .storage()
                 .instance()
-                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+                .get::<ObserverKey, EscrowObserver>(&ObserverKey::Entry(escrow_id, i))
             {
                 if existing.observer == observer {
                     let last_index = count.saturating_sub(1);
@@ -4092,19 +4072,19 @@ impl EscrowContract {
                         if let Some(last) = env
                             .storage()
                             .instance()
-                            .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, last_index))
+                            .get::<ObserverKey, EscrowObserver>(&ObserverKey::Entry(escrow_id, last_index))
                         {
                             env.storage()
                                 .instance()
-                                .set(&DataKey::EscrowObserver(escrow_id, i), &last);
+                                .set(&ObserverKey::Entry(escrow_id, i), &last);
                         }
                     }
                     env.storage()
                         .instance()
-                        .remove(&DataKey::EscrowObserver(escrow_id, last_index));
+                        .remove(&ObserverKey::Entry(escrow_id, last_index));
                     env.storage()
                         .instance()
-                        .set(&DataKey::EscrowObserverCount(escrow_id), &last_index);
+                        .set(&ObserverKey::Count(escrow_id), &last_index);
                     return Ok(());
                 }
             }
@@ -4119,7 +4099,7 @@ impl EscrowContract {
         let total: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .get(&ObserverKey::Count(escrow_id))
             .unwrap_or(0);
         let mut items: Vec<EscrowObserver> = Vec::new(&env);
         let mut i = 0u64;
@@ -4127,7 +4107,7 @@ impl EscrowContract {
             if let Some(o) = env
                 .storage()
                 .instance()
-                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+                .get::<ObserverKey, EscrowObserver>(&ObserverKey::Entry(escrow_id, i))
             {
                 items.push_back(o);
             }
@@ -4143,14 +4123,14 @@ impl EscrowContract {
         let total: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowObserverCount(escrow_id))
+            .get(&ObserverKey::Count(escrow_id))
             .unwrap_or(0);
         let mut i = 0u64;
         while i < total {
             if let Some(o) = env
                 .storage()
                 .instance()
-                .get::<DataKey, EscrowObserver>(&DataKey::EscrowObserver(escrow_id, i))
+                .get::<ObserverKey, EscrowObserver>(&ObserverKey::Entry(escrow_id, i))
             {
                 if o.observer == observer {
                     return o.expires_at > now;
@@ -4404,6 +4384,9 @@ impl EscrowContract {
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
+            escalated_at: None,
+            escalation_timeout: 604800,
+            auto_resolve_in_favor_of: AutoResolveFavor::Customer,
         };
 
         env.storage()
@@ -4617,10 +4600,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get::<DataKey, VestingAccelerationConfig>(&DataKey::VestingAccelerationConfig(schedule_id))
-            .ok_or(Error::AccelerationConfigNotFound)?;
+            .ok_or(Error::EscrowNotFound)?;
 
         if acceleration_config.total_accelerated_bps >= acceleration_config.max_acceleration_bps {
-            return Err(Error::MilestoneAlreadyCompleted);
+            return Err(Error::MilestoneAlreadyReleased);
         }
 
         let next_total = acceleration_config
@@ -4701,62 +4684,6 @@ impl EscrowContract {
             cliff_passed,
             seconds_remaining,
         })
-    }
-
-    /// Calculates the total vested amount that has been unlocked based on the current timestamp.
-    /// Supports both milestone-based and time-linear vesting.
-    ///
-    /// # Arguments
-    /// * `env` - The Soroban environment
-    /// * `escrow_id` - The ID of the escrow
-    ///
-    /// # Returns
-    /// The total vested amount (including already released amounts)
-    pub fn get_vested_amount(env: Env, escrow_id: u64) -> i128 {
-        let vesting_schedule = match env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
-        {
-            Some(schedule) => schedule,
-            None => return 0,
-        };
-
-        let current_timestamp = env.ledger().timestamp();
-
-        // Before cliff - nothing is vested
-        if current_timestamp < vesting_schedule.cliff_timestamp {
-            return 0;
-        }
-
-        // After end - everything is vested
-        if current_timestamp >= vesting_schedule.end_timestamp {
-            return vesting_schedule.total_amount;
-        }
-
-        // If milestones exist, use milestone-based vesting
-        if !vesting_schedule.milestones.is_empty() {
-            let mut vested_amount: i128 = 0;
-            for milestone in vesting_schedule.milestones.iter() {
-                if current_timestamp >= milestone.unlock_timestamp {
-                    vested_amount = vested_amount.saturating_add(milestone.amount);
-                }
-            }
-            vested_amount
-        } else {
-            // Time-linear vesting (proportional to time elapsed since cliff)
-            let total_duration = vesting_schedule
-                .end_timestamp
-                .saturating_sub(vesting_schedule.cliff_timestamp);
-            let elapsed = current_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
-
-            if total_duration == 0 {
-                return 0;
-            }
-
-            let vested_portion = (elapsed as i128).saturating_mul(vesting_schedule.total_amount);
-            vested_portion / total_duration as i128
-        }
     }
 
     /// Calculates the releasable amount (vested but not yet released).
@@ -4914,7 +4841,7 @@ impl EscrowContract {
         }
 
         if !found {
-            return Err(Error::MilestoneNotFound);
+            return Err(Error::InvalidStatus);
         }
 
         vesting_schedule.milestones = milestones;
@@ -4965,12 +4892,12 @@ impl EscrowContract {
                     return Err(Error::MilestoneAlreadyReleased);
                 }
                 if m.approved_by.is_none() {
-                    return Err(Error::MilestoneNotApproved);
+                    return Err(Error::InvalidStatus);
                 }
                 // Guard: total released must not exceed locked amount
                 let new_total = vesting_schedule.released_amount.saturating_add(m.amount);
                 if new_total > vesting_schedule.total_amount {
-                    return Err(Error::MilestoneOverflow);
+                    return Err(Error::InvalidStatus);
                 }
                 release_amount = m.amount;
                 m.released = true;
@@ -4980,7 +4907,7 @@ impl EscrowContract {
         }
 
         if !found {
-            return Err(Error::MilestoneNotFound);
+            return Err(Error::InvalidStatus);
         }
 
         vesting_schedule.milestones = milestones;
@@ -5064,7 +4991,7 @@ impl EscrowContract {
         }
 
         if existing_total.saturating_add(milestone.amount) > vesting_schedule.total_amount {
-            return Err(Error::MilestoneOverflow);
+            return Err(Error::InvalidStatus);
         }
 
         if milestone.unlock_timestamp < vesting_schedule.cliff_timestamp {
@@ -5105,7 +5032,7 @@ impl EscrowContract {
             .try_transfer(&contract_address, recipient, &amount)
             .is_err()
         {
-            return Err(Error::TokenTransferPartialFailure);
+            return Err(Error::InvalidStatus);
         }
         Ok(())
     }
@@ -5356,7 +5283,7 @@ impl EscrowContract {
                     .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if config.total_admins <= config.required_signatures {
-                    return Err(Error::InsufficientAdmins);
+                    return Err(Error::InvalidStatus);
                 }
                 let mut new_admins = Vec::new(env);
                 for a in config.admins.iter() {
@@ -5382,24 +5309,24 @@ impl EscrowContract {
                     .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if required == 0 || required > config.total_admins {
-                    return Err(Error::InsufficientAdmins);
+                    return Err(Error::InvalidStatus);
                 }
                 config.required_signatures = required;
                 env.storage()
                     .instance()
                     .set(&AdminKey::MultiSigConfig, &config);
             }
-            ActionType::UpdateThreshold { new_threshold } => {
+            ActionType::UpdateThreshold(new_threshold) => {
                 let mut config: MultiSigConfig = env
                     .storage()
                     .instance()
                     .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if new_threshold == 0 {
-                    return Err(Error::InvalidThreshold);
+                    return Err(Error::InvalidStatus);
                 }
                 if new_threshold > config.total_admins {
-                    return Err(Error::InsufficientAdmins);
+                    return Err(Error::InvalidStatus);
                 }
                 config.required_signatures = new_threshold;
                 env.storage()
@@ -5470,10 +5397,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&DataKey::TimeLockAction(action_id))
-            .ok_or(Error::ProposalNotFound)?;
+            .ok_or(Error::Unauthorized)?;
 
         if action.executed {
-            return Err(Error::ActionAlreadyExecuted);
+            return Err(Error::AlreadyProcessed);
         }
         if action.cancelled {
             return Err(Error::AlreadyProcessed);
@@ -5484,7 +5411,7 @@ impl EscrowContract {
             return Err(Error::ActionNotReady);
         }
         if current_time > action.expires_at {
-            return Err(Error::ProposalExpired);
+            return Err(Error::InvalidStatus);
         }
 
         action.executed = true;
@@ -5534,10 +5461,10 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&DataKey::TimeLockAction(action_id))
-            .ok_or(Error::ProposalNotFound)?;
+            .ok_or(Error::Unauthorized)?;
 
         if action.executed {
-            return Err(Error::ProposalAlreadyExecuted);
+            return Err(Error::InvalidStatus);
         }
         if action.cancelled {
             return Err(Error::AlreadyProcessed);
@@ -5566,7 +5493,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .get(&DataKey::TimeLockAction(action_id))
-            .ok_or(Error::ProposalNotFound)
+            .ok_or(Error::Unauthorized)
     }
 
     pub fn set_timelock_config(
@@ -5780,7 +5707,7 @@ impl EscrowContract {
             return Err(Error::Unauthorized);
         }
         if reason.len() == 0 {
-            return Err(Error::EmptyPauseReason);
+            return Err(Error::Unauthorized);
         }
         if env
             .storage()
@@ -5991,10 +5918,10 @@ impl EscrowContract {
         if let Some(status) = env
             .storage()
             .instance()
-            .get::<DataKey, MigrationStatus>(&DataKey::MigrationStatusKey)
+            .get::<EscrowAuxKey, MigrationStatus>(&EscrowAuxKey::MigrationStatusKey)
         {
             if !status.in_progress && status.completed_at.is_some() {
-                return Err(Error::MigrationAlreadyComplete);
+                return Err(Error::MigrationNotStarted);
             }
         }
 
@@ -6013,7 +5940,7 @@ impl EscrowContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::MigrationStatusKey, &status);
+            .set(&EscrowAuxKey::MigrationStatusKey, &status);
         Ok(())
     }
 
@@ -6027,7 +5954,7 @@ impl EscrowContract {
         let mut status: MigrationStatus = env
             .storage()
             .instance()
-            .get(&DataKey::MigrationStatusKey)
+            .get(&EscrowAuxKey::MigrationStatusKey)
             .ok_or(Error::MigrationNotStarted)?;
 
         if !status.in_progress {
@@ -6037,7 +5964,7 @@ impl EscrowContract {
         if env
             .storage()
             .instance()
-            .get::<DataKey, bool>(&DataKey::EscrowMigrated(escrow_id))
+            .get::<EscrowAuxKey, bool>(&EscrowAuxKey::EscrowMigrated(escrow_id))
             .unwrap_or(false)
         {
             return Err(Error::AlreadyMigrated);
@@ -6055,12 +5982,12 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowMigrated(escrow_id), &true);
+            .set(&EscrowAuxKey::EscrowMigrated(escrow_id), &true);
 
         status.migrated_count += 1;
         env.storage()
             .instance()
-            .set(&DataKey::MigrationStatusKey, &status);
+            .set(&EscrowAuxKey::MigrationStatusKey, &status);
 
         Ok(())
     }
@@ -6079,7 +6006,7 @@ impl EscrowContract {
         let status: MigrationStatus = env
             .storage()
             .instance()
-            .get(&DataKey::MigrationStatusKey)
+            .get(&EscrowAuxKey::MigrationStatusKey)
             .ok_or(Error::MigrationNotStarted)?;
 
         if !status.in_progress {
@@ -6092,7 +6019,7 @@ impl EscrowContract {
             if env
                 .storage()
                 .instance()
-                .get::<DataKey, bool>(&DataKey::EscrowMigrated(escrow_id))
+                .get::<EscrowAuxKey, bool>(&EscrowAuxKey::EscrowMigrated(escrow_id))
                 .unwrap_or(false)
             {
                 continue;
@@ -6108,7 +6035,7 @@ impl EscrowContract {
                     .set(&DataKey::Escrow(escrow_id), &escrow);
                 env.storage()
                     .instance()
-                    .set(&DataKey::EscrowMigrated(escrow_id), &true);
+                    .set(&EscrowAuxKey::EscrowMigrated(escrow_id), &true);
                 migrated += 1;
             }
         }
@@ -6117,12 +6044,12 @@ impl EscrowContract {
         let mut updated_status: MigrationStatus = env
             .storage()
             .instance()
-            .get(&DataKey::MigrationStatusKey)
+            .get(&EscrowAuxKey::MigrationStatusKey)
             .ok_or(Error::MigrationNotStarted)?;
         updated_status.migrated_count += migrated as u64;
         env.storage()
             .instance()
-            .set(&DataKey::MigrationStatusKey, &updated_status);
+            .set(&EscrowAuxKey::MigrationStatusKey, &updated_status);
 
         Ok(migrated)
     }
@@ -6137,7 +6064,7 @@ impl EscrowContract {
         let mut status: MigrationStatus = env
             .storage()
             .instance()
-            .get(&DataKey::MigrationStatusKey)
+            .get(&EscrowAuxKey::MigrationStatusKey)
             .ok_or(Error::MigrationNotStarted)?;
 
         if !status.in_progress {
@@ -6152,7 +6079,7 @@ impl EscrowContract {
         status.completed_at = Some(env.ledger().timestamp());
         env.storage()
             .instance()
-            .set(&DataKey::MigrationStatusKey, &status);
+            .set(&EscrowAuxKey::MigrationStatusKey, &status);
 
         Ok(())
     }
@@ -6160,7 +6087,7 @@ impl EscrowContract {
     pub fn get_migration_status(env: Env) -> MigrationStatus {
         env.storage()
             .instance()
-            .get(&DataKey::MigrationStatusKey)
+            .get(&EscrowAuxKey::MigrationStatusKey)
             .unwrap_or(MigrationStatus {
                 in_progress: false,
                 migrated_count: 0,
@@ -6182,7 +6109,7 @@ impl EscrowContract {
             let fn_str = String::from_str(env, function_name);
             for fn_name in state.paused_functions.iter() {
                 if fn_name == fn_str {
-                    return Err(Error::FunctionPaused);
+                    return Err(Error::ContractPaused);
                 }
             }
         }
@@ -6679,6 +6606,9 @@ impl EscrowContract {
             fee_bps,
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
+            escalated_at: None,
+            escalation_timeout: 604800,
+            auto_resolve_in_favor_of: AutoResolveFavor::Customer,
         };
 
         env.storage()
@@ -7144,7 +7074,7 @@ impl EscrowContract {
                     index: i as u32,
                     escrow_id: 0,
                     success: false,
-                    error_code: Error::NotAnAdmin as u32,
+                    error_code: 24,
                 });
             }
             return results;
@@ -7157,7 +7087,7 @@ impl EscrowContract {
                 index: 0,
                 escrow_id: 0,
                 success: false,
-                error_code: Error::BatchTooLarge as u32,
+                error_code: 2,
             });
             return results;
         }
@@ -7202,12 +7132,12 @@ impl EscrowContract {
     ) -> Result<u64, u32> {
         // Validate inputs similar to create_escrow
         if entry.amount <= 0 {
-            return Err(Error::InvalidStatus as u32); // Using InvalidStatus as generic error
+            return Err(2); // InvalidStatus
         }
 
         let current_timestamp = env.ledger().timestamp();
         if entry.release_timestamp <= current_timestamp {
-            return Err(Error::ReleaseNotYetAvailable as u32);
+            return Err(5); // ReleaseNotYetAvailable
         }
 
         // Get counter and create escrow
@@ -7241,6 +7171,9 @@ impl EscrowContract {
             fee_bps: 0,         // Default fee
             expiry_timestamp: 0,
             auto_refund_on_expiry: false,
+            escalated_at: None,
+            escalation_timeout: 604800,
+            auto_resolve_in_favor_of: AutoResolveFavor::Customer,
         };
 
         env.storage()
@@ -7419,7 +7352,7 @@ impl EscrowContract {
         let counter: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowTemplateCounter)
+            .get(&EscrowAuxKey::EscrowTemplateCounter)
             .unwrap_or(0);
         let template_id = counter + 1;
 
@@ -7436,10 +7369,10 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::EscrowTemplate(template_id), &template);
+            .set(&EscrowAuxKey::EscrowTemplate(template_id), &template);
         env.storage()
             .instance()
-            .set(&DataKey::EscrowTemplateCounter, &template_id);
+            .set(&EscrowAuxKey::EscrowTemplateCounter, &template_id);
 
         TemplateCreated {
             template_id,
@@ -7460,7 +7393,7 @@ impl EscrowContract {
         let template: EscrowTemplate = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
+            .get(&EscrowAuxKey::EscrowTemplate(template_id))
             .ok_or(Error::TemplateNotFound)?;
 
         if !template.active {
@@ -7501,7 +7434,7 @@ impl EscrowContract {
         let mut template: EscrowTemplate = env
             .storage()
             .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
+            .get(&EscrowAuxKey::EscrowTemplate(template_id))
             .ok_or(Error::TemplateNotFound)?;
 
         let config: MultiSigConfig = env
@@ -7522,7 +7455,7 @@ impl EscrowContract {
         template.active = false;
         env.storage()
             .instance()
-            .set(&DataKey::EscrowTemplate(template_id), &template);
+            .set(&EscrowAuxKey::EscrowTemplate(template_id), &template);
 
         TemplateDeactivated { template_id }.publish(&env);
 
@@ -7532,7 +7465,7 @@ impl EscrowContract {
     pub fn get_template(env: Env, template_id: u64) -> Result<EscrowTemplate, Error> {
         env.storage()
             .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
+            .get(&EscrowAuxKey::EscrowTemplate(template_id))
             .ok_or(Error::TemplateNotFound)
     }
 
@@ -7585,7 +7518,7 @@ impl EscrowContract {
         }
         env.storage()
             .instance()
-            .set(&DataKey::StaleThresholdConfigKey, &config);
+            .set(&EscrowAuxKey::StaleThresholdConfigKey, &config);
         Ok(())
     }
 
@@ -7593,7 +7526,7 @@ impl EscrowContract {
     pub fn get_stale_threshold(env: Env) -> Option<StaleThresholdConfig> {
         env.storage()
             .instance()
-            .get(&DataKey::StaleThresholdConfigKey)
+            .get(&EscrowAuxKey::StaleThresholdConfigKey)
     }
 
     /// Classify the health of a single escrow against the configured thresholds.
@@ -7655,7 +7588,7 @@ impl EscrowContract {
         match env
             .storage()
             .instance()
-            .get::<DataKey, StaleThresholdConfig>(&DataKey::StaleThresholdConfigKey)
+            .get::<EscrowAuxKey, StaleThresholdConfig>(&EscrowAuxKey::StaleThresholdConfigKey)
         {
             Some(config) => config,
             None => panic_with_error!(env, Error::StaleThresholdNotConfigured),
@@ -7739,4 +7672,8 @@ mod migration_test;
 
 #[cfg(test)]
 mod multi_party_rollback_test;
+
+#[cfg(test)]
+mod observer_test;
+
 mod health_check_test;
