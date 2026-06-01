@@ -77,6 +77,16 @@ pub enum DataKey {
     // Migration
     MigrationStatusKey,
     EscrowMigrated(u64),
+    // Issue #78: Escrow templates
+    EscrowTemplate(u64),
+    EscrowTemplateCounter,
+    // Escrow health / stale detection
+    StaleThresholdConfigKey,
+    // Multi-round dispute appeals
+    DisputeAppeal(u64),
+    DisputeAppealCounter,
+    DisputeRoundKey(u64),
+    AppealsByEscrow(u64, u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,8 +240,18 @@ pub enum Error {
     EscrowNotExpired = 67,
     EscrowAlreadyExpired = 68,
     ExpiryBeforeRelease = 69,
-    BatchReleaseSizeLimitExceeded = 73,
-    BatchReleasePartialFailure = 74,
+    TemplateNotFound = 70,
+    TemplateInactive = 71,
+    InitiationDeadlinePassed = 69,
+    EscrowAlreadyFullyAccepted = 70,
+    RollbackAlreadyExecuted = 71,
+    RollbackNotYetAvailable = 72,
+    StaleThresholdNotConfigured = 66,
+    AppealWindowClosed = 73,
+    AppealAlreadyFiled = 74,
+    MaxDisputeRoundsReached = 75,
+    BatchReleaseSizeLimitExceeded = 76,
+    BatchReleasePartialFailure = 77,
 
 }
 
