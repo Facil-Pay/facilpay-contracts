@@ -4459,7 +4459,7 @@ fn test_mark_milestone_complete_duplicate_milestone_fails() {
         .unwrap();
 
     let result = client.try_mark_milestone_complete(&admin, &escrow_id);
-    assert_eq!(result, Err(Ok(Error::MilestoneAlreadyCompleted)));
+    assert_eq!(result, Err(Ok(Error::MilestoneAlreadyReleased)));
 }
 
 #[test]
