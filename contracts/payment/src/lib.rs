@@ -1240,6 +1240,36 @@ pub struct RouteOption {
     pub effective_cost: i128,
 }
 
+// Issue #210: Payment tagging system
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentTagSet {
+    pub payment_id: u64,
+    pub tags: Vec<BytesN<32>>,
+}
+
+// Issue #205: Invoice-based payment with line items
+#[derive(Clone)]
+#[contracttype]
+pub struct LineItem {
+    pub description_hash: BytesN<32>,
+    pub quantity: u32,
+    pub unit_price: i128,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentInvoice {
+    pub invoice_id: u64,
+    pub payment_id: u64,
+    pub items: Vec<LineItem>,
+    pub subtotal: i128,
+    pub tax: i128,
+    pub total: i128,
+    pub issued_at: u64,
+}
+
 #[contract]
 pub struct PaymentContract;
 
@@ -8017,6 +8047,188 @@ impl PaymentContract {
         );
 
         Ok(())
+    }
+
+    // Issue #210: Payment tagging system
+    pub fn tag_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        tags: Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate tag count (max 10)
+        if tags.len() > 10 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Store tags using Symbol-based key
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        if env.storage().persistent().has(&tag_key) {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        env.storage().persistent().set(&tag_key, &tags);
+
+        Ok(())
+    }
+
+    pub fn get_payment_tags(env: Env, payment_id: u64) -> Vec<BytesN<32>> {
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        match env.storage().persistent().get::<_, Vec<BytesN<32>>>(&tag_key) {
+            Some(tags) => tags,
+            None => Vec::new(&env),
+        }
+    }
+
+    pub fn remove_payment_tag(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        tag: BytesN<32>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        let mut tags: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&tag_key)
+            .ok_or(Error::PaymentNotFound)?;
+
+        // Find and remove the tag
+        let mut found = false;
+        let mut new_tags = Vec::new(&env);
+        for existing_tag in tags.iter() {
+            if existing_tag != tag {
+                new_tags.push_back(existing_tag);
+            } else {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(Error::PaymentNotFound);
+        }
+
+        env.storage().persistent().set(&tag_key, &new_tags);
+
+        Ok(())
+    }
+
+    // Issue #205: Invoice-based payment with line items
+    pub fn attach_invoice(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        items: Vec<LineItem>,
+        tax: i128,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if invoice already attached
+        let invoice_key = Symbol::new(&env, &format!("inv_{}", payment_id));
+        if env.storage().persistent().has(&invoice_key) {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        // Validate line items and calculate subtotal
+        let mut subtotal: i128 = 0;
+        for item in items.iter() {
+            if item.quantity == 0 || item.amount < 0 {
+                return Err(Error::InvalidAmount);
+            }
+            subtotal = subtotal.checked_add(item.amount).ok_or(Error::InvalidAmount)?;
+        }
+
+        // Verify total
+        let total = subtotal.checked_add(tax).ok_or(Error::InvalidAmount)?;
+        if total != payment.amount {
+            return Err(Error::RefundExceedsPayment);
+        }
+
+        // Get next invoice ID
+        let counter_key = Symbol::new(&env, "inv_counter");
+        let invoice_id: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&counter_key)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::InvalidAmount)?;
+
+        // Create and store invoice
+        let invoice = PaymentInvoice {
+            invoice_id,
+            payment_id,
+            items,
+            subtotal,
+            tax,
+            total,
+            issued_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&invoice_key, &invoice);
+        env.storage().persistent().set(&counter_key, &invoice_id);
+
+        Ok(invoice_id)
+    }
+
+    pub fn get_invoice(env: Env, invoice_id: u64) -> Option<PaymentInvoice> {
+        // Search through all invoices (simplified - in production would use indexed storage)
+        let counter_key = Symbol::new(&env, "inv_counter");
+        let max_id: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&counter_key)
+            .unwrap_or(0);
+
+        for payment_id in 1..=max_id {
+            let key = Symbol::new(&env, &format!("inv_{}", payment_id));
+            if let Some(invoice) = env.storage().persistent().get::<_, PaymentInvoice>(&key) {
+                if invoice.invoice_id == invoice_id {
+                    return Some(invoice);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_payment_invoice(env: Env, payment_id: u64) -> Option<PaymentInvoice> {
+        let key = Symbol::new(&env, &format!("inv_{}", payment_id));
+        env.storage().persistent().get::<_, PaymentInvoice>(&key)
+    }
+
+    pub fn verify_invoice_total(env: Env, invoice_id: u64) -> bool {
+        if let Some(invoice) = Self::get_invoice(env, invoice_id) {
+            let mut calculated_subtotal: i128 = 0;
+            for item in invoice.items.iter() {
+                calculated_subtotal = calculated_subtotal.saturating_add(item.amount);
+            }
+            let calculated_total = calculated_subtotal.saturating_add(invoice.tax);
+            calculated_total == invoice.total
+        } else {
+            false
+        }
     }
 }
 
