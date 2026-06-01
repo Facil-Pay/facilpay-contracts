@@ -62,6 +62,10 @@ pub enum ArbitrationKey {
     ArbitratorScoreIndex(i128, u64),
     ArbitratorScoreCount,
     ArbitrationTimeoutConfig,
+    // Issue #194: Tiered arbitration
+    SeniorArbitratorList,
+    ArbitrationTierConfig,
+    CaseEscalated(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,6 +104,31 @@ pub enum SystemKey {
     HooksByEventCount(RefundEventType),
     SubscriberHooks(Address, u64),
     SubscriberHookCount(Address),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EvidenceKey {
+    Evidence(u64, Address),
+    EvidenceIndex(u64, u64),
+    EvidenceCount(u64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum VoucherKey {
+    Voucher(u64),
+    VoucherCounter,
+    CustomerVoucher(Address, u64),
+    CustomerVoucherCount(Address),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum TokenKey {
+    SupportedToken(Address),
+    TokenCount,
+    TokenByIndex(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +203,20 @@ pub enum Error {
     HookNotOwnedBySubscriber = 43,
     MerchantQuotaExceeded = 44,
     QuotaNotConfigured = 45,
+    // Issue #190: Dispute evidence
+    EvidenceTooLarge = 46,
+    EvidenceAlreadySubmitted = 47,
+    // Issue #191: Multi-token refund
+    UnsupportedRefundToken = 48,
+    RefundTokenMismatch = 49,
+    // Issue #192: Refund vouchers
+    VoucherExpired = 50,
+    VoucherAlreadyRedeemed = 51,
+    VoucherNotFound = 52,
+    // Issue #194: Tiered arbitration
+    EscalationNotAllowed = 53,
+    NoSeniorArbitrators = 54,
+    CaseAlreadyEscalated = 55,
 }
 
 #[contractevent]
@@ -384,6 +427,63 @@ pub struct NotificationHook {
     pub active: bool,
 }
 
+// Issue #190: Dispute evidence attachment
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundEvidence {
+    pub refund_id: u64,
+    pub submitter: Address,
+    pub evidence_hash: BytesN<32>,
+    pub submitted_at: u64,
+}
+
+// Issue #191: Multi-token refund support
+#[derive(Clone)]
+#[contracttype]
+pub struct SupportedRefundToken {
+    pub token: Address,
+    pub active: bool,
+}
+
+// Issue #192: Refund credit vouchers
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundVoucher {
+    pub voucher_id: u64,
+    pub refund_id: u64,
+    pub customer: Address,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub redeemed: bool,
+}
+
+// Issue #194: Tiered arbitration escalation
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ArbitratorTier {
+    Junior,
+    Senior,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ArbitrationTierConfig {
+    pub junior_quorum: u32,
+    pub senior_quorum: u32,
+    pub escalation_timeout_seconds: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct TieredArbitrator {
+    pub address: Address,
+    pub tier: ArbitratorTier,
+    pub active: bool,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HookRegistered {
@@ -419,6 +519,8 @@ pub struct Refund {
     pub amount: i128,
     pub original_payment_amount: i128,
     pub token: Address,
+    // Issue #191: original payment token for multi-token refund matching
+    pub original_token: Address,
     pub status: RefundStatus,
     pub requested_at: u64,
     pub reason: String,
@@ -877,6 +979,23 @@ impl RefundContract {
     ) -> Result<u64, Error> {
         // Require merchant authentication
         merchant.require_auth();
+
+        // Issue #191: validate token against supported registry if registry is non-empty
+        let token_count: u64 = env
+            .storage()
+            .instance()
+            .get(&TokenKey::TokenCount)
+            .unwrap_or(0);
+        if token_count > 0 {
+            let supported: Option<SupportedRefundToken> = env
+                .storage()
+                .instance()
+                .get(&TokenKey::SupportedToken(token.clone()));
+            match supported {
+                Some(t) if t.active => {}
+                _ => return Err(Error::UnsupportedRefundToken),
+            }
+        }
 
         Self::create_refund(
             env,
@@ -3438,6 +3557,8 @@ impl RefundContract {
             amount,
             original_payment_amount,
             token: token.clone(),
+            // Issue #191: record original payment token
+            original_token: token.clone(),
             status: initial_status.clone(),
             requested_at: env.ledger().timestamp(),
             reason,
@@ -4642,6 +4763,449 @@ impl RefundContract {
         }
 
         results
+    }
+
+    // ── Issue #190: Dispute evidence attachment ────────────────────────────
+
+    pub fn submit_refund_evidence(
+        env: Env,
+        submitter: Address,
+        refund_id: u64,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        submitter.require_auth();
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if submitter != refund.customer && submitter != refund.merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .has(&EvidenceKey::Evidence(refund_id, submitter.clone()))
+        {
+            return Err(Error::EvidenceAlreadySubmitted);
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&EvidenceKey::EvidenceCount(refund_id))
+            .unwrap_or(0);
+
+        let evidence = RefundEvidence {
+            refund_id,
+            submitter: submitter.clone(),
+            evidence_hash,
+            submitted_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&EvidenceKey::Evidence(refund_id, submitter.clone()), &evidence);
+        env.storage()
+            .instance()
+            .set(&EvidenceKey::EvidenceIndex(refund_id, count), &submitter);
+        env.storage()
+            .instance()
+            .set(&EvidenceKey::EvidenceCount(refund_id), &(count + 1));
+
+        Ok(())
+    }
+
+    pub fn get_refund_evidence(
+        env: Env,
+        refund_id: u64,
+        submitter: Address,
+    ) -> Option<RefundEvidence> {
+        env.storage()
+            .instance()
+            .get(&EvidenceKey::Evidence(refund_id, submitter))
+    }
+
+    pub fn get_all_refund_evidence(env: Env, refund_id: u64) -> Vec<RefundEvidence> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&EvidenceKey::EvidenceCount(refund_id))
+            .unwrap_or(0);
+        let mut results = Vec::new(&env);
+        let mut i = 0u64;
+        while i < count {
+            if let Some(submitter) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&EvidenceKey::EvidenceIndex(refund_id, i))
+            {
+                if let Some(ev) = env
+                    .storage()
+                    .instance()
+                    .get::<_, RefundEvidence>(&EvidenceKey::Evidence(refund_id, submitter))
+                {
+                    results.push_back(ev);
+                }
+            }
+            i += 1;
+        }
+        results
+    }
+
+    // ── Issue #191: Multi-token refund support ─────────────────────────────
+
+    pub fn register_refund_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&TokenKey::TokenCount)
+            .unwrap_or(0);
+
+        let entry = SupportedRefundToken {
+            token: token.clone(),
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&TokenKey::SupportedToken(token.clone()), &entry);
+
+        let already_indexed = (0..count).any(|i| {
+            env.storage()
+                .instance()
+                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+                .map(|t| t == token)
+                .unwrap_or(false)
+        });
+        if !already_indexed {
+            env.storage()
+                .instance()
+                .set(&TokenKey::TokenByIndex(count), &token);
+            env.storage()
+                .instance()
+                .set(&TokenKey::TokenCount, &(count + 1));
+        }
+
+        Ok(())
+    }
+
+    pub fn deregister_refund_token(
+        env: Env,
+        admin: Address,
+        token: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut entry: SupportedRefundToken = env
+            .storage()
+            .instance()
+            .get(&TokenKey::SupportedToken(token.clone()))
+            .ok_or(Error::RefundNotFound)?;
+
+        entry.active = false;
+        env.storage()
+            .instance()
+            .set(&TokenKey::SupportedToken(token), &entry);
+
+        Ok(())
+    }
+
+    pub fn get_supported_refund_tokens(env: Env) -> Vec<SupportedRefundToken> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&TokenKey::TokenCount)
+            .unwrap_or(0);
+        let mut results = Vec::new(&env);
+        let mut i = 0u64;
+        while i < count {
+            if let Some(token) = env
+                .storage()
+                .instance()
+                .get::<_, Address>(&TokenKey::TokenByIndex(i))
+            {
+                if let Some(entry) = env
+                    .storage()
+                    .instance()
+                    .get::<_, SupportedRefundToken>(&TokenKey::SupportedToken(token))
+                {
+                    results.push_back(entry);
+                }
+            }
+            i += 1;
+        }
+        results
+    }
+
+    // ── Issue #192: Refund credit vouchers ────────────────────────────────
+
+    pub fn issue_refund_voucher(
+        env: Env,
+        admin: Address,
+        refund_id: u64,
+        expiry_seconds: u64,
+    ) -> Result<u64, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::VoucherCounter)
+            .unwrap_or(0);
+        let voucher_id = counter + 1;
+
+        let now = env.ledger().timestamp();
+        let voucher = RefundVoucher {
+            voucher_id,
+            refund_id,
+            customer: refund.customer.clone(),
+            merchant: refund.merchant.clone(),
+            amount: refund.amount,
+            token: refund.token.clone(),
+            issued_at: now,
+            expires_at: now.saturating_add(expiry_seconds),
+            redeemed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::VoucherCounter, &voucher_id);
+
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::CustomerVoucherCount(refund.customer.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::CustomerVoucher(refund.customer.clone(), customer_count), &voucher_id);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::CustomerVoucherCount(refund.customer.clone()), &(customer_count + 1));
+
+        Ok(voucher_id)
+    }
+
+    pub fn redeem_refund_voucher(
+        env: Env,
+        customer: Address,
+        voucher_id: u64,
+        _payment_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::VoucherNotFound)?;
+
+        if voucher.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+        if voucher.redeemed {
+            return Err(Error::VoucherAlreadyRedeemed);
+        }
+        if env.ledger().timestamp() > voucher.expires_at {
+            return Err(Error::VoucherExpired);
+        }
+
+        voucher.redeemed = true;
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+
+        Ok(())
+    }
+
+    pub fn get_voucher(env: Env, voucher_id: u64) -> Option<RefundVoucher> {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+    }
+
+    pub fn get_customer_vouchers(env: Env, customer: Address) -> Vec<RefundVoucher> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::CustomerVoucherCount(customer.clone()))
+            .unwrap_or(0);
+        let mut results = Vec::new(&env);
+        let mut i = 0u64;
+        while i < count {
+            if let Some(vid) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&VoucherKey::CustomerVoucher(customer.clone(), i))
+            {
+                if let Some(v) = env
+                    .storage()
+                    .instance()
+                    .get::<_, RefundVoucher>(&VoucherKey::Voucher(vid))
+                {
+                    results.push_back(v);
+                }
+            }
+            i += 1;
+        }
+        results
+    }
+
+    // ── Issue #194: Tiered arbitration escalation ─────────────────────────
+
+    pub fn add_senior_arbitrator(
+        env: Env,
+        admin: Address,
+        arbitrator: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::SeniorArbitratorList)
+            .unwrap_or(Vec::new(&env));
+        if !list.contains(&arbitrator) {
+            list.push_back(arbitrator);
+            env.storage()
+                .instance()
+                .set(&ArbitrationKey::SeniorArbitratorList, &list);
+        }
+        Ok(())
+    }
+
+    pub fn set_arbitration_tier_config(
+        env: Env,
+        admin: Address,
+        config: ArbitrationTierConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::ArbitrationTierConfig, &config);
+        Ok(())
+    }
+
+    pub fn escalate_arbitration_case(env: Env, case_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::CaseEscalated(case_id))
+        {
+            return Err(Error::CaseAlreadyEscalated);
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::InvalidStatus);
+        }
+
+        let config: ArbitrationTierConfig = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationTierConfig)
+            .ok_or(Error::EscalationNotAllowed)?;
+
+        if env.ledger().timestamp() < case.created_at.saturating_add(config.escalation_timeout_seconds) {
+            return Err(Error::EscalationNotAllowed);
+        }
+
+        let senior_list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::SeniorArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        if senior_list.len() == 0 {
+            return Err(Error::NoSeniorArbitrators);
+        }
+
+        case.arbitrators = senior_list;
+        case.votes_for_refund = 0;
+        case.votes_against_refund = 0;
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::CaseEscalated(case_id), &true);
+
+        Ok(())
+    }
+
+    pub fn get_arbitration_tier(env: Env, case_id: u64) -> ArbitratorTier {
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::CaseEscalated(case_id))
+        {
+            ArbitratorTier::Senior
+        } else {
+            ArbitratorTier::Junior
+        }
     }
 }
 
