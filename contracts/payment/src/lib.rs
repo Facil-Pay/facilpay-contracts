@@ -46,6 +46,45 @@ pub enum DataKey {
     PaymentChannelCounter,
     MeteredSubscription(u64),
     MeteredSubscriptionCounter,
+    // Fee sweep (#216)
+    SweepRecipient,
+    SweepCounter,
+    SweepHistory(u64),
+    // Customer spend limits (#217)
+    CustomerSpendLimit(Address),
+    // Subscription groups (#218)
+    SubscriptionGroupCounter,
+    SubscriptionGroup(u64),
+    SubscriptionGroupMembership(u64), // subscription_id -> group_id
+    // Finality delay (#219)
+    FinalityConfig,
+    PendingSettlement(u64),
+    PendingSettlementCount(Address),
+    PendingSettlementIndex(Address, u64),
+    SettlementFinalized(u64),
+    AccumulatedFees,
+    MerchantFeeRecord(Address),
+    FeeWaiver(Address),
+    MerchantAnalytics(Address),
+    CustomerAnalytics(Address),
+    GlobalMerchantList(u64),
+    MerchantPayments(Address, u64),
+    MerchantPaymentCount(Address),
+    CustomerPayments(Address, u64),
+    CustomerPaymentCount(Address),
+    CustomerSubscriptions(Address, u64),
+    CustomerSubscriptionCount(Address),
+    MerchantSubscriptions(Address, u64),
+    MerchantSubscriptionCount(Address),
+    CustomerMerchantVolume(Address, Address),
+    CustomerMerchantCount(Address),
+    CustomerMerchantList(Address, u64),
+    CustomerMonthlyVolume(Address, u64),
+    CustomerHourCount(Address, u32),
+    MerchantAnalyticsBucket(Address, u64),
+    AutoEscrowRule(Address),
+    AutoEscrowTriggered(u64),
+    EscrowedPaymentDispute(u64),
 }
 
 // Customer-specific data keys
@@ -268,6 +307,20 @@ pub enum Error {
     ChannelNotExpired = 78,
     MeteredSubscriptionNotFound = 79,
     BillingCapExceeded = 80,
+    // Fee sweep (#216)
+    NothingToSweep = 114,
+    SweepRecipientNotSet = 115,
+    // Customer spend limits (#217)
+    SpendLimitExceeded = 116,
+    SpendLimitNotConfigured = 117,
+    // Subscription groups (#218)
+    GroupNotFound = 118,
+    SubscriptionAlreadyInGroup = 119,
+    GroupSizeLimitExceeded = 120,
+    // Finality delay (#219)
+    SettlementNotReady = 121,
+    FinalityConfigNotFound = 122,
+    SettlementAlreadyFinalized = 123,
 }
 
 #[contractevent]
@@ -1102,6 +1155,54 @@ pub struct PauseHistory {
     pub reason: String,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeSweepRecord {
+    pub sweep_id: u64,
+    pub amount: i128,
+    pub token: Address,
+    pub recipient: Address,
+    pub swept_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CustomerSpendLimit {
+    pub customer: Address,
+    pub limit_amount: i128,
+    pub period_seconds: u64,
+    pub used: i128,
+    pub period_start: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SubscriptionGroup {
+    pub group_id: u64,
+    pub owner: Address,
+    pub subscription_ids: Vec<u64>,
+    pub discount_bps: u32,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FinalityConfig {
+    pub delay_seconds: u64,
+    pub min_amount_threshold: i128,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingSettlement {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub release_at: u64,
+}
+
 #[contract]
 pub struct PaymentContract;
 
@@ -1588,6 +1689,9 @@ impl PaymentContract {
 
         // Check merchant rate limits
         PaymentContract::check_merchant_rate_limit(env, &merchant, amount)?;
+
+        // Check customer spend limit (#217)
+        PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -2369,6 +2473,72 @@ impl PaymentContract {
             &payment.token,
             &payment.customer,
         );
+
+        // Check finality delay config (#219)
+        let finality: Option<FinalityConfig> = env.storage().instance().get(&DataKey::FinalityConfig);
+        if let Some(ref fc) = finality {
+            if fc.active && payment.amount >= fc.min_amount_threshold {
+                // Hold funds — create PendingSettlement instead of transferring
+                let release_at = env.ledger().timestamp() + fc.delay_seconds;
+                let settlement = PendingSettlement {
+                    payment_id,
+                    merchant: payment.merchant.clone(),
+                    amount: net_amount,
+                    token: payment.token.clone(),
+                    release_at,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingSettlement(payment_id), &settlement);
+                let idx: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PendingSettlementCount(payment.merchant.clone()))
+                    .unwrap_or(0);
+                env.storage().instance().set(
+                    &DataKey::PendingSettlementIndex(payment.merchant.clone(), idx),
+                    &payment_id,
+                );
+                env.storage().instance().set(
+                    &DataKey::PendingSettlementCount(payment.merchant.clone()),
+                    &(idx + 1),
+                );
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Payment(payment_id), &payment);
+                PaymentContract::update_merchant_fee_record_post_completion(
+                    env,
+                    payment.merchant.clone(),
+                    payment.amount,
+                    fee_amount,
+                );
+                let mut analytics: PaymentAnalytics = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PaymentAnalyticsKey)
+                    .unwrap_or(PaymentAnalytics {
+                        total_payments_created: 0,
+                        total_payments_completed: 0,
+                        total_payments_cancelled: 0,
+                        total_payments_refunded: 0,
+                        total_volume: 0,
+                        total_refunded_volume: 0,
+                        unique_customers: 0,
+                        unique_merchants: 0,
+                    });
+                analytics.total_payments_completed += 1;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PaymentAnalyticsKey, &analytics);
+                (PaymentCompleted {
+                    payment_id,
+                    merchant: payment.merchant.clone(),
+                    amount: payment.amount,
+                })
+                .publish(env);
+                return Ok(());
+            }
+        }
 
         // Token transfer: net amount from customer to merchant
         let token_client = token::Client::new(env, &payment.token);
@@ -7139,6 +7309,418 @@ impl PaymentContract {
         }
         BytesN::from_array(env, &pk)
     }
+
+    // ── FEE SWEEP (#216) ─────────────────────────────────────────────────────
+
+    pub fn set_sweep_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepRecipient, &recipient);
+        Ok(())
+    }
+
+    pub fn sweep_platform_fees(env: Env, admin: Address) -> Result<i128, Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepRecipient)
+            .ok_or(Error::SweepRecipientNotSet)?;
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        if accumulated <= 0 {
+            return Err(Error::NothingToSweep);
+        }
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)?;
+        let token_client = token::Client::new(&env, &fee_config.fee_token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &accumulated);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &0i128);
+        let sweep_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepCounter, &sweep_id);
+        let record = FeeSweepRecord {
+            sweep_id,
+            amount: accumulated,
+            token: fee_config.fee_token,
+            recipient,
+            swept_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepHistory(sweep_id), &record);
+        Ok(accumulated)
+    }
+
+    pub fn get_sweep_history(env: Env, limit: u32) -> Vec<FeeSweepRecord> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepCounter)
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        let start = if total > limit as u64 { total - limit as u64 + 1 } else { 1 };
+        for i in start..=total {
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get(&DataKey::SweepHistory(i))
+            {
+                result.push_back(record);
+            }
+        }
+        result
+    }
+
+    pub fn get_sweepable_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0)
+    }
+
+    // ── CUSTOMER SPEND LIMITS (#217) ─────────────────────────────────────────
+
+    pub fn set_customer_spend_limit(
+        env: Env,
+        admin: Address,
+        customer: Address,
+        limit: i128,
+        period_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        let spend_limit = CustomerSpendLimit {
+            customer: customer.clone(),
+            limit_amount: limit,
+            period_seconds,
+            used: 0,
+            period_start: now,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSpendLimit(customer), &spend_limit);
+        Ok(())
+    }
+
+    pub fn get_spend_limit(env: Env, customer: Address) -> Option<CustomerSpendLimit> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer))
+    }
+
+    pub fn remove_customer_spend_limit(
+        env: Env,
+        admin: Address,
+        customer: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::CustomerSpendLimit(customer));
+        Ok(())
+    }
+
+    pub fn check_spend_allowance(env: Env, customer: Address, amount: i128) -> bool {
+        let limit: Option<CustomerSpendLimit> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer));
+        match limit {
+            None => true,
+            Some(l) => {
+                let now = env.ledger().timestamp();
+                let used = if now > l.period_start + l.period_seconds { 0 } else { l.used };
+                used + amount <= l.limit_amount
+            }
+        }
+    }
+
+    fn check_and_update_spend_limit(env: &Env, customer: &Address, amount: i128) -> Result<(), Error> {
+        let limit: Option<CustomerSpendLimit> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer.clone()));
+        let mut limit = match limit {
+            None => return Ok(()),
+            Some(l) => l,
+        };
+        let now = env.ledger().timestamp();
+        if now > limit.period_start + limit.period_seconds {
+            limit.used = 0;
+            limit.period_start = now;
+        }
+        if limit.used + amount > limit.limit_amount {
+            return Err(Error::SpendLimitExceeded);
+        }
+        limit.used += amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSpendLimit(customer.clone()), &limit);
+        Ok(())
+    }
+
+    // ── SUBSCRIPTION GROUPS (#218) ────────────────────────────────────────────
+
+    pub fn create_subscription_group(
+        env: Env,
+        owner: Address,
+        discount_bps: u32,
+    ) -> Result<u64, Error> {
+        owner.require_auth();
+        let group_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroupCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroupCounter, &group_id);
+        let group = SubscriptionGroup {
+            group_id,
+            owner,
+            subscription_ids: Vec::new(&env),
+            discount_bps,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        Ok(group_id)
+    }
+
+    pub fn add_to_group(
+        env: Env,
+        owner: Address,
+        group_id: u64,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        let mut group: SubscriptionGroup = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+            .ok_or(Error::GroupNotFound)?;
+        if group.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        if group.subscription_ids.len() >= 20 {
+            return Err(Error::GroupSizeLimitExceeded);
+        }
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::SubscriptionGroupMembership(subscription_id))
+            .is_some()
+        {
+            return Err(Error::SubscriptionAlreadyInGroup);
+        }
+        group.subscription_ids.push_back(subscription_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroupMembership(subscription_id), &group_id);
+        Ok(())
+    }
+
+    pub fn remove_from_group(
+        env: Env,
+        owner: Address,
+        group_id: u64,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        let mut group: SubscriptionGroup = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+            .ok_or(Error::GroupNotFound)?;
+        if group.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        let mut new_ids = Vec::new(&env);
+        for id in group.subscription_ids.iter() {
+            if id != subscription_id {
+                new_ids.push_back(id);
+            }
+        }
+        group.subscription_ids = new_ids;
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        env.storage()
+            .instance()
+            .remove(&DataKey::SubscriptionGroupMembership(subscription_id));
+        Ok(())
+    }
+
+    pub fn get_subscription_group(env: Env, group_id: u64) -> Option<SubscriptionGroup> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+    }
+
+    pub fn get_group_next_billing(env: Env, group_id: u64) -> u64 {
+        let group: Option<SubscriptionGroup> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id));
+        let group = match group {
+            None => return 0,
+            Some(g) => g,
+        };
+        let mut earliest: u64 = u64::MAX;
+        for sub_id in group.subscription_ids.iter() {
+            if let Some(sub) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
+            {
+                if sub.next_payment_at < earliest {
+                    earliest = sub.next_payment_at;
+                }
+            }
+        }
+        if earliest == u64::MAX { 0 } else { earliest }
+    }
+
+    // ── FINALITY DELAY (#219) ─────────────────────────────────────────────────
+
+    pub fn configure_finality_delay(
+        env: Env,
+        admin: Address,
+        config: FinalityConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let ms_config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !ms_config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FinalityConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_finality_config(env: Env) -> Option<FinalityConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FinalityConfig)
+    }
+
+    pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::SettlementFinalized(payment_id))
+        {
+            return Err(Error::SettlementAlreadyFinalized);
+        }
+        let settlement: PendingSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSettlement(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+        let now = env.ledger().timestamp();
+        if now < settlement.release_at {
+            return Err(Error::SettlementNotReady);
+        }
+        let token_client = token::Client::new(&env, &settlement.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &settlement.merchant,
+            &settlement.amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::SettlementFinalized(payment_id), &true);
+        Ok(())
+    }
+
+    pub fn get_pending_settlements(env: Env, merchant: Address) -> Vec<PendingSettlement> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSettlementCount(merchant.clone()))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        for i in 0..count {
+            if let Some(payment_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::PendingSettlementIndex(merchant.clone(), i))
+            {
+                if !env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::SettlementFinalized(payment_id))
+                {
+                    if let Some(s) = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::PendingSettlement(payment_id))
+                    {
+                        result.push_back(s);
+                    }
+                }
+            }
+        }
+        result
+    }
 }
 
 mod test;
@@ -7161,3 +7743,15 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_fee_sweep;
+
+#[cfg(test)]
+mod test_spend_limits;
+
+#[cfg(test)]
+mod test_subscription_groups;
+
+#[cfg(test)]
+mod test_finality_delay;
