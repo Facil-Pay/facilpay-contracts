@@ -89,6 +89,9 @@ pub enum DataKey {
     EscrowedPaymentDispute(u64),
     // Payment routing (#118)
     RouteOptions(Address, Address), // (input_token, output_token)
+    // Fee rebate programme
+    FeeRebateConfig,
+    MerchantRebateAccrual(Address),
     // Payment memo with hash verification
     PaymentMemo(u64),
     PaymentMemoVersion(u64),
@@ -331,6 +334,10 @@ pub enum Error {
     SettlementNotReady = 121,
     FinalityConfigNotFound = 122,
     SettlementAlreadyFinalized = 123,
+    // Fee rebate programme
+    RebateThresholdNotMet = 106,
+    RebateAlreadyClaimed = 107,
+    RebateConfigNotFound = 108,
 }
 
 #[contractevent]
@@ -920,6 +927,24 @@ pub struct FeeWaiver {
     pub valid_until: u64,
     pub reason: String,
     pub granted_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeRebateConfig {
+    pub threshold_volume: i128,
+    pub rebate_bps: u32,
+    pub rebate_period_seconds: u64,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRebateAccrual {
+    pub merchant: Address,
+    pub accrued_rebate: i128,
+    pub period_start: u64,
+    pub period_volume: i128,
 }
 
 #[contractevent]
@@ -2715,6 +2740,9 @@ impl PaymentContract {
 
         // Accrue loyalty points for completed payments if loyalty is configured.
         PaymentContract::maybe_accrue_loyalty_points(&env, payment.customer.clone(), payment.amount);
+
+        // Accrue fee rebate for merchant if rebate programme is active
+        PaymentContract::maybe_accrue_fee_rebate(env, payment.merchant.clone(), payment.amount, fee_amount);
 
         // Attempt to trigger auto-escrow if a rule exists
         // Ignore errors - if there's no rule, payment is below minimum, or already triggered,
@@ -5596,6 +5624,136 @@ impl PaymentContract {
         }
     }
 
+    // ── FEE REBATE FUNCTIONS ──────────────────────────────────────────────────
+
+    pub fn configure_fee_rebate(
+        env: Env,
+        admin: Address,
+        config: FeeRebateConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRebateConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_rebate_accrual(env: Env, merchant: Address) -> Option<MerchantRebateAccrual> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant))
+    }
+
+    pub fn claim_fee_rebate(env: Env, merchant: Address) -> Result<i128, Error> {
+        merchant.require_auth();
+
+        let config: FeeRebateConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeRebateConfig)
+            .ok_or(Error::RebateConfigNotFound)?;
+
+        if !config.active {
+            return Err(Error::RebateConfigNotFound);
+        }
+
+        let accrual: MerchantRebateAccrual = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant.clone()))
+            .ok_or(Error::RebateThresholdNotMet)?;
+
+        if accrual.accrued_rebate == 0 {
+            return Err(Error::RebateAlreadyClaimed);
+        }
+
+        let rebate = accrual.accrued_rebate;
+
+        // Deduct from accumulated fees and transfer to merchant
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &(accumulated - rebate));
+
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)?;
+        let token_client = token::Client::new(&env, &fee_config.fee_token);
+        token_client.transfer(&env.current_contract_address(), &merchant, &rebate);
+
+        // Reset accrual (keep period_start and period_volume, zero out rebate)
+        let reset = MerchantRebateAccrual {
+            merchant: accrual.merchant,
+            accrued_rebate: 0,
+            period_start: accrual.period_start,
+            period_volume: accrual.period_volume,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRebateAccrual(merchant), &reset);
+
+        Ok(rebate)
+    }
+
+    fn maybe_accrue_fee_rebate(
+        env: &Env,
+        merchant: Address,
+        payment_amount: i128,
+        fee_amount: i128,
+    ) {
+        let config: Option<FeeRebateConfig> = env.storage().instance().get(&DataKey::FeeRebateConfig);
+        let config = match config {
+            Some(c) if c.active => c,
+            _ => return,
+        };
+
+        let now = env.ledger().timestamp();
+
+        let mut accrual: MerchantRebateAccrual = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant.clone()))
+            .unwrap_or(MerchantRebateAccrual {
+                merchant: merchant.clone(),
+                accrued_rebate: 0,
+                period_start: now,
+                period_volume: 0,
+            });
+
+        // Reset period if elapsed
+        if now >= accrual.period_start + config.rebate_period_seconds {
+            accrual.period_start = now;
+            accrual.period_volume = 0;
+            accrual.accrued_rebate = 0;
+        }
+
+        accrual.period_volume += payment_amount;
+
+        // Only accrue rebate on volume above the threshold
+        if accrual.period_volume > config.threshold_volume && fee_amount > 0 {
+            let rebate = (fee_amount * (config.rebate_bps as i128)) / 10000;
+            accrual.accrued_rebate += rebate;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRebateAccrual(merchant), &accrual);
+    }
+
     // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────
 
     fn validate_batch_size(len: u32) -> Result<(), Error> {
@@ -8443,3 +8601,6 @@ mod test_subscription_groups;
 
 #[cfg(test)]
 mod test_finality_delay;
+
+#[cfg(test)]
+mod test_fee_rebate;
