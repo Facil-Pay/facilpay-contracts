@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    Address, Bytes, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -23,7 +23,6 @@ pub enum DataKey {
     EscrowCounter,
     MultiPartyEscrow(u64),
     MultiPartyEscrowCounter,
-    MultiPartyInitConfig(u64),
     CustomerEscrows(Address, u64),
     MerchantEscrows(Address, u64),
     CustomerEscrowCount(Address),
@@ -34,7 +33,6 @@ pub enum DataKey {
     ReputationScore(Address),
     ReputationConfig,
     VestingSchedule(u64),
-    VestingAccelerationConfig(u64),
     TimeLockAction(u64),
     TimeLockCounter,
     TimeLockConfig,
@@ -89,6 +87,10 @@ pub enum DataKey {
     DisputeAppealCounter,
     DisputeRoundKey(u64),
     AppealsByEscrow(u64, u64),
+    // Escrow renewal mechanism
+    EscrowRenewalConfig,
+    EscrowRenewal(u64),
+    EscrowRenewalCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,32 +124,6 @@ pub struct EscrowFeeConfig {
     pub fee_bps: i128,
     pub fee_recipient: Address,
     pub enabled: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub enum EscrowHealth {
-    Healthy,
-    NearExpiry,
-    Stale,
-    Disputed,
-    Expired,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct EscrowHealthReport {
-    pub escrow_id: u64,
-    pub health: EscrowHealth,
-    pub seconds_until_expiry: Option<i64>,
-    pub last_activity: u64,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct StaleThresholdConfig {
-    pub inactivity_seconds: u64,
-    pub near_expiry_buffer_seconds: u64,
 }
 
 #[contractevent]
@@ -186,6 +162,7 @@ pub struct InsuranceConfig {
     pub enabled: bool,
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct InsuranceClaim {
     pub claim_id: u64,
@@ -194,6 +171,30 @@ pub struct InsuranceClaim {
     pub amount: i128,
     pub approved: bool,
     pub paid_at: Option<u64>,
+}
+
+/// Configuration for escrow renewal mechanism
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewalConfig {
+    pub enabled: bool,
+    pub max_renewals: u32,           // Maximum number of times an escrow can be renewed
+    pub renewal_fee_bps: u32,        // Fee in basis points for renewal
+    pub min_renewal_period: u64,     // Minimum renewal period in seconds
+    pub max_renewal_period: u64,     // Maximum renewal period in seconds
+}
+
+/// Tracks escrow renewal history
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewal {
+    pub renewal_id: u64,
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewed_at: u64,
+    pub renewal_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -249,9 +250,6 @@ pub enum Error {
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
     MilestoneOverflow = 49,
-    AccelerationLimitExceeded = 66,
-    AccelerationConfigNotFound = 67,
-    MilestoneAlreadyCompleted = 68,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
@@ -273,15 +271,16 @@ pub enum Error {
     ExpiryBeforeRelease = 69,
     TemplateNotFound = 70,
     TemplateInactive = 71,
-    InitiationDeadlinePassed = 69,
-    EscrowAlreadyFullyAccepted = 70,
-    RollbackAlreadyExecuted = 71,
+    InitiationDeadlinePassed = 79,
+    EscrowAlreadyFullyAccepted = 80,
+    RollbackAlreadyExecuted = 81,
     RollbackNotYetAvailable = 72,
-    // 63 is already taken by MigrationNotStarted; use next free code.
-    StaleThresholdNotConfigured = 66,
+    StaleThresholdNotConfigured = 78,
     AppealWindowClosed = 73,
     AppealAlreadyFiled = 74,
     MaxDisputeRoundsReached = 75,
+    BatchReleaseSizeLimitExceeded = 76,
+    BatchReleasePartialFailure = 77,
 }
 
 #[contractevent]
@@ -349,22 +348,6 @@ pub struct MultiPartyEscrowReleased {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MultiPartyEscrowAccepted {
-    pub escrow_id: u64,
-    pub participant: Address,
-    pub acceptances: u32,
-    pub required_acceptances: u32,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MultiPartyEscrowRolledBack {
-    pub escrow_id: u64,
-    pub refunded_amount: i128,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WeightUpdated {
     pub escrow_id: u64,
     pub participant: Address,
@@ -421,6 +404,22 @@ pub struct EvidenceSubmitted {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineSet {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub set_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineExceeded {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub submitted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeEscalated {
     pub escrow_id: u64,
     pub level: u64,
@@ -451,6 +450,28 @@ pub struct AppealResolved {
     pub escrow_id: u64,
     pub in_favor_of: Address,
     pub resolved_at: u64,
+}
+
+/// Event emitted when an escrow is renewed
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewed {
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewal_count: u32,
+}
+
+/// Event emitted when escrow renewal configuration is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewalConfigUpdated {
+    pub max_renewals: u32,
+    pub renewal_fee_bps: u32,
+    pub min_renewal_period: u64,
+    pub max_renewal_period: u64,
+    pub updated_by: Address,
 }
 
 #[derive(Clone)]
@@ -626,6 +647,7 @@ pub struct Escrow {
     pub escalated_at: Option<u64>,
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
+    pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
 }
 
 #[derive(Clone)]
@@ -661,19 +683,6 @@ pub struct MultiPartyEscrow {
     pub threshold_bps: u32, // cumulative approved weight needed for release
     pub created_at: u64,
     pub release_timestamp: u64,
-}
-
-/// Tracks the acceptance lifecycle of a multi-party escrow so that funds can be
-/// atomically rolled back to depositors if not all parties accept before the
-/// initiation deadline.
-#[derive(Clone)]
-#[contracttype]
-pub struct MultiPartyInitConfig {
-    pub escrow_id: u64,
-    pub required_acceptances: u32,
-    pub deadline: u64,
-    pub accepted_by: Vec<Address>,
-    pub rolled_back: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -735,15 +744,6 @@ pub struct VestingSchedule {
     pub cliff_timestamp: u64,
     pub end_timestamp: u64,
     pub milestones: Vec<VestingMilestone>,
-}
-
-#[derive(Clone)]
-#[contracttype]
-pub struct VestingAccelerationConfig {
-    pub schedule_id: u64,
-    pub milestone_bps: u32,
-    pub max_acceleration_bps: u32,
-    pub total_accelerated_bps: u32,
 }
 
 /// Snapshot of vesting cliff progress for a given escrow.
@@ -888,6 +888,21 @@ pub struct EscrowBatchEntry {
     pub amount: i128,
     pub release_timestamp: u64,
     pub description: String,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchReleaseRequest {
+    pub escrow_ids: Vec<u64>,
+    pub override_recipient: Option<Address>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchReleaseResult {
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<u64>,
+    pub errors: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -1190,41 +1205,6 @@ pub struct MultiPartyDisputeResolved {
     pub escrow_id: u64,
     pub favor_merchant: bool,
     pub resolved_at: u64,
-}
-
-// Issue #78: Escrow template/cloning system
-#[derive(Clone)]
-#[contracttype]
-pub struct EscrowTemplate {
-    pub template_id: u64,
-    pub owner: Address,
-    pub token: Address,
-    pub amount: i128,
-    pub release_delay_seconds: u64,
-    pub description: String,
-    pub created_at: u64,
-    pub active: bool,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TemplateCreated {
-    pub template_id: u64,
-    pub owner: Address,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowCreatedFromTemplate {
-    pub escrow_id: u64,
-    pub template_id: u64,
-    pub customer: Address,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TemplateDeactivated {
-    pub template_id: u64,
 }
 
 fn sum_approved_weight(participants: &Vec<Participant>) -> u32 {
@@ -2186,183 +2166,6 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Admin sets the initiation acceptance window for an existing multi-party
-    /// escrow. `deadline_seconds` is added to the current ledger time. If fewer
-    /// than `required_acceptances` parties accept before the deadline, the
-    /// escrow can be rolled back via `rollback_unaccepted_escrow`.
-    pub fn set_initiation_deadline(
-        env: Env,
-        admin: Address,
-        escrow_id: u64,
-        deadline_seconds: u64,
-        required_acceptances: u32,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        let multisig = Self::get_multisig_config(env.clone());
-        if !multisig.admins.contains(&admin) {
-            return Err(Error::NotAnAdmin);
-        }
-        if !env
-            .storage()
-            .instance()
-            .has(&DataKey::MultiPartyEscrow(escrow_id))
-        {
-            return Err(Error::EscrowNotFound);
-        }
-
-        let config = MultiPartyInitConfig {
-            escrow_id,
-            required_acceptances,
-            deadline: env.ledger().timestamp() + deadline_seconds,
-            accepted_by: Vec::new(&env),
-            rolled_back: false,
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
-        Ok(())
-    }
-
-    /// A participant accepts a multi-party escrow during the initiation window.
-    /// Fails with `InitiationDeadlinePassed` once the deadline is reached, and
-    /// with `EscrowAlreadyFullyAccepted` once the required acceptances are met.
-    pub fn accept_multi_party_escrow(
-        env: Env,
-        participant: Address,
-        escrow_id: u64,
-    ) -> Result<(), Error> {
-        participant.require_auth();
-
-        let mut config: MultiPartyInitConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiPartyInitConfig(escrow_id))
-            .ok_or(Error::EscrowNotFound)?;
-
-        if config.rolled_back {
-            return Err(Error::RollbackAlreadyExecuted);
-        }
-        if config.accepted_by.len() >= config.required_acceptances {
-            return Err(Error::EscrowAlreadyFullyAccepted);
-        }
-        if env.ledger().timestamp() >= config.deadline {
-            return Err(Error::InitiationDeadlinePassed);
-        }
-
-        let escrow: MultiPartyEscrow = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiPartyEscrow(escrow_id))
-            .ok_or(Error::EscrowNotFound)?;
-
-        // Caller must be a participant of the escrow.
-        let mut is_participant = false;
-        for p in escrow.participants.iter() {
-            if p.address == participant {
-                is_participant = true;
-                break;
-            }
-        }
-        if !is_participant {
-            return Err(Error::ParticipantNotFound);
-        }
-
-        if config.accepted_by.contains(&participant) {
-            return Err(Error::AlreadyApproved);
-        }
-
-        config.accepted_by.push_back(participant.clone());
-        let acceptances = config.accepted_by.len();
-        let required = config.required_acceptances;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
-
-        MultiPartyEscrowAccepted {
-            escrow_id,
-            participant,
-            acceptances,
-            required_acceptances: required,
-        }
-        .publish(&env);
-
-        Ok(())
-    }
-
-    /// Rolls back a multi-party escrow that was not fully accepted before its
-    /// initiation deadline, atomically refunding each participant's share back
-    /// to their address. Fails with `RollbackNotYetAvailable` before the
-    /// deadline, `EscrowAlreadyFullyAccepted` if all parties accepted, and
-    /// `RollbackAlreadyExecuted` if a rollback already ran.
-    pub fn rollback_unaccepted_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
-        let mut config: MultiPartyInitConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiPartyInitConfig(escrow_id))
-            .ok_or(Error::EscrowNotFound)?;
-
-        if config.rolled_back {
-            return Err(Error::RollbackAlreadyExecuted);
-        }
-        if env.ledger().timestamp() < config.deadline {
-            return Err(Error::RollbackNotYetAvailable);
-        }
-        if config.accepted_by.len() >= config.required_acceptances {
-            return Err(Error::EscrowAlreadyFullyAccepted);
-        }
-
-        let mut escrow: MultiPartyEscrow = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiPartyEscrow(escrow_id))
-            .ok_or(Error::EscrowNotFound)?;
-
-        if escrow.status != EscrowStatus::Locked {
-            return Err(Error::InvalidStatus);
-        }
-
-        // Atomically refund each participant's deposited share. Any failed
-        // transfer panics and reverts the whole call, so this is all-or-nothing.
-        let token_client = token::Client::new(&env, &escrow.token);
-        let contract_address = env.current_contract_address();
-        let mut refunded: i128 = 0;
-        for p in escrow.participants.iter() {
-            if p.share_bps > 0 {
-                let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
-                if amount > 0 {
-                    token_client.transfer(&contract_address, &p.address, &amount);
-                    refunded += amount;
-                }
-            }
-        }
-
-        escrow.status = EscrowStatus::Cancelled;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
-
-        config.rolled_back = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
-
-        MultiPartyEscrowRolledBack {
-            escrow_id,
-            refunded_amount: refunded,
-        }
-        .publish(&env);
-
-        Ok(())
-    }
-
-    /// Returns the initiation/acceptance status of a multi-party escrow, or
-    /// `None` if no initiation deadline was configured for it.
-    pub fn get_initiation_status(env: Env, escrow_id: u64) -> Option<MultiPartyInitConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey::MultiPartyInitConfig(escrow_id))
-    }
-
     pub fn get_multi_party_escrow(env: Env, escrow_id: u64) -> Result<MultiPartyEscrow, Error> {
         if !env
             .storage()
@@ -2669,27 +2472,20 @@ impl EscrowContract {
             }
         }
 
-        Self::internal_release_escrow(env, admin, escrow_id, early_release)
+        Self::internal_release_escrow(env, admin, escrow_id, early_release, None)
     }
 
-    fn internal_release_escrow(
-        env: Env,
-        _admin: Address,
-        escrow_id: u64,
-        early_release: bool,
-    ) -> Result<(), Error> {
+    fn can_release_escrow(env: Env, escrow_id: u64, early_release: bool) -> Result<(), Error> {
         let current_time: u64 = env.ledger().timestamp();
 
-        // Check if escrow exists
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
             return Err(Error::EscrowNotFound);
         }
 
-        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
 
         match escrow.status {
             EscrowStatus::Locked => {
-                // Enforce timelock unless admin approves early release
                 if !early_release {
                     if current_time < escrow.release_timestamp {
                         return Err(Error::ReleaseNotYetAvailable);
@@ -2699,12 +2495,29 @@ impl EscrowContract {
                         return Err(Error::ReleaseOnHoldPeriod);
                     }
                 }
-                escrow.status = EscrowStatus::Released;
+                Ok(())
             }
-            EscrowStatus::Released => return Err(Error::AlreadyProcessed),
-            EscrowStatus::Disputed => return Err(Error::InvalidStatus),
-            EscrowStatus::Resolved => return Err(Error::AlreadyProcessed),
-            EscrowStatus::Cancelled => return Err(Error::AlreadyProcessed),
+            EscrowStatus::Released => Err(Error::AlreadyProcessed),
+            EscrowStatus::Disputed => Err(Error::InvalidStatus),
+            EscrowStatus::Resolved => Err(Error::AlreadyProcessed),
+            EscrowStatus::Cancelled => Err(Error::AlreadyProcessed),
+        }
+    }
+
+    fn internal_release_escrow(
+        env: Env,
+        _admin: Address,
+        escrow_id: u64,
+        early_release: bool,
+        recipient_override: Option<Address>,
+    ) -> Result<(), Error> {
+        let current_time: u64 = env.ledger().timestamp();
+
+        Self::can_release_escrow(env.clone(), escrow_id, early_release)?;
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status == EscrowStatus::Locked {
+            escrow.status = EscrowStatus::Released;
         }
 
         env.storage()
@@ -2743,10 +2556,11 @@ impl EscrowContract {
             .publish(&env);
         }
 
+        let recipient = recipient_override.unwrap_or(escrow.merchant.clone());
         EscrowContract::transfer_if_token_contract(
             &env,
             &escrow.token,
-            &escrow.merchant,
+            &recipient,
             merchant_amount,
         )?;
 
@@ -2792,7 +2606,7 @@ impl EscrowContract {
 
         EscrowReleased {
             escrow_id,
-            merchant: escrow.merchant,
+            merchant: recipient,
             amount: escrow.amount,
         }
         .publish(&env);
@@ -2890,6 +2704,16 @@ impl EscrowContract {
                 escrow.status = EscrowStatus::Disputed;
                 escrow.dispute_started_at = env.ledger().timestamp();
                 escrow.last_activity_at = escrow.dispute_started_at;
+                // Set evidence submission deadline to 7 days from dispute start
+                let evidence_deadline_seconds = 7 * 24 * 60 * 60; // 7 days
+                escrow.evidence_deadline = Some(escrow.dispute_started_at + evidence_deadline_seconds);
+                
+                EvidenceDeadlineSet {
+                    escrow_id,
+                    deadline: escrow.evidence_deadline.unwrap(),
+                    set_at: escrow.dispute_started_at,
+                }
+                .publish(&env);
             }
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
@@ -2953,6 +2777,21 @@ impl EscrowContract {
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        
+        // Check evidence submission deadline
+        if let Some(deadline) = escrow.evidence_deadline {
+            let current_time = env.ledger().timestamp();
+            if current_time > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: current_time,
+                }
+                .publish(&env);
+                return Err(Error::EvidenceDeadlinePassed);
+            }
+        }
+        
         EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
     }
 
@@ -4303,188 +4142,6 @@ impl EscrowContract {
             .ok_or(Error::EscrowNotFound)
     }
 
-    fn get_base_vested_amount(env: &Env, escrow_id: u64) -> i128 {
-        let vesting_schedule = match env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
-        {
-            Some(schedule) => schedule,
-            None => return 0,
-        };
-
-        let current_timestamp = env.ledger().timestamp();
-
-        // Before cliff - nothing is vested
-        if current_timestamp < vesting_schedule.cliff_timestamp {
-            return 0;
-        }
-
-        // After end - everything is vested
-        if current_timestamp >= vesting_schedule.end_timestamp {
-            return vesting_schedule.total_amount;
-        }
-
-        // If milestones exist, use milestone-based vesting
-        if !vesting_schedule.milestones.is_empty() {
-            let mut vested_amount: i128 = 0;
-            for milestone in vesting_schedule.milestones.iter() {
-                if current_timestamp >= milestone.unlock_timestamp {
-                    vested_amount = vested_amount.saturating_add(milestone.amount);
-                }
-            }
-            vested_amount
-        } else {
-            // Time-linear vesting (proportional to time elapsed since cliff)
-            let total_duration = vesting_schedule
-                .end_timestamp
-                .saturating_sub(vesting_schedule.cliff_timestamp);
-            let elapsed = current_timestamp.saturating_sub(vesting_schedule.cliff_timestamp);
-
-            if total_duration == 0 {
-                return 0;
-            }
-
-            let vested_portion = (elapsed as i128).saturating_mul(vesting_schedule.total_amount);
-            vested_portion / total_duration as i128
-        }
-    }
-
-    pub fn get_vested_amount(env: Env, escrow_id: u64) -> i128 {
-        let vesting_schedule = match env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(escrow_id))
-        {
-            Some(schedule) => schedule,
-            None => return 0,
-        };
-
-        let base_vested = Self::get_base_vested_amount(&env, escrow_id);
-        let accelerated_amount = Self::calculate_accelerated_amount(env.clone(), escrow_id);
-        let total_vested = base_vested.saturating_add(accelerated_amount);
-
-        if total_vested > vesting_schedule.total_amount {
-            vesting_schedule.total_amount
-        } else {
-            total_vested
-        }
-    }
-
-    pub fn set_vesting_acceleration_config(
-        env: Env,
-        admin: Address,
-        schedule_id: u64,
-        milestone_bps: u32,
-        max_acceleration_bps: u32,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        let config = Self::get_multisig_config(env.clone());
-        if !config.admins.contains(&admin) {
-            return Err(Error::NotAnAdmin);
-        }
-
-        if milestone_bps == 0 || milestone_bps > max_acceleration_bps || max_acceleration_bps > 10000 {
-            return Err(Error::InvalidVestingSchedule);
-        }
-
-        if env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(schedule_id))
-            .is_none()
-        {
-            return Err(Error::EscrowNotFound);
-        }
-
-        let acceleration_config = VestingAccelerationConfig {
-            schedule_id,
-            milestone_bps,
-            max_acceleration_bps,
-            total_accelerated_bps: 0,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::VestingAccelerationConfig(schedule_id), &acceleration_config);
-
-        Ok(())
-    }
-
-    pub fn mark_milestone_complete(
-        env: Env,
-        admin: Address,
-        schedule_id: u64,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        let config = Self::get_multisig_config(env.clone());
-        if !config.admins.contains(&admin) {
-            return Err(Error::NotAnAdmin);
-        }
-
-        let mut acceleration_config = env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingAccelerationConfig>(&DataKey::VestingAccelerationConfig(schedule_id))
-            .ok_or(Error::AccelerationConfigNotFound)?;
-
-        if acceleration_config.total_accelerated_bps >= acceleration_config.max_acceleration_bps {
-            return Err(Error::MilestoneAlreadyCompleted);
-        }
-
-        let next_total = acceleration_config
-            .total_accelerated_bps
-            .saturating_add(acceleration_config.milestone_bps);
-        if next_total > acceleration_config.max_acceleration_bps {
-            return Err(Error::AccelerationLimitExceeded);
-        }
-
-        acceleration_config.total_accelerated_bps = next_total;
-        env.storage()
-            .instance()
-            .set(&DataKey::VestingAccelerationConfig(schedule_id), &acceleration_config);
-
-        Ok(())
-    }
-
-    pub fn get_acceleration_config(
-        env: Env,
-        schedule_id: u64,
-    ) -> Option<VestingAccelerationConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey::VestingAccelerationConfig(schedule_id))
-    }
-
-    pub fn calculate_accelerated_amount(env: Env, schedule_id: u64) -> i128 {
-        let vesting_schedule = match env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingSchedule>(&DataKey::VestingSchedule(schedule_id))
-        {
-            Some(schedule) => schedule,
-            None => return 0,
-        };
-
-        let acceleration_config = match env
-            .storage()
-            .instance()
-            .get::<DataKey, VestingAccelerationConfig>(&DataKey::VestingAccelerationConfig(schedule_id))
-        {
-            Some(config) => config,
-            None => return 0,
-        };
-
-        let base_vested = Self::get_base_vested_amount(&env, schedule_id);
-        let remaining_unvested = vesting_schedule
-            .total_amount
-            .saturating_sub(base_vested);
-
-        remaining_unvested
-            .saturating_mul(acceleration_config.total_accelerated_bps as i128)
-            / 10000
-    }
-
     /// Returns cliff timing and whether the ledger time has reached the cliff.
     ///
     /// # Errors
@@ -5316,6 +4973,7 @@ impl EscrowContract {
                     action.proposed_by,
                     action.escrow_id,
                     true,
+                    None,
                 )?;
             }
             _ => {}
@@ -7213,136 +6871,66 @@ impl EscrowContract {
         Ok(())
     }
 
-    // ── Issue #78: Escrow template/cloning system ────────────────────────
-
-    pub fn create_escrow_template(
+    pub fn batch_release_escrows(
         env: Env,
-        owner: Address,
-        token: Address,
-        amount: i128,
-        release_delay_seconds: u64,
-        description: String,
-    ) -> Result<u64, Error> {
-        owner.require_auth();
+        admin: Address,
+        request: BatchReleaseRequest,
+    ) -> Result<BatchReleaseResult, Error> {
+        admin.require_auth();
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowTemplateCounter)
-            .unwrap_or(0);
-        let template_id = counter + 1;
-
-        let template = EscrowTemplate {
-            template_id,
-            owner: owner.clone(),
-            token,
-            amount,
-            release_delay_seconds,
-            description,
-            created_at: env.ledger().timestamp(),
-            active: true,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowTemplate(template_id), &template);
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowTemplateCounter, &template_id);
-
-        TemplateCreated {
-            template_id,
-            owner,
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
         }
-        .publish(&env);
 
-        Ok(template_id)
+        if request.escrow_ids.len() > 20 {
+            return Err(Error::BatchReleaseSizeLimitExceeded);
+        }
+
+        let mut succeeded = Vec::new(&env);
+        let mut failed = Vec::new(&env);
+        let mut errors = Vec::new(&env);
+
+        for id in request.escrow_ids.iter() {
+            match Self::internal_release_escrow(
+                env.clone(),
+                admin.clone(),
+                *id,
+                false,
+                request.override_recipient.clone(),
+            ) {
+                Ok(_) => succeeded.push_back(*id),
+                Err(e) => {
+                    failed.push_back(*id);
+                    errors.push_back(e as u32);
+                }
+            }
+        }
+
+        Ok(BatchReleaseResult {
+            succeeded,
+            failed,
+            errors,
+        })
     }
 
-    pub fn create_escrow_from_template(
-        env: Env,
-        customer: Address,
-        template_id: u64,
-    ) -> Result<u64, Error> {
-        customer.require_auth();
+    pub fn estimate_batch_release(env: Env, escrow_ids: Vec<u64>) -> BatchReleaseResult {
+        let mut succeeded = Vec::new(&env);
+        let mut failed = Vec::new(&env);
+        let mut errors = Vec::new(&env);
 
-        let template: EscrowTemplate = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
-            .ok_or(Error::TemplateNotFound)?;
-
-        if !template.active {
-            return Err(Error::TemplateInactive);
+        for id in escrow_ids.iter() {
+            match Self::can_release_escrow(env.clone(), *id, false) {
+                Ok(_) => succeeded.push_back(*id),
+                Err(_) => failed.push_back(*id),
+            }
         }
 
-        let release_timestamp = env.ledger().timestamp() + template.release_delay_seconds;
-
-        let escrow_id = Self::create_escrow(
-            env.clone(),
-            customer.clone(),
-            template.owner.clone(),
-            template.amount,
-            template.token.clone(),
-            release_timestamp,
-            0,
-            0,
-            false,
-        )?;
-
-        EscrowCreatedFromTemplate {
-            escrow_id,
-            template_id,
-            customer,
+        BatchReleaseResult {
+            succeeded,
+            failed,
+            errors,
         }
-        .publish(&env);
-
-        Ok(escrow_id)
-    }
-
-    pub fn deactivate_template(
-        env: Env,
-        owner: Address,
-        template_id: u64,
-    ) -> Result<(), Error> {
-        owner.require_auth();
-
-        let mut template: EscrowTemplate = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
-            .ok_or(Error::TemplateNotFound)?;
-
-        let config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&AdminKey::MultiSigConfig)
-            .unwrap_or(MultiSigConfig {
-                admins: Vec::new(&env),
-                required_signatures: 1,
-                total_admins: 0,
-                proposal_ttl: 0,
-            });
-
-        if template.owner != owner && !config.admins.contains(&owner) {
-            return Err(Error::Unauthorized);
-        }
-
-        template.active = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowTemplate(template_id), &template);
-
-        TemplateDeactivated { template_id }.publish(&env);
-
-        Ok(())
-    }
-
-    pub fn get_template(env: Env, template_id: u64) -> Result<EscrowTemplate, Error> {
-        env.storage()
-            .instance()
-            .get(&DataKey::EscrowTemplate(template_id))
-            .ok_or(Error::TemplateNotFound)
     }
 
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────
@@ -7375,123 +6963,6 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::MerchantAnalytics(merchant.clone()), &analytics);
-    }
-
-    /// Configure the thresholds used to classify escrow health (admin only).
-    ///
-    /// `inactivity_seconds` controls when a non-terminal escrow is considered
-    /// `Stale`, and `near_expiry_buffer_seconds` controls when one is flagged
-    /// `NearExpiry`.
-    pub fn set_stale_threshold(
-        env: Env,
-        admin: Address,
-        config: StaleThresholdConfig,
-    ) -> Result<(), Error> {
-        admin.require_auth();
-        let multisig = Self::get_multisig_config(env.clone());
-        if !multisig.admins.contains(&admin) {
-            return Err(Error::NotAnAdmin);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::StaleThresholdConfigKey, &config);
-        Ok(())
-    }
-
-    /// Returns the configured stale-threshold config, or `None` if unset.
-    pub fn get_stale_threshold(env: Env) -> Option<StaleThresholdConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey::StaleThresholdConfigKey)
-    }
-
-    /// Classify the health of a single escrow against the configured thresholds.
-    ///
-    /// Panics with `EscrowNotFound` if the escrow does not exist, or
-    /// `StaleThresholdNotConfigured` if `set_stale_threshold` was never called.
-    pub fn get_escrow_health(env: Env, escrow_id: u64) -> EscrowHealthReport {
-        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
-            panic_with_error!(&env, Error::EscrowNotFound);
-        }
-        let config = Self::require_stale_threshold(&env);
-        let escrow = Self::get_escrow(&env, escrow_id);
-        let now = env.ledger().timestamp();
-
-        let seconds_until_expiry: Option<i64> = if escrow.expiry_timestamp == 0 {
-            None
-        } else {
-            Some(escrow.expiry_timestamp as i64 - now as i64)
-        };
-
-        EscrowHealthReport {
-            escrow_id,
-            health: Self::classify_health(&escrow, now, &config),
-            seconds_until_expiry,
-            last_activity: escrow.last_activity_at,
-        }
-    }
-
-    /// Returns at most `limit` IDs of escrows currently classified as `Stale`.
-    ///
-    /// Panics with `StaleThresholdNotConfigured` if thresholds are not set.
-    pub fn get_stale_escrows(env: Env, limit: u32) -> Vec<u64> {
-        let config = Self::require_stale_threshold(&env);
-        let now = env.ledger().timestamp();
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::EscrowCounter)
-            .unwrap_or(0);
-
-        let mut result = Vec::new(&env);
-        let mut id: u64 = 1;
-        while id <= counter && (result.len() as u32) < limit {
-            if let Some(escrow) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Escrow>(&DataKey::Escrow(id))
-            {
-                if Self::classify_health(&escrow, now, &config) == EscrowHealth::Stale {
-                    result.push_back(id);
-                }
-            }
-            id += 1;
-        }
-        result
-    }
-
-    fn require_stale_threshold(env: &Env) -> StaleThresholdConfig {
-        match env
-            .storage()
-            .instance()
-            .get::<DataKey, StaleThresholdConfig>(&DataKey::StaleThresholdConfigKey)
-        {
-            Some(config) => config,
-            None => panic_with_error!(env, Error::StaleThresholdNotConfigured),
-        }
-    }
-
-    /// Pure classification of an escrow's health given the current time and config.
-    ///
-    /// Precedence: Disputed > Expired > NearExpiry > Stale > Healthy.
-    fn classify_health(escrow: &Escrow, now: u64, config: &StaleThresholdConfig) -> EscrowHealth {
-        if escrow.status == EscrowStatus::Disputed {
-            return EscrowHealth::Disputed;
-        }
-        if escrow.expiry_timestamp != 0 && now >= escrow.expiry_timestamp {
-            return EscrowHealth::Expired;
-        }
-        if escrow.expiry_timestamp != 0
-            && escrow.expiry_timestamp - now <= config.near_expiry_buffer_seconds
-        {
-            return EscrowHealth::NearExpiry;
-        }
-        if now >= escrow.last_activity_at
-            && now - escrow.last_activity_at >= config.inactivity_seconds
-        {
-            return EscrowHealth::Stale;
-        }
-        EscrowHealth::Healthy
     }
 }
 
@@ -7545,7 +7016,3 @@ mod escalation_timeout_test;
 #[cfg(test)]
 mod bulk_evidence_test;
 mod migration_test;
-
-#[cfg(test)]
-mod multi_party_rollback_test;
-mod health_check_test;

@@ -89,8 +89,12 @@ pub enum DataKey {
     EscrowedPaymentDispute(u64),
     // Payment routing (#118)
     RouteOptions(Address, Address), // (input_token, output_token)
-    MerchantVerificationLevel(Address),
-    VerificationTierLimit(MerchantVerificationLevel),
+    // Fee rebate programme
+    FeeRebateConfig,
+    MerchantRebateAccrual(Address),
+    // Payment memo with hash verification
+    PaymentMemo(u64),
+    PaymentMemoVersion(u64),
 }
 
 // Customer-specific data keys
@@ -332,6 +336,10 @@ pub enum Error {
     SettlementAlreadyFinalized = 123,
     VerificationLevelNotFound = 95,
     TierLimitsNotConfigured = 96,
+    // Fee rebate programme
+    RebateThresholdNotMet = 106,
+    RebateAlreadyClaimed = 107,
+    RebateConfigNotFound = 108,
 }
 
 #[contractevent]
@@ -940,6 +948,24 @@ pub struct FeeWaiver {
     pub granted_by: Address,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct FeeRebateConfig {
+    pub threshold_volume: i128,
+    pub rebate_bps: u32,
+    pub rebate_period_seconds: u64,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRebateAccrual {
+    pub merchant: Address,
+    pub accrued_rebate: i128,
+    pub period_start: u64,
+    pub period_volume: i128,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionProposed {
@@ -1142,6 +1168,45 @@ pub struct PaymentMetadata {
     pub version: u32,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoSet {
+    pub payment_id: u64,
+    pub memo_ref: String,
+    pub set_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoUpdated {
+    pub payment_id: u64,
+    pub memo_ref: String,
+    pub updated_by: Address,
+    pub version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoVerified {
+    pub payment_id: u64,
+    pub memo_hash: BytesN<32>,
+    pub verified_at: u64,
+    pub verified_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentMemo {
+    pub payment_id: u64,
+    pub memo_ref: String,           // Reference to memo content (IPFS CID, URL, etc.)
+    pub memo_hash: BytesN<32>,      // SHA-256 hash of memo plaintext (immutable)
+    pub reference_hash: BytesN<32>, // Hash linking memo to payment (for integrity)
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version: u32,
+    pub created_by: Address,
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct PaymentAnalytics {
@@ -1259,6 +1324,36 @@ pub struct RouteOption {
     pub output_amount: i128,
     pub fee_bps: u32,
     pub effective_cost: i128,
+}
+
+// Issue #210: Payment tagging system
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentTagSet {
+    pub payment_id: u64,
+    pub tags: Vec<BytesN<32>>,
+}
+
+// Issue #205: Invoice-based payment with line items
+#[derive(Clone)]
+#[contracttype]
+pub struct LineItem {
+    pub description_hash: BytesN<32>,
+    pub quantity: u32,
+    pub unit_price: i128,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentInvoice {
+    pub invoice_id: u64,
+    pub payment_id: u64,
+    pub items: Vec<LineItem>,
+    pub subtotal: i128,
+    pub tax: i128,
+    pub total: i128,
+    pub issued_at: u64,
 }
 
 #[contract]
@@ -2728,6 +2823,9 @@ impl PaymentContract {
 
         // Accrue loyalty points for completed payments if loyalty is configured.
         PaymentContract::maybe_accrue_loyalty_points(&env, payment.customer.clone(), payment.amount);
+
+        // Accrue fee rebate for merchant if rebate programme is active
+        PaymentContract::maybe_accrue_fee_rebate(env, payment.merchant.clone(), payment.amount, fee_amount);
 
         // Attempt to trigger auto-escrow if a rule exists
         // Ignore errors - if there's no rule, payment is below minimum, or already triggered,
@@ -5640,6 +5738,136 @@ impl PaymentContract {
         }
     }
 
+    // ── FEE REBATE FUNCTIONS ──────────────────────────────────────────────────
+
+    pub fn configure_fee_rebate(
+        env: Env,
+        admin: Address,
+        config: FeeRebateConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRebateConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_rebate_accrual(env: Env, merchant: Address) -> Option<MerchantRebateAccrual> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant))
+    }
+
+    pub fn claim_fee_rebate(env: Env, merchant: Address) -> Result<i128, Error> {
+        merchant.require_auth();
+
+        let config: FeeRebateConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeRebateConfig)
+            .ok_or(Error::RebateConfigNotFound)?;
+
+        if !config.active {
+            return Err(Error::RebateConfigNotFound);
+        }
+
+        let accrual: MerchantRebateAccrual = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant.clone()))
+            .ok_or(Error::RebateThresholdNotMet)?;
+
+        if accrual.accrued_rebate == 0 {
+            return Err(Error::RebateAlreadyClaimed);
+        }
+
+        let rebate = accrual.accrued_rebate;
+
+        // Deduct from accumulated fees and transfer to merchant
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &(accumulated - rebate));
+
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)?;
+        let token_client = token::Client::new(&env, &fee_config.fee_token);
+        token_client.transfer(&env.current_contract_address(), &merchant, &rebate);
+
+        // Reset accrual (keep period_start and period_volume, zero out rebate)
+        let reset = MerchantRebateAccrual {
+            merchant: accrual.merchant,
+            accrued_rebate: 0,
+            period_start: accrual.period_start,
+            period_volume: accrual.period_volume,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRebateAccrual(merchant), &reset);
+
+        Ok(rebate)
+    }
+
+    fn maybe_accrue_fee_rebate(
+        env: &Env,
+        merchant: Address,
+        payment_amount: i128,
+        fee_amount: i128,
+    ) {
+        let config: Option<FeeRebateConfig> = env.storage().instance().get(&DataKey::FeeRebateConfig);
+        let config = match config {
+            Some(c) if c.active => c,
+            _ => return,
+        };
+
+        let now = env.ledger().timestamp();
+
+        let mut accrual: MerchantRebateAccrual = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRebateAccrual(merchant.clone()))
+            .unwrap_or(MerchantRebateAccrual {
+                merchant: merchant.clone(),
+                accrued_rebate: 0,
+                period_start: now,
+                period_volume: 0,
+            });
+
+        // Reset period if elapsed
+        if now >= accrual.period_start + config.rebate_period_seconds {
+            accrual.period_start = now;
+            accrual.period_volume = 0;
+            accrual.accrued_rebate = 0;
+        }
+
+        accrual.period_volume += payment_amount;
+
+        // Only accrue rebate on volume above the threshold
+        if accrual.period_volume > config.threshold_volume && fee_amount > 0 {
+            let rebate = (fee_amount * (config.rebate_bps as i128)) / 10000;
+            accrual.accrued_rebate += rebate;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRebateAccrual(merchant), &accrual);
+    }
+
     // ── BATCH PAYMENT OPERATIONS ──────────────────────────────────────────────
 
     fn validate_batch_size(len: u32) -> Result<(), Error> {
@@ -7289,6 +7517,143 @@ impl PaymentContract {
         }
     }
 
+    /// Set structured payment memo with hash-verified reference field
+    /// Memo hash is immutable after first set to ensure integrity
+    pub fn set_payment_memo(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+        memo_ref: String,
+        memo_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Verify caller is customer, merchant, or admin
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != payment.customer && caller != payment.merchant && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if memo already exists
+        let existing_memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        let current_time = env.ledger().timestamp();
+
+        if let Some(existing) = existing_memo {
+            // Memo already set - emit update event with new version
+            let new_version = existing.version + 1;
+            
+            // Create reference hash linking memo to payment for integrity verification
+            let reference_data = format!("{}:{}", payment_id, existing.memo_hash.to_string());
+            let reference_hash = env.crypto().sha256(&Bytes::from_slice(&env, reference_data.as_bytes()));
+            
+            let updated_memo = PaymentMemo {
+                payment_id,
+                memo_ref: memo_ref.clone(),
+                memo_hash: existing.memo_hash, // Keep original hash immutable
+                reference_hash,
+                created_at: existing.created_at,
+                updated_at: current_time,
+                version: new_version,
+                created_by: existing.created_by,
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMemo(payment_id), &updated_memo);
+
+            PaymentMemoUpdated {
+                payment_id,
+                memo_ref,
+                updated_by: caller,
+                version: new_version,
+            }
+            .publish(&env);
+        } else {
+            // First time setting memo
+            // Create reference hash linking memo to payment for integrity verification
+            let reference_data = format!("{}:{}", payment_id, memo_hash.to_string());
+            let reference_hash = env.crypto().sha256(&Bytes::from_slice(&env, reference_data.as_bytes()));
+            
+            let memo = PaymentMemo {
+                payment_id,
+                memo_ref: memo_ref.clone(),
+                memo_hash,
+                reference_hash,
+                created_at: current_time,
+                updated_at: current_time,
+                version: 1,
+                created_by: caller.clone(),
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMemo(payment_id), &memo);
+
+            PaymentMemoSet {
+                payment_id,
+                memo_ref,
+                set_by: caller,
+            }
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    /// Get payment memo
+    pub fn get_payment_memo(env: Env, payment_id: u64) -> Option<PaymentMemo> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id))
+    }
+
+    /// Verify memo integrity by comparing provided hash against stored memo hash
+    /// Returns true if hashes match, false otherwise
+    pub fn verify_memo_integrity(
+        env: Env,
+        payment_id: u64,
+        plaintext_hash: BytesN<32>,
+    ) -> bool {
+        let memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        match memo {
+            Some(m) => m.memo_hash == plaintext_hash,
+            None => false,
+        }
+    }
+
+    /// Verify memo reference integrity using the reference hash
+    /// Returns true if the reference hash matches the stored reference hash
+    pub fn verify_memo_reference(
+        env: Env,
+        payment_id: u64,
+        expected_reference_hash: BytesN<32>,
+    ) -> bool {
+        let memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        match memo {
+            Some(m) => m.reference_hash == expected_reference_hash,
+            None => false,
+        }
+    }
+
     // Dynamic fee calculation functions (#124)
     pub fn calculate_risk_score(env: Env, customer: Address, merchant: Address, amount: i128, currency: Currency) -> u32 {
         let config: RiskFeeConfig = env
@@ -8134,6 +8499,188 @@ impl PaymentContract {
 
         Ok(())
     }
+
+    // Issue #210: Payment tagging system
+    pub fn tag_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        tags: Vec<BytesN<32>>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate tag count (max 10)
+        if tags.len() > 10 {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Store tags using Symbol-based key
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        if env.storage().persistent().has(&tag_key) {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        env.storage().persistent().set(&tag_key, &tags);
+
+        Ok(())
+    }
+
+    pub fn get_payment_tags(env: Env, payment_id: u64) -> Vec<BytesN<32>> {
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        match env.storage().persistent().get::<_, Vec<BytesN<32>>>(&tag_key) {
+            Some(tags) => tags,
+            None => Vec::new(&env),
+        }
+    }
+
+    pub fn remove_payment_tag(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        tag: BytesN<32>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        let tag_key = Symbol::new(&env, &format!("tag_{}", payment_id));
+        let mut tags: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&tag_key)
+            .ok_or(Error::PaymentNotFound)?;
+
+        // Find and remove the tag
+        let mut found = false;
+        let mut new_tags = Vec::new(&env);
+        for existing_tag in tags.iter() {
+            if existing_tag != tag {
+                new_tags.push_back(existing_tag);
+            } else {
+                found = true;
+            }
+        }
+
+        if !found {
+            return Err(Error::PaymentNotFound);
+        }
+
+        env.storage().persistent().set(&tag_key, &new_tags);
+
+        Ok(())
+    }
+
+    // Issue #205: Invoice-based payment with line items
+    pub fn attach_invoice(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        items: Vec<LineItem>,
+        tax: i128,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+
+        // Check if payment exists and merchant is authorized
+        let payment = Self::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if invoice already attached
+        let invoice_key = Symbol::new(&env, &format!("inv_{}", payment_id));
+        if env.storage().persistent().has(&invoice_key) {
+            return Err(Error::AlreadyProcessed);
+        }
+
+        // Validate line items and calculate subtotal
+        let mut subtotal: i128 = 0;
+        for item in items.iter() {
+            if item.quantity == 0 || item.amount < 0 {
+                return Err(Error::InvalidAmount);
+            }
+            subtotal = subtotal.checked_add(item.amount).ok_or(Error::InvalidAmount)?;
+        }
+
+        // Verify total
+        let total = subtotal.checked_add(tax).ok_or(Error::InvalidAmount)?;
+        if total != payment.amount {
+            return Err(Error::RefundExceedsPayment);
+        }
+
+        // Get next invoice ID
+        let counter_key = Symbol::new(&env, "inv_counter");
+        let invoice_id: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&counter_key)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::InvalidAmount)?;
+
+        // Create and store invoice
+        let invoice = PaymentInvoice {
+            invoice_id,
+            payment_id,
+            items,
+            subtotal,
+            tax,
+            total,
+            issued_at: env.ledger().timestamp(),
+        };
+
+        env.storage().persistent().set(&invoice_key, &invoice);
+        env.storage().persistent().set(&counter_key, &invoice_id);
+
+        Ok(invoice_id)
+    }
+
+    pub fn get_invoice(env: Env, invoice_id: u64) -> Option<PaymentInvoice> {
+        // Search through all invoices (simplified - in production would use indexed storage)
+        let counter_key = Symbol::new(&env, "inv_counter");
+        let max_id: u64 = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&counter_key)
+            .unwrap_or(0);
+
+        for payment_id in 1..=max_id {
+            let key = Symbol::new(&env, &format!("inv_{}", payment_id));
+            if let Some(invoice) = env.storage().persistent().get::<_, PaymentInvoice>(&key) {
+                if invoice.invoice_id == invoice_id {
+                    return Some(invoice);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_payment_invoice(env: Env, payment_id: u64) -> Option<PaymentInvoice> {
+        let key = Symbol::new(&env, &format!("inv_{}", payment_id));
+        env.storage().persistent().get::<_, PaymentInvoice>(&key)
+    }
+
+    pub fn verify_invoice_total(env: Env, invoice_id: u64) -> bool {
+        if let Some(invoice) = Self::get_invoice(env, invoice_id) {
+            let mut calculated_subtotal: i128 = 0;
+            for item in invoice.items.iter() {
+                calculated_subtotal = calculated_subtotal.saturating_add(item.amount);
+            }
+            let calculated_total = calculated_subtotal.saturating_add(invoice.tax);
+            calculated_total == invoice.total
+        } else {
+            false
+        }
+    }
 }
 
 mod test;
@@ -8168,3 +8715,6 @@ mod test_subscription_groups;
 
 #[cfg(test)]
 mod test_finality_delay;
+
+#[cfg(test)]
+mod test_fee_rebate;
