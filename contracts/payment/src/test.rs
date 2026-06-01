@@ -74,6 +74,91 @@ fn test_rate_limit_window_resets_after_duration() {
     assert_eq!(rl.payment_count, 1); // only 1 payment in the new window
 }
 
+// Payout schedule tests
+#[test]
+fn test_immediate_mode_bypasses_accumulation() {
+    let env = Env::default();
+    let (client, _admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Merchant opts into Immediate payouts
+    client.set_payout_schedule(&merchant, &PayoutFrequency::Immediate, &token).unwrap();
+
+    // Schedule a payment and execute it
+    env.ledger().set_timestamp(1000);
+    let pid = client
+        .schedule_payment(&customer, &merchant, &token, &50, &1100)
+        .unwrap();
+    env.ledger().set_timestamp(1100);
+    client.execute_scheduled_payment(&pid).unwrap();
+
+    // Immediate mode should not accumulate
+    let acc = client.get_accumulated_balance(&merchant);
+    assert_eq!(acc, 0);
+}
+
+#[test]
+fn test_batch_accumulation_and_premature_trigger() {
+    let env = Env::default();
+    let (client, _admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Merchant opts into daily payouts
+    client.set_payout_schedule(&merchant, &PayoutFrequency::Daily, &token).unwrap();
+
+    // Schedule and execute a payment — should accumulate
+    env.ledger().set_timestamp(2000);
+    let pid = client
+        .schedule_payment(&customer, &merchant, &token, &123, &2010)
+        .unwrap();
+    env.ledger().set_timestamp(2010);
+    client.execute_scheduled_payment(&pid).unwrap();
+
+    let acc = client.get_accumulated_balance(&merchant);
+    assert_eq!(acc, 123);
+
+    // Attempt to trigger payout prematurely
+    let res = client.try_trigger_scheduled_payout(&merchant);
+    assert_eq!(res.unwrap_err().unwrap(), Error::PayoutNotYetDue);
+}
+
+#[test]
+fn test_trigger_advances_period_and_resets_accumulated() {
+    let env = Env::default();
+    let (client, _admin, _) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    client.set_payout_schedule(&merchant, &PayoutFrequency::Daily, &token).unwrap();
+
+    // Accumulate some funds
+    env.ledger().set_timestamp(3000);
+    let pid = client
+        .schedule_payment(&customer, &merchant, &token, &500, &3010)
+        .unwrap();
+    env.ledger().set_timestamp(3010);
+    client.execute_scheduled_payment(&pid).unwrap();
+
+    // Advance to payout time and trigger
+    let schedule = client.get_payout_schedule(&merchant).unwrap();
+    let next = schedule.next_payout_at;
+    env.ledger().set_timestamp(next + 1);
+    client.trigger_scheduled_payout(&merchant).unwrap();
+
+    // After payout accumulated must be zero and next_payout_at advanced
+    let schedule2 = client.get_payout_schedule(&merchant).unwrap();
+    assert_eq!(schedule2.accumulated, 0);
+    assert!(schedule2.next_payout_at > next);
+}
+
 #[test]
 #[should_panic]
 fn test_rate_limit_exceeded_within_window() {
