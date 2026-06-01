@@ -11,6 +11,7 @@ pub enum DataKey {
     EscrowCounter,
     MultiPartyEscrow(u64),
     MultiPartyEscrowCounter,
+    MultiPartyInitConfig(u64),
     CustomerEscrows(Address, u64),
     MerchantEscrows(Address, u64),
     CustomerEscrowCount(Address),
@@ -210,6 +211,10 @@ pub enum Error {
     MigrationNotStarted = 63,
     MigrationAlreadyComplete = 64,
     AlreadyMigrated = 65,
+    InitiationDeadlinePassed = 69,
+    EscrowAlreadyFullyAccepted = 70,
+    RollbackAlreadyExecuted = 71,
+    RollbackNotYetAvailable = 72,
 }
 
 #[contractevent]
@@ -273,6 +278,22 @@ pub struct ParticipantApproved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultiPartyEscrowReleased {
     pub escrow_id: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyEscrowAccepted {
+    pub escrow_id: u64,
+    pub participant: Address,
+    pub acceptances: u32,
+    pub required_acceptances: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiPartyEscrowRolledBack {
+    pub escrow_id: u64,
+    pub refunded_amount: i128,
 }
 
 #[contractevent]
@@ -533,6 +554,19 @@ pub struct MultiPartyEscrow {
     pub threshold_bps: u32, // cumulative approved weight needed for release
     pub created_at: u64,
     pub release_timestamp: u64,
+}
+
+/// Tracks the acceptance lifecycle of a multi-party escrow so that funds can be
+/// atomically rolled back to depositors if not all parties accept before the
+/// initiation deadline.
+#[derive(Clone)]
+#[contracttype]
+pub struct MultiPartyInitConfig {
+    pub escrow_id: u64,
+    pub required_acceptances: u32,
+    pub deadline: u64,
+    pub accepted_by: Vec<Address>,
+    pub rolled_back: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1881,6 +1915,183 @@ impl EscrowContract {
         MultiPartyEscrowReleased { escrow_id }.publish(&env);
 
         Ok(())
+    }
+
+    /// Admin sets the initiation acceptance window for an existing multi-party
+    /// escrow. `deadline_seconds` is added to the current ledger time. If fewer
+    /// than `required_acceptances` parties accept before the deadline, the
+    /// escrow can be rolled back via `rollback_unaccepted_escrow`.
+    pub fn set_initiation_deadline(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        deadline_seconds: u64,
+        required_acceptances: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::MultiPartyEscrow(escrow_id))
+        {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let config = MultiPartyInitConfig {
+            escrow_id,
+            required_acceptances,
+            deadline: env.ledger().timestamp() + deadline_seconds,
+            accepted_by: Vec::new(&env),
+            rolled_back: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
+        Ok(())
+    }
+
+    /// A participant accepts a multi-party escrow during the initiation window.
+    /// Fails with `InitiationDeadlinePassed` once the deadline is reached, and
+    /// with `EscrowAlreadyFullyAccepted` once the required acceptances are met.
+    pub fn accept_multi_party_escrow(
+        env: Env,
+        participant: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        participant.require_auth();
+
+        let mut config: MultiPartyInitConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyInitConfig(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if config.rolled_back {
+            return Err(Error::RollbackAlreadyExecuted);
+        }
+        if config.accepted_by.len() >= config.required_acceptances {
+            return Err(Error::EscrowAlreadyFullyAccepted);
+        }
+        if env.ledger().timestamp() >= config.deadline {
+            return Err(Error::InitiationDeadlinePassed);
+        }
+
+        let escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        // Caller must be a participant of the escrow.
+        let mut is_participant = false;
+        for p in escrow.participants.iter() {
+            if p.address == participant {
+                is_participant = true;
+                break;
+            }
+        }
+        if !is_participant {
+            return Err(Error::ParticipantNotFound);
+        }
+
+        if config.accepted_by.contains(&participant) {
+            return Err(Error::AlreadyApproved);
+        }
+
+        config.accepted_by.push_back(participant.clone());
+        let acceptances = config.accepted_by.len();
+        let required = config.required_acceptances;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
+
+        MultiPartyEscrowAccepted {
+            escrow_id,
+            participant,
+            acceptances,
+            required_acceptances: required,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Rolls back a multi-party escrow that was not fully accepted before its
+    /// initiation deadline, atomically refunding each participant's share back
+    /// to their address. Fails with `RollbackNotYetAvailable` before the
+    /// deadline, `EscrowAlreadyFullyAccepted` if all parties accepted, and
+    /// `RollbackAlreadyExecuted` if a rollback already ran.
+    pub fn rollback_unaccepted_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        let mut config: MultiPartyInitConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyInitConfig(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if config.rolled_back {
+            return Err(Error::RollbackAlreadyExecuted);
+        }
+        if env.ledger().timestamp() < config.deadline {
+            return Err(Error::RollbackNotYetAvailable);
+        }
+        if config.accepted_by.len() >= config.required_acceptances {
+            return Err(Error::EscrowAlreadyFullyAccepted);
+        }
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiPartyEscrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Atomically refund each participant's deposited share. Any failed
+        // transfer panics and reverts the whole call, so this is all-or-nothing.
+        let token_client = token::Client::new(&env, &escrow.token);
+        let contract_address = env.current_contract_address();
+        let mut refunded: i128 = 0;
+        for p in escrow.participants.iter() {
+            if p.share_bps > 0 {
+                let amount = (escrow.total_amount * (p.share_bps as i128)) / 10000;
+                if amount > 0 {
+                    token_client.transfer(&contract_address, &p.address, &amount);
+                    refunded += amount;
+                }
+            }
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyEscrow(escrow_id), &escrow);
+
+        config.rolled_back = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultiPartyInitConfig(escrow_id), &config);
+
+        MultiPartyEscrowRolledBack {
+            escrow_id,
+            refunded_amount: refunded,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the initiation/acceptance status of a multi-party escrow, or
+    /// `None` if no initiation deadline was configured for it.
+    pub fn get_initiation_status(env: Env, escrow_id: u64) -> Option<MultiPartyInitConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultiPartyInitConfig(escrow_id))
     }
 
     pub fn get_multi_party_escrow(env: Env, escrow_id: u64) -> Result<MultiPartyEscrow, Error> {
@@ -6566,3 +6777,6 @@ mod escalation_timeout_test;
 #[cfg(test)]
 mod bulk_evidence_test;
 mod migration_test;
+
+#[cfg(test)]
+mod multi_party_rollback_test;
