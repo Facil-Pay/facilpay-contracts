@@ -100,6 +100,12 @@ pub enum SystemKey {
     HooksByEventCount(RefundEventType),
     SubscriberHooks(Address, u64),
     SubscriberHookCount(Address),
+    // Platform fee deduction on refund processing
+    RefundFeeConfig,
+    AccumulatedRefundFees,
+    // Per-customer refund cooldown
+    CustomerRefundCooldown(Address),
+    RefundCooldownConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +180,12 @@ pub enum Error {
     HookNotOwnedBySubscriber = 43,
     MerchantQuotaExceeded = 44,
     QuotaNotConfigured = 45,
+    // Platform fee deduction errors
+    RefundFeeConfigNotSet = 46,
+    InsufficientRefundForFee = 47,
+    // Cooldown errors
+    RefundCooldownNotMet = 48,
+    RefundCooldownConfigNotSet = 49,
 }
 
 #[contractevent]
@@ -666,6 +678,35 @@ pub struct GlobalRefundRateLimit {
     pub window_seconds: u64,
 }
 
+/// Configuration for platform fee deduction on refund processing
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundFeeConfig {
+    pub fee_bps: u32,           // Fee in basis points (e.g., 100 = 1%)
+    pub min_fee: i128,          // Minimum fee amount
+    pub max_fee: i128,          // Maximum fee amount
+    pub treasury: Address,      // Address to receive fees
+    pub fee_token: Address,     // Token in which fees are collected
+    pub active: bool,           // Whether fee collection is enabled
+}
+
+/// Per-customer refund cooldown configuration
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundCooldownConfig {
+    pub cooldown_seconds: u64,  // Minimum time between refund requests per customer
+    pub enabled: bool,          // Whether cooldown is enforced
+}
+
+/// Tracks the last refund request time for a customer
+#[derive(Clone)]
+#[contracttype]
+pub struct CustomerRefundCooldown {
+    pub customer: Address,
+    pub last_refund_requested_at: u64,
+    pub cooldown_seconds: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoApproved {
@@ -834,6 +875,36 @@ pub struct FraudSignalRaised {
 pub struct FraudSignalReviewed {
     pub address: Address,
     pub reviewed_by: Address,
+}
+
+/// Event emitted when platform fee is deducted from a refund
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundFeeDeducted {
+    pub refund_id: u64,
+    pub fee_amount: i128,
+    pub net_refund_amount: i128,
+    pub treasury: Address,
+}
+
+/// Event emitted when refund fee configuration is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundFeeConfigUpdated {
+    pub fee_bps: u32,
+    pub min_fee: i128,
+    pub max_fee: i128,
+    pub updated_by: Address,
+}
+
+/// Event emitted when customer refund cooldown is enforced
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundCooldownEnforced {
+    pub customer: Address,
+    pub last_refund_at: u64,
+    pub cooldown_seconds: u64,
+    pub available_at: u64,
 }
 
 #[contract]
@@ -3401,6 +3472,10 @@ impl RefundContract {
                 return Err(Error::AddressFlaggedForFraud);
             }
         }
+
+        // Check per-customer refund cooldown
+        Self::check_refund_cooldown(&env, &customer)?;
+
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
                 &env,
@@ -3502,11 +3577,14 @@ impl RefundContract {
             refund_id,
             payment_id,
             merchant,
-            customer,
+            customer: customer.clone(),
             amount,
             token,
         })
         .publish(&env);
+
+        // Update customer refund cooldown
+        Self::update_customer_refund_cooldown(&env, &customer)?;
 
         // Issue #144: Invoke notification hooks for Requested event
         Self::invoke_hooks(&env, RefundEventType::Requested, refund_id);
@@ -3565,6 +3643,14 @@ impl RefundContract {
             refund.payment_id,
             refund.amount,
             refund.original_payment_amount,
+        )?;
+
+        // Deduct platform fee from refund amount
+        let (net_refund_amount, _fee_amount) = Self::deduct_refund_fee(
+            env,
+            refund_id,
+            refund.amount,
+            &refund.token,
         )?;
 
         // Enforce merchant refund quota if configured
@@ -4642,6 +4728,245 @@ impl RefundContract {
         }
 
         results
+    }
+
+    // ── PLATFORM FEE DEDUCTION FUNCTIONS ────────────────────────────────────
+
+    /// Sets the platform fee configuration for refund processing
+    pub fn set_refund_fee_config(
+        env: Env,
+        admin: Address,
+        fee_bps: u32,
+        min_fee: i128,
+        max_fee: i128,
+        treasury: Address,
+        fee_token: Address,
+        active: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let config = RefundFeeConfig {
+            fee_bps,
+            min_fee,
+            max_fee,
+            treasury,
+            fee_token,
+            active,
+        };
+        env.storage().instance().set(&SystemKey::RefundFeeConfig, &config);
+
+        (RefundFeeConfigUpdated {
+            fee_bps,
+            min_fee,
+            max_fee,
+            updated_by: admin,
+        }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Gets the current refund fee configuration
+    pub fn get_refund_fee_config(env: Env) -> Option<RefundFeeConfig> {
+        env.storage().instance().get(&SystemKey::RefundFeeConfig)
+    }
+
+    /// Gets accumulated refund fees
+    pub fn get_accumulated_refund_fees(env: Env) -> i128 {
+        env.storage().instance()
+            .get(&SystemKey::AccumulatedRefundFees)
+            .unwrap_or(0)
+    }
+
+    /// Withdraws accumulated refund fees to the treasury
+    pub fn withdraw_refund_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let config = env.storage().instance()
+            .get(&SystemKey::RefundFeeConfig)
+            .ok_or(Error::RefundFeeConfigNotSet)?;
+
+        let accumulated: i128 = env.storage().instance()
+            .get(&SystemKey::AccumulatedRefundFees)
+            .unwrap_or(0);
+
+        if amount > accumulated {
+            return Err(Error::InsufficientRefundForFee);
+        }
+
+        let token_client = token::Client::new(&env, &config.fee_token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &config.treasury,
+            &amount,
+        );
+
+        env.storage().instance()
+            .set(&SystemKey::AccumulatedRefundFees, &(accumulated - amount));
+
+        Ok(())
+    }
+
+    /// Internal function to deduct platform fee from refund amount
+    fn deduct_refund_fee(
+        env: &Env,
+        refund_id: u64,
+        refund_amount: i128,
+        token: &Address,
+    ) -> Result<(i128, i128), Error> {
+        let config: Option<RefundFeeConfig> = env.storage().instance().get(&SystemKey::RefundFeeConfig);
+        let config = match config {
+            None => {
+                return Ok((refund_amount, 0));
+            }
+            Some(c) if !c.active => {
+                return Ok((refund_amount, 0));
+            }
+            Some(c) if c.fee_token != *token => {
+                return Ok((refund_amount, 0));
+            }
+            Some(c) => c,
+        };
+
+        let fee = Self::compute_refund_fee(refund_amount, config.fee_bps, config.min_fee, config.max_fee);
+
+        if fee <= 0 {
+            return Ok((refund_amount, 0));
+        }
+
+        let net_amount = refund_amount.checked_sub(fee)
+            .ok_or(Error::InsufficientRefundForFee)?;
+
+        // Update accumulated fees
+        let accumulated: i128 = env.storage().instance()
+            .get(&SystemKey::AccumulatedRefundFees)
+            .unwrap_or(0);
+        env.storage().instance()
+            .set(&SystemKey::AccumulatedRefundFees, &(accumulated + fee));
+
+        (RefundFeeDeducted {
+            refund_id,
+            fee_amount: fee,
+            net_refund_amount: net_amount,
+            treasury: config.treasury,
+        }).publish(env);
+
+        Ok((net_amount, fee))
+    }
+
+    /// Computes the refund fee amount with min/max clamping
+    fn compute_refund_fee(amount: i128, fee_bps: u32, min_fee: i128, max_fee: i128) -> i128 {
+        let raw_fee = (amount * (fee_bps as i128)) / 10000;
+
+        let fee = if min_fee > 0 && raw_fee < min_fee {
+            min_fee
+        } else {
+            raw_fee
+        };
+
+        let fee = if max_fee > 0 && fee > max_fee {
+            max_fee
+        } else {
+            fee
+        };
+
+        if fee < 0 {
+            0
+        } else {
+            fee
+        }
+    }
+
+    // ── PER-CUSTOMER REFUND COOLDOWN FUNCTIONS ──────────────────────────────
+
+    /// Sets the per-customer refund cooldown configuration
+    pub fn set_refund_cooldown_config(
+        env: Env,
+        admin: Address,
+        cooldown_seconds: u64,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let config = RefundCooldownConfig {
+            cooldown_seconds,
+            enabled,
+        };
+        env.storage().instance().set(&SystemKey::RefundCooldownConfig, &config);
+
+        Ok(())
+    }
+
+    /// Gets the current refund cooldown configuration
+    pub fn get_refund_cooldown_config(env: Env) -> Option<RefundCooldownConfig> {
+        env.storage().instance().get(&SystemKey::RefundCooldownConfig)
+    }
+
+    /// Gets the cooldown status for a customer
+    pub fn get_customer_refund_cooldown(env: Env, customer: Address) -> Option<CustomerRefundCooldown> {
+        env.storage().instance().get(&SystemKey::CustomerRefundCooldown(customer))
+    }
+
+    /// Checks if a customer is within the refund cooldown period
+    fn check_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
+        let config = match env.storage().instance().get(&SystemKey::RefundCooldownConfig) {
+            Some(c) if c.enabled => c,
+            _ => return Ok(()), // Cooldown not enabled
+        };
+
+        if let Some(cooldown) = env.storage().instance().get::<_, CustomerRefundCooldown>(&SystemKey::CustomerRefundCooldown(customer.clone())) {
+            let now = env.ledger().timestamp();
+            let available_at = cooldown.last_refund_requested_at.saturating_add(cooldown.cooldown_seconds);
+
+            if now < available_at {
+                (RefundCooldownEnforced {
+                    customer: customer.clone(),
+                    last_refund_at: cooldown.last_refund_requested_at,
+                    cooldown_seconds: cooldown.cooldown_seconds,
+                    available_at,
+                }).publish(env);
+                return Err(Error::RefundCooldownNotMet);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Updates the customer refund cooldown timestamp
+    fn update_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
+        let config = match env.storage().instance().get(&SystemKey::RefundCooldownConfig) {
+            Some(c) if c.enabled => c,
+            _ => return Ok(()), // Cooldown not enabled
+        };
+
+        let now = env.ledger().timestamp();
+        let cooldown = CustomerRefundCooldown {
+            customer: customer.clone(),
+            last_refund_requested_at: now,
+            cooldown_seconds: config.cooldown_seconds,
+        };
+
+        env.storage().instance()
+            .set(&SystemKey::CustomerRefundCooldown(customer.clone()), &cooldown);
+
+        Ok(())
     }
 }
 

@@ -89,6 +89,10 @@ pub enum DataKey {
     DisputeAppealCounter,
     DisputeRoundKey(u64),
     AppealsByEscrow(u64, u64),
+    // Escrow renewal mechanism
+    EscrowRenewalConfig,
+    EscrowRenewal(u64),
+    EscrowRenewalCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,6 +190,7 @@ pub struct InsuranceConfig {
     pub enabled: bool,
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct InsuranceClaim {
     pub claim_id: u64,
@@ -194,6 +199,30 @@ pub struct InsuranceClaim {
     pub amount: i128,
     pub approved: bool,
     pub paid_at: Option<u64>,
+}
+
+/// Configuration for escrow renewal mechanism
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewalConfig {
+    pub enabled: bool,
+    pub max_renewals: u32,           // Maximum number of times an escrow can be renewed
+    pub renewal_fee_bps: u32,        // Fee in basis points for renewal
+    pub min_renewal_period: u64,     // Minimum renewal period in seconds
+    pub max_renewal_period: u64,     // Maximum renewal period in seconds
+}
+
+/// Tracks escrow renewal history
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewal {
+    pub renewal_id: u64,
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewed_at: u64,
+    pub renewal_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -282,6 +311,11 @@ pub enum Error {
     AppealWindowClosed = 73,
     AppealAlreadyFiled = 74,
     MaxDisputeRoundsReached = 75,
+    // Escrow renewal errors
+    EscrowRenewalNotAllowed = 76,
+    EscrowRenewalConfigNotSet = 77,
+    InvalidRenewalPeriod = 78,
+    MaxRenewalsExceeded = 79,
 }
 
 #[contractevent]
@@ -451,6 +485,28 @@ pub struct AppealResolved {
     pub escrow_id: u64,
     pub in_favor_of: Address,
     pub resolved_at: u64,
+}
+
+/// Event emitted when an escrow is renewed
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewed {
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewal_count: u32,
+}
+
+/// Event emitted when escrow renewal configuration is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewalConfigUpdated {
+    pub max_renewals: u32,
+    pub renewal_fee_bps: u32,
+    pub min_renewal_period: u64,
+    pub max_renewal_period: u64,
+    pub updated_by: Address,
 }
 
 #[derive(Clone)]
@@ -7492,6 +7548,158 @@ impl EscrowContract {
             return EscrowHealth::Stale;
         }
         EscrowHealth::Healthy
+    }
+
+    // ── ESCROW RENEWAL MECHANISM ────────────────────────────────────────────
+
+    /// Sets the escrow renewal configuration
+    pub fn set_escrow_renewal_config(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+        max_renewals: u32,
+        renewal_fee_bps: u32,
+        min_renewal_period: u64,
+        max_renewal_period: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin = env.storage().instance()
+            .get(&AdminKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        
+        // Verify admin is authorized
+        if let MultiSigConfig { admins, .. } = stored_admin {
+            if !admins.contains(&admin) {
+                return Err(Error::NotAnAdmin);
+            }
+        }
+
+        if min_renewal_period == 0 || max_renewal_period == 0 || min_renewal_period > max_renewal_period {
+            return Err(Error::InvalidRenewalPeriod);
+        }
+
+        let config = EscrowRenewalConfig {
+            enabled,
+            max_renewals,
+            renewal_fee_bps,
+            min_renewal_period,
+            max_renewal_period,
+        };
+
+        env.storage().instance().set(&DataKey::EscrowRenewalConfig, &config);
+
+        (EscrowRenewalConfigUpdated {
+            max_renewals,
+            renewal_fee_bps,
+            min_renewal_period,
+            max_renewal_period,
+            updated_by: admin,
+        }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Gets the current escrow renewal configuration
+    pub fn get_escrow_renewal_config(env: Env) -> Option<EscrowRenewalConfig> {
+        env.storage().instance().get(&DataKey::EscrowRenewalConfig)
+    }
+
+    /// Renews an expired escrow agreement by extending its expiry timestamp
+    pub fn renew_escrow(
+        env: Env,
+        escrow_id: u64,
+        renewal_period_seconds: u64,
+        requester: Address,
+    ) -> Result<u64, Error> {
+        requester.require_auth();
+
+        let config = env.storage().instance()
+            .get(&DataKey::EscrowRenewalConfig)
+            .ok_or(Error::EscrowRenewalConfigNotSet)?;
+
+        if !config.enabled {
+            return Err(Error::EscrowRenewalNotAllowed);
+        }
+
+        if renewal_period_seconds < config.min_renewal_period || renewal_period_seconds > config.max_renewal_period {
+            return Err(Error::InvalidRenewalPeriod);
+        }
+
+        let mut escrow: Escrow = env.storage().instance()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+
+        // Only customer or merchant can renew
+        if requester != escrow.customer && requester != escrow.merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        // Escrow must be expired or near expiry to be renewed
+        let now = env.ledger().timestamp();
+        if escrow.expiry_timestamp == 0 || now < escrow.expiry_timestamp - (7 * 24 * 60 * 60) {
+            return Err(Error::EscrowNotExpired);
+        }
+
+        // Check if escrow is already in a terminal state
+        if escrow.status == EscrowStatus::Released || escrow.status == EscrowStatus::Cancelled {
+            return Err(Error::InvalidStatus);
+        }
+
+        // Count existing renewals for this escrow
+        let renewal_count: u64 = env.storage().instance()
+            .get(&DataKey::EscrowRenewalCount(escrow_id))
+            .unwrap_or(0);
+
+        if renewal_count >= config.max_renewals as u64 {
+            return Err(Error::MaxRenewalsExceeded);
+        }
+
+        // Calculate renewal fee
+        let renewal_fee = (escrow.amount * (config.renewal_fee_bps as i128)) / 10000;
+
+        // Update escrow expiry timestamp
+        let new_expiry = now.saturating_add(renewal_period_seconds);
+        escrow.expiry_timestamp = new_expiry;
+        escrow.last_activity_at = now;
+
+        env.storage().instance().set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Record renewal
+        let renewal_id = renewal_count + 1;
+        let renewal = EscrowRenewal {
+            renewal_id,
+            escrow_id,
+            renewed_by: requester.clone(),
+            new_expiry_timestamp: new_expiry,
+            renewal_fee,
+            renewed_at: now,
+            renewal_count: renewal_count as u32 + 1,
+        };
+
+        env.storage().instance().set(&DataKey::EscrowRenewal(escrow_id), &renewal);
+        env.storage().instance().set(&DataKey::EscrowRenewalCount(escrow_id), &renewal_id);
+
+        (EscrowRenewed {
+            escrow_id,
+            renewed_by: requester,
+            new_expiry_timestamp: new_expiry,
+            renewal_fee,
+            renewal_count: renewal_count as u32 + 1,
+        }).publish(&env);
+
+        Ok(renewal_id)
+    }
+
+    /// Gets the renewal history for an escrow
+    pub fn get_escrow_renewal(env: Env, escrow_id: u64) -> Option<EscrowRenewal> {
+        env.storage().instance().get(&DataKey::EscrowRenewal(escrow_id))
+    }
+
+    /// Gets the renewal count for an escrow
+    pub fn get_escrow_renewal_count(env: Env, escrow_id: u64) -> u64 {
+        env.storage().instance()
+            .get(&DataKey::EscrowRenewalCount(escrow_id))
+            .unwrap_or(0)
     }
 }
 
