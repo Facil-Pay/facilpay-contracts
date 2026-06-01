@@ -112,7 +112,7 @@ fn test_trigger_arbitration_timeout_success() {
 // ── Test 2: trigger rejected before timeout_at ────────────────────────────────
 
 #[test]
-#[should_panic(expected = "CaseNotTimedOut")]
+#[should_panic(expected = "Error(Contract, #19)")]
 fn test_trigger_arbitration_timeout_too_early() {
     let (env, client, contract_id, admin, merchant, customer, _arb1, _arb2, _arb3, token_client) =
         setup();
@@ -131,7 +131,7 @@ fn test_trigger_arbitration_timeout_too_early() {
 // ── Test 3: trigger blocked when quorum already reached ───────────────────────
 
 #[test]
-#[should_panic(expected = "QuorumNotReached")]
+#[should_panic(expected = "Error(Contract, #15)")]
 fn test_trigger_arbitration_timeout_blocked_by_quorum() {
     let (env, client, contract_id, admin, merchant, customer, arb1, arb2, arb3, token_client) =
         setup();

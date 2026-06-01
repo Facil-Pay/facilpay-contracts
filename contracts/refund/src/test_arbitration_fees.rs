@@ -69,7 +69,7 @@ fn test_set_arbitration_fee_config_valid() {
 }
 
 #[test]
-#[should_panic(expected = "InvalidFeeConfig")]
+#[should_panic(expected = "Error(Contract, #30)")]
 fn test_set_arbitration_fee_config_invalid_sum() {
     let (env, admin, _, _, _, _, _, treasury, token_client) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
@@ -88,7 +88,7 @@ fn test_set_arbitration_fee_config_invalid_sum() {
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized")]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_set_arbitration_fee_config_unauthorized() {
     let (env, admin, _, customer, _, _, _, treasury, token_client) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
@@ -199,6 +199,11 @@ fn test_fee_distribution_majority_only() {
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
 
+    // Register arbitrators
+    client.register_arbitrator(&admin, &arbitrator1);
+    client.register_arbitrator(&admin, &arbitrator2);
+    client.register_arbitrator(&admin, &arbitrator3);
+
     // Set fee configuration: 80/20 split
     let config = ArbitrationFeeConfig {
         arbitrator_share_bps: 8000, // 80%
@@ -276,6 +281,11 @@ fn test_withdraw_treasury_fees() {
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
 
+    // Register arbitrators
+    client.register_arbitrator(&admin, &arbitrator1);
+    client.register_arbitrator(&admin, &arbitrator2);
+    client.register_arbitrator(&admin, &arbitrator3);
+
     // Set fee configuration
     let config = ArbitrationFeeConfig {
         arbitrator_share_bps: 7000, // 70%
@@ -332,7 +342,7 @@ fn test_withdraw_treasury_fees() {
 }
 
 #[test]
-#[should_panic(expected = "InsufficientTreasuryFees")]
+#[should_panic(expected = "Error(Contract, #31)")]
 fn test_withdraw_treasury_fees_insufficient() {
     let (env, admin, _, _, _, _, _, _, _) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
@@ -344,7 +354,7 @@ fn test_withdraw_treasury_fees_insufficient() {
 }
 
 #[test]
-#[should_panic(expected = "Unauthorized")]
+#[should_panic(expected = "Error(Contract, #3)")]
 fn test_withdraw_treasury_fees_unauthorized() {
     let (env, admin, _, customer, _, _, _, _, _) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
@@ -361,6 +371,11 @@ fn test_fee_distribution_without_config() {
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
+
+    // Register arbitrators
+    client.register_arbitrator(&admin, &arbitrator1);
+    client.register_arbitrator(&admin, &arbitrator2);
+    client.register_arbitrator(&admin, &arbitrator3);
 
     // Don't set any fee configuration - should default to 100% arbitrators
 
@@ -425,6 +440,11 @@ fn test_fee_distribution_100_percent_treasury() {
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
+
+    // Register arbitrators
+    client.register_arbitrator(&admin, &arbitrator1);
+    client.register_arbitrator(&admin, &arbitrator2);
+    client.register_arbitrator(&admin, &arbitrator3);
 
     // Set fee configuration: 0% arbitrators, 100% treasury
     let config = ArbitrationFeeConfig {
