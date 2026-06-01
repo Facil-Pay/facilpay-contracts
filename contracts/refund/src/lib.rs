@@ -104,6 +104,12 @@ pub enum SystemKey {
     HooksByEventCount(RefundEventType),
     SubscriberHooks(Address, u64),
     SubscriberHookCount(Address),
+    // Platform fee deduction on refund processing
+    RefundFeeConfig,
+    AccumulatedRefundFees,
+    // Per-customer refund cooldown
+    CustomerRefundCooldown(Address),
+    RefundCooldownConfig,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -529,6 +535,8 @@ pub struct Refund {
     pub approved_at: Option<u64>,
     pub rejected_at: Option<u64>,
     pub processed_at: Option<u64>,
+    // Issue #199: TTL expiry
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -768,6 +776,35 @@ pub struct GlobalRefundRateLimit {
     pub window_seconds: u64,
 }
 
+/// Configuration for platform fee deduction on refund processing
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundFeeConfig {
+    pub fee_bps: u32,           // Fee in basis points (e.g., 100 = 1%)
+    pub min_fee: i128,          // Minimum fee amount
+    pub max_fee: i128,          // Maximum fee amount
+    pub treasury: Address,      // Address to receive fees
+    pub fee_token: Address,     // Token in which fees are collected
+    pub active: bool,           // Whether fee collection is enabled
+}
+
+/// Per-customer refund cooldown configuration
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundCooldownConfig {
+    pub cooldown_seconds: u64,  // Minimum time between refund requests per customer
+    pub enabled: bool,          // Whether cooldown is enforced
+}
+
+/// Tracks the last refund request time for a customer
+#[derive(Clone)]
+#[contracttype]
+pub struct CustomerRefundCooldown {
+    pub customer: Address,
+    pub last_refund_requested_at: u64,
+    pub cooldown_seconds: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AutoApproved {
@@ -936,6 +973,115 @@ pub struct FraudSignalRaised {
 pub struct FraudSignalReviewed {
     pub address: Address,
     pub reviewed_by: Address,
+}
+
+// Issues #195/#197/#198/#199: extended storage keys
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RefundExtKey {
+    CategoryWindow(Address, u8),
+    PaymentCategoryTag(u64),
+    AssignmentConfig,
+    RotationIndex,
+    RefundTTLConfig,
+}
+
+// Issue #195: Batch decision types
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum BatchDecisionType {
+    Approve,
+    Reject,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchRefundDecision {
+    pub refund_ids: Vec<u64>,
+    pub decision: BatchDecisionType,
+    pub note_hash: BytesN<32>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct BatchDecisionResult {
+    pub succeeded: Vec<u64>,
+    pub failed: Vec<u64>,
+}
+
+// Issue #197: Payment categories
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum PaymentCategory {
+    DigitalGoods,
+    PhysicalGoods,
+    Subscription,
+    Service,
+    Other,
+}
+
+impl PaymentCategory {
+    pub fn to_index(&self) -> u8 {
+        match self {
+            PaymentCategory::DigitalGoods => 0,
+            PaymentCategory::PhysicalGoods => 1,
+            PaymentCategory::Subscription => 2,
+            PaymentCategory::Service => 3,
+            PaymentCategory::Other => 4,
+        }
+    }
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct CategoryRefundWindow {
+    pub category: PaymentCategory,
+    pub window_seconds: u64,
+    pub merchant: Address,
+}
+
+// Issue #198: Arbitrator auto-assignment
+#[derive(Clone)]
+#[contracttype]
+pub struct ArbitratorAssignmentConfig {
+    pub rotation_index: u32,
+    pub panel_size: u32,
+}
+
+// Issue #199: Refund TTL
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundTTLConfig {
+    pub default_ttl_seconds: u64,
+    pub active: bool,
+/// Event emitted when platform fee is deducted from a refund
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundFeeDeducted {
+    pub refund_id: u64,
+    pub fee_amount: i128,
+    pub net_refund_amount: i128,
+    pub treasury: Address,
+}
+
+/// Event emitted when refund fee configuration is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundFeeConfigUpdated {
+    pub fee_bps: u32,
+    pub min_fee: i128,
+    pub max_fee: i128,
+    pub updated_by: Address,
+}
+
+/// Event emitted when customer refund cooldown is enforced
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundCooldownEnforced {
+    pub customer: Address,
+    pub last_refund_at: u64,
+    pub cooldown_seconds: u64,
+    pub available_at: u64,
 }
 
 #[contract]
@@ -2169,6 +2315,9 @@ impl RefundContract {
             requires_admin_approval: true,
             auto_approve_below: 0,
             active: true,
+            parent_merchant: None,
+            tiers: Vec::new(&env),
+            inherit_from_parent: false,
         };
 
         Self::store_refund_policy(&env, merchant.clone(), policy, admin.clone());
@@ -3520,6 +3669,10 @@ impl RefundContract {
                 return Err(Error::AddressFlaggedForFraud);
             }
         }
+
+        // Check per-customer refund cooldown
+        Self::check_refund_cooldown(&env, &customer)?;
+
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
                 &env,
@@ -3549,6 +3702,13 @@ impl RefundContract {
             }
         };
 
+        let ttl_expires_at: Option<u64> = env
+            .storage()
+            .instance()
+            .get::<RefundExtKey, RefundTTLConfig>(&RefundExtKey::RefundTTLConfig)
+            .filter(|cfg| cfg.active)
+            .map(|cfg| env.ledger().timestamp().saturating_add(cfg.default_ttl_seconds));
+
         let refund = Refund {
             id: refund_id,
             payment_id,
@@ -3571,6 +3731,8 @@ impl RefundContract {
             },
             rejected_at: None,
             processed_at: None,
+            // Issue #199: TTL expiry
+            expires_at: ttl_expires_at,
         };
 
         env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
@@ -3623,11 +3785,14 @@ impl RefundContract {
             refund_id,
             payment_id,
             merchant,
-            customer,
+            customer: customer.clone(),
             amount,
             token,
         })
         .publish(&env);
+
+        // Update customer refund cooldown
+        Self::update_customer_refund_cooldown(&env, &customer)?;
 
         // Issue #144: Invoke notification hooks for Requested event
         Self::invoke_hooks(&env, RefundEventType::Requested, refund_id);
@@ -3648,6 +3813,13 @@ impl RefundContract {
 
         if refund.status != RefundStatus::Requested {
             return Err(Error::InvalidStatus);
+        }
+
+        // Issue #199: reject if TTL has expired
+        if let Some(expires_at) = refund.expires_at {
+            if env.ledger().timestamp() >= expires_at {
+                return Err(Error::RefundRequestExpired);
+            }
         }
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
@@ -3686,6 +3858,14 @@ impl RefundContract {
             refund.payment_id,
             refund.amount,
             refund.original_payment_amount,
+        )?;
+
+        // Deduct platform fee from refund amount
+        let (net_refund_amount, _fee_amount) = Self::deduct_refund_fee(
+            env,
+            refund_id,
+            refund.amount,
+            &refund.token,
         )?;
 
         // Enforce merchant refund quota if configured
@@ -4723,6 +4903,440 @@ impl RefundContract {
                 }
             }
         }
+    }
+
+    // ── Issue #195: Batch approve / reject refunds ────────────────────────────
+
+    const BATCH_DECISION_LIMIT: u32 = 50;
+
+    pub fn batch_approve_refunds(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u64>,
+    ) -> Result<BatchDecisionResult, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if refund_ids.len() > Self::BATCH_DECISION_LIMIT {
+            return Err(Error::BatchSizeLimitExceeded);
+        }
+
+        let mut succeeded = Vec::new(&env);
+        let mut failed = Vec::new(&env);
+        let mut had_failure = false;
+
+        for refund_id in refund_ids.iter() {
+            match Self::approve_refund_internal(&env, admin.clone(), refund_id) {
+                Ok(()) => succeeded.push_back(refund_id),
+                Err(_) => {
+                    failed.push_back(refund_id);
+                    had_failure = true;
+                }
+            }
+        }
+
+        if had_failure {
+            return Err(Error::BatchDecisionPartialFailure);
+        }
+
+        Ok(BatchDecisionResult { succeeded, failed })
+    }
+
+    pub fn batch_reject_refunds(
+        env: Env,
+        admin: Address,
+        refund_ids: Vec<u64>,
+        note_hash: BytesN<32>,
+    ) -> Result<BatchDecisionResult, Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if refund_ids.len() > Self::BATCH_DECISION_LIMIT {
+            return Err(Error::BatchSizeLimitExceeded);
+        }
+
+        let mut succeeded = Vec::new(&env);
+        let mut failed = Vec::new(&env);
+        let mut had_failure = false;
+
+        for refund_id in refund_ids.iter() {
+            let result = (|| -> Result<(), Error> {
+                let mut refund: Refund = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Refund(refund_id))
+                    .ok_or(Error::RefundNotFound)?;
+                if refund.status != RefundStatus::Requested {
+                    return Err(Error::InvalidStatus);
+                }
+                Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+                refund.status = RefundStatus::Rejected;
+                refund.rejected_at = Some(env.ledger().timestamp());
+                env.storage().instance().set(&DataKey::Refund(refund_id), &refund);
+                Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+                env.storage().instance().set(
+                    &SystemKey::RefundRejectedAt(refund_id),
+                    &env.ledger().timestamp(),
+                );
+                (RefundRejected {
+                    refund_id,
+                    rejected_by: admin.clone(),
+                    rejected_at: env.ledger().timestamp(),
+                    rejection_reason: soroban_sdk::String::from_str(&env, "batch rejection"),
+                })
+                .publish(&env);
+                Self::invoke_hooks(&env, RefundEventType::Rejected, refund_id);
+                Ok(())
+            })();
+            match result {
+                Ok(()) => succeeded.push_back(refund_id),
+                Err(_) => {
+                    failed.push_back(refund_id);
+                    had_failure = true;
+                }
+            }
+        }
+
+        let _ = note_hash;
+
+        if had_failure {
+            return Err(Error::BatchDecisionPartialFailure);
+        }
+
+        Ok(BatchDecisionResult { succeeded, failed })
+    }
+
+    // ── Issue #197: Category-based dynamic refund windows ─────────────────────
+
+    pub fn set_category_window(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        category: PaymentCategory,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        let cat_idx = category.to_index();
+        let window = CategoryRefundWindow {
+            category,
+            window_seconds,
+            merchant: merchant.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::CategoryWindow(merchant, cat_idx), &window);
+        Ok(())
+    }
+
+    pub fn get_category_window(
+        env: Env,
+        merchant: Address,
+        category: PaymentCategory,
+    ) -> Option<u64> {
+        let cat_idx = category.to_index();
+        env.storage()
+            .instance()
+            .get::<RefundExtKey, CategoryRefundWindow>(
+                &RefundExtKey::CategoryWindow(merchant, cat_idx),
+            )
+            .map(|w| w.window_seconds)
+    }
+
+    pub fn tag_payment_category(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        category: PaymentCategory,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if env
+            .storage()
+            .instance()
+            .has(&RefundExtKey::PaymentCategoryTag(payment_id))
+        {
+            return Err(Error::PaymentCategoryAlreadySet);
+        }
+        let cat_idx = category.to_index();
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::PaymentCategoryTag(payment_id), &cat_idx);
+        Ok(())
+    }
+
+    pub fn get_effective_window(env: Env, merchant: Address, payment_id: u64) -> u64 {
+        let default_window: u64 = Self::get_refund_policy(&env, merchant.clone())
+            .map(|p| p.refund_window)
+            .unwrap_or(30 * 24 * 60 * 60);
+
+        let cat_idx_opt: Option<u8> = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::PaymentCategoryTag(payment_id));
+
+        if let Some(cat_idx) = cat_idx_opt {
+            if let Some(window) = env
+                .storage()
+                .instance()
+                .get::<RefundExtKey, CategoryRefundWindow>(
+                    &RefundExtKey::CategoryWindow(merchant, cat_idx),
+                )
+                .map(|w| w.window_seconds)
+            {
+                return window;
+            }
+        }
+
+        default_window
+    }
+
+    // ── Issue #198: Round-robin arbitrator auto-assignment ─────────────────────
+
+    pub fn configure_auto_assignment(
+        env: Env,
+        admin: Address,
+        panel_size: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        if arbitrators.is_empty() {
+            return Err(Error::NoAvailableArbitrators);
+        }
+
+        if panel_size as u32 > arbitrators.len() {
+            return Err(Error::PanelSizeExceedsArbitratorCount);
+        }
+
+        let config = ArbitratorAssignmentConfig {
+            rotation_index: 0,
+            panel_size,
+        };
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::AssignmentConfig, &config);
+        Ok(())
+    }
+
+    pub fn auto_assign_arbitrators(env: Env, case_id: u64) -> Result<Vec<Address>, Error> {
+        let mut config: ArbitratorAssignmentConfig = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::AssignmentConfig)
+            .ok_or(Error::AutoAssignmentNotConfigured)?;
+
+        let arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        if arbitrators.is_empty() {
+            return Err(Error::NoAvailableArbitrators);
+        }
+
+        let total = arbitrators.len() as u32;
+        if config.panel_size > total {
+            return Err(Error::PanelSizeExceedsArbitratorCount);
+        }
+
+        let mut panel = Vec::new(&env);
+        for i in 0..config.panel_size {
+            let idx = ((config.rotation_index + i) % total) as u32;
+            panel.push_back(arbitrators.get(idx).unwrap());
+        }
+
+        config.rotation_index = (config.rotation_index + config.panel_size) % total;
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::AssignmentConfig, &config);
+
+        let _ = case_id;
+        Ok(panel)
+    }
+
+    pub fn get_next_arbitrators(env: Env, count: u32) -> Vec<Address> {
+        let config: ArbitratorAssignmentConfig = match env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::AssignmentConfig)
+        {
+            Some(c) => c,
+            None => return Vec::new(&env),
+        };
+
+        let arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+
+        let total = arbitrators.len() as u32;
+        if total == 0 || count == 0 {
+            return Vec::new(&env);
+        }
+
+        let n = if count > total { total } else { count };
+        let mut result = Vec::new(&env);
+        for i in 0..n {
+            let idx = ((config.rotation_index + i) % total) as u32;
+            result.push_back(arbitrators.get(idx).unwrap());
+        }
+        result
+    }
+
+    pub fn reset_rotation_index(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut config: ArbitratorAssignmentConfig = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::AssignmentConfig)
+            .ok_or(Error::AutoAssignmentNotConfigured)?;
+
+        config.rotation_index = 0;
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::AssignmentConfig, &config);
+        Ok(())
+    }
+
+    // ── Issue #199: Refund request TTL with automatic expiry ──────────────────
+
+    pub fn set_refund_ttl_config(
+        env: Env,
+        admin: Address,
+        ttl_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let cfg = RefundTTLConfig {
+            default_ttl_seconds: ttl_seconds,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&RefundExtKey::RefundTTLConfig, &cfg);
+        Ok(())
+    }
+
+    pub fn expire_stale_refund(env: Env, refund_id: u64) -> Result<(), Error> {
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::InvalidStatus);
+        }
+
+        let expires_at = refund.expires_at.ok_or(Error::TTLNotConfigured)?;
+
+        if env.ledger().timestamp() < expires_at {
+            return Err(Error::RefundRequestExpired);
+        }
+
+        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+        refund.status = RefundStatus::Rejected;
+        refund.rejected_at = Some(env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+
+        (RefundRejected {
+            refund_id,
+            rejected_by: env.current_contract_address(),
+            rejected_at: env.ledger().timestamp(),
+            rejection_reason: soroban_sdk::String::from_str(&env, "TTL expired"),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_expired_refunds(env: Env, limit: u32) -> Vec<u64> {
+        let now = env.ledger().timestamp();
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundCounter)
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut collected = 0u32;
+        let mut id = 1u64;
+
+        while id <= total && collected < limit {
+            if let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Refund>(&DataKey::Refund(id))
+            {
+                if refund.status == RefundStatus::Requested {
+                    if let Some(expires_at) = refund.expires_at {
+                        if now >= expires_at {
+                            results.push_back(id);
+                            collected += 1;
+                        }
+                    }
+                }
+            }
+            id += 1;
+        }
+
+        results
     }
 
     fn get_merchant_refunds_by_status_internal(
