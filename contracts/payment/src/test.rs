@@ -556,6 +556,204 @@ fn test_complete_payment_success() {
 }
 
 #[test]
+fn test_loyalty_points_accrue_on_payment_completion() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 1,
+            expiry_seconds: 3600,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let balance = client.get_loyalty_balance(&customer).expect("balance exists");
+    assert_eq!(balance.points, 100);
+    assert_eq!(balance.customer, customer);
+}
+
+#[test]
+fn test_redeem_points_calculates_discount_and_caps_at_half_payment_value() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 2,
+            expiry_seconds: 3600,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let discount = client.redeem_points(&customer, &50, &payment_id).unwrap();
+    assert_eq!(discount, 100);
+}
+
+#[test]
+fn test_redeem_points_applies_50_percent_cap_on_discount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 20,
+            expiry_seconds: 3600,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let discount = client.redeem_points(&customer, &10, &payment_id).unwrap();
+    assert_eq!(discount, 500);
+}
+
+#[test]
+fn test_redeem_points_fails_when_points_are_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 1,
+            expiry_seconds: 100,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    env.ledger().set_timestamp(1101);
+    let result = client.try_redeem_points(&customer, &10, &payment_id);
+    assert_eq!(result.unwrap_err().unwrap(), Error::PointsExpired);
+}
+
+#[test]
 fn test_complete_payment_event_emission() {
     let env = Env::default();
     env.mock_all_auths();

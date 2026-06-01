@@ -33,6 +33,8 @@ pub enum DataKey {
     DunningConfig,
     MultiSigConfig,
     LargePaymentThreshold,
+    LoyaltyConfig,
+    CustomerLoyaltyBalance(Address),
     RiskFeeConfig,
     ConversionRate(Currency),
     PlatformAnalyticsDaily(u64),
@@ -309,6 +311,9 @@ pub enum Error {
     ChannelNotExpired = 78,
     MeteredSubscriptionNotFound = 79,
     BillingCapExceeded = 80,
+    LoyaltyNotConfigured = 100,
+    InsufficientPoints = 101,
+    PointsExpired = 102,
     // Fee sweep (#216)
     NothingToSweep = 114,
     SweepRecipientNotSet = 115,
@@ -788,6 +793,24 @@ pub struct AnalyticsBucket {
     pub total_volume: i128,
     pub total_refunds: i128,
     pub failed_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct LoyaltyConfig {
+    pub points_per_unit: u32,
+    pub redemption_rate: u32,
+    pub expiry_seconds: u64,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct CustomerLoyaltyBalance {
+    pub customer: Address,
+    pub points: u64,
+    pub last_updated: u64,
+    pub expires_at: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2618,6 +2641,9 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Accrue loyalty points for completed payments if loyalty is configured.
+        PaymentContract::maybe_accrue_loyalty_points(&env, payment.customer.clone(), payment.amount);
+
         // Attempt to trigger auto-escrow if a rule exists
         // Ignore errors - if there's no rule, payment is below minimum, or already triggered,
         // we just skip the auto-escrow (the payment completion still succeeds)
@@ -2627,6 +2653,134 @@ impl PaymentContract {
         PaymentContract::update_platform_daily_bucket(env, now, 0, 0, 0);
 
         Ok(())
+    }
+
+    pub fn configure_loyalty(env: Env, admin: Address, config: LoyaltyConfig) -> Result<(), Error> {
+        Self::require_not_paused(&env, "configure_loyalty")?;
+        admin.require_auth();
+
+        let multisig_config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !multisig_config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if config.points_per_unit == 0 || config.expiry_seconds == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::LoyaltyConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_loyalty_balance(env: Env, customer: Address) -> Option<CustomerLoyaltyBalance> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerLoyaltyBalance(customer))
+    }
+
+    pub fn redeem_points(
+        env: Env,
+        customer: Address,
+        points: u64,
+        payment_id: u64,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "redeem_points")?;
+        customer.require_auth();
+
+        let config: LoyaltyConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::LoyaltyConfig)
+            .ok_or(Error::LoyaltyNotConfigured)?;
+        if !config.active {
+            return Err(Error::LoyaltyNotConfigured);
+        }
+
+        let mut balance: CustomerLoyaltyBalance = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerLoyaltyBalance(customer.clone()))
+            .ok_or(Error::InsufficientPoints)?;
+
+        let now = env.ledger().timestamp();
+        if balance.expires_at != 0 && now > balance.expires_at {
+            return Err(Error::PointsExpired);
+        }
+
+        if balance.points < points {
+            return Err(Error::InsufficientPoints);
+        }
+
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut discount = (points as i128) * (config.redemption_rate as i128);
+        let max_discount = payment.amount / 2;
+        if discount > max_discount {
+            discount = max_discount;
+        }
+
+        balance.points -= points;
+        balance.last_updated = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerLoyaltyBalance(customer.clone()), &balance);
+
+        Ok(discount)
+    }
+
+    fn get_loyalty_config(env: &Env) -> Option<LoyaltyConfig> {
+        env.storage().instance().get(&DataKey::LoyaltyConfig)
+    }
+
+    fn maybe_accrue_loyalty_points(env: &Env, customer: Address, amount: i128) {
+        if amount <= 0 {
+            return;
+        }
+        let config = match PaymentContract::get_loyalty_config(env) {
+            Some(c) if c.active && c.points_per_unit > 0 => c,
+            _ => return,
+        };
+
+        let points = (amount / i128::from(config.points_per_unit)) as u64;
+        if points == 0 {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+        let mut balance: CustomerLoyaltyBalance = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerLoyaltyBalance(customer.clone()))
+            .unwrap_or(CustomerLoyaltyBalance {
+                customer: customer.clone(),
+                points: 0,
+                last_updated: 0,
+                expires_at: 0,
+            });
+
+        if balance.expires_at != 0 && now > balance.expires_at {
+            balance.points = points;
+        } else {
+            balance.points = balance.points.saturating_add(points);
+        }
+        balance.last_updated = now;
+        balance.expires_at = now + config.expiry_seconds;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerLoyaltyBalance(customer), &balance);
     }
 
     // Partial payment functions (#112)
