@@ -40,6 +40,120 @@ fn test_set_refund_policy_successfully() {
 }
 
 #[test]
+fn test_create_policy_template_successfully() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    env.mock_all_auths();
+    let tiers: Vec<(u32, i128)> = Vec::new(&env);
+    let template_id = client.create_policy_template(
+        &admin,
+        &String::from_str(&env, "Standard Template"),
+        &tiers,
+        &86400u64,
+    );
+
+    let template = client.get_policy_template(&template_id);
+    assert!(template.is_some());
+    let template = template.unwrap();
+    assert_eq!(template.template_id, template_id);
+    assert_eq!(template.name, String::from_str(&env, "Standard Template"));
+    assert_eq!(template.default_window_seconds, 86400u64);
+    assert!(template.active);
+}
+
+#[test]
+fn test_list_policy_templates_returns_only_active_templates() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    env.mock_all_auths();
+    let tiers: Vec<(u32, i128)> = Vec::new(&env);
+    let template_id_1 = client.create_policy_template(
+        &admin,
+        &String::from_str(&env, "Active Template"),
+        &tiers,
+        &86400u64,
+    );
+    let template_id_2 = client.create_policy_template(
+        &admin,
+        &String::from_str(&env, "Inactive Template"),
+        &tiers,
+        &172800u64,
+    );
+
+    client.deactivate_policy_template(&admin, &template_id_2);
+
+    let templates = client.list_policy_templates();
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates.get(0).unwrap().template_id, template_id_1);
+}
+
+#[test]
+fn test_apply_template_to_merchant_overwrites_policy_and_preserves_history() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.initialize(&admin);
+
+    env.mock_all_auths();
+    client.set_refund_policy(&merchant, &(7u64 * 24u64 * 60u64 * 60u64), &5000, &true, &0i128);
+
+    let tiers: Vec<(u32, i128)> = Vec::new(&env);
+    let template_id = client.create_policy_template(
+        &admin,
+        &String::from_str(&env, "Template Policy"),
+        &tiers,
+        &259200u64,
+    );
+
+    client.apply_template_to_merchant(&admin, &merchant, &template_id);
+
+    let policy = client.get_refund_policy(&merchant).unwrap();
+    assert_eq!(policy.refund_window, 259200u64);
+    assert!(policy.active);
+
+    let version_2 = client.get_refund_policy_version(&merchant, &2u32).unwrap();
+    assert_eq!(version_2.policy.refund_window, 259200u64);
+}
+
+#[test]
+fn test_apply_inactive_policy_template_returns_template_inactive() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    client.initialize(&admin);
+
+    env.mock_all_auths();
+    let tiers: Vec<(u32, i128)> = Vec::new(&env);
+    let template_id = client.create_policy_template(
+        &admin,
+        &String::from_str(&env, "Inactive Template"),
+        &tiers,
+        &86400u64,
+    );
+
+    client.deactivate_policy_template(&admin, &template_id);
+
+    let result = client.try_apply_template_to_merchant(&admin, &merchant, &template_id);
+    assert_eq!(result, Err(Ok(Error::TemplateInactive)));
+}
+
+#[test]
 #[should_panic]
 fn test_set_refund_policy_with_invalid_percentage_should_fail() {
     let env = Env::default();
