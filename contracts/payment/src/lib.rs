@@ -89,6 +89,8 @@ pub enum DataKey {
     EscrowedPaymentDispute(u64),
     // Payment routing (#118)
     RouteOptions(Address, Address), // (input_token, output_token)
+    MerchantVerificationLevel(Address),
+    VerificationTierLimit(MerchantVerificationLevel),
 }
 
 // Customer-specific data keys
@@ -328,6 +330,8 @@ pub enum Error {
     SettlementNotReady = 121,
     FinalityConfigNotFound = 122,
     SettlementAlreadyFinalized = 123,
+    VerificationLevelNotFound = 95,
+    TierLimitsNotConfigured = 96,
 }
 
 #[contractevent]
@@ -665,6 +669,23 @@ pub struct MerchantRateLimit {
     pub current_transactions: u32,
     pub current_amount: i128,
     pub window_start: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum MerchantVerificationLevel {
+    Unverified,
+    Basic,
+    Standard,
+    Premium,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct VerificationTierLimits {
+    pub level: MerchantVerificationLevel,
+    pub tx_per_period: u32,
+    pub volume_limit: i128,
 }
 
 #[derive(Clone)]
@@ -1271,6 +1292,70 @@ impl PaymentContract {
         // Keep Admin key for backward compat
         env.storage().instance().set(&DataKey::Admin, &admin);
         (AdminAdded { admin }).publish(&env);
+    }
+
+    pub fn set_merchant_verification_level(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        level: MerchantVerificationLevel,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantVerificationLevel(merchant), &level);
+            
+        Ok(())
+    }
+
+    pub fn get_merchant_verification_level(
+        env: Env,
+        merchant: Address,
+    ) -> MerchantVerificationLevel {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantVerificationLevel(merchant))
+            .unwrap_or(MerchantVerificationLevel::Unverified)
+    }
+
+    pub fn set_verification_tier_limits(
+        env: Env,
+        admin: Address,
+        limits: VerificationTierLimits,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::VerificationTierLimit(limits.level.clone()), &limits);
+            
+        Ok(())
+    }
+
+    pub fn get_tier_limits(
+        env: Env,
+        level: MerchantVerificationLevel,
+    ) -> Option<VerificationTierLimits> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VerificationTierLimit(level))
     }
 
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
@@ -4783,85 +4868,116 @@ impl PaymentContract {
     }
 
     pub fn check_rate_limit(env: Env, merchant: Address, amount: i128) -> bool {
-        // Check merchant-specific limit first (read-only)
-        if let Some(limit) = env
+        let level = Self::get_merchant_verification_level(env.clone(), merchant.clone());
+        let tier_limits_opt = Self::get_tier_limits(env.clone(), level);
+
+        let (max_tx, max_amt) = if let Some(tier_limits) = tier_limits_opt {
+            (tier_limits.tx_per_period, tier_limits.volume_limit)
+        } else if let Some(custom_limit) = env
             .storage()
             .instance()
-            .get(&DataKey::MerchantRateLimit(merchant.clone()))
+            .get::<_, MerchantRateLimit>(&DataKey::MerchantRateLimit(merchant.clone()))
         {
-            let now = env.ledger().timestamp();
-            // Check if window needs reset (read-only)
-            let reset_needed = limit.window_start > 0 && now >= limit.window_start + 3600;
-            let current_transactions = if reset_needed { 0 } else { limit.current_transactions };
-            let current_amount = if reset_needed { 0 } else { limit.current_amount };
-            // Check limits
-            if current_transactions >= limit.max_transactions_per_hour {
-                return false;
-            }
-            if current_amount + amount > limit.max_amount_per_hour {
-                return false;
-            }
-            // Would pass
-            return true;
+            (custom_limit.max_transactions_per_hour, custom_limit.max_amount_per_hour)
         } else {
             // Fallback to global config
             let config: Option<RateLimitConfig> =
                 env.storage().instance().get(&DataKey::RateLimitConfig);
             if let Some(config) = config {
-                // For merchants, use global as fallback, but since it's read-only, just check if amount exceeds
                 if config.max_payment_amount > 0 && amount > config.max_payment_amount {
                     return false;
                 }
-                // For transactions, since no state, assume ok
-                return true;
-            } else {
-                // No limits
-                return true;
             }
+            return true;
+        };
+
+        if let Some(l) = env
+            .storage()
+            .instance()
+            .get::<_, MerchantRateLimit>(&DataKey::MerchantRateLimit(merchant.clone()))
+        {
+            let now = env.ledger().timestamp();
+            let reset_needed = l.window_start > 0 && now >= l.window_start + 3600;
+            let current_transactions = if reset_needed { 0 } else { l.current_transactions };
+            let current_amount = if reset_needed { 0 } else { l.current_amount };
+
+            if max_tx > 0 && current_transactions >= max_tx {
+                return false;
+            }
+            if max_amt > 0 && current_amount + amount > max_amt {
+                return false;
+            }
+            return true;
+        } else {
+            if max_amt > 0 && amount > max_amt {
+                return false;
+            }
+            return true;
         }
     }
 
     fn check_merchant_rate_limit(env: &Env, merchant: &Address, amount: i128) -> Result<(), Error> {
-        // If no merchant limit, use global as fallback, but enforce if set
-        if let Some(mut limit) = env
+        let level = Self::get_merchant_verification_level(env.clone(), merchant.clone());
+        let tier_limits_opt = Self::get_tier_limits(env.clone(), level);
+
+        let (max_tx, max_amt) = if let Some(tier_limits) = tier_limits_opt {
+            (tier_limits.tx_per_period, tier_limits.volume_limit)
+        } else if let Some(custom_limit) = env
             .storage()
             .instance()
-            .get(&DataKey::MerchantRateLimit(merchant.clone()))
+            .get::<_, MerchantRateLimit>(&DataKey::MerchantRateLimit(merchant.clone()))
         {
-            let now = env.ledger().timestamp();
-            // Reset window if 1 hour passed
-            if limit.window_start > 0 && now >= limit.window_start + 3600 {
-                limit.current_transactions = 0;
-                limit.current_amount = 0;
-                limit.window_start = now;
-            } else if limit.window_start == 0 {
-                limit.window_start = now;
-            }
-            // Check limits
-            if limit.current_transactions >= limit.max_transactions_per_hour {
-                return Err(Error::MerchantRateLimitExceeded);
-            }
-            if limit.current_amount + amount > limit.max_amount_per_hour {
-                return Err(Error::AmountRateLimitExceeded);
-            }
-            // Update counters
-            limit.current_transactions += 1;
-            limit.current_amount += amount;
-            env.storage()
-                .instance()
-                .set(&DataKey::MerchantRateLimit(merchant.clone()), &limit);
+            (custom_limit.max_transactions_per_hour, custom_limit.max_amount_per_hour)
         } else {
-            // Fallback to global config for merchants
             let config: Option<RateLimitConfig> =
                 env.storage().instance().get(&DataKey::RateLimitConfig);
             if let Some(config) = config {
-                // For merchants, enforce global amount limit if set
                 if config.max_payment_amount > 0 && amount > config.max_payment_amount {
                     return Err(Error::AmountExceedsLimit);
                 }
-                // No transaction limit for merchants in global
             }
+            return Ok(());
+        };
+
+        let mut limit = env
+            .storage()
+            .instance()
+            .get::<_, MerchantRateLimit>(&DataKey::MerchantRateLimit(merchant.clone()))
+            .unwrap_or(MerchantRateLimit {
+                merchant: merchant.clone(),
+                max_transactions_per_hour: max_tx,
+                max_amount_per_hour: max_amt,
+                current_transactions: 0,
+                current_amount: 0,
+                window_start: 0,
+            });
+
+        limit.max_transactions_per_hour = max_tx;
+        limit.max_amount_per_hour = max_amt;
+
+        let now = env.ledger().timestamp();
+        
+        if limit.window_start > 0 && now >= limit.window_start + 3600 {
+            limit.current_transactions = 0;
+            limit.current_amount = 0;
+            limit.window_start = now;
+        } else if limit.window_start == 0 {
+            limit.window_start = now;
         }
+
+        if limit.max_transactions_per_hour > 0 && limit.current_transactions >= limit.max_transactions_per_hour {
+            return Err(Error::MerchantRateLimitExceeded);
+        }
+        if limit.max_amount_per_hour > 0 && limit.current_amount + amount > limit.max_amount_per_hour {
+            return Err(Error::AmountRateLimitExceeded);
+        }
+
+        limit.current_transactions += 1;
+        limit.current_amount += amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRateLimit(merchant.clone()), &limit);
+
         Ok(())
     }
 
