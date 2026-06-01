@@ -306,6 +306,7 @@ pub enum Error {
     EscrowAlreadyFullyAccepted = 70,
     RollbackAlreadyExecuted = 71,
     RollbackNotYetAvailable = 72,
+    EvidenceDeadlinePassed = 73,
     // 63 is already taken by MigrationNotStarted; use next free code.
     StaleThresholdNotConfigured = 66,
     AppealWindowClosed = 73,
@@ -451,6 +452,22 @@ pub struct EvidenceSubmitted {
     pub escrow_id: u64,
     pub submitter: Address,
     pub ipfs_hash: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineSet {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub set_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineExceeded {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub submitted_at: u64,
 }
 
 #[contractevent]
@@ -682,6 +699,7 @@ pub struct Escrow {
     pub escalated_at: Option<u64>,
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
+    pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
 }
 
 #[derive(Clone)]
@@ -2946,6 +2964,16 @@ impl EscrowContract {
                 escrow.status = EscrowStatus::Disputed;
                 escrow.dispute_started_at = env.ledger().timestamp();
                 escrow.last_activity_at = escrow.dispute_started_at;
+                // Set evidence submission deadline to 7 days from dispute start
+                let evidence_deadline_seconds = 7 * 24 * 60 * 60; // 7 days
+                escrow.evidence_deadline = Some(escrow.dispute_started_at + evidence_deadline_seconds);
+                
+                EvidenceDeadlineSet {
+                    escrow_id,
+                    deadline: escrow.evidence_deadline.unwrap(),
+                    set_at: escrow.dispute_started_at,
+                }
+                .publish(&env);
             }
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
@@ -3009,6 +3037,21 @@ impl EscrowContract {
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        
+        // Check evidence submission deadline
+        if let Some(deadline) = escrow.evidence_deadline {
+            let current_time = env.ledger().timestamp();
+            if current_time > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: current_time,
+                }
+                .publish(&env);
+                return Err(Error::EvidenceDeadlinePassed);
+            }
+        }
+        
         EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
     }
 

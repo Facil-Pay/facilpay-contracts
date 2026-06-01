@@ -89,6 +89,9 @@ pub enum DataKey {
     EscrowedPaymentDispute(u64),
     // Payment routing (#118)
     RouteOptions(Address, Address), // (input_token, output_token)
+    // Payment memo with hash verification
+    PaymentMemo(u64),
+    PaymentMemoVersion(u64),
 }
 
 // Customer-specific data keys
@@ -1119,6 +1122,45 @@ pub struct PaymentMetadata {
     pub encrypted: bool,
     pub updated_at: u64,
     pub version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoSet {
+    pub payment_id: u64,
+    pub memo_ref: String,
+    pub set_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoUpdated {
+    pub payment_id: u64,
+    pub memo_ref: String,
+    pub updated_by: Address,
+    pub version: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentMemoVerified {
+    pub payment_id: u64,
+    pub memo_hash: BytesN<32>,
+    pub verified_at: u64,
+    pub verified_by: Address,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentMemo {
+    pub payment_id: u64,
+    pub memo_ref: String,           // Reference to memo content (IPFS CID, URL, etc.)
+    pub memo_hash: BytesN<32>,      // SHA-256 hash of memo plaintext (immutable)
+    pub reference_hash: BytesN<32>, // Hash linking memo to payment (for integrity)
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub version: u32,
+    pub created_by: Address,
 }
 
 #[derive(Clone)]
@@ -7199,6 +7241,143 @@ impl PaymentContract {
 
         match metadata {
             Some(meta) => meta.content_hash == plaintext_hash,
+            None => false,
+        }
+    }
+
+    /// Set structured payment memo with hash-verified reference field
+    /// Memo hash is immutable after first set to ensure integrity
+    pub fn set_payment_memo(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+        memo_ref: String,
+        memo_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+
+        // Verify caller is customer, merchant, or admin
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if caller != payment.customer && caller != payment.merchant && caller != admin {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if memo already exists
+        let existing_memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        let current_time = env.ledger().timestamp();
+
+        if let Some(existing) = existing_memo {
+            // Memo already set - emit update event with new version
+            let new_version = existing.version + 1;
+            
+            // Create reference hash linking memo to payment for integrity verification
+            let reference_data = format!("{}:{}", payment_id, existing.memo_hash.to_string());
+            let reference_hash = env.crypto().sha256(&Bytes::from_slice(&env, reference_data.as_bytes()));
+            
+            let updated_memo = PaymentMemo {
+                payment_id,
+                memo_ref: memo_ref.clone(),
+                memo_hash: existing.memo_hash, // Keep original hash immutable
+                reference_hash,
+                created_at: existing.created_at,
+                updated_at: current_time,
+                version: new_version,
+                created_by: existing.created_by,
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMemo(payment_id), &updated_memo);
+
+            PaymentMemoUpdated {
+                payment_id,
+                memo_ref,
+                updated_by: caller,
+                version: new_version,
+            }
+            .publish(&env);
+        } else {
+            // First time setting memo
+            // Create reference hash linking memo to payment for integrity verification
+            let reference_data = format!("{}:{}", payment_id, memo_hash.to_string());
+            let reference_hash = env.crypto().sha256(&Bytes::from_slice(&env, reference_data.as_bytes()));
+            
+            let memo = PaymentMemo {
+                payment_id,
+                memo_ref: memo_ref.clone(),
+                memo_hash,
+                reference_hash,
+                created_at: current_time,
+                updated_at: current_time,
+                version: 1,
+                created_by: caller.clone(),
+            };
+
+            env.storage()
+                .instance()
+                .set(&DataKey::PaymentMemo(payment_id), &memo);
+
+            PaymentMemoSet {
+                payment_id,
+                memo_ref,
+                set_by: caller,
+            }
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    /// Get payment memo
+    pub fn get_payment_memo(env: Env, payment_id: u64) -> Option<PaymentMemo> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id))
+    }
+
+    /// Verify memo integrity by comparing provided hash against stored memo hash
+    /// Returns true if hashes match, false otherwise
+    pub fn verify_memo_integrity(
+        env: Env,
+        payment_id: u64,
+        plaintext_hash: BytesN<32>,
+    ) -> bool {
+        let memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        match memo {
+            Some(m) => m.memo_hash == plaintext_hash,
+            None => false,
+        }
+    }
+
+    /// Verify memo reference integrity using the reference hash
+    /// Returns true if the reference hash matches the stored reference hash
+    pub fn verify_memo_reference(
+        env: Env,
+        payment_id: u64,
+        expected_reference_hash: BytesN<32>,
+    ) -> bool {
+        let memo: Option<PaymentMemo> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentMemo(payment_id));
+
+        match memo {
+            Some(m) => m.reference_hash == expected_reference_hash,
             None => false,
         }
     }

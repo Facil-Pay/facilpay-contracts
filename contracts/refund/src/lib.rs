@@ -44,6 +44,9 @@ pub enum DataKey {
     // Rate limiting
     CustomerRefundRateLimit(Address),
     GlobalRefundRateLimit,
+    // Admin override audit log
+    AdminOverrideHistory(u64),
+    AdminOverrideHistoryCount,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -876,6 +879,31 @@ pub struct PolicyOverrideApplied {
     pub refund_id: u64,
     pub admin: Address,
     pub reason: String,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRefundOverride {
+    pub override_id: u64,
+    pub refund_id: u64,
+    pub admin: Address,
+    pub reason: String,
+    pub override_amount: i128,
+    pub override_status: RefundStatus,
+    pub executed_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct AdminOverrideHistory {
+    pub override_id: u64,
+    pub refund_id: u64,
+    pub admin: Address,
+    pub reason: String,
+    pub override_amount: i128,
+    pub override_status: RefundStatus,
+    pub executed_at: u64,
+    pub transaction_hash: BytesN<32>, // Immutable hash of override details
 }
 
 #[contractevent]
@@ -3198,20 +3226,89 @@ impl RefundContract {
         }
 
         // Verify refund exists
-        let _refund: Refund = env
+        let refund: Refund = env
             .storage()
             .instance()
             .get(&DataKey::Refund(refund_id))
             .ok_or(Error::RefundNotFound)?;
 
-        // Emit PolicyOverrideApplied event
-        (PolicyOverrideApplied {
+        // Generate immutable audit log entry
+        let override_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminOverrideHistoryCount)
+            .unwrap_or(0);
+        
+        let executed_at = env.ledger().timestamp();
+        
+        // Create hash of override details for immutability verification
+        let override_details = format!(
+            "{}:{}:{}:{}:{}",
+            refund_id,
+            admin.to_string(),
+            reason,
+            refund.amount,
+            executed_at
+        );
+        let transaction_hash = env.crypto().sha256(&Bytes::from_slice(&env, override_details.as_bytes()));
+        
+        let audit_entry = AdminOverrideHistory {
+            override_id,
+            refund_id,
+            admin: admin.clone(),
+            reason: reason.clone(),
+            override_amount: refund.amount,
+            override_status: refund.status.clone(),
+            executed_at,
+            transaction_hash: transaction_hash.clone(),
+        };
+        
+        // Store immutable audit log entry
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminOverrideHistory(override_id), &audit_entry);
+        
+        // Increment counter
+        env.storage()
+            .instance()
+            .set(&DataKey::AdminOverrideHistoryCount, &(override_id + 1));
+
+        // Emit AdminRefundOverride event
+        AdminRefundOverride {
+            override_id,
+            refund_id,
+            admin: admin.clone(),
+            reason: reason.clone(),
+            override_amount: refund.amount,
+            override_status: refund.status,
+            executed_at,
+        }
+        .publish(&env);
+
+        // Emit legacy PolicyOverrideApplied event for backward compatibility
+        PolicyOverrideApplied {
             refund_id,
             admin,
             reason,
-        }).publish(&env);
+        }
+        .publish(&env);
 
         Ok(())
+    }
+
+    /// Retrieve admin override audit log entry by override_id
+    pub fn get_admin_override_history(env: Env, override_id: u64) -> Option<AdminOverrideHistory> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminOverrideHistory(override_id))
+    }
+
+    /// Get total count of admin override audit log entries
+    pub fn get_admin_override_history_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminOverrideHistoryCount)
+            .unwrap_or(0)
     }
 
     // ── Issue #138: Refund policy inheritance for merchant hierarchies ────────
