@@ -93,6 +93,9 @@ pub enum EscrowAuxKey {
     EscrowRenewalConfig,
     EscrowRenewal(u64),
     EscrowRenewalCount(u64),
+    // Sub-account milestones
+    SubAccount(u64, u64),
+    SubAccountCounter(u64),
 }
 
 /// Observer storage keys (separate enum to stay within Soroban symbol limits).
@@ -269,6 +272,9 @@ pub enum Error {
     RollbackAlreadyExecuted = 92,
     RollbackNotYetAvailable = 93,
     StaleThresholdNotConfigured = 94,
+    SubAccountNotFound = 95,
+    SubAccountAlreadyReleased = 96,
+    SubAccountFundingExceedsEscrow = 97,
 }
 
 #[contractevent]
@@ -636,6 +642,17 @@ pub struct Escrow {
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
     pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowSubAccount {
+    pub escrow_id: u64,
+    pub sub_id: u64,
+    pub label_hash: BytesN<32>,
+    pub amount: i128,
+    pub released: bool,
+    pub release_condition: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2481,6 +2498,24 @@ impl EscrowContract {
         }
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Guard: block full release if any sub-accounts remain unreleased
+        let sub_count: u64 = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccountCounter(escrow_id))
+            .unwrap_or(0);
+        for sub_id in 1..=sub_count {
+            if let Some(sub) = env
+                .storage()
+                .instance()
+                .get::<EscrowAuxKey, EscrowSubAccount>(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+            {
+                if !sub.released {
+                    return Err(Error::InvalidStatus);
+                }
+            }
+        }
 
         match escrow.status {
             EscrowStatus::Locked => {
@@ -7452,6 +7487,160 @@ impl EscrowContract {
         }
         EscrowHealth::Healthy
     }
+
+    pub fn create_sub_account(
+        env: Env,
+        merchant: Address,
+        escrow_id: u64,
+        label_hash: BytesN<32>,
+        amount: i128,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let sub_count: u64 = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccountCounter(escrow_id))
+            .unwrap_or(0);
+        let mut allocated: i128 = 0;
+        for sub_id in 1..=sub_count {
+            if let Some(sub) = env
+                .storage()
+                .instance()
+                .get::<EscrowAuxKey, EscrowSubAccount>(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+            {
+                allocated += sub.amount;
+            }
+        }
+
+        if allocated + amount > escrow.amount {
+            return Err(Error::SubAccountFundingExceedsEscrow);
+        }
+
+        let sub_id = sub_count + 1;
+        let sub = EscrowSubAccount {
+            escrow_id,
+            sub_id,
+            label_hash,
+            amount,
+            released: false,
+            release_condition: None,
+        };
+
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::SubAccount(escrow_id, sub_id), &sub);
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::SubAccountCounter(escrow_id), &sub_id);
+
+        Ok(sub_id)
+    }
+
+    pub fn fund_sub_account(
+        env: Env,
+        funder: Address,
+        escrow_id: u64,
+        sub_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        funder.require_auth();
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let mut sub: EscrowSubAccount = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+            .ok_or(Error::SubAccountNotFound)?;
+
+        let sub_count: u64 = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccountCounter(escrow_id))
+            .unwrap_or(0);
+        let mut allocated: i128 = 0;
+        for id in 1..=sub_count {
+            if id == sub_id {
+                continue;
+            }
+            if let Some(s) = env
+                .storage()
+                .instance()
+                .get::<EscrowAuxKey, EscrowSubAccount>(&EscrowAuxKey::SubAccount(escrow_id, id))
+            {
+                allocated += s.amount;
+            }
+        }
+
+        if allocated + sub.amount + amount > escrow.amount {
+            return Err(Error::SubAccountFundingExceedsEscrow);
+        }
+
+        sub.amount += amount;
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::SubAccount(escrow_id, sub_id), &sub);
+
+        Ok(())
+    }
+
+    pub fn release_sub_account(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        sub_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        let mut sub: EscrowSubAccount = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+            .ok_or(Error::SubAccountNotFound)?;
+
+        if sub.released {
+            return Err(Error::SubAccountAlreadyReleased);
+        }
+
+        EscrowContract::transfer_if_token_contract(&env, &escrow.token, &escrow.merchant, sub.amount)?;
+
+        sub.released = true;
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::SubAccount(escrow_id, sub_id), &sub);
+
+        Ok(())
+    }
+
+    pub fn get_sub_account(env: Env, escrow_id: u64, sub_id: u64) -> Option<EscrowSubAccount> {
+        env.storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+    }
+
+    pub fn list_sub_accounts(env: Env, escrow_id: u64) -> Vec<EscrowSubAccount> {
+        let sub_count: u64 = env
+            .storage()
+            .instance()
+            .get(&EscrowAuxKey::SubAccountCounter(escrow_id))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        for sub_id in 1..=sub_count {
+            if let Some(sub) = env
+                .storage()
+                .instance()
+                .get::<EscrowAuxKey, EscrowSubAccount>(&EscrowAuxKey::SubAccount(escrow_id, sub_id))
+            {
+                result.push_back(sub);
+            }
+        }
+        result
+    }
 }
 
 impl EscrowAnalytics {
@@ -7512,3 +7701,6 @@ mod multi_party_rollback_test;
 mod observer_test;
 
 mod health_check_test;
+
+#[cfg(test)]
+mod test_sub_account;
