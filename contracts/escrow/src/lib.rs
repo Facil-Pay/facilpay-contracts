@@ -74,6 +74,9 @@ pub enum DataKey {
     EscalationConfig,
     EscrowEvidencePage(u64, u32),
     EscrowEvidencePageCount(u64),
+    // Tenure-weighted reputation
+    TenureConfig,
+    TenureBonusApplied(u64, Address),
 }
 
 /// Secondary storage keys (keeps `DataKey` within Soroban's 50-variant limit).
@@ -253,6 +256,8 @@ pub enum Error {
     ObserverNotFound = 48,
     ObserverAccessExpired = 49,
     AccelerationLimitExceeded = 66,
+    TenureConfigNotFound = 67,
+    TenureBonusAlreadyApplied = 68,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
@@ -544,6 +549,22 @@ pub struct ReputationConfigUpdated {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenureConfigUpdated {
+    pub base_score: u32,
+    pub weight_per_day: u32,
+    pub max_bonus_days: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TenureBonusGranted {
+    pub escrow_id: u64,
+    pub participant: Address,
+    pub bonus: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VestingScheduleCreated {
     pub escrow_id: u64,
     pub total_amount: i128,
@@ -601,6 +622,20 @@ pub struct ReputationConfig {
     pub loss_penalty: i64,
     pub completion_reward: i64,
     pub dispute_initiation_penalty: i64,
+}
+
+/// Configuration for the duration-weighted ("tenure") reputation bonus.
+/// Dispute-free escrows that stay active longer reward their participants more.
+#[derive(Clone)]
+#[contracttype]
+pub struct TenureReputationConfig {
+    /// Flat reputation credit granted for honouring an escrow to completion,
+    /// independent of how long it stayed active.
+    pub base_score: u32,
+    /// Reputation points earned per full day the escrow remained active.
+    pub weight_per_day: u32,
+    /// Cap on the number of days that count towards the bonus.
+    pub max_bonus_days: u32,
 }
 
 #[derive(Clone)]
@@ -2601,6 +2636,14 @@ impl EscrowContract {
         EscrowContract::update_reputation_on_completion(&env, &escrow.merchant);
         EscrowContract::update_reputation_on_completion(&env, &escrow.customer);
 
+        // Apply the duration-weighted tenure bonus when configured. Dispute-free
+        // completions reward longer-running agreements more; the once-per-escrow
+        // guard makes repeated invocations harmless, so errors are ignored here.
+        if EscrowContract::get_tenure_config(env.clone()).is_some() {
+            let _ = EscrowContract::apply_tenure_bonus(env.clone(), escrow_id, escrow.merchant.clone());
+            let _ = EscrowContract::apply_tenure_bonus(env.clone(), escrow_id, escrow.customer.clone());
+        }
+
         // Update global analytics
         let duration = current_time.saturating_sub(escrow.created_at);
         let mut analytics: EscrowAnalytics = env
@@ -4138,6 +4181,114 @@ impl EscrowContract {
             new_score: loser_rep.score,
         }
         .publish(env);
+    }
+
+    // ── TENURE-WEIGHTED REPUTATION ───────────────────────────────────────────
+
+    /// Admin configures the duration-weighted reputation bonus parameters.
+    pub fn set_tenure_reputation_config(
+        env: Env,
+        admin: Address,
+        config: TenureReputationConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::TenureConfig, &config);
+        TenureConfigUpdated {
+            base_score: config.base_score,
+            weight_per_day: config.weight_per_day,
+            max_bonus_days: config.max_bonus_days,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the tenure reputation configuration, or `None` if unset.
+    pub fn get_tenure_config(env: Env) -> Option<TenureReputationConfig> {
+        env.storage().instance().get(&DataKey::TenureConfig)
+    }
+
+    /// Computes the duration-weighted tenure bonus for an escrow:
+    /// `min(days_active × weight_per_day, max_bonus_days × weight_per_day)`.
+    ///
+    /// Returns `0` when no tenure config is set or when the escrow is (or has
+    /// been) disputed, since disputed escrows are ineligible for the bonus.
+    pub fn calculate_tenure_bonus(env: Env, escrow_id: u64) -> u32 {
+        let config = match Self::get_tenure_config(env.clone()) {
+            Some(c) => c,
+            None => return 0,
+        };
+        let escrow = Self::get_escrow(&env, escrow_id);
+        if !Self::is_tenure_eligible(&escrow) {
+            return 0;
+        }
+
+        let seconds_active = env
+            .ledger()
+            .timestamp()
+            .saturating_sub(escrow.created_at);
+        let days_active = seconds_active / 86_400;
+        let earned = days_active.saturating_mul(config.weight_per_day as u64);
+        let cap = (config.max_bonus_days as u64).saturating_mul(config.weight_per_day as u64);
+        earned.min(cap).min(u32::MAX as u64) as u32
+    }
+
+    /// Applies the tenure bonus for a single participant of an escrow.
+    ///
+    /// Called from `release_escrow` on dispute-free completion, and may be
+    /// invoked at most once per escrow per participant. Grants the configured
+    /// `base_score` plus the duration-weighted bonus to the participant's
+    /// reputation. Disputed escrows are ineligible and receive nothing.
+    pub fn apply_tenure_bonus(
+        env: Env,
+        escrow_id: u64,
+        participant: Address,
+    ) -> Result<(), Error> {
+        let config = Self::get_tenure_config(env.clone()).ok_or(Error::TenureConfigNotFound)?;
+
+        let marker = DataKey::TenureBonusApplied(escrow_id, participant.clone());
+        if env.storage().instance().has(&marker) {
+            return Err(Error::TenureBonusAlreadyApplied);
+        }
+        env.storage().instance().set(&marker, &true);
+
+        let bonus = Self::calculate_tenure_bonus(env.clone(), escrow_id);
+        let escrow = Self::get_escrow(&env, escrow_id);
+        // Ineligible (disputed) escrows are marked applied but grant nothing.
+        let increase: i64 = if Self::is_tenure_eligible(&escrow) {
+            config.base_score as i64 + bonus as i64
+        } else {
+            0
+        };
+
+        if increase > 0 {
+            let mut rep = Self::get_or_default_reputation(&env, &participant);
+            let old_score = rep.score;
+            rep.score = (rep.score + increase).min(10000);
+            rep.last_updated = env.ledger().timestamp();
+            env.storage()
+                .instance()
+                .set(&DataKey::ReputationScore(participant.clone()), &rep);
+            ReputationUpdated {
+                address: participant.clone(),
+                old_score,
+                new_score: rep.score,
+            }
+            .publish(&env);
+        }
+
+        TenureBonusGranted {
+            escrow_id,
+            participant,
+            bonus,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// An escrow is eligible for the tenure bonus only if it has never entered
+    /// a dispute.
+    fn is_tenure_eligible(escrow: &Escrow) -> bool {
+        escrow.status != EscrowStatus::Disputed && escrow.dispute_started_at == 0
     }
 
     /// Weighted auto-resolve: each piece of evidence contributes the submitter's
