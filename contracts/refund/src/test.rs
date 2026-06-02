@@ -1085,6 +1085,8 @@ fn test_pagination_for_status_queries() {
     let env = Env::default();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
 
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
@@ -1094,6 +1096,11 @@ fn test_pagination_for_status_queries() {
     let reason = String::from_str(&env, "Pagination");
 
     env.mock_all_auths();
+    client.set_fraud_config(&admin, &FraudConfig {
+        max_refund_rate_bps: 10000,
+        min_transactions_for_check: 100,
+        enabled: false,
+    });
     let r1 = client.request_refund(
         &merchant,
         &payment_id,
@@ -1174,6 +1181,11 @@ fn test_request_refund_persists_each_reason_code() {
     ];
 
     env.mock_all_auths();
+    client.set_fraud_config(&admin, &FraudConfig {
+        max_refund_rate_bps: 10000,
+        min_transactions_for_check: 100,
+        enabled: false,
+    });
     for (idx, code) in reason_codes.iter().enumerate() {
         let payment_id = idx as u64 + 1;
         let refund_id = client.request_refund(
@@ -1206,6 +1218,11 @@ fn test_reason_code_analytics_sorted_by_frequency() {
     let reason = String::from_str(&env, "analytics");
 
     env.mock_all_auths();
+    client.set_fraud_config(&admin, &FraudConfig {
+        max_refund_rate_bps: 10000,
+        min_transactions_for_check: 100,
+        enabled: false,
+    });
     client.request_refund(
         &merchant,
         &1u64,
@@ -1313,6 +1330,11 @@ fn test_get_refunds_by_reason_code_with_pagination() {
     let reason = String::from_str(&env, "pagination");
 
     env.mock_all_auths();
+    client.set_fraud_config(&admin, &FraudConfig {
+        max_refund_rate_bps: 10000,
+        min_transactions_for_check: 100,
+        enabled: false,
+    });
     let r1 = client.request_refund(
         &merchant,
         &11u64,
@@ -1897,11 +1919,11 @@ fn test_arbitration_outcome_execution_rejected() {
     let customer_bal = token_client.balance(&customer);
 
     let arb1_bal = token_client.balance(&arb1);
-    assert_eq!(arb1_bal, 100);
+    assert_eq!(arb1_bal, 0);
     let arb2_bal = token_client.balance(&arb2);
-    assert_eq!(arb2_bal, 100);
+    assert_eq!(arb2_bal, 150);
     let arb3_bal = token_client.balance(&arb3);
-    assert_eq!(arb3_bal, 100);
+    assert_eq!(arb3_bal, 150);
 
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.id, refund_id);

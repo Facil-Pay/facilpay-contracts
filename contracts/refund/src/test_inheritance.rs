@@ -22,13 +22,10 @@ fn test_single_level_inheritance() {
     env.mock_all_auths();
 
     // Parent sets their own policy
-    client.set_refund_policy(
-        &parent_merchant,
-        &(14u64 * 24 * 60 * 60), // 14 days
-        &7500u32,                // 75%
-        &false,                 // No admin approval
-        &500i128,               // Auto-approve below 500
-    );
+    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 14, max_refund_bps: 7500 }]);
+    client.set_refund_policy(&parent_merchant, &tiers);
+    client.set_requires_admin_approval(&parent_merchant, &false);
+    client.set_auto_approve_below(&parent_merchant, &500i128);
 
     // Set child parent relationship
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
@@ -40,10 +37,10 @@ fn test_single_level_inheritance() {
     assert!(effective_policy.is_some());
     let policy = effective_policy.unwrap();
     assert_eq!(policy.merchant, parent_merchant); // Returns parent's policy
-    assert_eq!(policy.refund_window, 14 * 24 * 60 * 60);
-    assert_eq!(policy.max_refund_percentage, 7500);
-    assert_eq!(policy.requires_admin_approval, false);
-    assert_eq!(policy.auto_approve_below, 500);
+    assert_eq!(policy.tiers.get(0).unwrap().days_from_purchase, 14);
+    assert_eq!(policy.tiers.get(0).unwrap().max_refund_bps, 7500);
+    assert_eq!(client.get_requires_admin_approval(&policy.merchant), false);
+    assert_eq!(client.get_auto_approve_below(&policy.merchant), 500);
 }
 
 #[test]
@@ -66,13 +63,10 @@ fn test_multi_level_inheritance() {
     client.set_merchant_parent(&admin, &merchant_c, &merchant_b);
 
     // Only A has explicit policy
-    client.set_refund_policy(
-        &merchant_a,
-        &(30u64 * 24 * 60 * 60), // 30 days
-        &10000u32,               // 100%
-        &true,
-        &0i128,
-    );
+    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    client.set_refund_policy(&merchant_a, &tiers);
+    client.set_requires_admin_approval(&merchant_a, &true);
+    client.set_auto_approve_below(&merchant_a, &0i128);
 
     // C should resolve A's policy through B
     let effective_policy = client.get_effective_refund_policy(&merchant_c);
@@ -80,7 +74,7 @@ fn test_multi_level_inheritance() {
     assert!(effective_policy.is_some());
     let policy = effective_policy.unwrap();
     assert_eq!(policy.merchant, merchant_a); // Returns A's policy
-    assert_eq!(policy.refund_window, 30 * 24 * 60 * 60);
+    assert_eq!(policy.tiers.get(0).unwrap().days_from_purchase, 30);
 }
 
 #[test]
@@ -101,22 +95,16 @@ fn test_child_override_priority() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent policy
-    client.set_refund_policy(
-        &parent_merchant,
-        &(30u64 * 24 * 60 * 60), // 30 days
-        &10000u32,               // 100%
-        &true,
-        &0i128,
-    );
+    let parent_tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    client.set_refund_policy(&parent_merchant, &parent_tiers);
+    client.set_requires_admin_approval(&parent_merchant, &true);
+    client.set_auto_approve_below(&parent_merchant, &0i128);
 
     // Child sets their OWN policy (override)
-    client.set_refund_policy(
-        &child_merchant,
-        &(7u64 * 24 * 60 * 60), // 7 days
-        &5000u32,               // 50%
-        &false,
-        &100i128,
-    );
+    let child_tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 5000 }]);
+    client.set_refund_policy(&child_merchant, &child_tiers);
+    client.set_requires_admin_approval(&child_merchant, &false);
+    client.set_auto_approve_below(&child_merchant, &100i128);
 
     // Child policy should be returned, not parent's
     let effective_policy = client.get_effective_refund_policy(&child_merchant);
@@ -124,8 +112,8 @@ fn test_child_override_priority() {
     assert!(effective_policy.is_some());
     let policy = effective_policy.unwrap();
     assert_eq!(policy.merchant, child_merchant); // Child's own policy
-    assert_eq!(policy.refund_window, 7 * 24 * 60 * 60); // 7 days, not 30
-    assert_eq!(policy.max_refund_percentage, 5000); // 50%, not 100%
+    assert_eq!(policy.tiers.get(0).unwrap().days_from_purchase, 7); // 7 days, not 30
+    assert_eq!(policy.tiers.get(0).unwrap().max_refund_bps, 5000); // 50%, not 100%
 }
 
 #[test]
@@ -241,13 +229,10 @@ fn test_inactive_policy_handling() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent sets their policy
-    client.set_refund_policy(
-        &parent_merchant,
-        &(30u64 * 24 * 60 * 60),
-        &10000u32,
-        &true,
-        &0i128,
-    );
+    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    client.set_refund_policy(&parent_merchant, &tiers);
+    client.set_requires_admin_approval(&parent_merchant, &true);
+    client.set_auto_approve_below(&parent_merchant, &0i128);
 
     // Deactivate parent policy
     client.deactivate_refund_policy(&parent_merchant);
@@ -281,13 +266,10 @@ fn test_inheritance_disabled() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent has policy
-    client.set_refund_policy(
-        &parent_merchant,
-        &(30u64 * 24 * 60 * 60),
-        &10000u32,
-        &true,
-        &0i128,
-    );
+    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    client.set_refund_policy(&parent_merchant, &tiers);
+    client.set_requires_admin_approval(&parent_merchant, &true);
+    client.set_auto_approve_below(&parent_merchant, &0i128);
 
     // Child sets policy with inherit_from_parent = false
     // We need to directly manipulate storage since set_refund_policy defaults to true
@@ -469,24 +451,19 @@ fn test_parent_updates_existing_policy() {
     env.mock_all_auths();
 
     // Child sets policy first (no parent yet)
-    client.set_refund_policy(
-        &child,
-        &(7u64 * 24 * 60 * 60),
-        &5000u32,
-        &false,
-        &100i128,
-    );
+    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 5000 }]);
+    client.set_refund_policy(&child, &tiers);
+    client.set_requires_admin_approval(&child, &false);
+    client.set_auto_approve_below(&child, &100i128);
 
     // Verify policy has no parent
-    let policy_before = client.get_refund_policy(&child).unwrap();
-    assert_eq!(policy_before.parent_merchant, None);
+    assert_eq!(client.get_merchant_parent(&child), None);
 
     // Now set parent
     client.set_merchant_parent(&admin, &child, &parent);
 
     // Policy should be updated with parent
-    let policy_after = client.get_refund_policy(&child).unwrap();
-    assert_eq!(policy_after.parent_merchant, Some(parent));
+    assert_eq!(client.get_merchant_parent(&child), Some(parent));
 }
 
 #[test]
@@ -510,6 +487,6 @@ fn test_effective_policy_falls_back_to_default() {
     let policy = effective.unwrap();
     assert!(policy.active);
     // Default policy is set in initialize()
-    assert_eq!(policy.refund_window, 30 * 24 * 60 * 60);
-    assert_eq!(policy.max_refund_percentage, 10000);
+    assert_eq!(policy.tiers.get(0).unwrap().days_from_purchase, 30);
+    assert_eq!(policy.tiers.get(0).unwrap().max_refund_bps, 10000);
 }
