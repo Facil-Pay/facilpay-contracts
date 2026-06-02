@@ -57,6 +57,9 @@ pub enum DataKey {
     // Admin override audit log
     AdminOverrideHistory(u64),
     AdminOverrideHistoryCount,
+    // Payment refund caps
+    PaymentRefundCap(u64),
+    PaymentRefundUsage(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,8 +224,13 @@ pub enum Error {
     MaxHooksPerEventReached = 42,
     HookNotOwnedBySubscriber = 43,
     // Issue #148: Customer eligibility errors
-    CustomerBlockedFromRefund = 46,
-    EligibilityEntryNotFound = 47,
+    CustomerBlockedFromRefund = 44,
+    EligibilityEntryNotFound = 45,
+    // Issue #XXX: Payment refund cap errors
+    RefundCountCapExceeded = 48,
+    RefundAmountCapExceeded = 49,
+    UnsupportedRefundToken = 50,
+    NoSeniorArbitrators = 51,
 }
 
 #[contractevent]
@@ -582,6 +590,14 @@ pub struct Refund {
     pub processed_at: Option<u64>,
     // Issue #199: TTL expiry
     pub expires_at: Option<u64>,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentRefundCap {
+    pub payment_id: u64,
+    pub max_refund_count: u32,
+    pub max_total_amount: i128,
 }
 
 #[derive(Clone)]
@@ -3929,6 +3945,9 @@ impl RefundContract {
         Self::check_and_update_circuit_breaker(&env, amount, original_payment_amount)?;
         Self::check_and_update_customer_refund_rate_limit(&env, customer.clone())?;
         
+        // Check payment refund cap
+        Self::check_payment_refund_cap(&env, payment_id, amount)?;
+        
         // Check for fraud signals (#137)
         if let Some(fraud_signal) = Self::check_fraud_signals(env.clone(), customer.clone()) {
             if !fraud_signal.reviewed {
@@ -4050,6 +4069,9 @@ impl RefundContract {
             &DataKey::PaymentRefundCount(payment_id),
             &(payment_count + 1),
         );
+
+        // Update payment refund usage for cap tracking
+        Self::update_payment_refund_usage(&env, payment_id, amount);
 
         (RefundRequested {
             refund_id,
@@ -6326,12 +6348,107 @@ impl RefundContract {
             ArbitratorTier::Junior
         }
     }
+
+    // ── Payment refund cap management ──────────────────────────────────────
+
+    pub fn set_payment_refund_cap(
+        env: Env,
+        admin: Address,
+        cap: PaymentRefundCap,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if cap.payment_id == 0 {
+            return Err(Error::InvalidPaymentId);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRefundCap(cap.payment_id), &cap);
+        Ok(())
+    }
+
+    pub fn get_payment_refund_cap(env: Env, payment_id: u64) -> Option<PaymentRefundCap> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCap(payment_id))
+    }
+
+    pub fn get_payment_refund_usage(env: Env, payment_id: u64) -> (u32, i128) {
+        let usage: Option<(u32, i128)> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundUsage(payment_id));
+        usage.unwrap_or((0, 0))
+    }
+
+    fn check_payment_refund_cap(
+        env: &Env,
+        payment_id: u64,
+        refund_amount: i128,
+    ) -> Result<(), Error> {
+        // If no cap is set, no restriction applies
+        let cap = match env.storage().instance().get(&DataKey::PaymentRefundCap(payment_id)) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        let (current_count, current_amount) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundUsage(payment_id))
+            .unwrap_or((0, 0));
+
+        // Check count cap (only for Requested and Approved statuses)
+        if current_count >= cap.max_refund_count {
+            return Err(Error::RefundCountCapExceeded);
+        }
+
+        // Check amount cap (cumulative across all statuses except Rejected)
+        let new_total_amount = current_amount.saturating_add(refund_amount);
+        if new_total_amount > cap.max_total_amount {
+            return Err(Error::RefundAmountCapExceeded);
+        }
+
+        Ok(())
+    }
+
+    fn update_payment_refund_usage(
+        env: &Env,
+        payment_id: u64,
+        refund_amount: i128,
+    ) {
+        let (current_count, current_amount) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundUsage(payment_id))
+            .unwrap_or((0, 0));
+
+        let new_count = current_count.saturating_add(1);
+        let new_amount = current_amount.saturating_add(refund_amount);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentRefundUsage(payment_id), &(new_count, new_amount));
+    }
+
 }
 
 mod test;
 mod test_process;
 mod test_policy;
 mod test_rate_limit;
+
+#[cfg(test)]
+mod test_payment_refund_cap;
 
 #[cfg(test)]
 mod test_circuit_breaker;
