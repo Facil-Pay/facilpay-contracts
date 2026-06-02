@@ -46,6 +46,8 @@ pub enum DataKey {
     PaymentChannelCounter,
     MeteredSubscription(u64),
     MeteredSubscriptionCounter,
+    // Payment split support
+    SplitConfig(u64),
 }
 
 // Customer-specific data keys
@@ -261,6 +263,10 @@ pub enum Error {
     ChannelNotExpired = 78,
     MeteredSubscriptionNotFound = 79,
     BillingCapExceeded = 80,
+    InvalidSplitShares = 85,
+    TooManyRecipients = 86,
+    SplitConfigNotFound = 87,
+    SplitAlreadyExecuted = 88,
 }
 
 #[contractevent]
@@ -428,6 +434,21 @@ pub struct MeteredSubscription {
     pub accumulated_units: u64,
     pub billing_cap: Option<i128>,
     pub last_reset_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct SplitRecipient {
+    pub address: Address,
+    pub share_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentSplitConfig {
+    pub payment_id: u64,
+    pub recipients: Vec<SplitRecipient>,
+    pub executed: bool,
 }
 
 #[contractevent]
@@ -6970,6 +6991,115 @@ impl PaymentContract {
         }
         BytesN::from_array(env, &pk)
     }
+
+    pub fn create_split_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        recipients: Vec<SplitRecipient>,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        if recipients.len() > 10 {
+            return Err(Error::TooManyRecipients);
+        }
+
+        let total_bps: u32 = recipients.iter().map(|r| r.share_bps).sum();
+        if total_bps != 10000 {
+            return Err(Error::InvalidSplitShares);
+        }
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentCounter)
+            .unwrap_or(0);
+        let payment_id = counter + 1;
+
+        let token_client = token::Client::new(&env, &token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&customer, &contract_address, &amount);
+
+        let payment = Payment {
+            id: payment_id,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
+            amount,
+            token,
+            currency: Currency::USDC,
+            status: PaymentStatus::Pending,
+            created_at: env.ledger().timestamp(),
+            expires_at: 0,
+            metadata: String::from_str(&env, ""),
+            notes: String::from_str(&env, ""),
+            refunded_amount: 0,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentCounter, &payment_id);
+
+        let config = PaymentSplitConfig {
+            payment_id,
+            recipients,
+            executed: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SplitConfig(payment_id), &config);
+
+        Ok(payment_id)
+    }
+
+    pub fn execute_split_settlement(
+        env: Env,
+        admin: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let mut config: PaymentSplitConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::SplitConfig(payment_id))
+            .ok_or(Error::SplitConfigNotFound)?;
+
+        if config.executed {
+            return Err(Error::SplitAlreadyExecuted);
+        }
+
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+
+        let token_client = token::Client::new(&env, &payment.token);
+        let contract_address = env.current_contract_address();
+
+        for recipient in config.recipients.iter() {
+            let share = (payment.amount * recipient.share_bps as i128) / 10000;
+            token_client.transfer(&contract_address, &recipient.address, &share);
+        }
+
+        config.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::SplitConfig(payment_id), &config);
+
+        Ok(())
+    }
+
+    pub fn get_split_config(env: Env, payment_id: u64) -> Option<PaymentSplitConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SplitConfig(payment_id))
+    }
 }
 
 mod test;
@@ -6992,3 +7122,6 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_split_payment;
