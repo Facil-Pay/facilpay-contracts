@@ -44,11 +44,11 @@ fn test_schedule_payment_flow_and_guards() {
     let token_client = token::Client::new(&env, &token_address);
     let token_asset = token::StellarAssetClient::new(&env, &token_address);
     token_asset.mint(&customer, &5_000);
+    token_client.approve(&customer, &client.address, &1_000, &10_000);
 
     env.ledger().set_timestamp(100);
     let payment_id = client
-        .schedule_payment(&customer, &merchant, &token_address, &1_000, &150)
-        .unwrap();
+        .schedule_payment(&customer, &merchant, &token_address, &1_000, &150);
     assert_eq!(token_client.balance(&customer), 4_000);
     assert_eq!(token_client.balance(&client.address), 1_000);
 
@@ -56,7 +56,7 @@ fn test_schedule_payment_flow_and_guards() {
     assert_eq!(early.err(), Some(Ok(Error::PaymentNotYetDue)));
 
     env.ledger().set_timestamp(151);
-    client.execute_scheduled_payment(&payment_id).unwrap();
+    client.execute_scheduled_payment(&payment_id);
     assert_eq!(token_client.balance(&merchant), 1_000);
 
     let second = client.try_execute_scheduled_payment(&payment_id);
@@ -73,16 +73,15 @@ fn test_cancel_scheduled_payment_refunds_customer() {
     let token_client = token::Client::new(&env, &token_address);
     let token_asset = token::StellarAssetClient::new(&env, &token_address);
     token_asset.mint(&customer, &2_000);
+    token_client.approve(&customer, &client.address, &1_200, &10_000);
 
     env.ledger().set_timestamp(50);
     let payment_id = client
-        .schedule_payment(&customer, &merchant, &token_address, &1_200, &90)
-        .unwrap();
+        .schedule_payment(&customer, &merchant, &token_address, &1_200, &90);
     client
-        .cancel_scheduled_payment(&customer, &payment_id)
-        .unwrap();
+        .cancel_scheduled_payment(&customer, &payment_id);
 
-    let scheduled = client.get_scheduled_payment(&payment_id).unwrap();
+    let scheduled = client.get_scheduled_payment(&payment_id);
     assert!(scheduled.cancelled);
     assert_eq!(token_client.balance(&customer), 2_000);
     assert_eq!(token_client.balance(&client.address), 0);
@@ -93,8 +92,7 @@ fn test_oracle_refresh_and_manual_fallback() {
     let (env, client, admin) = setup();
     env.ledger().set_timestamp(1_005);
     client
-        .set_conversion_rate(&admin, &Currency::BTC, &90_0000000)
-        .unwrap();
+        .set_conversion_rate(&admin, &Currency::BTC, &90_0000000);
 
     let oracle_id = env.register(MockOracleContract, ());
     let feed = BytesN::from_array(&env, &[1; 32]);
@@ -105,8 +103,8 @@ fn test_oracle_refresh_and_manual_fallback() {
         max_staleness_seconds: 20,
         enabled: true,
     };
-    client.set_oracle_rate_config(&admin, &cfg).unwrap();
-    let refreshed = client.refresh_conversion_rate(&Currency::BTC).unwrap();
+    client.set_oracle_rate_config(&admin, &cfg);
+    let refreshed = client.refresh_conversion_rate(&Currency::BTC);
     assert_eq!(refreshed, 123_0000000);
 
     let stale_cfg = OracleRateConfig {
@@ -116,7 +114,7 @@ fn test_oracle_refresh_and_manual_fallback() {
         max_staleness_seconds: 1,
         enabled: true,
     };
-    client.set_oracle_rate_config(&admin, &stale_cfg).unwrap();
+    client.set_oracle_rate_config(&admin, &stale_cfg);
     let stale = client.try_refresh_conversion_rate(&Currency::ETH);
     assert_eq!(stale.err(), Some(Ok(Error::OracleFeedStale)));
 
@@ -128,12 +126,10 @@ fn test_oracle_refresh_and_manual_fallback() {
         enabled: false,
     };
     client
-        .set_conversion_rate(&admin, &Currency::USDC, &1_0000000)
-        .unwrap();
+        .set_conversion_rate(&admin, &Currency::USDC, &1_0000000);
     client
-        .set_oracle_rate_config(&admin, &disabled_cfg)
-        .unwrap();
-    let fallback = client.refresh_conversion_rate(&Currency::USDC).unwrap();
+        .set_oracle_rate_config(&admin, &disabled_cfg);
+    let fallback = client.refresh_conversion_rate(&Currency::USDC);
     assert_eq!(fallback, 1_0000000);
 }
 
@@ -142,7 +138,9 @@ fn test_cross_contract_condition_success_and_failure() {
     let (env, client, admin) = setup();
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    token::StellarAssetClient::new(&env, &token).mint(&customer, &100);
+    token::Client::new(&env, &token).approve(&customer, &client.address, &100, &10_000);
     let meta = String::from_str(&env, "cond");
 
     let good_id = env.register(FreshStateContract, ());
@@ -158,14 +156,11 @@ fn test_cross_contract_condition_success_and_failure() {
             &300,
             &meta,
             &condition,
-        )
-        .unwrap();
+        );
     client
-        .execute_if_condition_met(&payment_id)
-        .expect("should execute when state matches");
+        .execute_if_condition_met(&payment_id);
     client
-        .execute_if_condition_met(&payment_id)
-        .expect("idempotent re-execution should succeed");
+        .execute_if_condition_met(&payment_id);
 
     let bad_target = Address::generate(&env);
     let bad_cond =
@@ -180,8 +175,7 @@ fn test_cross_contract_condition_success_and_failure() {
             &300,
             &meta,
             &bad_cond,
-        )
-        .unwrap();
+        );
     let eval = client.try_evaluate_condition(&payment_id2);
     assert_eq!(eval.err(), Some(Ok(Error::ConditionEvaluationFailed)));
 
@@ -207,8 +201,7 @@ fn test_analytics_range_and_top_merchants() {
             &Currency::USDC,
             &0,
             &meta,
-        )
-        .unwrap();
+        );
     let _ = client.cancel_payment(&customer, &p1);
 
     env.ledger().set_timestamp(7_200);
@@ -221,12 +214,10 @@ fn test_analytics_range_and_top_merchants() {
             &Currency::USDC,
             &0,
             &meta,
-        )
-        .unwrap();
+        );
 
     let range = client
-        .get_merchant_analytics_range(&merchant_a, &3_600, &10_800)
-        .unwrap();
+        .get_merchant_analytics_range(&merchant_a, &3_600, &10_800);
     assert_eq!(range.len(), 1);
     assert_eq!(range.get(0).unwrap().total_volume, 1_000);
     assert_eq!(range.get(0).unwrap().failed_count, 1);

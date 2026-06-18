@@ -525,6 +525,7 @@ fn test_set_default_refund_policy_by_admin_succeeds() {
         active: true,
         created_at: env.ledger().timestamp(),
         updated_at: env.ledger().timestamp(),
+        default_window_seconds: 30 * 24 * 60 * 60,
     };
 
     client.set_default_refund_policy(&admin, &policy);
@@ -559,6 +560,7 @@ fn test_set_default_refund_policy_by_non_admin_fails() {
         active: true,
         created_at: env.ledger().timestamp(),
         updated_at: env.ledger().timestamp(),
+        default_window_seconds: 30 * 24 * 60 * 60,
     };
 
     // attacker != stored admin → should panic with Unauthorized
@@ -623,6 +625,7 @@ fn test_request_refund_uses_global_default_when_no_merchant_policy() {
         active: true,
         created_at: env.ledger().timestamp(),
         updated_at: env.ledger().timestamp(),
+        default_window_seconds: 30 * 24 * 60 * 60,
     };
     client.set_default_refund_policy(&admin, &default_policy);
     client.set_requires_admin_approval(&admin, &false);
@@ -720,6 +723,7 @@ fn test_default_policy_change_does_not_affect_pending_refunds() {
         active: true,
         created_at: env.ledger().timestamp(),
         updated_at: env.ledger().timestamp(),
+        default_window_seconds: 30 * 24 * 60 * 60,
     };
     client.set_default_refund_policy(&admin, &new_default);
     client.set_requires_admin_approval(&admin, &false);

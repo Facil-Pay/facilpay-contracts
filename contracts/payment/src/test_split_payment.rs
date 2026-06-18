@@ -13,11 +13,7 @@ fn setup(env: &Env) -> (PaymentContractClient<'_>, Address, Address) {
 }
 
 fn make_token(env: &Env, admin: &Address) -> Address {
-    let token_id = env.register(
-        soroban_sdk::token::StellarAssetContract,
-        (&admin,),
-    );
-    token_id
+    env.register_stellar_asset_contract(admin.clone())
 }
 
 fn fund(env: &Env, token: &Address, admin: &Address, to: &Address, amount: i128) {

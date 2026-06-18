@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     Address, Env, String,
 };
 
@@ -40,9 +40,9 @@ fn test_zero_trial_default_behavior() {
     let (client, _) = setup(&env);
     let sub_id = make_sub(&client, &env, 0);
     let sub = client.get_subscription(&sub_id);
-    assert_eq!(sub.trial_period_seconds, 0);
-    assert_eq!(sub.trial_ends_at, 0);
-    assert!(!sub.converted);
+    assert_eq!(sub.trial_data.period_seconds, 0);
+    assert_eq!(sub.trial_data.ends_at, 0);
+    assert!(!sub.trial_data.converted);
 }
 
 // During trial: execute_recurring_payment returns Ok without charging
@@ -55,7 +55,7 @@ fn test_execute_during_trial_skips_charge() {
     let sub_id = make_sub(&client, &env, 7200); // 2-hour trial
 
     let sub = client.get_subscription(&sub_id);
-    assert!(sub.trial_ends_at > now);
+    assert!(sub.trial_data.ends_at > now);
 
     // Advance time past next_payment_at but still within trial
     env.ledger().set_timestamp(now + 3700); // past interval, inside trial
@@ -67,7 +67,7 @@ fn test_execute_during_trial_skips_charge() {
     // payment_count should still be 0 (no charge)
     let sub_after = client.get_subscription(&sub_id);
     assert_eq!(sub_after.payment_count, 0);
-    assert!(!sub_after.converted);
+    assert!(!sub_after.trial_data.converted);
 }
 
 // First post-trial payment sets converted = true and emits TrialConverted
@@ -89,6 +89,7 @@ fn test_first_post_trial_payment_sets_converted() {
     let token_address = token_contract.address();
     let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
     asset_client.mint(&customer, &100_000i128);
+    soroban_sdk::token::Client::new(&env, &token_address).approve(&customer, &contract_id, &100_000i128, &10_000);
 
     let trial_secs = 3600u64;
     let interval = 1800u64;
@@ -113,7 +114,7 @@ fn test_first_post_trial_payment_sets_converted() {
     client.execute_recurring_payment(&sub_id);
 
     let sub = client.get_subscription(&sub_id);
-    assert!(sub.converted);
+    assert!(sub.trial_data.converted);
     assert_eq!(sub.payment_count, 1);
 }
 
@@ -143,16 +144,14 @@ fn test_cancel_during_trial_emits_trial_cancelled() {
     // Cancel while still in trial
     client.cancel_subscription(&customer, &sub_id);
 
-    let sub = client.get_subscription(&sub_id);
-    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
-
-    // TrialCancelled event should be among emitted events
+    // Check events immediately — each invocation resets the event log
     let events = env.events().all();
     let has_trial_cancelled = events.iter().any(|e| {
-        // events are (contract, topics, data); we just check count > 0
-        // TrialCancelled is emitted before SubscriptionCancelled
         let _ = e;
         true
     });
     assert!(has_trial_cancelled);
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
 }

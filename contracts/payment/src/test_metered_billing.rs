@@ -21,6 +21,7 @@ fn setup(env: &Env) -> (PaymentContractClient, Address, Address, Address, Addres
     let customer = Address::generate(env);
     let merchant = Address::generate(env);
     asset_client.mint(&customer, &1_000_000i128);
+    token::Client::new(env, &token_address).approve(&customer, &id, &1_000_000i128, &10_000);
 
     (client, admin, merchant, customer, token_address)
 }

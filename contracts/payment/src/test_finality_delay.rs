@@ -1,5 +1,5 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
 
 use crate::{Currency, Error, FinalityConfig, PaymentContract, PaymentContractClient};
 
@@ -130,6 +130,7 @@ fn test_threshold_bypass_settles_immediately() {
     let merchant = Address::generate(&env);
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
+    soroban_sdk::token::Client::new(&env, &token_addr).approve(&customer, &client.address, &50, &10_000);
 
     // min_amount_threshold = 1000, payment = 50 → bypass
     client.configure_finality_delay(&admin, &FinalityConfig {

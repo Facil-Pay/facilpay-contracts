@@ -153,7 +153,7 @@ pub enum TokenKey {
     TokenByIndex(u64),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum RefundStatus {
     Requested,
@@ -180,8 +180,6 @@ pub enum Error {
     RefundNotFound = 2,
     Unauthorized = 3,
     InvalidPaymentId = 4,
-    TransferFailed = 5,
-    NotApproved = 6,
     InvalidStatus = 7,
     AlreadyProcessed = 8,
     RefundExceedsPayment = 9,
@@ -196,29 +194,24 @@ pub enum Error {
     FunctionPaused = 18,
     CaseNotTimedOut = 19,
     BatchRefundTooLarge = 20,
-    RefundRateLimitExceeded = 26,
-    PaymentContractNotSet = 27,
-    PaymentOwnershipMismatch = 28,
-    CircuitBreakerTripped = 29,
-    TemplateNotFound = 46,
-    TemplateInactive = 47,
-    InvalidFeeConfig = 30,
-    InsufficientTreasuryFees = 31,
-    StakeRequired = 32,
-    StakeAlreadyReturned = 33,
-    ArbitratorNotFound = 34,
-    InvalidScoreThreshold = 35,
-    AutoRefundTriggerNotFound = 36,
-    DuplicateAutoRefundTrigger = 37,
-    AddressFlaggedForFraud = 38,
-    FraudConfigNotSet = 39,
-    FraudSignalNotFound = 40,
     // Issue #138: Refund policy inheritance errors
     CircularInheritance = 21,
     MaxInheritanceDepth = 22,
     RefundNotRejected = 23,
     AppealWindowExpired = 24,
     AppealAlreadyFiled = 25,
+    RefundRateLimitExceeded = 26,
+    PaymentContractNotSet = 27,
+    PaymentOwnershipMismatch = 28,
+    CircuitBreakerTripped = 29,
+    InvalidFeeConfig = 30,
+    InsufficientTreasuryFees = 31,
+    ArbitratorNotFound = 34,
+    InvalidScoreThreshold = 35,
+    AutoRefundTriggerNotFound = 36,
+    DuplicateAutoRefundTrigger = 37,
+    AddressFlaggedForFraud = 38,
+    FraudSignalNotFound = 40,
     // Issue #144: Notification hook errors
     HookNotFound = 41,
     MaxHooksPerEventReached = 42,
@@ -226,11 +219,18 @@ pub enum Error {
     // Issue #148: Customer eligibility errors
     CustomerBlockedFromRefund = 44,
     EligibilityEntryNotFound = 45,
+    TemplateNotFound = 46,
+    TemplateInactive = 47,
     // Issue #XXX: Payment refund cap errors
     RefundCountCapExceeded = 48,
     RefundAmountCapExceeded = 49,
     UnsupportedRefundToken = 50,
-    NoSeniorArbitrators = 51,
+    // New specific errors
+    VoucherNotFound = 52,
+    VoucherExpired = 53,
+    VoucherAlreadyRedeemed = 54,
+    EvidenceAlreadySubmitted = 55,
+    CaseAlreadyEscalated = 56,
 }
 
 #[contractevent]
@@ -690,6 +690,7 @@ pub struct RefundPolicy {
     pub active: bool,
     pub created_at: u64,
     pub updated_at: u64,
+    pub default_window_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1057,7 +1058,7 @@ pub struct FraudSignalReviewed {
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum RefundExtKey {
-    CategoryWindow(Address, u8),
+    CategoryWindow(Address, u32),
     PaymentCategoryTag(u64),
     AssignmentConfig,
     RotationIndex,
@@ -1099,7 +1100,7 @@ pub enum PaymentCategory {
 }
 
 impl PaymentCategory {
-    pub fn to_index(&self) -> u8 {
+    pub fn to_index(&self) -> u32 {
         match self {
             PaymentCategory::DigitalGoods => 0,
             PaymentCategory::PhysicalGoods => 1,
@@ -1132,6 +1133,8 @@ pub struct ArbitratorAssignmentConfig {
 pub struct RefundTTLConfig {
     pub default_ttl_seconds: u64,
     pub active: bool,
+}
+
 /// Event emitted when platform fee is deducted from a refund
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1167,6 +1170,8 @@ pub struct RefundContract;
 
 #[contractimpl]
 impl RefundContract {
+    const BATCH_DECISION_LIMIT: u32 = 50;
+
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
@@ -1185,6 +1190,7 @@ impl RefundContract {
             active: true,
             created_at: env.ledger().timestamp(),
             updated_at: env.ledger().timestamp(),
+            default_window_seconds: 30 * 24 * 60 * 60, // 30 days
         };
         env.storage().instance().set(&DataKey::DefaultRefundPolicy, &default_policy);
 
@@ -1651,7 +1657,7 @@ impl RefundContract {
             .storage()
             .instance()
             .get(&DataKey::MerchantRefundQuota(merchant.clone()))
-            .ok_or(Error::QuotaNotConfigured)?;
+            .ok_or(Error::PolicyNotFound)?;
         quota.used = 0;
         quota.period_start = env.ledger().timestamp();
         env.storage()
@@ -2429,6 +2435,7 @@ impl RefundContract {
             active: true,
             created_at: env.ledger().timestamp(),
             updated_at: env.ledger().timestamp(),
+            default_window_seconds: 30 * 24 * 60 * 60,
         };
 
         Self::set_requires_admin_approval_inner(&env, &merchant, true);
@@ -2695,6 +2702,54 @@ impl RefundContract {
     /// Withdraw accumulated treasury fees
     /// Requires admin authorization
     /// Returns the amount withdrawn
+    fn deduct_refund_fee(
+        env: &Env,
+        refund_id: u64,
+        amount: i128,
+        token: &Address,
+    ) -> Result<(i128, i128), Error> {
+        let config: RefundFeeConfig = match env
+            .storage()
+            .instance()
+            .get(&SystemKey::RefundFeeConfig)
+        {
+            Some(c) => c,
+            None => return Ok((amount, 0)),
+        };
+        if !config.active {
+            return Ok((amount, 0));
+        }
+        let raw_fee = amount
+            .saturating_mul(config.fee_bps as i128)
+            .checked_div(10_000)
+            .unwrap_or(0);
+        let fee = raw_fee.max(config.min_fee).min(config.max_fee);
+        let net = amount.saturating_sub(fee);
+        if fee > 0 {
+            token::Client::new(env, token).transfer(
+                &env.current_contract_address(),
+                &config.treasury,
+                &fee,
+            );
+            let accumulated: i128 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::AccumulatedRefundFees)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&SystemKey::AccumulatedRefundFees, &accumulated.saturating_add(fee));
+            (RefundFeeDeducted {
+                refund_id,
+                fee_amount: fee,
+                net_refund_amount: net,
+                treasury: config.treasury,
+            })
+            .publish(env);
+        }
+        Ok((net, fee))
+    }
+
     pub fn withdraw_treasury_fees(env: Env, admin: Address) -> Result<i128, Error> {
         admin.require_auth();
 
@@ -3070,6 +3125,7 @@ impl RefundContract {
             active: true,
             created_at: now,
             updated_at: now,
+            default_window_seconds: 30 * 24 * 60 * 60,
         };
 
         env.storage().instance().set(&DataKey::RefundPolicy(merchant.clone()), &policy);
@@ -3354,15 +3410,11 @@ impl RefundContract {
         let executed_at = env.ledger().timestamp();
         
         // Create hash of override details for immutability verification
-        let override_details = format!(
-            "{}:{}:{}:{}:{}",
-            refund_id,
-            admin.to_string(),
-            reason,
-            refund.amount,
-            executed_at
-        );
-        let transaction_hash = env.crypto().sha256(&Bytes::from_slice(&env, override_details.as_bytes()));
+        let mut hash_data = Bytes::new(&env);
+        hash_data.append(&Bytes::from_slice(&env, &refund_id.to_be_bytes()));
+        hash_data.append(&Bytes::from_slice(&env, &refund.amount.to_be_bytes()));
+        hash_data.append(&Bytes::from_slice(&env, &executed_at.to_be_bytes()));
+        let transaction_hash = env.crypto().sha256(&hash_data);
         
         let audit_entry = AdminOverrideHistory {
             override_id,
@@ -3372,7 +3424,7 @@ impl RefundContract {
             override_amount: refund.amount,
             override_status: refund.status.clone(),
             executed_at,
-            transaction_hash: transaction_hash.clone(),
+            transaction_hash: transaction_hash.into(),
         };
         
         // Store immutable audit log entry
@@ -4110,7 +4162,7 @@ impl RefundContract {
         // Issue #199: reject if TTL has expired
         if let Some(expires_at) = refund.expires_at {
             if env.ledger().timestamp() >= expires_at {
-                return Err(Error::RefundRequestExpired);
+                return Err(Error::RefundWindowExpired);
             }
         }
 
@@ -4177,7 +4229,7 @@ impl RefundContract {
                 .checked_add(refund.amount)
                 .ok_or(Error::InvalidAmount)?;
             if new_used > quota.limit {
-                return Err(Error::MerchantQuotaExceeded);
+                return Err(Error::RefundExceedsPolicy);
             }
             quota.used = new_used;
             env.storage()
@@ -4879,9 +4931,8 @@ impl RefundContract {
 
     // Helper functions for fraud detection
     fn get_customer_payment_count(env: &Env, address: &Address) -> u64 {
-        // This would typically call the payment contract to get actual statistics
-        // For now, return a placeholder value
-        10
+        // Without a payment contract configured, we have no payment data
+        0
     }
 
     fn get_customer_refund_count(env: &Env, address: &Address) -> u64 {
@@ -4892,6 +4943,29 @@ impl RefundContract {
             .get(&DataKey::CustomerRefundCount(address.clone()))
             .unwrap_or(0);
         refund_count
+    }
+
+    fn update_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
+        let config: RefundCooldownConfig = match env
+            .storage()
+            .instance()
+            .get(&SystemKey::RefundCooldownConfig)
+        {
+            Some(c) => c,
+            None => return Ok(()), // No cooldown configured, skip
+        };
+        if !config.enabled {
+            return Ok(());
+        }
+        let record = CustomerRefundCooldown {
+            customer: customer.clone(),
+            last_refund_requested_at: env.ledger().timestamp(),
+            cooldown_seconds: config.cooldown_seconds,
+        };
+        env.storage()
+            .instance()
+            .set(&SystemKey::CustomerRefundCooldown(customer.clone()), &record);
+        Ok(())
     }
 
     // Issue #147: Customer refund history functions
@@ -5451,29 +5525,32 @@ impl RefundContract {
             return results;
         }
 
-        if refund_ids.len() > Self::BATCH_DECISION_LIMIT {
-            return Err(Error::BatchSizeLimitExceeded);
-        }
+        let total = Self::get_merchant_refund_count(env, merchant);
+        let mut matched = 0u64;
+        let mut collected = 0u64;
+        let mut index = 0u64;
 
-        let mut succeeded = Vec::new(&env);
-        let mut failed = Vec::new(&env);
-        let mut had_failure = false;
-
-        for refund_id in refund_ids.iter() {
-            match Self::approve_refund_internal(&env, admin.clone(), refund_id) {
-                Ok(()) => succeeded.push_back(refund_id),
-                Err(_) => {
-                    failed.push_back(refund_id);
-                    had_failure = true;
+        while index < total && collected < limit {
+            if
+                let Some(refund_id) = env
+                    .storage()
+                    .instance()
+                    .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
+            {
+                if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(refund_id)) {
+                    if refund.status == status {
+                        if matched >= offset {
+                            results.push_back(refund);
+                            collected += 1;
+                        }
+                        matched += 1;
+                    }
                 }
             }
+            index += 1;
         }
 
-        if had_failure {
-            return Err(Error::BatchDecisionPartialFailure);
-        }
-
-        Ok(BatchDecisionResult { succeeded, failed })
+        results
     }
 
     pub fn batch_reject_refunds(
@@ -5493,7 +5570,7 @@ impl RefundContract {
         }
 
         if refund_ids.len() > Self::BATCH_DECISION_LIMIT {
-            return Err(Error::BatchSizeLimitExceeded);
+            return Err(Error::BatchRefundTooLarge);
         }
 
         let mut succeeded = Vec::new(&env);
@@ -5541,7 +5618,7 @@ impl RefundContract {
         let _ = note_hash;
 
         if had_failure {
-            return Err(Error::BatchDecisionPartialFailure);
+            return Err(Error::BatchRefundTooLarge);
         }
 
         Ok(BatchDecisionResult { succeeded, failed })
@@ -5603,7 +5680,7 @@ impl RefundContract {
             .instance()
             .has(&RefundExtKey::PaymentCategoryTag(payment_id))
         {
-            return Err(Error::PaymentCategoryAlreadySet);
+            return Err(Error::AlreadyProcessed);
         }
         let cat_idx = category.to_index();
         env.storage()
@@ -5614,10 +5691,10 @@ impl RefundContract {
 
     pub fn get_effective_window(env: Env, merchant: Address, payment_id: u64) -> u64 {
         let default_window: u64 = Self::get_refund_policy(&env, merchant.clone())
-            .map(|p| p.refund_window)
+            .map(|p| if p.default_window_seconds > 0 { p.default_window_seconds } else { 30 * 24 * 60 * 60 })
             .unwrap_or(30 * 24 * 60 * 60);
 
-        let cat_idx_opt: Option<u8> = env
+        let cat_idx_opt: Option<u32> = env
             .storage()
             .instance()
             .get(&RefundExtKey::PaymentCategoryTag(payment_id));
@@ -5662,11 +5739,11 @@ impl RefundContract {
             .unwrap_or(Vec::new(&env));
 
         if arbitrators.is_empty() {
-            return Err(Error::NoAvailableArbitrators);
+            return Err(Error::ArbitratorNotFound);
         }
 
         if panel_size as u32 > arbitrators.len() {
-            return Err(Error::PanelSizeExceedsArbitratorCount);
+            return Err(Error::ArbitratorNotFound);
         }
 
         let config = ArbitratorAssignmentConfig {
@@ -5684,7 +5761,7 @@ impl RefundContract {
             .storage()
             .instance()
             .get(&RefundExtKey::AssignmentConfig)
-            .ok_or(Error::AutoAssignmentNotConfigured)?;
+            .ok_or(Error::PolicyNotFound)?;
 
         let arbitrators: Vec<Address> = env
             .storage()
@@ -5693,12 +5770,12 @@ impl RefundContract {
             .unwrap_or(Vec::new(&env));
 
         if arbitrators.is_empty() {
-            return Err(Error::NoAvailableArbitrators);
+            return Err(Error::ArbitratorNotFound);
         }
 
         let total = arbitrators.len() as u32;
         if config.panel_size > total {
-            return Err(Error::PanelSizeExceedsArbitratorCount);
+            return Err(Error::ArbitratorNotFound);
         }
 
         let mut panel = Vec::new(&env);
@@ -5761,7 +5838,7 @@ impl RefundContract {
             .storage()
             .instance()
             .get(&RefundExtKey::AssignmentConfig)
-            .ok_or(Error::AutoAssignmentNotConfigured)?;
+            .ok_or(Error::PolicyNotFound)?;
 
         config.rotation_index = 0;
         env.storage()
@@ -5808,10 +5885,10 @@ impl RefundContract {
             return Err(Error::InvalidStatus);
         }
 
-        let expires_at = refund.expires_at.ok_or(Error::TTLNotConfigured)?;
+        let expires_at = refund.expires_at.ok_or(Error::PolicyNotFound)?;
 
         if env.ledger().timestamp() < expires_at {
-            return Err(Error::RefundRequestExpired);
+            return Err(Error::RefundWindowExpired);
         }
 
         Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
@@ -5861,46 +5938,6 @@ impl RefundContract {
                 }
             }
             id += 1;
-        }
-
-        results
-    }
-
-    fn get_merchant_refunds_by_status_internal(
-        env: &Env,
-        merchant: &Address,
-        status: RefundStatus,
-        limit: u64,
-        offset: u64
-    ) -> Vec<Refund> {
-        let mut results: Vec<Refund> = Vec::new(env);
-        if limit == 0 {
-            return results;
-        }
-
-        let total = Self::get_merchant_refund_count(env, merchant);
-        let mut matched = 0u64;
-        let mut collected = 0u64;
-        let mut index = 0u64;
-
-        while index < total && collected < limit {
-            if
-                let Some(refund_id) = env
-                    .storage()
-                    .instance()
-                    .get::<_, u64>(&DataKey::MerchantRefunds(merchant.clone(), index))
-            {
-                if let Some(refund) = env.storage().instance().get::<_, Refund>(&DataKey::Refund(refund_id)) {
-                    if refund.status == status {
-                        if matched >= offset {
-                            results.push_back(refund);
-                            collected += 1;
-                        }
-                        matched += 1;
-                    }
-                }
-            }
-            index += 1;
         }
 
         results
@@ -6308,10 +6345,10 @@ impl RefundContract {
             .storage()
             .instance()
             .get(&ArbitrationKey::ArbitrationTierConfig)
-            .ok_or(Error::EscalationNotAllowed)?;
+            .ok_or(Error::CaseNotTimedOut)?;
 
         if env.ledger().timestamp() < case.created_at.saturating_add(config.escalation_timeout_seconds) {
-            return Err(Error::EscalationNotAllowed);
+            return Err(Error::CaseNotTimedOut);
         }
 
         let senior_list: Vec<Address> = env
@@ -6321,7 +6358,7 @@ impl RefundContract {
             .unwrap_or(Vec::new(&env));
 
         if senior_list.len() == 0 {
-            return Err(Error::NoSeniorArbitrators);
+            return Err(Error::ArbitratorNotFound);
         }
 
         case.arbitrators = senior_list;
@@ -6396,16 +6433,16 @@ impl RefundContract {
         refund_amount: i128,
     ) -> Result<(), Error> {
         // If no cap is set, no restriction applies
-        let cap = match env.storage().instance().get(&DataKey::PaymentRefundCap(payment_id)) {
+        let cap: PaymentRefundCap = match env.storage().instance().get(&DataKey::PaymentRefundCap(payment_id)) {
             Some(c) => c,
             None => return Ok(()),
         };
 
-        let (current_count, current_amount) = env
+        let (current_count, current_amount): (u32, i128) = env
             .storage()
             .instance()
             .get(&DataKey::PaymentRefundUsage(payment_id))
-            .unwrap_or((0, 0));
+            .unwrap_or((0u32, 0i128));
 
         // Check count cap (only for Requested and Approved statuses)
         if current_count >= cap.max_refund_count {
@@ -6426,13 +6463,13 @@ impl RefundContract {
         payment_id: u64,
         refund_amount: i128,
     ) {
-        let (current_count, current_amount) = env
+        let (current_count, current_amount): (u32, i128) = env
             .storage()
             .instance()
             .get(&DataKey::PaymentRefundUsage(payment_id))
-            .unwrap_or((0, 0));
+            .unwrap_or((0u32, 0i128));
 
-        let new_count = current_count.saturating_add(1);
+        let new_count = current_count.saturating_add(1u32);
         let new_amount = current_amount.saturating_add(refund_amount);
 
         env.storage()

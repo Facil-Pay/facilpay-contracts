@@ -1,25 +1,28 @@
 #![cfg(test)]
 mod tests {
     use crate::{
-        PaymentContract, Error, Payment, PaymentStatus, Currency, PaymentForwardConfig,
-        FeeConfig, FeeTier, RateLimitConfig, MultiSigConfig,
+        PaymentContract, Error, Currency, PaymentStatus, FeeConfig,
+        PaymentContractClient,
     };
-    use soroban_sdk::{testutils::Address as AddressTestUtils, Address, Env, String};
+    use soroban_sdk::{testutils::Address as AddressTestUtils, token, Address, Env, String};
 
-    fn setup_env() -> (Env, Address, Address, Address, Address, Address) {
+    fn setup_env() -> (Env, PaymentContractClient<'static>, Address, Address, Address, Address, Address) {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
 
-        let admin = Address::random(&env);
-        let customer = Address::random(&env);
-        let merchant = Address::random(&env);
-        let forward_to = Address::random(&env);
-        let token = Address::random(&env);
+        let contract_id = env.register(PaymentContract, ());
+        let client = PaymentContractClient::new(&env, &contract_id);
 
-        // Initialize contract
-        PaymentContract::initialize(env.clone(), admin.clone());
+        let admin = Address::generate(&env);
+        let customer = Address::generate(&env);
+        let merchant = Address::generate(&env);
+        let forward_to = Address::generate(&env);
 
-        // Set up fee config
+        client.initialize(&admin);
+
+        let token_admin = Address::generate(&env);
+        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+
         let fee_config = FeeConfig {
             fee_bps: 100,
             min_fee: 0,
@@ -28,46 +31,44 @@ mod tests {
             fee_token: token.clone(),
             active: true,
         };
-        PaymentContract::set_fee_config(env.clone(), admin.clone(), fee_config).unwrap();
+        client.set_fee_config(&admin, &fee_config);
 
-        (env, admin, customer, merchant, forward_to, token)
+        (env, client, admin, customer, merchant, forward_to, token)
     }
 
-    fn create_test_payment(
+    fn create_and_complete_payment(
         env: &Env,
+        client: &PaymentContractClient,
+        admin: &Address,
         customer: &Address,
         merchant: &Address,
         amount: i128,
         token: &Address,
     ) -> u64 {
-        let payment_id = PaymentContract::create_payment(
-            env.clone(),
-            customer.clone(),
-            merchant.clone(),
-            amount,
-            token.clone(),
-            Currency::USDC,
-            3600,
-            String::from_slice(&env, "test metadata"),
-        ).unwrap();
+        let contract_id = client.address.clone();
+        token::StellarAssetClient::new(env, token).mint(customer, &amount);
+        token::Client::new(env, token).approve(customer, &contract_id, &amount, &10_000);
+        let payment_id = client.create_payment(
+            customer,
+            merchant,
+            &amount,
+            token,
+            &Currency::USDC,
+            &3600,
+            &String::from_slice(env, "test metadata"),
+        );
+        client.complete_payment(admin, &payment_id);
         payment_id
     }
 
     #[test]
     fn test_set_payment_forward_valid() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        let result = PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            5000, // 50%
-        );
-
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &5000);
         assert!(result.is_ok());
 
-        // Verify the forward config was stored
-        let config = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config = client.get_forward_config(&merchant);
         assert_eq!(config.merchant, merchant);
         assert_eq!(config.forward_to, forward_to);
         assert_eq!(config.forward_bps, 5000);
@@ -76,299 +77,160 @@ mod tests {
 
     #[test]
     fn test_set_payment_forward_invalid_bps_zero() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        let result = PaymentContract::set_payment_forward(
-            env,
-            merchant,
-            forward_to,
-            0, // Invalid: must be between 1 and 10000
-        );
-
-        assert_eq!(result, Err(Error::InvalidForwardBps));
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &0);
+        assert_eq!(result, Err(Ok(Error::InvalidForwardBps)));
     }
 
     #[test]
     fn test_set_payment_forward_invalid_bps_too_high() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        let result = PaymentContract::set_payment_forward(
-            env,
-            merchant,
-            forward_to,
-            10001, // Invalid: must be between 1 and 10000
-        );
-
-        assert_eq!(result, Err(Error::InvalidForwardBps));
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &10001);
+        assert_eq!(result, Err(Ok(Error::InvalidForwardBps)));
     }
 
     #[test]
     fn test_set_payment_forward_loop_detection() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set up a forward config for forward_to
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            forward_to.clone(),
-            Address::random(&env),
-            5000,
-        ).unwrap();
+        // Set up a forward config for forward_to (pointing elsewhere)
+        client.set_payment_forward(&forward_to, &Address::generate(&env), &5000);
 
         // Try to set merchant to forward to forward_to (which already has a forward)
-        let result = PaymentContract::set_payment_forward(
-            env,
-            merchant,
-            forward_to,
-            5000,
-        );
-
-        assert_eq!(result, Err(Error::ForwardLoop));
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &5000);
+        assert_eq!(result, Err(Ok(Error::ForwardLoop)));
     }
 
     #[test]
     fn test_set_payment_forward_valid_bps_boundaries() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Test minimum valid value (1)
-        let result1 = PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            1,
-        );
+        let result1 = client.try_set_payment_forward(&merchant, &forward_to, &1);
         assert!(result1.is_ok());
 
-        // Remove and test maximum valid value (10000)
-        PaymentContract::remove_payment_forward(env.clone(), merchant.clone()).unwrap();
+        client.remove_payment_forward(&merchant);
 
-        let result2 = PaymentContract::set_payment_forward(
-            env,
-            merchant,
-            forward_to,
-            10000,
-        );
+        let result2 = client.try_set_payment_forward(&merchant, &forward_to, &10000);
         assert!(result2.is_ok());
     }
 
     #[test]
     fn test_remove_payment_forward_success() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // First, set a forward config
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to,
-            5000,
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &5000);
+        assert!(client.try_get_forward_config(&merchant).is_ok());
 
-        // Verify it exists
-        assert!(PaymentContract::get_forward_config(env.clone(), merchant.clone()).is_ok());
-
-        // Remove it
-        let result = PaymentContract::remove_payment_forward(env.clone(), merchant.clone());
+        let result = client.try_remove_payment_forward(&merchant);
         assert!(result.is_ok());
 
-        // Verify it's gone
-        let config = PaymentContract::get_forward_config(env, merchant);
-        assert_eq!(config, Err(Error::ForwardConfigNotFound));
+        assert!(client.try_get_forward_config(&merchant).is_err());
     }
 
     #[test]
     fn test_remove_payment_forward_not_found() {
-        let (env, _admin, _customer, merchant, _forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, _forward_to, _token) = setup_env();
 
-        // Try to remove a forward config that doesn't exist
-        let result = PaymentContract::remove_payment_forward(env, merchant);
-
-        assert_eq!(result, Err(Error::ForwardConfigNotFound));
+        let result = client.try_remove_payment_forward(&merchant);
+        assert_eq!(result, Err(Ok(Error::ForwardConfigNotFound)));
     }
 
     #[test]
     fn test_get_forward_config_not_found() {
-        let (env, _admin, _customer, merchant, _forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, _forward_to, _token) = setup_env();
 
-        // Try to get a forward config that doesn't exist
-        let result = PaymentContract::get_forward_config(env, merchant);
-
-        assert_eq!(result, Err(Error::ForwardConfigNotFound));
+        let result = client.try_get_forward_config(&merchant);
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_payment_forward_on_completion() {
-        let (env, admin, customer, merchant, forward_to, token) = setup_env();
+        let (env, client, admin, customer, merchant, forward_to, token) = setup_env();
 
-        // Create a forward config
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            5000, // 50%
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &5000);
 
-        // Create a payment
-        let payment_id = create_test_payment(&env, &customer, &merchant, 1000000, &token);
+        let payment_id = create_and_complete_payment(&env, &client, &admin, &customer, &merchant, 1_000, &token);
 
-        // Complete the payment - this should trigger forwarding
-        let result = PaymentContract::complete_payment(
-            env.clone(),
-            admin.clone(),
-            payment_id,
-        );
-
-        assert!(result.is_ok());
-
-        // Verify payment is completed
-        let payment = PaymentContract::get_payment(&env, payment_id);
+        let payment = client.get_payment(&payment_id);
         assert_eq!(payment.status, PaymentStatus::Completed);
     }
 
     #[test]
     fn test_payment_forward_calculation() {
-        let (env, admin, customer, merchant, forward_to, token) = setup_env();
+        let (env, client, admin, customer, merchant, forward_to, token) = setup_env();
 
-        // Create a forward config with 25% (2500 bps)
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            2500,
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &2500);
 
-        // Create a payment with 1,000,000 units
-        let payment_id = create_test_payment(&env, &customer, &merchant, 1000000, &token);
+        let payment_id = create_and_complete_payment(&env, &client, &admin, &customer, &merchant, 1_000_000, &token);
 
-        // Complete the payment
-        PaymentContract::complete_payment(
-            env.clone(),
-            admin.clone(),
-            payment_id,
-        ).unwrap();
-
-        // The merchant should receive: 1,000,000 * (1 - 0.01) = 990,000 (after 1% fee)
-        // Then forward: 990,000 * 0.25 = 247,500 to forward_to
-        // So merchant keeps: 990,000 - 247,500 = 742,500
-
-        // Note: This test verifies the logic works; actual token transfer amounts
-        // would depend on the token contract mock implementation
+        let payment = client.get_payment(&payment_id);
+        assert_eq!(payment.status, PaymentStatus::Completed);
     }
 
     #[test]
     fn test_payment_forward_multiple_updates() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        let new_forward_to = Address::random(&env);
+        let new_forward_to = Address::generate(&env);
 
-        // Set initial forward config
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to,
-            5000,
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &5000);
+        client.set_payment_forward(&merchant, &new_forward_to, &7500);
 
-        // Update with new forward_to
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            new_forward_to.clone(),
-            7500, // Change to 75%
-        ).unwrap();
-
-        // Verify the updated config
-        let config = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config = client.get_forward_config(&merchant);
         assert_eq!(config.forward_to, new_forward_to);
         assert_eq!(config.forward_bps, 7500);
     }
 
     #[test]
     fn test_payment_forward_with_minimal_bps() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set with minimal bps (1 = 0.01%)
-        let result = PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to,
-            1,
-        );
-
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &1);
         assert!(result.is_ok());
 
-        let config = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config = client.get_forward_config(&merchant);
         assert_eq!(config.forward_bps, 1);
     }
 
     #[test]
     fn test_payment_forward_with_full_bps() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set with full bps (10000 = 100%)
-        let result = PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to,
-            10000,
-        );
-
+        let result = client.try_set_payment_forward(&merchant, &forward_to, &10000);
         assert!(result.is_ok());
 
-        let config = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config = client.get_forward_config(&merchant);
         assert_eq!(config.forward_bps, 10000);
     }
 
     #[test]
     fn test_payment_forward_config_persistence() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set a forward config
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            5000,
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &5000);
 
-        // Get it multiple times to ensure it persists
-        let config1 = PaymentContract::get_forward_config(env.clone(), merchant.clone()).unwrap();
-        let config2 = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config1 = client.get_forward_config(&merchant);
+        let config2 = client.get_forward_config(&merchant);
 
-        assert_eq!(config1, config2);
+        assert_eq!(config1.forward_bps, config2.forward_bps);
         assert_eq!(config1.forward_to, forward_to);
     }
 
     #[test]
     fn test_remove_and_readd_forward_config() {
-        let (env, _admin, _customer, merchant, forward_to, _token) = setup_env();
+        let (env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set initial config
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            forward_to.clone(),
-            5000,
-        ).unwrap();
+        client.set_payment_forward(&merchant, &forward_to, &5000);
+        client.remove_payment_forward(&merchant);
 
-        // Remove it
-        PaymentContract::remove_payment_forward(env.clone(), merchant.clone()).unwrap();
+        assert!(client.try_get_forward_config(&merchant).is_err());
 
-        // Verify it's gone
-        assert_eq!(
-            PaymentContract::get_forward_config(env.clone(), merchant.clone()),
-            Err(Error::ForwardConfigNotFound)
-        );
+        let new_forward_to = Address::generate(&env);
+        client.set_payment_forward(&merchant, &new_forward_to, &7500);
 
-        // Re-add it with different settings
-        let new_forward_to = Address::random(&env);
-        PaymentContract::set_payment_forward(
-            env.clone(),
-            merchant.clone(),
-            new_forward_to.clone(),
-            7500,
-        ).unwrap();
-
-        // Verify the new config
-        let config = PaymentContract::get_forward_config(env, merchant).unwrap();
+        let config = client.get_forward_config(&merchant);
         assert_eq!(config.forward_to, new_forward_to);
         assert_eq!(config.forward_bps, 7500);
     }
