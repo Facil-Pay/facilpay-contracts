@@ -8293,6 +8293,9 @@ mod swap_test;
 #[cfg(test)]
 mod hierarchy_test;
 
+#[cfg(test)]
+mod dispute_and_multiparty_test;
+
 // mod test;
 
 // #[cfg(test)]
