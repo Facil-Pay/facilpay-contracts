@@ -1,12 +1,12 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
 
-fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+fn create_token_contract<'a>(
+    env: &Env,
+    admin: &Address,
+) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
     let contract = env.register_stellar_asset_contract_v2(admin.clone());
     let contract_address = contract.address();
     (
@@ -142,12 +142,8 @@ fn test_stake_deposit_on_escalation() {
     // Escalate to arbitration (should require stake)
     let fee_pool = 1000i128;
 
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // With mock_all_auths, balances don't actually change
     // Just verify stake record was created
@@ -211,12 +207,8 @@ fn test_stake_returned_on_win() {
     // Escalate to arbitration
     let fee_pool = 1000i128;
 
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Vote against refund (merchant wins)
     let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -296,12 +288,8 @@ fn test_stake_forfeited_on_loss() {
     // Escalate to arbitration
     let fee_pool = 1000i128;
 
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Vote for refund (merchant loses)
     let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -362,12 +350,8 @@ fn test_escalation_without_stake_config() {
     // Escalate to arbitration (should work without stake)
     let fee_pool = 1000i128;
 
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Verify no stake was recorded
     let stake = client.get_arbitration_stake(&case_id);
@@ -425,12 +409,8 @@ fn test_escalation_with_disabled_stake() {
     // Escalate to arbitration (should work without stake since disabled)
     let fee_pool = 1000i128;
 
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Verify no stake was recorded
     let stake = client.get_arbitration_stake(&case_id);

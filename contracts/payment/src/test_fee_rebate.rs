@@ -97,7 +97,15 @@ fn test_no_accrual_below_threshold() {
     // Threshold = 5000; payment = 1000 (below threshold)
     client.configure_fee_rebate(&admin, &rebate_config(5_000, 2000, 86_400));
 
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     let accrual = client.get_rebate_accrual(&merchant);
     // Either None or zero accrued_rebate
@@ -114,7 +122,15 @@ fn test_accrual_above_threshold() {
     client.configure_fee_rebate(&admin, &rebate_config(500, 2000, 86_400));
 
     // Payment of 1000 → fee = 10 → rebate = 20% of 10 = 2
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     let accrual = client.get_rebate_accrual(&merchant).unwrap();
     assert!(accrual.accrued_rebate > 0);
@@ -127,7 +143,15 @@ fn test_claim_rebate() {
     let (env, client, admin, token_addr, customer, merchant) = setup();
 
     client.configure_fee_rebate(&admin, &rebate_config(500, 2000, 86_400));
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     let accrual_before = client.get_rebate_accrual(&merchant).unwrap();
     assert!(accrual_before.accrued_rebate > 0);
@@ -146,7 +170,15 @@ fn test_double_claim_guard() {
     let (env, client, admin, token_addr, customer, merchant) = setup();
 
     client.configure_fee_rebate(&admin, &rebate_config(500, 2000, 86_400));
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     client.claim_fee_rebate(&merchant);
 
@@ -162,7 +194,15 @@ fn test_period_reset() {
     // 10-second period
     client.configure_fee_rebate(&admin, &rebate_config(500, 2000, 10));
 
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     let accrual_before = client.get_rebate_accrual(&merchant).unwrap();
     assert!(accrual_before.accrued_rebate > 0);
@@ -174,9 +214,22 @@ fn test_period_reset() {
     let token_sa = StellarAssetClient::new(&env, &token_addr);
     let token = TokenClient::new(&env, &token_addr);
     token_sa.mint(&customer, &1_000_000);
-    token.approve(&customer, &contract_id_from_client(&client), &1_000_000, &10_000);
+    token.approve(
+        &customer,
+        &contract_id_from_client(&client),
+        &1_000_000,
+        &10_000,
+    );
 
-    do_payment(&env, &client, &admin, &customer, &merchant, &token_addr, 1_000);
+    do_payment(
+        &env,
+        &client,
+        &admin,
+        &customer,
+        &merchant,
+        &token_addr,
+        1_000,
+    );
 
     let accrual_after = client.get_rebate_accrual(&merchant).unwrap();
     // Period was reset: period_volume should equal only the new payment

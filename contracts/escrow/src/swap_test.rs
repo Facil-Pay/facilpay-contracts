@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, contract, contractimpl};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
 
 #[contract]
 pub struct MockSwapOracle;
@@ -39,27 +39,14 @@ fn test_escrow_swap_successful() {
 
     // Create escrow (8 arguments as defined in lib.rs)
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Set rate to 1.5 (15_000_000)
     oracle_client.set_rate(&15_000_000_i128);
 
     // Configure swap by merchant (min_output = 1400)
-    client.configure_escrow_swap(
-        &merchant,
-        &escrow_id,
-        &target_token,
-        &1400_i128,
-        &oracle,
-    );
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1400_i128, &oracle);
 
     // Verify config is retrieved correctly
     let config = client.get_swap_config(&escrow_id).unwrap();
@@ -102,26 +89,13 @@ fn test_escrow_swap_successful_by_admin() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     oracle_client.set_rate(&15_000_000_i128);
 
     // Configure swap by admin
-    client.configure_escrow_swap(
-        &admin,
-        &escrow_id,
-        &target_token,
-        &1400_i128,
-        &oracle,
-    );
+    client.configure_escrow_swap(&admin, &escrow_id, &target_token, &1400_i128, &oracle);
 
     // Execute swap by admin
     let output = client.execute_escrow_swap(&admin, &escrow_id);
@@ -150,27 +124,14 @@ fn test_escrow_swap_below_minimum_fails() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Set rate to 1.2 (12_000_000) -> output = 1200
     oracle_client.set_rate(&12_000_000_i128);
 
     // Configure swap (min_output = 1300)
-    client.configure_escrow_swap(
-        &merchant,
-        &escrow_id,
-        &target_token,
-        &1300_i128,
-        &oracle,
-    );
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1300_i128, &oracle);
 
     // Executing should fail with SwapOutputBelowMinimum
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
@@ -195,25 +156,12 @@ fn test_escrow_swap_double_execution_fails() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     oracle_client.set_rate(&15_000_000_i128);
 
-    client.configure_escrow_swap(
-        &merchant,
-        &escrow_id,
-        &target_token,
-        &1400_i128,
-        &oracle,
-    );
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1400_i128, &oracle);
 
     // Execute first time: success
     let output = client.execute_escrow_swap(&merchant, &escrow_id);
@@ -242,14 +190,7 @@ fn test_escrow_swap_unauthorized_config_fails() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Non-merchant, non-admin tries to configure swap: fails with Unauthorized
@@ -281,23 +222,10 @@ fn test_escrow_swap_unauthorized_execute_fails() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
-    client.configure_escrow_swap(
-        &merchant,
-        &escrow_id,
-        &target_token,
-        &1400_i128,
-        &oracle,
-    );
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1400_i128, &oracle);
 
     // Non-merchant, non-admin tries to execute swap: fails with Unauthorized
     let res = client.try_execute_escrow_swap(&unauthorized_caller, &escrow_id);
@@ -319,14 +247,7 @@ fn test_escrow_swap_config_not_found_fails() {
     client.initialize(&admin);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Execute swap directly without configuring first: fails with SwapConfigNotFound

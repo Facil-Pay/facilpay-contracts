@@ -32,7 +32,7 @@ fn test_global_refund_rate_limit() {
             &token,
             &reason,
             &RefundReasonCode::Other,
-            &0
+            &0,
         );
     }
 
@@ -46,7 +46,7 @@ fn test_global_refund_rate_limit() {
         &token,
         &reason,
         &RefundReasonCode::Other,
-        &0
+        &0,
     );
 
     assert!(res.is_err());
@@ -69,7 +69,7 @@ fn test_customer_override_refund_rate_limit() {
 
     // Set global limit: 1 request per 24 hours
     client.set_global_refund_rate_limit(&admin, &1, &86400);
-    
+
     // Set customer override: 5 requests per 24 hours
     client.set_customer_rate_limit(&admin, &customer, &5, &86400);
 
@@ -84,10 +84,10 @@ fn test_customer_override_refund_rate_limit() {
             &token,
             &reason,
             &RefundReasonCode::Other,
-            &0
+            &0,
         );
     }
-    
+
     let status = client.get_customer_rate_limit_status(&customer);
     assert_eq!(status.request_count, 3);
 }
@@ -120,7 +120,7 @@ fn test_rate_limit_window_reset() {
         &token,
         &reason,
         &RefundReasonCode::Other,
-        &0
+        &0,
     );
 
     // 2nd request fails
@@ -133,7 +133,7 @@ fn test_rate_limit_window_reset() {
         &token,
         &reason,
         &RefundReasonCode::Other,
-        &0
+        &0,
     );
     assert!(res.is_err());
 
@@ -150,6 +150,6 @@ fn test_rate_limit_window_reset() {
         &token,
         &reason,
         &RefundReasonCode::Other,
-        &0
+        &0,
     );
 }

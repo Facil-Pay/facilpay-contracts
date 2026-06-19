@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{ testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String };
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String,
+};
 
 #[test]
 fn test_set_refund_policy_successfully() {
@@ -15,7 +17,13 @@ fn test_set_refund_policy_successfully() {
     client.initialize(&admin);
 
     env.mock_all_auths();
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 14, max_refund_bps: 5000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 14,
+            max_refund_bps: 5000,
+        }],
+    );
     let requires_admin_approval = false;
     let auto_approve_below = 1000i128;
 
@@ -29,7 +37,10 @@ fn test_set_refund_policy_successfully() {
     assert_eq!(policy.merchant, merchant);
     assert_eq!(policy.tiers.get(0).unwrap().days_from_purchase, 14);
     assert_eq!(policy.tiers.get(0).unwrap().max_refund_bps, 5000);
-    assert_eq!(client.get_requires_admin_approval(&merchant), requires_admin_approval);
+    assert_eq!(
+        client.get_requires_admin_approval(&merchant),
+        requires_admin_approval
+    );
     assert_eq!(client.get_auto_approve_below(&merchant), auto_approve_below);
     assert!(policy.active);
 }
@@ -103,7 +114,13 @@ fn test_apply_template_to_merchant_overwrites_policy_and_preserves_history() {
     client.initialize(&admin);
 
     env.mock_all_auths();
-    let tiers1 = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 5000 }]);
+    let tiers1 = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 7,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers1);
 
     let tiers: Vec<(u32, i128)> = Vec::new(&env);
@@ -162,7 +179,13 @@ fn test_set_refund_policy_with_invalid_percentage_should_fail() {
     client.initialize(&admin);
 
     env.mock_all_auths();
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 15000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 15000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 }
 
@@ -179,7 +202,13 @@ fn test_deactivate_refund_policy_successfully() {
 
     env.mock_all_auths();
     // First set a policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     // Then deactivate it
@@ -230,7 +259,7 @@ fn test_admin_override_policy_successfully() {
         &token,
         &String::from_str(&env, "Test"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Then admin overrides policy
@@ -268,7 +297,7 @@ fn test_admin_override_policy_by_non_admin_should_fail() {
         &token,
         &String::from_str(&env, "Test"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Try to override with unauthorized user
@@ -292,7 +321,13 @@ fn test_refund_window_expired_should_fail() {
 
     env.mock_all_auths();
     // Set a policy with 1 day refund window
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 1, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 1,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     // Simulate payment created 2 days ago
@@ -308,7 +343,7 @@ fn test_refund_window_expired_should_fail() {
         &token,
         &String::from_str(&env, "Too late"),
         &RefundReasonCode::Other,
-        &payment_created_at
+        &payment_created_at,
     );
 
     assert_eq!(result, Err(Ok(Error::RefundWindowExpired)));
@@ -329,7 +364,13 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
 
     env.mock_all_auths();
     // Set a policy with 50% max refund
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 5000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     // Try to request 75% refund
@@ -342,7 +383,7 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
         &token,
         &String::from_str(&env, "Too much"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     assert_eq!(result, Err(Ok(Error::RefundExceedsPolicy)));
@@ -363,7 +404,13 @@ fn test_auto_approve_below_threshold() {
 
     env.mock_all_auths();
     // Set policy with auto-approve for amounts <= 500
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
     client.set_requires_admin_approval(&merchant, &false);
     client.set_auto_approve_below(&merchant, &500i128);
@@ -378,7 +425,7 @@ fn test_auto_approve_below_threshold() {
         &token,
         &String::from_str(&env, "Small refund"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     // Check that AutoApproved event was emitted (before next contract call clears events)
@@ -404,7 +451,13 @@ fn test_refund_with_inactive_policy_should_fail() {
 
     env.mock_all_auths();
     // Set a policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     // Deactivate it
@@ -420,7 +473,7 @@ fn test_refund_with_inactive_policy_should_fail() {
         &token,
         &String::from_str(&env, "Inactive policy"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     assert_eq!(result, Err(Ok(Error::PolicyInactive)));
@@ -452,7 +505,7 @@ fn test_refund_without_merchant_policy_uses_default() {
         &token,
         &String::from_str(&env, "Default policy"),
         &RefundReasonCode::Other,
-        &env.ledger().timestamp()
+        &env.ledger().timestamp(),
     );
 
     let refund = client.get_refund(&refund_id);
@@ -471,7 +524,13 @@ fn test_refund_policy_set_event_emitted() {
     client.initialize(&admin);
 
     env.mock_all_auths();
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 7,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     // Check that RefundPolicySet event was emitted
@@ -492,7 +551,13 @@ fn test_refund_policy_deactivated_event_emitted() {
 
     env.mock_all_auths();
     // Set and then deactivate policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant, &tiers);
 
     client.deactivate_refund_policy(&merchant);

@@ -22,7 +22,13 @@ fn test_single_level_inheritance() {
     env.mock_all_auths();
 
     // Parent sets their own policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 14, max_refund_bps: 7500 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 14,
+            max_refund_bps: 7500,
+        }],
+    );
     client.set_refund_policy(&parent_merchant, &tiers);
     client.set_requires_admin_approval(&parent_merchant, &false);
     client.set_auto_approve_below(&parent_merchant, &500i128);
@@ -63,7 +69,13 @@ fn test_multi_level_inheritance() {
     client.set_merchant_parent(&admin, &merchant_c, &merchant_b);
 
     // Only A has explicit policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&merchant_a, &tiers);
     client.set_requires_admin_approval(&merchant_a, &true);
     client.set_auto_approve_below(&merchant_a, &0i128);
@@ -95,13 +107,25 @@ fn test_child_override_priority() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent policy
-    let parent_tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let parent_tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&parent_merchant, &parent_tiers);
     client.set_requires_admin_approval(&parent_merchant, &true);
     client.set_auto_approve_below(&parent_merchant, &0i128);
 
     // Child sets their OWN policy (override)
-    let child_tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 5000 }]);
+    let child_tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 7,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&child_merchant, &child_tiers);
     client.set_requires_admin_approval(&child_merchant, &false);
     client.set_auto_approve_below(&child_merchant, &100i128);
@@ -229,7 +253,13 @@ fn test_inactive_policy_handling() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent sets their policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&parent_merchant, &tiers);
     client.set_requires_admin_approval(&parent_merchant, &true);
     client.set_auto_approve_below(&parent_merchant, &0i128);
@@ -266,7 +296,13 @@ fn test_inheritance_disabled() {
     client.set_merchant_parent(&admin, &child_merchant, &parent_merchant);
 
     // Parent has policy
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 30, max_refund_bps: 10000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 30,
+            max_refund_bps: 10000,
+        }],
+    );
     client.set_refund_policy(&parent_merchant, &tiers);
     client.set_requires_admin_approval(&parent_merchant, &true);
     client.set_auto_approve_below(&parent_merchant, &0i128);
@@ -451,7 +487,13 @@ fn test_parent_updates_existing_policy() {
     env.mock_all_auths();
 
     // Child sets policy first (no parent yet)
-    let tiers = Vec::from_array(&env, [RefundTier { days_from_purchase: 7, max_refund_bps: 5000 }]);
+    let tiers = Vec::from_array(
+        &env,
+        [RefundTier {
+            days_from_purchase: 7,
+            max_refund_bps: 5000,
+        }],
+    );
     client.set_refund_policy(&child, &tiers);
     client.set_requires_admin_approval(&child, &false);
     client.set_auto_approve_below(&child, &100i128);

@@ -24,7 +24,14 @@ fn default_config(enabled: bool) -> CircuitBreakerConfig {
     }
 }
 
-fn request(client: &RefundContractClient, merchant: &Address, customer: &Address, token: &Address, amount: i128, payment_amount: i128) -> u64 {
+fn request(
+    client: &RefundContractClient,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+    amount: i128,
+    payment_amount: i128,
+) -> u64 {
     let reason = soroban_sdk::String::from_str(&client.env, "test");
     client.request_refund(
         merchant,
@@ -50,8 +57,15 @@ fn test_circuit_breaker_trips_when_rate_exceeded() {
 
     // 10% threshold: 1000/10000 = 10%. request 1100/10000 = 11% -> should trip
     let result = client.try_request_refund(
-        &merchant, &1u64, &customer, &1100_i128, &10000_i128, &token,
-        &String::from_str(&env, "test"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &1u64,
+        &customer,
+        &1100_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "test"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
     assert_eq!(result, Err(Ok(Error::CircuitBreakerTripped)));
 
@@ -71,14 +85,28 @@ fn test_tripped_breaker_blocks_new_requests() {
 
     // Trip the breaker
     let _ = client.try_request_refund(
-        &merchant, &1u64, &customer, &1100_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &1u64,
+        &customer,
+        &1100_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
 
     // Now a small refund should also be blocked
     let result = client.try_request_refund(
-        &merchant, &2u64, &customer, &10_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &2u64,
+        &customer,
+        &10_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
     assert_eq!(result, Err(Ok(Error::CircuitBreakerTripped)));
 }
@@ -94,8 +122,15 @@ fn test_auto_reset_after_cooldown() {
 
     // Trip the breaker
     let _ = client.try_request_refund(
-        &merchant, &1u64, &customer, &1100_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &1u64,
+        &customer,
+        &1100_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
 
     // Advance past cooldown (600s from timestamp 1000)
@@ -103,8 +138,15 @@ fn test_auto_reset_after_cooldown() {
 
     // A small refund should succeed now (new window, low rate)
     let result = client.try_request_refund(
-        &merchant, &2u64, &customer, &10_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &2u64,
+        &customer,
+        &10_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
     assert!(result.is_ok());
 
@@ -123,8 +165,15 @@ fn test_manual_reset_by_admin() {
 
     // Trip the breaker
     let _ = client.try_request_refund(
-        &merchant, &1u64, &customer, &1100_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &1u64,
+        &customer,
+        &1100_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
 
     assert!(client.get_circuit_breaker_state().tripped);
@@ -146,8 +195,15 @@ fn test_disabled_breaker_does_not_block() {
 
     // High refund rate, but breaker disabled — should not block
     let result = client.try_request_refund(
-        &merchant, &1u64, &customer, &9000_i128, &10000_i128, &token,
-        &String::from_str(&env, "reason"), &RefundReasonCode::Other, &0u64,
+        &merchant,
+        &1u64,
+        &customer,
+        &9000_i128,
+        &10000_i128,
+        &token,
+        &String::from_str(&env, "reason"),
+        &RefundReasonCode::Other,
+        &0u64,
     );
     assert!(result.is_ok());
 

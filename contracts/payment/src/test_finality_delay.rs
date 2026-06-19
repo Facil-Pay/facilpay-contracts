@@ -1,5 +1,8 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 use crate::{Currency, Error, FinalityConfig, PaymentContract, PaymentContractClient};
 
@@ -9,7 +12,9 @@ fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
     let contract_id = env.register_contract(None, PaymentContract);
     let client = PaymentContractClient::new(&env, &contract_id);
     let admin = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&contract_id, &10_000_000);
     client.initialize(&admin);
@@ -19,11 +24,14 @@ fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
 #[test]
 fn test_configure_finality_delay() {
     let (_, client, admin, _) = setup();
-    client.configure_finality_delay(&admin, &FinalityConfig {
-        delay_seconds: 86400,
-        min_amount_threshold: 100,
-        active: true,
-    });
+    client.configure_finality_delay(
+        &admin,
+        &FinalityConfig {
+            delay_seconds: 86400,
+            min_amount_threshold: 100,
+            active: true,
+        },
+    );
     let cfg = client.get_finality_config().unwrap();
     assert_eq!(cfg.delay_seconds, 86400);
     assert!(cfg.active);
@@ -37,11 +45,14 @@ fn test_complete_payment_creates_pending_settlement() {
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
 
-    client.configure_finality_delay(&admin, &FinalityConfig {
-        delay_seconds: 3600,
-        min_amount_threshold: 100,
-        active: true,
-    });
+    client.configure_finality_delay(
+        &admin,
+        &FinalityConfig {
+            delay_seconds: 3600,
+            min_amount_threshold: 100,
+            active: true,
+        },
+    );
 
     let payment_id = client.create_payment(
         &customer,
@@ -67,11 +78,14 @@ fn test_finalize_before_release_at_fails() {
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
 
-    client.configure_finality_delay(&admin, &FinalityConfig {
-        delay_seconds: 3600,
-        min_amount_threshold: 100,
-        active: true,
-    });
+    client.configure_finality_delay(
+        &admin,
+        &FinalityConfig {
+            delay_seconds: 3600,
+            min_amount_threshold: 100,
+            active: true,
+        },
+    );
 
     let payment_id = client.create_payment(
         &customer,
@@ -96,11 +110,14 @@ fn test_finalize_after_delay_succeeds() {
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
 
-    client.configure_finality_delay(&admin, &FinalityConfig {
-        delay_seconds: 3600,
-        min_amount_threshold: 100,
-        active: true,
-    });
+    client.configure_finality_delay(
+        &admin,
+        &FinalityConfig {
+            delay_seconds: 3600,
+            min_amount_threshold: 100,
+            active: true,
+        },
+    );
 
     let payment_id = client.create_payment(
         &customer,
@@ -130,14 +147,22 @@ fn test_threshold_bypass_settles_immediately() {
     let merchant = Address::generate(&env);
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
-    soroban_sdk::token::Client::new(&env, &token_addr).approve(&customer, &client.address, &50, &10_000);
+    soroban_sdk::token::Client::new(&env, &token_addr).approve(
+        &customer,
+        &client.address,
+        &50,
+        &10_000,
+    );
 
     // min_amount_threshold = 1000, payment = 50 → bypass
-    client.configure_finality_delay(&admin, &FinalityConfig {
-        delay_seconds: 3600,
-        min_amount_threshold: 1000,
-        active: true,
-    });
+    client.configure_finality_delay(
+        &admin,
+        &FinalityConfig {
+            delay_seconds: 3600,
+            min_amount_threshold: 1000,
+            active: true,
+        },
+    );
 
     let payment_id = client.create_payment(
         &customer,

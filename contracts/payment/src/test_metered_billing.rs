@@ -1,10 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
 
 fn setup(env: &Env) -> (PaymentContractClient, Address, Address, Address, Address) {
     let id = env.register(PaymentContract, ());

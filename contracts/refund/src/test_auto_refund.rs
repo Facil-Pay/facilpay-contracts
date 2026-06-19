@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, testutils::Ledger, Address, Bytes, BytesN, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, testutils::Address as _, testutils::Ledger, Address, Bytes, BytesN,
+    Env, String,
+};
 
 fn setup(env: &Env) -> (RefundContractClient, Address) {
     let contract_id = env.register(RefundContract, ());
@@ -59,7 +62,12 @@ impl MockStateContract {
     }
 }
 
-fn sample_payment(env: &Env, merchant: &Address, customer: &Address, token: &Address) -> ExternalPayment {
+fn sample_payment(
+    env: &Env,
+    merchant: &Address,
+    customer: &Address,
+    token: &Address,
+) -> ExternalPayment {
     ExternalPayment {
         id: 7,
         customer: customer.clone(),
@@ -84,13 +92,16 @@ fn test_evaluate_auto_refund_triggers_on_timeout() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
     let token = Address::generate(&env);
-    let payment_contract = install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
+    let payment_contract =
+        install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
     client.set_payment_contract_address(&admin, &payment_contract);
 
     let trigger_id = client.register_auto_refund_trigger(
         &merchant,
         &7u64,
-        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition { fulfillment_deadline: 9_000 }),
+        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+            fulfillment_deadline: 9_000,
+        }),
         &2_500u32,
     );
 
@@ -112,13 +123,16 @@ fn test_evaluate_auto_refund_holds_before_timeout() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
     let token = Address::generate(&env);
-    let payment_contract = install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
+    let payment_contract =
+        install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
     client.set_payment_contract_address(&admin, &payment_contract);
 
     let trigger_id = client.register_auto_refund_trigger(
         &merchant,
         &7u64,
-        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition { fulfillment_deadline: 9_000 }),
+        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+            fulfillment_deadline: 9_000,
+        }),
         &2_500u32,
     );
 
@@ -137,7 +151,8 @@ fn test_evaluate_auto_refund_triggers_on_contract_state_match() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
     let token = Address::generate(&env);
-    let payment_contract = install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
+    let payment_contract =
+        install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
     client.set_payment_contract_address(&admin, &payment_contract);
 
     let state_contract_id = env.register(MockStateContract, ());
@@ -172,13 +187,16 @@ fn test_evaluate_auto_refund_cannot_retrigger_after_success() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
     let token = Address::generate(&env);
-    let payment_contract = install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
+    let payment_contract =
+        install_mock_payment_contract(&env, sample_payment(&env, &merchant, &customer, &token));
     client.set_payment_contract_address(&admin, &payment_contract);
 
     let trigger_id = client.register_auto_refund_trigger(
         &merchant,
         &7u64,
-        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition { fulfillment_deadline: 9_000 }),
+        &AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+            fulfillment_deadline: 9_000,
+        }),
         &2_500u32,
     );
 

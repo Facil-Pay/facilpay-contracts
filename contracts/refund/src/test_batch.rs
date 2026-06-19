@@ -12,7 +12,12 @@ fn setup(env: &Env) -> (RefundContractClient, Address) {
     (client, admin)
 }
 
-fn make_refund(client: &RefundContractClient, env: &Env, merchant: &Address, payment_id: u64) -> u64 {
+fn make_refund(
+    client: &RefundContractClient,
+    env: &Env,
+    merchant: &Address,
+    payment_id: u64,
+) -> u64 {
     let customer = Address::generate(env);
     let token = Address::generate(env);
     client.request_refund(
@@ -137,5 +142,8 @@ fn test_oversized_batch_rejected() {
     let results = client.approve_refund_batch(&admin, &ids);
     assert_eq!(results.len(), 1);
     assert!(!results.get(0).unwrap().success);
-    assert_eq!(results.get(0).unwrap().error_code, Error::BatchRefundTooLarge as u32);
+    assert_eq!(
+        results.get(0).unwrap().error_code,
+        Error::BatchRefundTooLarge as u32
+    );
 }

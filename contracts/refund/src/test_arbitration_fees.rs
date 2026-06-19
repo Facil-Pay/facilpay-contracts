@@ -1,12 +1,12 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _,
-    token, Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, token, Address, Env, String};
 
-fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+fn create_token_contract<'a>(
+    env: &Env,
+    admin: &Address,
+) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
     let contract = env.register_stellar_asset_contract_v2(admin.clone());
     let contract_address = contract.address();
     (
@@ -15,7 +15,17 @@ fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, 
     )
 }
 
-fn setup_test_env() -> (Env, Address, Address, Address, Address, Address, Address, Address, token::Client<'static>) {
+fn setup_test_env() -> (
+    Env,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    token::Client<'static>,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -40,7 +50,17 @@ fn setup_test_env() -> (Env, Address, Address, Address, Address, Address, Addres
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
 
-    (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, treasury, token_client)
+    (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        treasury,
+        token_client,
+    )
 }
 
 #[test]
@@ -109,8 +129,18 @@ fn test_set_arbitration_fee_config_unauthorized() {
 
 #[test]
 fn test_fee_distribution_equal_split() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, treasury, token_client) = setup_test_env();
-    
+    let (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        treasury,
+        token_client,
+    ) = setup_test_env();
+
     // Set fee configuration: 50/50 split
     let config = ArbitrationFeeConfig {
         arbitrator_share_bps: 5000, // 50%
@@ -119,16 +149,16 @@ fn test_fee_distribution_equal_split() {
         fee_token: token_client.address.clone(),
         fee_per_case: 1000,
     };
-    
+
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
-    
+
     // Register arbitrators
     client.register_arbitrator(&admin, &arbitrator1);
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
-    
+
     client.set_arbitration_fee_config(&admin, &config);
 
     // Create a refund request
@@ -145,18 +175,18 @@ fn test_fee_distribution_equal_split() {
     );
 
     // Reject it first so we can escalate
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected for testing"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Rejected for testing"),
+    );
 
     // Escalate to arbitration with fee pool of 1000
     let fee_pool = 1000i128;
     token_client.transfer(&merchant, &contract_id, &fee_pool);
-    
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Cast votes - all three arbitrators vote for refund (majority)
     let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -194,7 +224,17 @@ fn test_fee_distribution_equal_split() {
 
 #[test]
 fn test_fee_distribution_majority_only() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, treasury, token_client) = setup_test_env();
+    let (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        treasury,
+        token_client,
+    ) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -228,18 +268,18 @@ fn test_fee_distribution_majority_only() {
     );
 
     // Reject it first so we can escalate
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected for testing"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Rejected for testing"),
+    );
 
     // Escalate to arbitration
     let fee_pool = 1000i128;
     token_client.transfer(&merchant, &contract_id, &fee_pool);
-    
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Cast votes - 2 for refund (majority), 1 against (minority)
     let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -266,7 +306,7 @@ fn test_fee_distribution_majority_only() {
     // 800 / 2 = 400 each
     assert_eq!(arb1_final - arb1_initial, 400);
     assert_eq!(arb2_final - arb2_initial, 400);
-    
+
     // Minority voter (arb3) should get nothing
     assert_eq!(arb3_final - arb3_initial, 0);
 
@@ -276,7 +316,17 @@ fn test_fee_distribution_majority_only() {
 
 #[test]
 fn test_withdraw_treasury_fees() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, treasury, token_client) = setup_test_env();
+    let (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        treasury,
+        token_client,
+    ) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -310,17 +360,17 @@ fn test_withdraw_treasury_fees() {
     );
 
     // Reject it first so we can escalate
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected for testing"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Rejected for testing"),
+    );
 
     let fee_pool = 1000i128;
     token_client.transfer(&merchant, &contract_id, &fee_pool);
-    
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     let hash = BytesN::from_array(&env, &[0u8; 32]);
     client.cast_arbitration_vote(&arbitrator1, &case_id, &true, &hash);
@@ -367,7 +417,8 @@ fn test_withdraw_treasury_fees_unauthorized() {
 
 #[test]
 fn test_fee_distribution_without_config() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, _, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, _, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -393,18 +444,18 @@ fn test_fee_distribution_without_config() {
     );
 
     // Reject it first so we can escalate
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected for testing"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Rejected for testing"),
+    );
 
     // Escalate to arbitration
     let fee_pool = 1000i128;
     token_client.transfer(&merchant, &contract_id, &fee_pool);
-    
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Cast votes
     let hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -436,7 +487,17 @@ fn test_fee_distribution_without_config() {
 
 #[test]
 fn test_fee_distribution_100_percent_treasury() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, treasury, token_client) = setup_test_env();
+    let (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        treasury,
+        token_client,
+    ) = setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -448,8 +509,8 @@ fn test_fee_distribution_100_percent_treasury() {
 
     // Set fee configuration: 0% arbitrators, 100% treasury
     let config = ArbitrationFeeConfig {
-        arbitrator_share_bps: 0,     // 0%
-        treasury_share_bps: 10000,   // 100%
+        arbitrator_share_bps: 0,   // 0%
+        treasury_share_bps: 10000, // 100%
         treasury_address: treasury.clone(),
         fee_token: token_client.address.clone(),
         fee_per_case: 1000,
@@ -470,18 +531,18 @@ fn test_fee_distribution_100_percent_treasury() {
     );
 
     // Reject it first so we can escalate
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected for testing"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Rejected for testing"),
+    );
 
     // Escalate to arbitration
     let fee_pool = 1000i128;
     token_client.transfer(&merchant, &contract_id, &fee_pool);
-    
-    let case_id = client.escalate_to_arbitration(
-        &merchant,
-        &refund_id,
-        &token_client.address,
-        &fee_pool,
-    );
+
+    let case_id =
+        client.escalate_to_arbitration(&merchant, &refund_id, &token_client.address, &fee_pool);
 
     // Cast votes
     let hash = BytesN::from_array(&env, &[0u8; 32]);

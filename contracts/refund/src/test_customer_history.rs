@@ -3,7 +3,10 @@
 use crate::{
     CustomerRefundSummary, RefundContract, RefundContractClient, RefundReasonCode, RefundStatus,
 };
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env, String,
+};
 
 fn setup_test_env<'a>() -> (Env, RefundContractClient<'a>, Address, Address, Address) {
     let env = Env::default();
@@ -41,10 +44,10 @@ fn test_lifecycle_timestamps_on_request() {
     );
 
     let refund = client.get_refund(&refund_id);
-    
+
     // Verify requested_at is set
     assert_eq!(refund.requested_at, 50);
-    
+
     // Verify other timestamps are None
     assert_eq!(refund.approved_at, None);
     assert_eq!(refund.rejected_at, None);
@@ -74,11 +77,11 @@ fn test_lifecycle_timestamps_on_approve() {
     client.approve_refund(&admin, &refund_id);
 
     let refund = client.get_refund(&refund_id);
-    
+
     // Verify approved_at is set
     assert!(refund.approved_at.is_some());
     assert_eq!(refund.approved_at.unwrap(), 100);
-    
+
     // Verify other timestamps
     assert!(refund.requested_at < refund.approved_at.unwrap());
     assert_eq!(refund.rejected_at, None);
@@ -108,11 +111,11 @@ fn test_lifecycle_timestamps_on_reject() {
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Invalid"));
 
     let refund = client.get_refund(&refund_id);
-    
+
     // Verify rejected_at is set
     assert!(refund.rejected_at.is_some());
     assert_eq!(refund.rejected_at.unwrap(), 100);
-    
+
     // Verify other timestamps
     assert!(refund.requested_at < refund.rejected_at.unwrap());
     assert_eq!(refund.approved_at, None);
@@ -145,13 +148,13 @@ fn test_lifecycle_timestamps_on_process() {
     client.process_refund(&admin, &refund_id);
 
     let refund = client.get_refund(&refund_id);
-    
+
     // Verify all timestamps are set correctly
     assert!(refund.requested_at == 0);
     assert_eq!(refund.approved_at, Some(100));
     assert_eq!(refund.processed_at, Some(200));
     assert_eq!(refund.rejected_at, None);
-    
+
     // Verify chronological order
     assert!(refund.requested_at < refund.approved_at.unwrap());
     assert!(refund.approved_at.unwrap() < refund.processed_at.unwrap());
@@ -234,12 +237,12 @@ fn test_get_customer_refund_history_newest_first() {
 
     let history = client.get_customer_refund_history(&customer, &10, &0);
     assert_eq!(history.len(), 3);
-    
+
     // Verify newest first ordering
     assert_eq!(history.get(0).unwrap().id, refund_id3);
     assert_eq!(history.get(1).unwrap().id, refund_id2);
     assert_eq!(history.get(2).unwrap().id, refund_id1);
-    
+
     // Verify timestamps are in descending order
     assert!(history.get(0).unwrap().requested_at > history.get(1).unwrap().requested_at);
     assert!(history.get(1).unwrap().requested_at > history.get(2).unwrap().requested_at);
@@ -426,11 +429,11 @@ fn test_get_customer_refund_summary_with_data() {
     client.reject_refund(&admin, &refund_id3, &String::from_str(&env, "Invalid"));
 
     let summary = client.get_customer_refund_summary(&customer);
-    
+
     assert_eq!(summary.total_requested, 3);
     assert_eq!(summary.total_approved, 2); // Only processed ones count as approved
     assert_eq!(summary.total_amount_refunded, 3000); // 1000 + 2000
-    
+
     // Average processing time: ((200-100) + (500-300)) / 2 = (100 + 200) / 2 = 150
     assert_eq!(summary.avg_processing_time, 150);
 }
@@ -466,7 +469,7 @@ fn test_get_customer_refund_summary_only_requested() {
     );
 
     let summary = client.get_customer_refund_summary(&customer);
-    
+
     assert_eq!(summary.total_requested, 2);
     assert_eq!(summary.total_approved, 0);
     assert_eq!(summary.total_amount_refunded, 0);
@@ -477,7 +480,7 @@ fn test_get_customer_refund_summary_only_requested() {
 fn test_customer_refund_history_multiple_customers() {
     let (env, client, _admin, merchant, _customer) = setup_test_env();
     let token = Address::generate(&env);
-    
+
     let customer1 = Address::generate(&env);
     let customer2 = Address::generate(&env);
 

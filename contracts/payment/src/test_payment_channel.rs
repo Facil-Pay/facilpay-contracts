@@ -18,7 +18,9 @@ fn test_close_expired_channel() {
     let admin = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
     let token_client = token::Client::new(&env, &token_id);
 
@@ -32,7 +34,14 @@ fn test_close_expired_channel() {
     env.ledger().set_timestamp(expires_at - 10);
 
     let dummy_pk = BytesN::<32>::from_array(&env, &[0u8; 32]);
-    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &expires_at, &dummy_pk);
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &expires_at,
+        &dummy_pk,
+    );
 
     // Fast forward
     env.ledger().set_timestamp(expires_at + 1);
@@ -45,7 +54,7 @@ fn test_close_expired_channel() {
 
 #[test]
 fn test_payment_channel_full_lifecycle() {
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     let env = Env::default();
@@ -58,7 +67,9 @@ fn test_payment_channel_full_lifecycle() {
     let customer = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
 
     let contract_id = env.register(PaymentContract, ());
@@ -117,7 +128,7 @@ fn test_payment_channel_full_lifecycle() {
 
 #[test]
 fn test_settle_channel_invalid_nonce() {
-    use ed25519_dalek::{SigningKey, Signer};
+    use ed25519_dalek::{Signer, SigningKey};
     use rand::rngs::OsRng;
 
     let env = Env::default();
@@ -128,7 +139,9 @@ fn test_settle_channel_invalid_nonce() {
     let customer = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
 
     let contract_id = env.register(PaymentContract, ());

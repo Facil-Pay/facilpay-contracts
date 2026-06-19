@@ -33,8 +33,14 @@ fn test_valid_split_payment() {
 
     fund(&env, &token, &admin, &customer, 1000);
 
-    let r1 = SplitRecipient { address: merchant.clone(), share_bps: 7000 };
-    let r2 = SplitRecipient { address: admin.clone(), share_bps: 3000 };
+    let r1 = SplitRecipient {
+        address: merchant.clone(),
+        share_bps: 7000,
+    };
+    let r2 = SplitRecipient {
+        address: admin.clone(),
+        share_bps: 3000,
+    };
     let mut recipients = Vec::new(&env);
     recipients.push_back(r1);
     recipients.push_back(r2);
@@ -68,8 +74,14 @@ fn test_invalid_split_shares() {
     fund(&env, &token, &admin, &customer, 1000);
 
     let mut recipients = Vec::new(&env);
-    recipients.push_back(SplitRecipient { address: merchant.clone(), share_bps: 5000 });
-    recipients.push_back(SplitRecipient { address: admin.clone(), share_bps: 4000 }); // total = 9000, not 10000
+    recipients.push_back(SplitRecipient {
+        address: merchant.clone(),
+        share_bps: 5000,
+    });
+    recipients.push_back(SplitRecipient {
+        address: admin.clone(),
+        share_bps: 4000,
+    }); // total = 9000, not 10000
 
     let result = client.try_create_split_payment(&customer, &merchant, &1000, &token, &recipients);
     assert_eq!(result, Err(Ok(Error::InvalidSplitShares)));
@@ -110,7 +122,10 @@ fn test_double_execution_rejected() {
     fund(&env, &token, &admin, &customer, 1000);
 
     let mut recipients = Vec::new(&env);
-    recipients.push_back(SplitRecipient { address: merchant.clone(), share_bps: 10000 });
+    recipients.push_back(SplitRecipient {
+        address: merchant.clone(),
+        share_bps: 10000,
+    });
 
     let payment_id = client.create_split_payment(&customer, &merchant, &1000, &token, &recipients);
 

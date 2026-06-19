@@ -47,8 +47,7 @@ fn test_schedule_payment_flow_and_guards() {
     token_client.approve(&customer, &client.address, &1_000, &10_000);
 
     env.ledger().set_timestamp(100);
-    let payment_id = client
-        .schedule_payment(&customer, &merchant, &token_address, &1_000, &150);
+    let payment_id = client.schedule_payment(&customer, &merchant, &token_address, &1_000, &150);
     assert_eq!(token_client.balance(&customer), 4_000);
     assert_eq!(token_client.balance(&client.address), 1_000);
 
@@ -76,10 +75,8 @@ fn test_cancel_scheduled_payment_refunds_customer() {
     token_client.approve(&customer, &client.address, &1_200, &10_000);
 
     env.ledger().set_timestamp(50);
-    let payment_id = client
-        .schedule_payment(&customer, &merchant, &token_address, &1_200, &90);
-    client
-        .cancel_scheduled_payment(&customer, &payment_id);
+    let payment_id = client.schedule_payment(&customer, &merchant, &token_address, &1_200, &90);
+    client.cancel_scheduled_payment(&customer, &payment_id);
 
     let scheduled = client.get_scheduled_payment(&payment_id);
     assert!(scheduled.cancelled);
@@ -91,8 +88,7 @@ fn test_cancel_scheduled_payment_refunds_customer() {
 fn test_oracle_refresh_and_manual_fallback() {
     let (env, client, admin) = setup();
     env.ledger().set_timestamp(1_005);
-    client
-        .set_conversion_rate(&admin, &Currency::BTC, &90_0000000);
+    client.set_conversion_rate(&admin, &Currency::BTC, &90_0000000);
 
     let oracle_id = env.register(MockOracleContract, ());
     let feed = BytesN::from_array(&env, &[1; 32]);
@@ -125,10 +121,8 @@ fn test_oracle_refresh_and_manual_fallback() {
         max_staleness_seconds: 100,
         enabled: false,
     };
-    client
-        .set_conversion_rate(&admin, &Currency::USDC, &1_0000000);
-    client
-        .set_oracle_rate_config(&admin, &disabled_cfg);
+    client.set_conversion_rate(&admin, &Currency::USDC, &1_0000000);
+    client.set_oracle_rate_config(&admin, &disabled_cfg);
     let fallback = client.refresh_conversion_rate(&Currency::USDC);
     assert_eq!(fallback, 1_0000000);
 }
@@ -138,7 +132,9 @@ fn test_cross_contract_condition_success_and_failure() {
     let (env, client, admin) = setup();
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &100);
     token::Client::new(&env, &token).approve(&customer, &client.address, &100, &10_000);
     let meta = String::from_str(&env, "cond");
@@ -146,36 +142,32 @@ fn test_cross_contract_condition_success_and_failure() {
     let good_id = env.register(FreshStateContract, ());
     let good_hash = BytesN::from_array(&env, &[7; 32]);
     let condition = ConditionType::CrossContractState(good_id, good_hash);
-    let payment_id = client
-        .create_conditional_payment(
-            &customer,
-            &merchant,
-            &100,
-            &token,
-            &Currency::USDC,
-            &300,
-            &meta,
-            &condition,
-        );
-    client
-        .execute_if_condition_met(&payment_id);
-    client
-        .execute_if_condition_met(&payment_id);
+    let payment_id = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &100,
+        &token,
+        &Currency::USDC,
+        &300,
+        &meta,
+        &condition,
+    );
+    client.execute_if_condition_met(&payment_id);
+    client.execute_if_condition_met(&payment_id);
 
     let bad_target = Address::generate(&env);
     let bad_cond =
         ConditionType::CrossContractState(bad_target, BytesN::from_array(&env, &[9; 32]));
-    let payment_id2 = client
-        .create_conditional_payment(
-            &customer,
-            &merchant,
-            &50,
-            &token,
-            &Currency::USDC,
-            &300,
-            &meta,
-            &bad_cond,
-        );
+    let payment_id2 = client.create_conditional_payment(
+        &customer,
+        &merchant,
+        &50,
+        &token,
+        &Currency::USDC,
+        &300,
+        &meta,
+        &bad_cond,
+    );
     let eval = client.try_evaluate_condition(&payment_id2);
     assert_eq!(eval.err(), Some(Ok(Error::ConditionEvaluationFailed)));
 
@@ -192,32 +184,29 @@ fn test_analytics_range_and_top_merchants() {
     let meta = String::from_str(&env, "");
 
     env.ledger().set_timestamp(3_600);
-    let p1 = client
-        .create_payment(
-            &customer,
-            &merchant_a,
-            &1_000,
-            &token,
-            &Currency::USDC,
-            &0,
-            &meta,
-        );
+    let p1 = client.create_payment(
+        &customer,
+        &merchant_a,
+        &1_000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
     let _ = client.cancel_payment(&customer, &p1);
 
     env.ledger().set_timestamp(7_200);
-    let _ = client
-        .create_payment(
-            &customer,
-            &merchant_b,
-            &5_000,
-            &token,
-            &Currency::USDC,
-            &0,
-            &meta,
-        );
+    let _ = client.create_payment(
+        &customer,
+        &merchant_b,
+        &5_000,
+        &token,
+        &Currency::USDC,
+        &0,
+        &meta,
+    );
 
-    let range = client
-        .get_merchant_analytics_range(&merchant_a, &3_600, &10_800);
+    let range = client.get_merchant_analytics_range(&merchant_a, &3_600, &10_800);
     assert_eq!(range.len(), 1);
     assert_eq!(range.get(0).unwrap().total_volume, 1_000);
     assert_eq!(range.get(0).unwrap().failed_count, 1);

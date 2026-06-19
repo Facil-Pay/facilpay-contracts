@@ -6,7 +6,10 @@ use soroban_sdk::{
     token, Address, BytesN, Env, String,
 };
 
-fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
+fn create_token_contract<'a>(
+    env: &Env,
+    admin: &Address,
+) -> (token::Client<'a>, token::StellarAssetClient<'a>) {
     let contract = env.register_stellar_asset_contract_v2(admin.clone());
     let contract_address = contract.address();
     (
@@ -15,7 +18,16 @@ fn create_token_contract<'a>(env: &Env, admin: &Address) -> (token::Client<'a>, 
     )
 }
 
-fn setup_test_env() -> (Env, Address, Address, Address, Address, Address, Address, token::Client<'static>) {
+fn setup_test_env() -> (
+    Env,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    token::Client<'static>,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -39,7 +51,16 @@ fn setup_test_env() -> (Env, Address, Address, Address, Address, Address, Addres
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
 
-    (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client)
+    (
+        env,
+        admin,
+        merchant,
+        customer,
+        arbitrator1,
+        arbitrator2,
+        arbitrator3,
+        token_client,
+    )
 }
 
 fn create_and_escalate_refund(
@@ -71,15 +92,15 @@ fn create_and_escalate_refund(
     );
 
     // Reject refund
-    client.reject_refund(admin, &refund_id, &String::from_str(env, "Rejected for testing"));
+    client.reject_refund(
+        admin,
+        &refund_id,
+        &String::from_str(env, "Rejected for testing"),
+    );
 
     // Escalate to arbitration
-    let case_id = client.escalate_to_arbitration(
-        customer,
-        &refund_id,
-        &token_client.address,
-        &3000,
-    );
+    let case_id =
+        client.escalate_to_arbitration(customer, &refund_id, &token_client.address, &3000);
 
     case_id
 }
@@ -95,7 +116,7 @@ fn test_register_arbitrator_initializes_reputation() {
 
     let reputation = client.get_arbitrator_reputation(&arbitrator1);
     assert!(reputation.is_some());
-    
+
     let rep = reputation.unwrap();
     assert_eq!(rep.arbitrator, arbitrator1);
     assert_eq!(rep.total_cases, 0);
@@ -107,7 +128,8 @@ fn test_register_arbitrator_initializes_reputation() {
 
 #[test]
 fn test_score_increases_on_majority_vote() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -116,7 +138,8 @@ fn test_score_increases_on_majority_vote() {
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
 
-    let case_id = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
 
     // All three arbitrators vote for refund (majority)
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -142,7 +165,8 @@ fn test_score_increases_on_majority_vote() {
 
 #[test]
 fn test_score_decreases_on_minority_vote() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -151,7 +175,8 @@ fn test_score_decreases_on_minority_vote() {
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
 
-    let case_id = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
 
     // Two arbitrators vote for refund, one against (minority)
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
@@ -169,14 +194,15 @@ fn test_score_decreases_on_minority_vote() {
 
     assert_eq!(rep1.score, 110); // Majority: 100 + 10
     assert_eq!(rep2.score, 110); // Majority: 100 + 10
-    assert_eq!(rep3.score, 95);  // Minority: 100 - 5
+    assert_eq!(rep3.score, 95); // Minority: 100 - 5
     assert_eq!(rep3.majority_votes, 0);
     assert_eq!(rep3.minority_votes, 1);
 }
 
 #[test]
 fn test_avg_resolution_time_updated() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -185,7 +211,8 @@ fn test_avg_resolution_time_updated() {
     client.register_arbitrator(&admin, &arbitrator2);
     client.register_arbitrator(&admin, &arbitrator3);
 
-    let case_id = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
 
     // Advance time by 1000 seconds
     env.ledger().with_mut(|li| {
@@ -209,7 +236,8 @@ fn test_avg_resolution_time_updated() {
 
 #[test]
 fn test_multiple_cases_update_average_resolution_time() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -219,7 +247,8 @@ fn test_multiple_cases_update_average_resolution_time() {
     client.register_arbitrator(&admin, &arbitrator3);
 
     // First case - 1000 seconds
-    let case_id1 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id1 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     env.ledger().with_mut(|li| {
         li.timestamp += 1000;
     });
@@ -233,7 +262,8 @@ fn test_multiple_cases_update_average_resolution_time() {
     let first_avg = rep_after_first.avg_resolution_time;
 
     // Second case - 2000 seconds
-    let case_id2 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id2 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     env.ledger().with_mut(|li| {
         li.timestamp += 2000;
     });
@@ -252,7 +282,8 @@ fn test_multiple_cases_update_average_resolution_time() {
 
 #[test]
 fn test_get_top_arbitrators_sorted_by_score() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -263,7 +294,8 @@ fn test_get_top_arbitrators_sorted_by_score() {
 
     // Create multiple cases to differentiate scores
     // Case 1: arbitrator1 and arbitrator2 in majority, arbitrator3 in minority
-    let case_id1 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id1 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
     client.cast_arbitration_vote(&arbitrator1, &case_id1, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id1, &true, &reasoning_hash);
@@ -271,7 +303,8 @@ fn test_get_top_arbitrators_sorted_by_score() {
     client.close_arbitration_case(&case_id1);
 
     // Case 2: arbitrator1 in majority, arbitrator2 and arbitrator3 in minority
-    let case_id2 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id2 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id2, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id2, &false, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator3, &case_id2, &true, &reasoning_hash);
@@ -279,13 +312,13 @@ fn test_get_top_arbitrators_sorted_by_score() {
 
     // Get top arbitrators
     let top_arbitrators = client.get_top_arbitrators(&3);
-    
+
     assert_eq!(top_arbitrators.len(), 3);
-    
+
     // arbitrator1 should be first (2 majority votes: 100 + 10 + 10 = 120)
     assert_eq!(top_arbitrators.get(0).unwrap().arbitrator, arbitrator1);
     assert_eq!(top_arbitrators.get(0).unwrap().score, 120);
-    
+
     // arbitrator2 and arbitrator3 should have lower scores
     // arbitrator2: 1 majority, 1 minority = 100 + 10 - 5 = 105
     // arbitrator3: 1 majority, 1 minority = 100 + 10 - 5 = 105
@@ -297,7 +330,8 @@ fn test_get_top_arbitrators_sorted_by_score() {
 
 #[test]
 fn test_get_top_arbitrators_with_limit() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -308,13 +342,14 @@ fn test_get_top_arbitrators_with_limit() {
 
     // Get top 2 arbitrators
     let top_arbitrators = client.get_top_arbitrators(&2);
-    
+
     assert_eq!(top_arbitrators.len(), 2);
 }
 
 #[test]
 fn test_deregister_low_performing_arbitrators() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -325,16 +360,18 @@ fn test_deregister_low_performing_arbitrators() {
 
     // Create cases to lower arbitrator3's score
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
-    
+
     // Case 1: arbitrator3 in minority
-    let case_id1 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id1 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id1, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id1, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator3, &case_id1, &false, &reasoning_hash);
     client.close_arbitration_case(&case_id1);
 
     // Case 2: arbitrator3 in minority again
-    let case_id2 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id2 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id2, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id2, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator3, &case_id2, &false, &reasoning_hash);
@@ -361,7 +398,8 @@ fn test_deregister_low_performing_arbitrators() {
 
 #[test]
 fn test_deregister_multiple_low_performers() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -374,23 +412,26 @@ fn test_deregister_multiple_low_performers() {
     // arbitrator1 and arbitrator2 vote FOR refund (majority)
     // arbitrator3 votes AGAINST refund (minority)
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
-    
+
     // Case 1
-    let case_id1 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id1 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id1, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id1, &false, &reasoning_hash); // minority
     client.cast_arbitration_vote(&arbitrator3, &case_id1, &true, &reasoning_hash);
     client.close_arbitration_case(&case_id1);
 
     // Case 2
-    let case_id2 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id2 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id2, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id2, &false, &reasoning_hash); // minority
     client.cast_arbitration_vote(&arbitrator3, &case_id2, &true, &reasoning_hash);
     client.close_arbitration_case(&case_id2);
 
     // Case 3
-    let case_id3 = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id3 =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     client.cast_arbitration_vote(&arbitrator1, &case_id3, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id3, &false, &reasoning_hash); // minority
     client.cast_arbitration_vote(&arbitrator3, &case_id3, &true, &reasoning_hash);
@@ -400,14 +441,14 @@ fn test_deregister_multiple_low_performers() {
     let rep1 = client.get_arbitrator_reputation(&arbitrator1).unwrap();
     let rep2 = client.get_arbitrator_reputation(&arbitrator2).unwrap();
     let rep3 = client.get_arbitrator_reputation(&arbitrator3).unwrap();
-    
+
     // arbitrator1: 3 majority votes = 100 + 10 + 10 + 10 = 130
     assert_eq!(rep1.score, 130);
     // arbitrator2: 3 minority votes = 100 - 5 - 5 - 5 = 85
     assert_eq!(rep2.score, 85);
     // arbitrator3: 3 majority votes = 100 + 10 + 10 + 10 = 130
     assert_eq!(rep3.score, 130);
-    
+
     // Deregister arbitrators with score below 90
     let removed_count = client.deregister_low_performers(&admin, &90);
     assert_eq!(removed_count, 1); // Only arbitrator2 should be removed
@@ -451,7 +492,8 @@ fn test_deregister_with_negative_threshold() {
 
 #[test]
 fn test_last_active_timestamp_updated() {
-    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) = setup_test_env();
+    let (env, admin, merchant, customer, arbitrator1, arbitrator2, arbitrator3, token_client) =
+        setup_test_env();
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(&env, &contract_id);
     client.initialize(&admin);
@@ -469,7 +511,8 @@ fn test_last_active_timestamp_updated() {
     });
 
     // Create and close a case
-    let case_id = create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
+    let case_id =
+        create_and_escalate_refund(&env, &client, &merchant, &customer, &admin, &token_client);
     let reasoning_hash = BytesN::from_array(&env, &[0u8; 32]);
     client.cast_arbitration_vote(&arbitrator1, &case_id, &true, &reasoning_hash);
     client.cast_arbitration_vote(&arbitrator2, &case_id, &true, &reasoning_hash);

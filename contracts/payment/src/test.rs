@@ -83,7 +83,9 @@ fn test_immediate_mode_bypasses_accumulation() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &50);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &50, &10000);
 
@@ -92,8 +94,7 @@ fn test_immediate_mode_bypasses_accumulation() {
 
     // Schedule a payment and execute it
     env.ledger().set_timestamp(1000);
-    let pid = client
-        .schedule_payment(&customer, &merchant, &token, &50, &1100);
+    let pid = client.schedule_payment(&customer, &merchant, &token, &50, &1100);
     env.ledger().set_timestamp(1100);
     client.execute_scheduled_payment(&pid);
 
@@ -110,7 +111,9 @@ fn test_batch_accumulation_and_premature_trigger() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &123);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &123, &10000);
 
@@ -119,8 +122,7 @@ fn test_batch_accumulation_and_premature_trigger() {
 
     // Schedule and execute a payment — should accumulate
     env.ledger().set_timestamp(2000);
-    let pid = client
-        .schedule_payment(&customer, &merchant, &token, &123, &2010);
+    let pid = client.schedule_payment(&customer, &merchant, &token, &123, &2010);
     env.ledger().set_timestamp(2010);
     client.execute_scheduled_payment(&pid);
 
@@ -140,7 +142,9 @@ fn test_trigger_advances_period_and_resets_accumulated() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &500);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &500, &10000);
 
@@ -148,8 +152,7 @@ fn test_trigger_advances_period_and_resets_accumulated() {
 
     // Accumulate some funds
     env.ledger().set_timestamp(3000);
-    let pid = client
-        .schedule_payment(&customer, &merchant, &token, &500, &3010);
+    let pid = client.schedule_payment(&customer, &merchant, &token, &500, &3010);
     env.ledger().set_timestamp(3010);
     client.execute_scheduled_payment(&pid);
 
@@ -691,7 +694,9 @@ fn test_loyalty_points_accrue_on_payment_completion() {
     );
     client.complete_payment(&admin, &payment_id);
 
-    let balance = client.get_loyalty_balance(&customer).expect("balance exists");
+    let balance = client
+        .get_loyalty_balance(&customer)
+        .expect("balance exists");
     assert_eq!(balance.points, 100);
     assert_eq!(balance.customer, customer);
 }
@@ -2141,7 +2146,9 @@ fn test_expire_pending_payment_success() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     let amount = 1000_i128;
     let expiration_duration = 10_u64;
 
@@ -2348,7 +2355,9 @@ fn test_payment_expired_event_emitted() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     let amount = 1000_i128;
     let expiration_duration = 10_u64;
 
@@ -2385,7 +2394,9 @@ fn test_multiple_payments_different_expiration_times() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     let amount = 1000_i128;
 
     env.mock_all_auths();
@@ -3618,7 +3629,10 @@ fn test_merchant_rate_limit_enforcement() {
         &meta,
     );
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::MerchantRateLimitExceeded);
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        Error::MerchantRateLimitExceeded
+    );
 }
 
 #[test]
@@ -3938,7 +3952,12 @@ fn test_dunning_successful_retry_fires_dunning_resolved() {
     // Fund the customer so the retry succeeds
     let asset_client = token::StellarAssetClient::new(&env, &token_address);
     asset_client.mint(&customer, &100_000i128);
-    token::Client::new(&env, &token_address).approve(&customer, &contract_id, &100_000i128, &10_000);
+    token::Client::new(&env, &token_address).approve(
+        &customer,
+        &contract_id,
+        &100_000i128,
+        &10_000,
+    );
 
     env.ledger().set_timestamp(dunning.next_retry_at + 1);
     client.execute_recurring_payment(&sub_id);
@@ -4826,7 +4845,9 @@ fn test_create_payment_batch_optimized_same_token_grouping() {
     let customer1 = Address::generate(&env);
     let customer2 = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     let sa = token::StellarAssetClient::new(&env, &token);
     let tc = token::Client::new(&env, &token);
     env.mock_all_auths();
@@ -4882,8 +4903,12 @@ fn test_create_payment_batch_optimized_cross_token_isolation() {
     let customer = Address::generate(&env);
     let merchant1 = Address::generate(&env);
     let merchant2 = Address::generate(&env);
-    let token1 = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
-    let token2 = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token1 = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let token2 = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     env.mock_all_auths();
 
     client.initialize(&admin);
@@ -6057,7 +6082,9 @@ fn test_complete_conditional_payment_success() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &1000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &1000, &10000);
 
@@ -6271,7 +6298,8 @@ fn test_grant_fee_waiver() {
     // Check event immediately — each invocation resets events
     let events = env.events().all();
     assert!(events.iter().any(|e| {
-        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "fee_waiver_granted"))
+        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok()
+            == Some(Symbol::new(&env, "fee_waiver_granted"))
     }));
 
     // Verify waiver was granted
@@ -6365,7 +6393,8 @@ fn test_revoke_fee_waiver() {
     // Check event immediately — each invocation resets events
     let events = env.events().all();
     assert!(events.iter().any(|e| {
-        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "fee_waiver_revoked"))
+        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok()
+            == Some(Symbol::new(&env, "fee_waiver_revoked"))
     }));
 
     // Verify waiver was revoked
@@ -6425,7 +6454,8 @@ fn test_expired_waiver_ignored() {
     // Verify expiration event was published
     let events = env.events().all();
     assert!(events.iter().any(|e| {
-        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "fee_waiver_expired"))
+        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok()
+            == Some(Symbol::new(&env, "fee_waiver_expired"))
     }));
 }
 
@@ -6523,14 +6553,17 @@ fn test_calculate_fee_respects_min_fee_with_waiver() {
     let (client, admin, _) = setup_fee_waiver_contract(&env);
 
     // Override fee config with min_fee=100 for this test
-    client.set_fee_config(&admin, &FeeConfig {
-        fee_bps: 200,
-        min_fee: 100,
-        max_fee: 10000,
-        treasury: Address::generate(&env),
-        fee_token: Address::generate(&env),
-        active: true,
-    });
+    client.set_fee_config(
+        &admin,
+        &FeeConfig {
+            fee_bps: 200,
+            min_fee: 100,
+            max_fee: 10000,
+            treasury: Address::generate(&env),
+            fee_token: Address::generate(&env),
+            active: true,
+        },
+    );
 
     let merchant = Address::generate(&env);
     let reason = String::from_str(&env, "99% waiver");
@@ -6575,14 +6608,16 @@ fn test_fee_waiver_events() {
     client.grant_fee_waiver(&admin, &merchant, &5000, &1000000000, &reason);
     let events_grant = env.events().all();
     assert!(events_grant.iter().any(|e| {
-        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "fee_waiver_granted"))
+        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok()
+            == Some(Symbol::new(&env, "fee_waiver_granted"))
     }));
 
     // Revoke waiver — check event immediately
     client.revoke_fee_waiver(&admin, &merchant);
     let events_revoke = env.events().all();
     assert!(events_revoke.iter().any(|e| {
-        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "fee_waiver_revoked"))
+        Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok()
+            == Some(Symbol::new(&env, "fee_waiver_revoked"))
     }));
 }
 
@@ -6643,7 +6678,9 @@ fn test_small_payment_completes_normally() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &500);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &500, &10000);
     let meta = String::from_str(&env, "");
@@ -6677,7 +6714,9 @@ fn test_threshold_zero_disables_multisig() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &5000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &5000, &10000);
     let meta = String::from_str(&env, "");
@@ -6711,7 +6750,9 @@ fn test_large_payment_approval_flow() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &2000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &2000, &10000);
     let meta = String::from_str(&env, "");
@@ -6963,14 +7004,21 @@ fn test_large_payment_events() {
 
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let token = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &2000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &2000, &10000);
     let meta = String::from_str(&env, "");
 
     // Set threshold to 1000 — check event immediately
     client.set_large_payment_threshold(&admin, &1000);
-    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "large_payment_threshold_updated"))));
+    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(
+        &env,
+        &e.1.get(0).unwrap_or_default()
+    )
+    .ok()
+        == Some(Symbol::new(&env, "large_payment_threshold_updated"))));
 
     // Create a large payment
     let payment_id = client.create_payment(
@@ -6985,15 +7033,30 @@ fn test_large_payment_events() {
 
     // Propose large payment — check event immediately
     client.propose_large_payment(&merchant, &payment_id);
-    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "large_payment_proposed"))));
+    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(
+        &env,
+        &e.1.get(0).unwrap_or_default()
+    )
+    .ok()
+        == Some(Symbol::new(&env, "large_payment_proposed"))));
 
     // Approve with admin — check event immediately
     client.approve_large_payment(&admin, &payment_id);
-    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "large_payment_approved"))));
+    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(
+        &env,
+        &e.1.get(0).unwrap_or_default()
+    )
+    .ok()
+        == Some(Symbol::new(&env, "large_payment_approved"))));
 
     // Execute — check event immediately
     client.execute_large_payment(&payment_id);
-    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(&env, &e.1.get(0).unwrap_or_default()).ok() == Some(Symbol::new(&env, "large_payment_executed"))));
+    assert!(env.events().all().iter().any(|e| Symbol::try_from_val(
+        &env,
+        &e.1.get(0).unwrap_or_default()
+    )
+    .ok()
+        == Some(Symbol::new(&env, "large_payment_executed"))));
 }
 
 // ── AUTO-ESCROW TESTS ──────────────────────────────────────────────────────
@@ -7022,7 +7085,7 @@ fn test_set_auto_escrow_rule() {
     // Verify rule was set
     let rule = client.get_auto_escrow_rule(&merchant);
     assert!(rule.is_some());
-    
+
     let rule = rule.unwrap();
     assert_eq!(rule.merchant, merchant);
     assert_eq!(rule.escrow_bps, 1000);
@@ -7084,7 +7147,9 @@ fn test_auto_escrow_skips_below_minimum() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let sa = token::StellarAssetClient::new(&env, &token);
     sa.mint(&customer, &500);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &500, &10000);
@@ -7121,7 +7186,9 @@ fn test_auto_escrow_triggers_on_complete_payment() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &1000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &1000, &10000);
 
@@ -7160,7 +7227,9 @@ fn test_auto_escrow_idempotency_guard() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &1000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &1000, &10000);
 
@@ -7200,7 +7269,9 @@ fn test_auto_escrow_correct_amount_calculation() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token_admin = Address::generate(&env);
-    let token = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     token::StellarAssetClient::new(&env, &token).mint(&customer, &1000);
     token::Client::new(&env, &token).approve(&customer, &contract_id, &1000, &10000);
 

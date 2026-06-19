@@ -45,7 +45,10 @@ fn test_set_get_payment_contract_address() {
 
     assert!(client.get_payment_contract_address().is_none());
     client.set_payment_contract_address(&admin, &payment_contract);
-    assert_eq!(client.get_payment_contract_address().unwrap(), payment_contract);
+    assert_eq!(
+        client.get_payment_contract_address().unwrap(),
+        payment_contract
+    );
 }
 
 // verify_payment_ownership returns false when no contract set

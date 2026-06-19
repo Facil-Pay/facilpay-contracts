@@ -264,7 +264,11 @@ fn test_hook_invocation_on_refund_rejected() {
         &env.ledger().timestamp(),
     );
 
-    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Invalid request"));
+    client.reject_refund(
+        &admin,
+        &refund_id,
+        &String::from_str(&env, "Invalid request"),
+    );
     // If hook invocation failed, the test would panic
 }
 

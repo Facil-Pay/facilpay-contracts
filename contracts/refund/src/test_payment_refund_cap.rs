@@ -297,7 +297,7 @@ fn test_no_cap_allows_unlimited() {
     client.initialize(&admin);
 
     // No cap is set for this payment, so unlimited refunds should be allowed
-    
+
     // Request multiple refunds without a cap
     for i in 0..5 {
         let res = client.try_request_refund(

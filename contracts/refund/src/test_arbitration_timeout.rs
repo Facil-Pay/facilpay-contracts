@@ -53,7 +53,18 @@ fn setup() -> (
     client.register_arbitrator(&admin, &arb2);
     client.register_arbitrator(&admin, &arb3);
 
-    (env, client, contract_id, admin, merchant, customer, arb1, arb2, arb3, token_client)
+    (
+        env,
+        client,
+        contract_id,
+        admin,
+        merchant,
+        customer,
+        arb1,
+        arb2,
+        arb3,
+        token_client,
+    )
 }
 
 fn create_open_case(
@@ -93,8 +104,15 @@ fn test_trigger_arbitration_timeout_success() {
     // Set a short timeout of 100 seconds
     client.set_arbitration_timeout(&admin, &100u64);
 
-    let (refund_id, case_id) =
-        create_open_case(&env, &client, &contract_id, &admin, &merchant, &customer, &token_client);
+    let (refund_id, case_id) = create_open_case(
+        &env,
+        &client,
+        &contract_id,
+        &admin,
+        &merchant,
+        &customer,
+        &token_client,
+    );
 
     // Advance time past timeout
     env.ledger().with_mut(|l| l.timestamp += 200);
@@ -120,8 +138,15 @@ fn test_trigger_arbitration_timeout_too_early() {
     // Set a long timeout of 1000 seconds
     client.set_arbitration_timeout(&admin, &1000u64);
 
-    let (_refund_id, case_id) =
-        create_open_case(&env, &client, &contract_id, &admin, &merchant, &customer, &token_client);
+    let (_refund_id, case_id) = create_open_case(
+        &env,
+        &client,
+        &contract_id,
+        &admin,
+        &merchant,
+        &customer,
+        &token_client,
+    );
 
     // Do NOT advance time — still before timeout_at
     let _ = env.ledger().timestamp(); // ensure time hasn't advanced
@@ -138,8 +163,15 @@ fn test_trigger_arbitration_timeout_blocked_by_quorum() {
 
     client.set_arbitration_timeout(&admin, &100u64);
 
-    let (_refund_id, case_id) =
-        create_open_case(&env, &client, &contract_id, &admin, &merchant, &customer, &token_client);
+    let (_refund_id, case_id) = create_open_case(
+        &env,
+        &client,
+        &contract_id,
+        &admin,
+        &merchant,
+        &customer,
+        &token_client,
+    );
 
     // Cast 3 votes to reach quorum
     let hash = BytesN::from_array(&env, &[0u8; 32]);

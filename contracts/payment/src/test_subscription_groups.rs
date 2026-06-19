@@ -52,7 +52,9 @@ fn test_add_and_remove_from_group() {
     let (env, client, admin) = setup();
     let owner = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&owner, &100_000);
 
@@ -73,7 +75,9 @@ fn test_subscription_already_in_group() {
     let (env, client, admin) = setup();
     let owner = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&owner, &100_000);
 
@@ -90,7 +94,9 @@ fn test_group_size_limit() {
     let (env, client, admin) = setup();
     let owner = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&owner, &10_000_000);
 
@@ -120,7 +126,9 @@ fn test_get_group_next_billing() {
     let (env, client, admin) = setup();
     let owner = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&owner, &100_000);
 

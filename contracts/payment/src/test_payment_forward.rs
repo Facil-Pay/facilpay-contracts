@@ -1,12 +1,19 @@
 #![cfg(test)]
 mod tests {
     use crate::{
-        PaymentContract, Error, Currency, PaymentStatus, FeeConfig,
-        PaymentContractClient,
+        Currency, Error, FeeConfig, PaymentContract, PaymentContractClient, PaymentStatus,
     };
     use soroban_sdk::{testutils::Address as AddressTestUtils, token, Address, Env, String};
 
-    fn setup_env() -> (Env, PaymentContractClient<'static>, Address, Address, Address, Address, Address) {
+    fn setup_env() -> (
+        Env,
+        PaymentContractClient<'static>,
+        Address,
+        Address,
+        Address,
+        Address,
+        Address,
+    ) {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
 
@@ -21,7 +28,9 @@ mod tests {
         client.initialize(&admin);
 
         let token_admin = Address::generate(&env);
-        let token = env.register_stellar_asset_contract_v2(token_admin).address();
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
 
         let fee_config = FeeConfig {
             fee_bps: 100,
@@ -95,10 +104,12 @@ mod tests {
     fn test_set_payment_forward_loop_detection() {
         let (env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
-        // Set up a forward config for forward_to (pointing elsewhere)
-        client.set_payment_forward(&forward_to, &Address::generate(&env), &5000);
+        // Build a 3-hop chain that closes back to merchant: forward_to (B) → C → merchant (A)
+        let c = Address::generate(&env);
+        client.set_payment_forward(&c, &merchant, &5000); // C → A
+        client.set_payment_forward(&forward_to, &c, &5000); // B → C
 
-        // Try to set merchant to forward to forward_to (which already has a forward)
+        // merchant (A) → forward_to (B) → C → merchant (A) is a cycle
         let result = client.try_set_payment_forward(&merchant, &forward_to, &5000);
         assert_eq!(result, Err(Ok(Error::ForwardLoop)));
     }
@@ -151,7 +162,8 @@ mod tests {
 
         client.set_payment_forward(&merchant, &forward_to, &5000);
 
-        let payment_id = create_and_complete_payment(&env, &client, &admin, &customer, &merchant, 1_000, &token);
+        let payment_id =
+            create_and_complete_payment(&env, &client, &admin, &customer, &merchant, 1_000, &token);
 
         let payment = client.get_payment(&payment_id);
         assert_eq!(payment.status, PaymentStatus::Completed);
@@ -163,7 +175,9 @@ mod tests {
 
         client.set_payment_forward(&merchant, &forward_to, &2500);
 
-        let payment_id = create_and_complete_payment(&env, &client, &admin, &customer, &merchant, 1_000_000, &token);
+        let payment_id = create_and_complete_payment(
+            &env, &client, &admin, &customer, &merchant, 1_000_000, &token,
+        );
 
         let payment = client.get_payment(&payment_id);
         assert_eq!(payment.status, PaymentStatus::Completed);

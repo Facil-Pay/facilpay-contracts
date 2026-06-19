@@ -89,7 +89,12 @@ fn test_first_post_trial_payment_sets_converted() {
     let token_address = token_contract.address();
     let asset_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
     asset_client.mint(&customer, &100_000i128);
-    soroban_sdk::token::Client::new(&env, &token_address).approve(&customer, &contract_id, &100_000i128, &10_000);
+    soroban_sdk::token::Client::new(&env, &token_address).approve(
+        &customer,
+        &contract_id,
+        &100_000i128,
+        &10_000,
+    );
 
     let trial_secs = 3600u64;
     let interval = 1800u64;

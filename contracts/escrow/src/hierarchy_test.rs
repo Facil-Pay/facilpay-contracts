@@ -19,25 +19,12 @@ fn test_two_level_hierarchy_success() {
 
     // Create root parent escrow (level 0)
     let parent_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &2000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64, &0_u64, &false,
     );
 
     // Create child escrow (level 1)
-    let child_id = client.create_child_escrow(
-        &admin,
-        &parent_id,
-        &500_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let child_id =
+        client.create_child_escrow(&admin, &parent_id, &500_i128, &token, &customer, &merchant);
 
     // Verify parent release is blocked since child is unresolved (Locked)
     let release_res = client.try_release_escrow(&admin, &parent_id, &false);
@@ -71,55 +58,24 @@ fn test_depth_limit_enforced() {
 
     // Root (level 0)
     let root_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Child (level 1)
-    let lvl1_id = client.create_child_escrow(
-        &admin,
-        &root_id,
-        &500_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let lvl1_id =
+        client.create_child_escrow(&admin, &root_id, &500_i128, &token, &customer, &merchant);
 
     // Grandchild (level 2)
-    let lvl2_id = client.create_child_escrow(
-        &admin,
-        &lvl1_id,
-        &250_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let lvl2_id =
+        client.create_child_escrow(&admin, &lvl1_id, &250_i128, &token, &customer, &merchant);
 
     // Great-grandchild (level 3)
-    let lvl3_id = client.create_child_escrow(
-        &admin,
-        &lvl2_id,
-        &100_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let lvl3_id =
+        client.create_child_escrow(&admin, &lvl2_id, &100_i128, &token, &customer, &merchant);
 
     // Creating under level 3 (would be level 4) should fail with MaxHierarchyDepth
-    let lvl4_res = client.try_create_child_escrow(
-        &admin,
-        &lvl3_id,
-        &50_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let lvl4_res =
+        client.try_create_child_escrow(&admin, &lvl3_id, &50_i128, &token, &customer, &merchant);
     assert_eq!(lvl4_res, Err(Ok(Error::MaxHierarchyDepth)));
 }
 
@@ -138,42 +94,17 @@ fn test_get_escrow_hierarchy() {
     client.initialize(&admin);
 
     let root_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
 
-    let child_1 = client.create_child_escrow(
-        &admin,
-        &root_id,
-        &500_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let child_1 =
+        client.create_child_escrow(&admin, &root_id, &500_i128, &token, &customer, &merchant);
 
-    let child_2 = client.create_child_escrow(
-        &admin,
-        &root_id,
-        &300_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let child_2 =
+        client.create_child_escrow(&admin, &root_id, &300_i128, &token, &customer, &merchant);
 
-    let grandchild_1 = client.create_child_escrow(
-        &admin,
-        &child_1,
-        &100_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let grandchild_1 =
+        client.create_child_escrow(&admin, &child_1, &100_i128, &token, &customer, &merchant);
 
     let hierarchy = client.get_escrow_hierarchy(&root_id);
     assert_eq!(hierarchy.len(), 4);
@@ -223,13 +154,7 @@ fn test_create_child_escrow_validation() {
     assert_eq!(res, Err(Ok(Error::NotAnAdmin)));
 
     // Non-existent parent fails with ParentEscrowNotFound
-    let res2 = client.try_create_child_escrow(
-        &admin,
-        &999_u64,
-        &100_i128,
-        &token,
-        &customer,
-        &merchant,
-    );
+    let res2 =
+        client.try_create_child_escrow(&admin, &999_u64, &100_i128, &token, &customer, &merchant);
     assert_eq!(res2, Err(Ok(Error::ParentEscrowNotFound)));
 }

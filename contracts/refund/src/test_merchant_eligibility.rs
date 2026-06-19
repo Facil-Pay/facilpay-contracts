@@ -291,14 +291,38 @@ fn test_block_then_allow_then_block_again() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant, &customer, &EligibilityRule::Block, &zero_hash(&env));
-    assert_eq!(client.check_refund_eligibility(&merchant, &customer), EligibilityRule::Block);
+    client.set_refund_eligibility(
+        &merchant,
+        &customer,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
+    assert_eq!(
+        client.check_refund_eligibility(&merchant, &customer),
+        EligibilityRule::Block
+    );
 
-    client.set_refund_eligibility(&merchant, &customer, &EligibilityRule::Allow, &zero_hash(&env));
-    assert_eq!(client.check_refund_eligibility(&merchant, &customer), EligibilityRule::Allow);
+    client.set_refund_eligibility(
+        &merchant,
+        &customer,
+        &EligibilityRule::Allow,
+        &zero_hash(&env),
+    );
+    assert_eq!(
+        client.check_refund_eligibility(&merchant, &customer),
+        EligibilityRule::Allow
+    );
 
-    client.set_refund_eligibility(&merchant, &customer, &EligibilityRule::Block, &zero_hash(&env));
-    assert_eq!(client.check_refund_eligibility(&merchant, &customer), EligibilityRule::Block);
+    client.set_refund_eligibility(
+        &merchant,
+        &customer,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
+    assert_eq!(
+        client.check_refund_eligibility(&merchant, &customer),
+        EligibilityRule::Block
+    );
 }
 
 // ── remove_refund_eligibility ─────────────────────────────────────────────────
@@ -385,9 +409,24 @@ fn test_get_eligibility_list_returns_all_entries() {
     let customer_b = Address::generate(&env);
     let customer_c = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant, &customer_a, &EligibilityRule::Block, &reason_hash(&env, 1));
-    client.set_refund_eligibility(&merchant, &customer_b, &EligibilityRule::Allow, &reason_hash(&env, 2));
-    client.set_refund_eligibility(&merchant, &customer_c, &EligibilityRule::Block, &reason_hash(&env, 3));
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_a,
+        &EligibilityRule::Block,
+        &reason_hash(&env, 1),
+    );
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_b,
+        &EligibilityRule::Allow,
+        &reason_hash(&env, 2),
+    );
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_c,
+        &EligibilityRule::Block,
+        &reason_hash(&env, 3),
+    );
 
     let list = client.get_merchant_eligibility_list(&merchant);
     assert_eq!(list.len(), 3);
@@ -409,7 +448,12 @@ fn test_get_eligibility_list_is_merchant_scoped() {
     let merchant_b = Address::generate(&env);
     let customer = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant_a, &customer, &EligibilityRule::Block, &zero_hash(&env));
+    client.set_refund_eligibility(
+        &merchant_a,
+        &customer,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
 
     let list_a = client.get_merchant_eligibility_list(&merchant_a);
     let list_b = client.get_merchant_eligibility_list(&merchant_b);
@@ -425,8 +469,18 @@ fn test_get_eligibility_list_reflects_correct_rules() {
     let customer_a = Address::generate(&env);
     let customer_b = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant, &customer_a, &EligibilityRule::Block, &reason_hash(&env, 5));
-    client.set_refund_eligibility(&merchant, &customer_b, &EligibilityRule::Allow, &reason_hash(&env, 6));
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_a,
+        &EligibilityRule::Block,
+        &reason_hash(&env, 5),
+    );
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_b,
+        &EligibilityRule::Allow,
+        &reason_hash(&env, 6),
+    );
 
     let list = client.get_merchant_eligibility_list(&merchant);
     assert_eq!(list.len(), 2);
@@ -452,8 +506,18 @@ fn test_get_eligibility_list_shrinks_after_removal() {
     let customer_a = Address::generate(&env);
     let customer_b = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant, &customer_a, &EligibilityRule::Block, &zero_hash(&env));
-    client.set_refund_eligibility(&merchant, &customer_b, &EligibilityRule::Block, &zero_hash(&env));
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_a,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
+    client.set_refund_eligibility(
+        &merchant,
+        &customer_b,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
 
     assert_eq!(client.get_merchant_eligibility_list(&merchant).len(), 2);
 
@@ -471,9 +535,19 @@ fn test_update_existing_entry_does_not_duplicate_in_list() {
     let merchant = Address::generate(&env);
     let customer = Address::generate(&env);
 
-    client.set_refund_eligibility(&merchant, &customer, &EligibilityRule::Block, &zero_hash(&env));
+    client.set_refund_eligibility(
+        &merchant,
+        &customer,
+        &EligibilityRule::Block,
+        &zero_hash(&env),
+    );
     // Update the same customer — should not add a second entry
-    client.set_refund_eligibility(&merchant, &customer, &EligibilityRule::Allow, &zero_hash(&env));
+    client.set_refund_eligibility(
+        &merchant,
+        &customer,
+        &EligibilityRule::Allow,
+        &zero_hash(&env),
+    );
 
     let list = client.get_merchant_eligibility_list(&merchant);
     assert_eq!(list.len(), 1);

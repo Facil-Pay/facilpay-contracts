@@ -1,5 +1,8 @@
 #![cfg(test)]
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env,
+};
 
 use crate::{Currency, Error, PaymentContract, PaymentContractClient};
 
@@ -66,7 +69,9 @@ fn test_spend_limit_enforced_on_create_payment() {
     let merchant = Address::generate(&env);
 
     // Register a token
-    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
     let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &10_000);
 

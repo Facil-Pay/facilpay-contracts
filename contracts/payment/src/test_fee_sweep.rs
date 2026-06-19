@@ -13,18 +13,22 @@ fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
     client.initialize(&admin);
     let token = soroban_sdk::token::StellarAssetClient::new(
         &env,
-        &env.register_stellar_asset_contract_v2(admin.clone()).address(),
+        &env.register_stellar_asset_contract_v2(admin.clone())
+            .address(),
     );
     let token_addr = token.address.clone();
     token.mint(&contract_id, &1_000_000);
-    client.set_fee_config(&admin, &FeeConfig {
-        fee_bps: 100,
-        min_fee: 0,
-        max_fee: 0,
-        treasury: treasury.clone(),
-        fee_token: token_addr,
-        active: true,
-    });
+    client.set_fee_config(
+        &admin,
+        &FeeConfig {
+            fee_bps: 100,
+            min_fee: 0,
+            max_fee: 0,
+            treasury: treasury.clone(),
+            fee_token: token_addr,
+            active: true,
+        },
+    );
     (env, client, admin, treasury)
 }
 
