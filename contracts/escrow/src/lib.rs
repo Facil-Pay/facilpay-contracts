@@ -3269,6 +3269,19 @@ impl EscrowContract {
         }
 
         let now = env.ledger().timestamp();
+
+        // Enforce the same evidence deadline as the single-item path.
+        if let Some(deadline) = escrow.evidence_deadline {
+            if now > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: now,
+                }
+                .publish(&env);
+                return Err(Error::EvidenceDeadlinePassed);
+            }
+        }
         let page_num: u32 = env
             .storage()
             .instance()
