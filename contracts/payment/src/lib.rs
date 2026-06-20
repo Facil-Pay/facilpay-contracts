@@ -2002,6 +2002,9 @@ impl PaymentContract {
             return Err(Error::PaymentNotYetDue);
         }
 
+        // Check customer spend limit (#282)
+        PaymentContract::check_and_update_spend_limit(&env, &scheduled.customer, scheduled.amount)?;
+
         Self::settle_or_accumulate(
             &env,
             scheduled.merchant.clone(),
@@ -4216,6 +4219,11 @@ impl PaymentContract {
                 return Err(Error::RetryTooEarly);
             }
 
+            // Check customer spend limit (#282)
+            if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
+                return Err(Error::SpendLimitExceeded);
+            }
+
             let token_client = token::Client::new(&env, &sub.token);
             let contract_address = env.current_contract_address();
             let transfer_ok = token_client
@@ -4318,6 +4326,11 @@ impl PaymentContract {
                 .instance()
                 .set(&DataKey::Subscription(subscription_id), &sub);
             return Ok(());
+        }
+
+        // Check customer spend limit (#282)
+        if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
+            return Err(Error::SpendLimitExceeded);
         }
 
         // Attempt token transfer
@@ -6525,6 +6538,30 @@ impl PaymentContract {
                 continue;
             }
 
+            // Check merchant rate limits
+            if let Err(e) =
+                PaymentContract::check_merchant_rate_limit(&env, &entry.merchant, entry.amount)
+            {
+                results.push_back(BatchResult {
+                    payment_id: 0,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+                continue;
+            }
+
+            // Check customer spend limit
+            if let Err(e) =
+                PaymentContract::check_and_update_spend_limit(&env, &entry.customer, entry.amount)
+            {
+                results.push_back(BatchResult {
+                    payment_id: 0,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+                continue;
+            }
+
             // Create payment record
             let counter: u64 = env
                 .storage()
@@ -8439,6 +8476,9 @@ impl PaymentContract {
         if total_bps != 10000 {
             return Err(Error::InvalidSplitShares);
         }
+
+        // Check customer spend limit (#282)
+        PaymentContract::check_and_update_spend_limit(&env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
