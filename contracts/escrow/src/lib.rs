@@ -2042,9 +2042,18 @@ impl EscrowContract {
             }
         }
 
+        let current_timestamp = env.ledger().timestamp();
+
         // Validate expiry: if set (non-zero), must be strictly after release_timestamp
         if expiry_timestamp != 0 && expiry_timestamp <= release_timestamp {
             return Err(Error::ExpiryBeforeRelease);
+        }
+
+        // Validate expiry: must be strictly in the future and after the hold period elapses
+        if expiry_timestamp != 0
+            && expiry_timestamp <= current_timestamp.saturating_add(min_hold_period)
+        {
+            return Err(Error::EscrowAlreadyExpired);
         }
 
         let counter: u64 = env
@@ -2053,8 +2062,6 @@ impl EscrowContract {
             .get(&DataKey::EscrowCounter)
             .unwrap_or(0);
         let escrow_id = counter + 1;
-
-        let current_timestamp = env.ledger().timestamp();
 
         let fee_config = Self::get_escrow_fee_config(env.clone());
         let fee_bps = if fee_config.enabled {
@@ -8330,8 +8337,8 @@ mod hierarchy_test;
 // #[cfg(test)]
 // mod pause_history_test;
 //
-// #[cfg(test)]
-// mod expiry_test;
+#[cfg(test)]
+mod expiry_test;
 //
 // #[cfg(test)]
 // mod multisig_threshold_test;

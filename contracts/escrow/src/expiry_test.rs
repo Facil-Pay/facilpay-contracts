@@ -100,3 +100,61 @@ fn test_create_escrow_expiry_before_release_fails() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn test_create_escrow_expiry_in_past_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(5000);
+    // expiry_timestamp(4999) is in the past relative to ledger time(5000)
+    let result = client.try_create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &4999_u64, &true,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_escrow_expiry_equal_to_current_time_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(5000);
+    // expiry_timestamp(5000) == ledger time(5000), must be strictly after
+    let result = client.try_create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &5000_u64, &true,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_escrow_expiry_within_hold_period_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    // min_hold_period=500 → expiry must be > 1000+500=1500; 1400 fails
+    let result = client.try_create_escrow(
+        &customer, &merchant, &500_i128, &token, &500_u64, &500_u64, &1400_u64, &true,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_escrow_expiry_after_hold_period_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    env.ledger().set_timestamp(1000);
+    // min_hold_period=500 → expiry must be > 1000+500=1500; 1600 succeeds
+    // release_timestamp=500, expiry=1600 (> release and > current+hold_period)
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &500_u64, &500_u64, &1600_u64, &true,
+    );
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.expiry_timestamp, 1600);
+}
