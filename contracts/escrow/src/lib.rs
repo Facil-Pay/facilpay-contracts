@@ -2031,6 +2031,10 @@ impl EscrowContract {
         expiry_timestamp: u64,
         auto_refund_on_expiry: bool,
     ) -> Result<u64, Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidStatus);
+        }
+
         // Block new escrow creation during migration
         if let Some(status) = env
             .storage()
@@ -2182,6 +2186,10 @@ impl EscrowContract {
         release_timestamp: u64,
     ) -> Result<u64, Error> {
         customer.require_auth();
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidStatus);
+        }
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
@@ -2534,6 +2542,11 @@ impl EscrowContract {
         }
         if tokens.len() > 10 {
             return Err(Error::InvalidStatus);
+        }
+        for entry in tokens.iter() {
+            if entry.amount <= 0 {
+                return Err(Error::InvalidStatus);
+            }
         }
 
         // Reject duplicate token addresses
