@@ -378,6 +378,29 @@ fn test_create_escrow() {
     assert_eq!(escrow.min_hold_period, min_hold_period);
 }
 
+
+#[test]
+fn test_create_escrow_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let result = client.try_create_escrow(
+        &customer,
+        &merchant,
+        &0_i128,
+        &token,
+        &1000_u64,
+        &0_u64,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
 #[test]
 fn test_get_escrow() {
     let env = Env::default();
@@ -2015,6 +2038,47 @@ fn test_release_vested_amount_before_cliff_returns_cliff_error() {
     assert_eq!(result, Err(Ok(Error::CliffPeriodNotPassed)));
 }
 
+
+#[test]
+fn test_create_multi_party_escrow_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1,
+        role: ParticipantRole::Merchant,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2,
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
+    });
+
+    let result = client.try_create_multi_party_escrow(
+        &customer,
+        &participants,
+        &0_i128,
+        &token,
+        &1000_u64,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
 #[test]
 #[should_panic]
 fn test_create_multi_party_escrow_invalid_shares() {
@@ -2933,6 +2997,29 @@ fn test_create_multi_token_escrow_empty_list() {
     assert_eq!(result, Err(Ok(Error::EmptyTokenList)));
 }
 
+
+#[test]
+fn test_create_multi_token_escrow_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_a = setup_token(&env);
+    let token_a_admin = token::StellarAssetClient::new(&env, &token_a);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    token_a_admin.mint(&customer, &1000);
+
+    let mut tokens = Vec::new(&env);
+    tokens.push_back(TokenEntry {
+        token: token_a,
+        amount: 0,
+    });
+
+    let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
 #[test]
 fn test_create_multi_token_escrow_duplicate_token() {
     let env = Env::default();
