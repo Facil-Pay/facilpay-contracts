@@ -1652,6 +1652,179 @@ fn test_create_multi_party_escrow_success() {
     assert_eq!(token_user_client.balance(&contract_id), amount);
 }
 
+
+#[test]
+fn shares_sum_to_9500_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1,
+        role: ParticipantRole::Merchant,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2,
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p3,
+        role: ParticipantRole::Arbitrator,
+        share_bps: 1500,
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
+    });
+
+    let result = client.try_create_multi_party_escrow(
+        &customer,
+        &participants,
+        &10_000_i128,
+        &token,
+        &1000_u64,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn shares_sum_to_10500_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1,
+        role: ParticipantRole::Merchant,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2,
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p3,
+        role: ParticipantRole::Arbitrator,
+        share_bps: 2500,
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
+    });
+
+    let result = client.try_create_multi_party_escrow(
+        &customer,
+        &participants,
+        &10_000_i128,
+        &token,
+        &1000_u64,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+}
+
+#[test]
+fn shares_sum_to_10000_releases_correctly() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let customer = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+
+    token_admin_client.mint(&customer, &10_000_i128);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1.clone(),
+        role: ParticipantRole::Merchant,
+        share_bps: 2500,
+        weight_bps: 2500,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2.clone(),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 2500,
+        weight_bps: 2500,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p3.clone(),
+        role: ParticipantRole::Arbitrator,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
+    });
+
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_multi_party_escrow(
+        &customer,
+        &participants,
+        &10_000_i128,
+        &token_id,
+        &1000_u64,
+    );
+
+    client.approve_release(&p1, &escrow_id);
+    client.approve_release(&p2, &escrow_id);
+    client.approve_release(&p3, &escrow_id);
+
+    env.ledger().set_timestamp(1001);
+    client.release_multi_party_escrow(&escrow_id);
+
+    let escrow = client.get_multi_party_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(token_client.balance(&p1), 2500);
+    assert_eq!(token_client.balance(&p2), 2500);
+    assert_eq!(token_client.balance(&p3), 5000);
+}
 #[test]
 #[should_panic]
 fn test_create_vesting_escrow_cliff_before_current_time() {
