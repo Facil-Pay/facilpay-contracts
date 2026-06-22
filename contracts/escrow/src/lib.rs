@@ -4270,7 +4270,12 @@ impl EscrowContract {
     /// Returns the reputation score for an address.
     /// New addresses start at the neutral score of 5000.
     pub fn get_reputation(env: Env, address: Address) -> ReputationScore {
-        EscrowContract::get_or_default_reputation(&env, &address)
+        let mut rep = EscrowContract::get_or_default_reputation(&env, &address);
+        let config = EscrowContract::get_or_default_decay_config(&env);
+        let now = env.ledger().timestamp();
+        let decayed_score = EscrowContract::compute_decayed_score(&rep, &config, now);
+        rep.score = decayed_score as i64;
+        rep
     }
 
     /// Admin configures the reputation reward/penalty magnitudes.
