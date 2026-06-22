@@ -335,6 +335,228 @@ pub struct Subscription {
     pub pause_data: SubscriptionPauseData,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Error {
+    PaymentNotFound = 1,
+    InvalidStatus = 2,
+    AlreadyProcessed = 3,
+    Unauthorized = 4,
+    PaymentExpired = 5,
+    NotExpired = 6,
+    NoExpiration = 7,
+    TransferFailed = 8,
+    MetadataTooLarge = 9,
+    NotesTooLarge = 10,
+    InvalidCurrency = 11,
+    RefundExceedsPayment = 12,
+    SubscriptionNotFound = 13,
+    SubscriptionNotActive = 14,
+    PaymentNotDue = 15,
+    MaxRetriesExceeded = 16,
+    SubscriptionEnded = 17,
+    InvalidBatchSize = 18,
+    BatchPartialFailure = 19,
+    RateLimitExceeded = 20,
+    DailyVolumeExceeded = 21,
+    AddressFlagged = 60,
+    AddressAlreadyFlagged = 61,
+    AmountExceedsLimit = 23,
+    DunningNotFound = 24,
+    SubscriptionNotInDunning = 25,
+    RetryNotDue = 26,
+    GracePeriodExpired = 27,
+    EscrowMappingNotFound = 28,
+    EscrowBridgeFailed = 29,
+    MultiSigNotInitialized = 30,
+    ProposalNotFound = 31,
+    ProposalExpired = 32,
+    ProposalAlreadyExecuted = 33,
+    MultiSigThresholdNotMet = 34,
+    InsufficientAdmins = 35,
+    NotAnAdmin = 36,
+    AlreadyApproved = 37,
+    FeeConfigNotFound = 38,
+    InsufficientFees = 39,
+    ConditionNotMet = 40,
+    ConditionAlreadyEvaluated = 41,
+    OracleCallFailed = 42,
+    ContractPaused = 43,
+    FunctionPaused = 44,
+    InvalidTierThresholds = 45,
+    AutoEscrowRuleNotFound = 46,
+    AutoEscrowBelowMinimum = 47,
+    AutoEscrowAlreadyTriggered = 48,
+    PaymentNotYetDue = 54,
+    ScheduledPaymentCancelled = 55,
+    OracleFeedStale = 58,
+    OracleNotConfigured = 59,
+    ConditionEvaluationFailed = 62,
+    ConditionRuntimeNotMet = 63,
+    RetryTooEarly = 56,
+    PaymentRequiresMultiSig = 64,
+    InsufficientPaymentApprovals = 65,
+    PaymentProposalExpired = 66,
+    MetadataAlreadySet = 67,
+    MetadataNotFound = 68,
+    HashMismatch = 69,
+    PaymentAlreadyFullyPaid = 52,
+    InstallmentExceedsRemaining = 53,
+    PartialPaymentNotFound = 70,
+    MerchantRateLimitExceeded = 50,
+    AmountRateLimitExceeded = 51,
+    InvalidFeeConfig = 71,
+    InvalidAmount = 72,
+    ChannelNotFound = 73,
+    InvalidSignature = 74,
+    InvalidNonce = 75,
+    ChannelClosed = 76,
+    ChannelExpired = 77,
+    ChannelNotExpired = 78,
+    MeteredSubscriptionNotFound = 79,
+    BillingCapExceeded = 80,
+    InvalidSplitShares = 85,
+    TooManyRecipients = 86,
+    SplitConfigNotFound = 87,
+    SplitAlreadyExecuted = 88,
+    LoyaltyNotConfigured = 100,
+    InsufficientPoints = 101,
+    PointsExpired = 102,
+    // Fee sweep (#216)
+    NothingToSweep = 114,
+    SweepRecipientNotSet = 115,
+    // Customer spend limits (#217)
+    SpendLimitExceeded = 116,
+    SpendLimitNotConfigured = 117,
+    // Subscription groups (#218)
+    GroupNotFound = 118,
+    SubscriptionAlreadyInGroup = 119,
+    GroupSizeLimitExceeded = 120,
+    // Finality delay (#219)
+    SettlementNotReady = 121,
+    FinalityConfigNotFound = 122,
+    SettlementAlreadyFinalized = 123,
+    VerificationLevelNotFound = 95,
+    TierLimitsNotConfigured = 96,
+    // Fee rebate programme
+    RebateThresholdNotMet = 106,
+    RebateAlreadyClaimed = 107,
+    RebateConfigNotFound = 108,
+    PayoutScheduleNotFound = 89,
+    PayoutNotYetDue = 90,
+    NothingToSettle = 91,
+    // Payment forwarding (#220)
+    ForwardConfigNotFound = 109,
+    ForwardLoop = 110,
+    InvalidForwardBps = 111,
+    // Arithmetic safety
+    BillingOverflow = 124,
+}
+
+// Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
+impl From<Error> for soroban_sdk::Error {
+    #[inline(always)]
+    fn from(val: Error) -> soroban_sdk::Error {
+        <_ as From<&Error>>::from(&val)
+    }
+}
+impl From<&Error> for soroban_sdk::Error {
+    #[inline(always)]
+    fn from(val: &Error) -> soroban_sdk::Error {
+        soroban_sdk::Error::from_contract_error(*val as u32)
+    }
+}
+impl TryFrom<soroban_sdk::Error> for Error {
+    type Error = soroban_sdk::Error;
+    #[inline(always)]
+    fn try_from(error: soroban_sdk::Error) -> Result<Self, soroban_sdk::Error> {
+        if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
+            let code = error.get_code();
+            if matches!(code, 1..=21 | 23..=48 | 50..=56 | 58..=80 | 85..=91 | 95..=96 | 100..=102 | 106..=111 | 114..=124)
+            {
+                // SAFETY: Error is #[repr(u32)] and all valid discriminants are covered by the matches! guard above
+                Ok(unsafe { core::mem::transmute::<u32, Error>(code) })
+            } else {
+                Err(error)
+            }
+        } else {
+            Err(error)
+        }
+    }
+}
+impl TryFrom<&soroban_sdk::Error> for Error {
+    type Error = soroban_sdk::Error;
+    #[inline(always)]
+    fn try_from(error: &soroban_sdk::Error) -> Result<Self, soroban_sdk::Error> {
+        <_ as TryFrom<soroban_sdk::Error>>::try_from(*error)
+    }
+}
+impl From<Error> for soroban_sdk::InvokeError {
+    #[inline(always)]
+    fn from(val: Error) -> soroban_sdk::InvokeError {
+        <_ as From<&Error>>::from(&val)
+    }
+}
+impl From<&Error> for soroban_sdk::InvokeError {
+    #[inline(always)]
+    fn from(val: &Error) -> soroban_sdk::InvokeError {
+        soroban_sdk::InvokeError::Contract(*val as u32)
+    }
+}
+impl TryFrom<soroban_sdk::InvokeError> for Error {
+    type Error = soroban_sdk::InvokeError;
+    #[inline(always)]
+    fn try_from(error: soroban_sdk::InvokeError) -> Result<Self, soroban_sdk::InvokeError> {
+        match error {
+            soroban_sdk::InvokeError::Abort => Err(error),
+            soroban_sdk::InvokeError::Contract(code) => {
+                soroban_sdk::Error::from_contract_error(code)
+                    .try_into()
+                    .map_err(|_| error)
+            }
+        }
+    }
+}
+impl TryFrom<&soroban_sdk::InvokeError> for Error {
+    type Error = soroban_sdk::InvokeError;
+    #[inline(always)]
+    fn try_from(error: &soroban_sdk::InvokeError) -> Result<Self, soroban_sdk::InvokeError> {
+        <_ as TryFrom<soroban_sdk::InvokeError>>::try_from(*error)
+    }
+}
+impl soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val> for Error {
+    type Error = soroban_sdk::ConversionError;
+    #[inline(always)]
+    fn try_from_val(
+        env: &soroban_sdk::Env,
+        val: &soroban_sdk::Val,
+    ) -> Result<Self, soroban_sdk::ConversionError> {
+        use soroban_sdk::TryIntoVal;
+        let error: soroban_sdk::Error = val.try_into_val(env)?;
+        error.try_into().map_err(|_| soroban_sdk::ConversionError)
+    }
+}
+impl soroban_sdk::TryFromVal<soroban_sdk::Env, Error> for soroban_sdk::Val {
+    type Error = soroban_sdk::ConversionError;
+    #[inline(always)]
+    fn try_from_val(
+        _env: &soroban_sdk::Env,
+        val: &Error,
+    ) -> Result<Self, soroban_sdk::ConversionError> {
+        let error: soroban_sdk::Error = val.into();
+        Ok(error.into())
+    }
+}
+impl soroban_sdk::TryFromVal<soroban_sdk::Env, &Error> for soroban_sdk::Val {
+    type Error = soroban_sdk::ConversionError;
+    #[inline(always)]
+    fn try_from_val(
+        env: &soroban_sdk::Env,
+        val: &&Error,
+    ) -> Result<Self, soroban_sdk::ConversionError> {
+        <_ as soroban_sdk::TryFromVal<soroban_sdk::Env, Error>>::try_from_val(env, *val)
+    }
+}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -484,7 +706,7 @@ pub struct PaymentChannel {
     pub token: Address,
     pub deposited: i128,
     pub settled: i128,
-    pub nonce: u64,
+    pub settled_nonce: u64,
     pub open: bool,
     pub expires_at: u64,
     pub customer_pk: BytesN<32>,
@@ -1876,6 +2098,9 @@ impl PaymentContract {
         if env.ledger().timestamp() < scheduled.scheduled_at {
             return Err(Error::Payment(PaymentError::NotYetDue));
         }
+
+        // Check customer spend limit (#282)
+        PaymentContract::check_and_update_spend_limit(&env, &scheduled.customer, scheduled.amount)?;
 
         Self::settle_or_accumulate(
             &env,
@@ -4091,6 +4316,11 @@ impl PaymentContract {
                 return Err(Error::Subscription(SubscriptionError::RetryTooEarly));
             }
 
+            // Check customer spend limit (#282)
+            if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
+                return Err(Error::SpendLimitExceeded);
+            }
+
             let token_client = token::Client::new(&env, &sub.token);
             let contract_address = env.current_contract_address();
             let transfer_ok = token_client
@@ -4193,6 +4423,11 @@ impl PaymentContract {
                 .instance()
                 .set(&DataKey::Subscription(SubscriptionKey::Data(subscription_id)), &sub);
             return Ok(());
+        }
+
+        // Check customer spend limit (#282)
+        if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
+            return Err(Error::SpendLimitExceeded);
         }
 
         // Attempt token transfer
@@ -4376,7 +4611,9 @@ impl PaymentContract {
             return Ok(0);
         }
 
-        let mut amount = (units_billed as i128).saturating_mul(sub.price_per_unit);
+        let mut amount = (units_billed as i128)
+            .checked_mul(sub.price_per_unit)
+            .ok_or(Error::BillingOverflow)?;
         let mut cap_hit = false;
 
         if let Some(cap) = sub.billing_cap {
@@ -6400,6 +6637,30 @@ impl PaymentContract {
                 continue;
             }
 
+            // Check merchant rate limits
+            if let Err(e) =
+                PaymentContract::check_merchant_rate_limit(&env, &entry.merchant, entry.amount)
+            {
+                results.push_back(BatchResult {
+                    payment_id: 0,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+                continue;
+            }
+
+            // Check customer spend limit
+            if let Err(e) =
+                PaymentContract::check_and_update_spend_limit(&env, &entry.customer, entry.amount)
+            {
+                results.push_back(BatchResult {
+                    payment_id: 0,
+                    success: false,
+                    error_code: Some(e as u32),
+                });
+                continue;
+            }
+
             // Create payment record
             let counter: u64 = env
                 .storage()
@@ -8150,7 +8411,7 @@ impl PaymentContract {
             token,
             deposited: amount,
             settled: 0,
-            nonce: 0,
+            settled_nonce: 0,
             open: true,
             expires_at,
             customer_pk,
@@ -8197,6 +8458,9 @@ impl PaymentContract {
 
         if nonce <= channel.nonce {
             return Err(Error::Feature(FeatureError::InvalidNonce));
+        // Enforce strictly increasing nonce to prevent stale off-chain state replay
+        if nonce <= channel.settled_nonce {
+            return Err(Error::InvalidNonce);
         }
 
         if merchant_amount > channel.deposited {
@@ -8224,7 +8488,7 @@ impl PaymentContract {
         }
 
         channel.settled = merchant_amount;
-        channel.nonce = nonce;
+        channel.settled_nonce = nonce;
         channel.open = false;
 
         env.storage()
@@ -8314,6 +8578,9 @@ impl PaymentContract {
         if total_bps != 10000 {
             return Err(Error::Feature(FeatureError::InvalidSplitShares));
         }
+
+        // Check customer spend limit (#282)
+        PaymentContract::check_and_update_spend_limit(&env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()

@@ -328,6 +328,59 @@ pub enum ClawbackCode {
     Cancelled = 3,
 }
 
+#[repr(u32)]
+#[contracterror]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Error {
+    EscrowNotFound = 1,
+    InvalidStatus = 2,
+    AlreadyProcessed = 3,
+    Unauthorized = 4,
+    ReleaseNotYetAvailable = 5,
+    NotDisputed = 6,
+    TimeoutNotReached = 7,
+    ReleaseOnHoldPeriod = 8,
+    InvalidVestingSchedule = 9,
+    CliffPeriodNotPassed = 10,
+    MilestoneAlreadyReleased = 11,
+    DuplicateApproval = 16,
+    ApprovalsThresholdNotMet = 17,
+    MultiSigNotInitialized = 18,
+    NotAnAdmin = 24,
+    AlreadyApproved = 25,
+    ActionNotReady = 26,
+    ContractPaused = 30,
+    ObserverAlreadyAdded = 47,
+    ObserverNotFound = 48,
+    AccelerationLimitExceeded = 66,
+    TransferNotAllowed = 42,
+    SameBeneficiary = 43,
+    ConditionalEscrowNotFound = 50,
+    ConditionAlreadyEvaluated = 51,
+    InvalidMerkleProof = 34,
+    RootAlreadyCommitted = 38,
+    MigrationNotStarted = 63,
+    AlreadyMigrated = 65,
+    ParticipantNotFound = 84,
+    EscrowNotExpired = 85,
+    EscrowAlreadyExpired = 86,
+    ExpiryBeforeRelease = 87,
+    TemplateNotFound = 88,
+    TemplateInactive = 89,
+    StaleThresholdNotConfigured = 94,
+    SubAccountNotFound = 95,
+    SubAccountAlreadyReleased = 96,
+    SubAccountFundingExceedsEscrow = 97,
+    SwapConfigNotFound = 53,
+    SwapOutputBelowMinimum = 54,
+    SwapAlreadyExecuted = 55,
+    MaxHierarchyDepth = 56,
+    ParentEscrowNotFound = 57,
+    ChildrenNotResolved = 58,
+    BatchReleaseSizeLimitExceeded = 76,
+    EvidenceDeadlinePassed = 73,
+    BatchTooLarge = 77,
+}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2025,9 +2078,18 @@ impl EscrowContract {
             }
         }
 
+        let current_timestamp = env.ledger().timestamp();
+
         // Validate expiry: if set (non-zero), must be strictly after release_timestamp
         if expiry_timestamp != 0 && expiry_timestamp <= release_timestamp {
             return Err(Error::Escrow(EscrowError::ExpiryBeforeRelease));
+        }
+
+        // Validate expiry: must be strictly in the future and after the hold period elapses
+        if expiry_timestamp != 0
+            && expiry_timestamp <= current_timestamp.saturating_add(min_hold_period)
+        {
+            return Err(Error::EscrowAlreadyExpired);
         }
 
         let counter: u64 = env
@@ -2036,8 +2098,6 @@ impl EscrowContract {
             .get(&DataKey::Escrow(EscrowKey::Counter))
             .unwrap_or(0);
         let escrow_id = counter + 1;
-
-        let current_timestamp = env.ledger().timestamp();
 
         let fee_config = Self::get_escrow_fee_config(env.clone());
         let fee_bps = if fee_config.enabled {
@@ -3249,9 +3309,23 @@ impl EscrowContract {
         const MAX_BATCH: u32 = 10;
         if evidence_items.len() > MAX_BATCH {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
+            return Err(Error::BatchTooLarge);
         }
 
         let now = env.ledger().timestamp();
+
+        // Enforce the same evidence deadline as the single-item path.
+        if let Some(deadline) = escrow.evidence_deadline {
+            if now > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: now,
+                }
+                .publish(&env);
+                return Err(Error::EvidenceDeadlinePassed);
+            }
+        }
         let page_num: u32 = env
             .storage()
             .instance()
@@ -8300,8 +8374,8 @@ mod hierarchy_test;
 // #[cfg(test)]
 // mod pause_history_test;
 //
-// #[cfg(test)]
-// mod expiry_test;
+#[cfg(test)]
+mod expiry_test;
 //
 // #[cfg(test)]
 // mod multisig_threshold_test;
@@ -8309,8 +8383,8 @@ mod hierarchy_test;
 // #[cfg(test)]
 // mod escalation_timeout_test;
 //
-// #[cfg(test)]
-// mod bulk_evidence_test;
+#[cfg(test)]
+mod bulk_evidence_test;
 // mod migration_test;
 //
 // #[cfg(test)]
