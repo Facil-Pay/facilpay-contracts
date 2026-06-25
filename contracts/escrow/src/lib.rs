@@ -60,7 +60,7 @@ pub enum BasicError {
     Unauthorized = 100, NotAnAdmin = 101, AlreadyApproved = 102, ContractPaused = 103,
     DuplicateApproval = 104, MultiSigNotInitialized = 105, MigrationNotStarted = 106,
     AlreadyMigrated = 107, ParticipantNotFound = 108, InvalidMerkleProof = 109,
-    RootAlreadyCommitted = 110,
+    RootAlreadyCommitted = 110, InvalidBps = 111,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -74,7 +74,7 @@ pub enum EscrowError {
     TemplateNotFound = 212, TemplateInactive = 213, SubAccountNotFound = 214,
     SubAccountAlreadyReleased = 215, SubAccountFundingExceedsEscrow = 216,
     ConditionalEscrowNotFound = 217, ParentEscrowNotFound = 218, ChildrenNotResolved = 219,
-    MaxHierarchyDepth = 220,
+    MaxHierarchyDepth = 220, BatchTooLarge = 221
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -122,8 +122,8 @@ impl TryFrom<soroban_sdk::Error> for Error {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
             if code >= 300 && code <= 314 { return Ok(Error::Action(unsafe { core::mem::transmute(code) })); }
-            if code >= 200 && code <= 220 { return Ok(Error::Escrow(unsafe { core::mem::transmute(code) })); }
-            if code >= 100 && code <= 110 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
+            if code >= 200 && code <= 221 { return Ok(Error::Escrow(unsafe { core::mem::transmute(code) })); }
+            if code >= 100 && code <= 111 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
         }
         Err(error)
     }
@@ -178,7 +178,7 @@ pub struct EscalationConfig {
 #[derive(Clone)]
 #[contracttype]
 pub struct EscrowFeeConfig {
-    pub fee_bps: i128,
+    pub fee_bps: i128, 
     pub fee_recipient: Address,
     pub enabled: bool,
 }
@@ -331,7 +331,7 @@ pub enum ClawbackCode {
 #[repr(u32)]
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
-pub enum Error {
+pub enum TestError {
     EscrowNotFound = 1,
     InvalidStatus = 2,
     AlreadyProcessed = 3,
@@ -2089,7 +2089,7 @@ impl EscrowContract {
         if expiry_timestamp != 0
             && expiry_timestamp <= current_timestamp.saturating_add(min_hold_period)
         {
-            return Err(Error::EscrowAlreadyExpired);
+            return Err(Error::Escrow(EscrowError::EscrowAlreadyExpired));
         }
 
         let counter: u64 = env
@@ -2528,7 +2528,7 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
-        if threshold_bps == 0 || threshold_bps > 10000 {
+        if let Err(_) = Self::validate_bps(threshold_bps) {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
 
@@ -3308,8 +3308,7 @@ impl EscrowContract {
 
         const MAX_BATCH: u32 = 10;
         if evidence_items.len() > MAX_BATCH {
-            return Err(Error::Escrow(EscrowError::InvalidStatus));
-            return Err(Error::BatchTooLarge);
+            return Err(Error::Escrow(EscrowError::BatchTooLarge));
         }
 
         let now = env.ledger().timestamp();
@@ -3323,7 +3322,7 @@ impl EscrowContract {
                     submitted_at: now,
                 }
                 .publish(&env);
-                return Err(Error::EvidenceDeadlinePassed);
+                return Err(Error::Action(ActionError::EvidenceDeadlinePassed));
             }
         }
         let page_num: u32 = env
@@ -4828,10 +4827,11 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
-        if milestone_bps == 0
-            || milestone_bps > max_acceleration_bps
-            || max_acceleration_bps > 10000
-        {
+        if let Err(_) = Self::validate_bps(milestone_bps) {
+            return Err(Error::Escrow(EscrowError::InvalidVestingSchedule));
+        }
+
+        if milestone_bps > max_acceleration_bps{
             return Err(Error::Escrow(EscrowError::InvalidVestingSchedule));
         }
 
@@ -8332,6 +8332,14 @@ impl EscrowContract {
         } else {
             true
         }
+    }
+
+    fn validate_bps(bps: u32) -> Result<(), Error> {
+        if bps < 1 || bps > 10000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        };
+
+        Ok(())
     }
 }
 

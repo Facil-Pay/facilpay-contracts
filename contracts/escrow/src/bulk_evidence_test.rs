@@ -64,7 +64,7 @@ fn test_oversized_batch_rejected() {
     }
 
     let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::BatchTooLarge))));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn test_batch_on_non_disputed_escrow_rejected() {
     items.push_back(Bytes::from_array(&env, &[1u8; 32]));
 
     let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::NotDisputed)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::NotDisputed))));
 }
 
 /// A third party that is neither the customer nor the merchant must be rejected
@@ -156,7 +156,7 @@ fn test_unauthorized_caller_rejected() {
     items.push_back(Bytes::from_array(&env, &[9u8; 32]));
 
     let result = client.try_submit_evidence_batch(&stranger, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 /// A rejected oversized batch must leave no partial state: the page count for
@@ -174,7 +174,7 @@ fn test_oversized_batch_leaves_no_partial_state() {
 
     // Must fail.
     let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::BatchTooLarge))));
 
     // No page should have been written — the page is empty.
     let page = client.get_evidence_page(&escrow_id, &0u32);
@@ -311,5 +311,5 @@ fn test_batch_rejected_after_evidence_deadline() {
     items.push_back(Bytes::from_array(&env, &[0xffu8; 32]));
 
     let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::EvidenceDeadlinePassed)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::EvidenceDeadlinePassed))));
 }

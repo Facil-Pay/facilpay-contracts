@@ -684,7 +684,7 @@ pub struct ArbitratorVote {
 #[contracttype]
 pub struct RefundTier {
     pub days_from_purchase: u64,
-    pub max_refund_bps: u32,
+    pub max_refund_bps: u32 ,
 }
 
 #[derive(Clone)]
@@ -1525,7 +1525,8 @@ impl RefundContract {
         if payment_id == 0 {
             return Err(Error::InvalidPaymentId);
         }
-        if refund_bps == 0 || refund_bps > 10000 {
+
+        if let Err(_) = Self::validate_bps(refund_bps) {
             return Err(Error::RefundExceedsPolicy);
         }
 
@@ -3210,7 +3211,7 @@ impl RefundContract {
 
         // Validate max_refund_bps is within bounds for all tiers (0-10000 basis points)
         for tier in tiers.iter() {
-            if tier.max_refund_bps > 10000 {
+            if let Err(_) = Self::validate_bps(tier.max_refund_bps) {
                 return Err(Error::RefundExceedsPolicy);
             }
         }
@@ -6722,6 +6723,14 @@ impl RefundContract {
             &DataKey::PaymentRefundUsage(payment_id),
             &(new_count, new_amount),
         );
+    }
+
+    fn validate_bps(bps: u32) -> Result<(), Error> {
+        if bps < 1 || bps > 10000 {
+            return Err(Error::InvalidAmount);
+        };
+
+        Ok(())
     }
 }
 

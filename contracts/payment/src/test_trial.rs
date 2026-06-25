@@ -67,7 +67,7 @@ fn test_create_subscription_rejects_zero_interval() {
         &String::from_str(&env, ""),
         &0u64,
     );
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidInterval);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::InvalidInterval));
 }
 
 // During trial: execute_recurring_payment returns Ok without charging

@@ -67,7 +67,7 @@ pub enum BasicError {
     InsufficientAdmins = 112, NotAnAdmin = 113, AlreadyApproved = 114,
     OracleCallFailed = 115, ContractPaused = 116, FunctionPaused = 117,
     InvalidTierThresholds = 118, OracleFeedStale = 119, OracleNotConfigured = 120,
-    InvalidAmount = 121, VerificationLevelNotFound = 122, TierLimitsNotConfigured = 123,
+    InvalidAmount = 121, VerificationLevelNotFound = 122, TierLimitsNotConfigured = 123, InvalidInterval = 124, InvalidBps = 125
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -80,7 +80,7 @@ pub enum PaymentError {
     MetadataNotFound = 211, HashMismatch = 212, AlreadyFullyPaid = 213,
     InstallmentExceedsRemaining = 214, PartialPaymentNotFound = 215,
     MerchantRateLimitExceeded = 216, AmountRateLimitExceeded = 217,
-    PayoutScheduleNotFound = 218, PayoutNotYetDue = 219, NothingToSettle = 220,
+    PayoutScheduleNotFound = 218, PayoutNotYetDue = 219, NothingToSettle = 220, BillingOverflow = 221
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,18 +160,18 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 500 && code <= 537 { return Ok(Error::Feature(unsafe { core::mem::transmute(code) })); }
             if code >= 400 && code <= 406 { return Ok(Error::Proposal(unsafe { core::mem::transmute(code) })); }
             if code >= 300 && code <= 314 { return Ok(Error::Subscription(unsafe { core::mem::transmute(code) })); }
-            if code >= 200 && code <= 220 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
-            if code >= 100 && code <= 123 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
+            if code >= 200 && code <= 221 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
+            if code >= 100 && code <= 125 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
         }
         Err(error)
     }
 }
 
-impl FromVal<Env, Error> for Val {
-    fn from_val(env: &Env, v: &Error) -> Self {
-        soroban_sdk::Error::from(v).into_val(env)
-    }
-}
+// impl FromVal<Env, Error> for Val {
+//     fn from_val(env: &Env, v: &Error) -> Self {
+//         soroban_sdk::Error::from(v).into_val(env)
+//     }
+// }
 
 impl TryFromVal<Env, Val> for Error {
     type Error = soroban_sdk::ConversionError;
@@ -337,7 +337,7 @@ pub struct Subscription {
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Error {
+pub enum TestError {
     PaymentNotFound = 1,
     InvalidStatus = 2,
     AlreadyProcessed = 3,
@@ -455,36 +455,36 @@ pub enum Error {
 }
 
 // Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
-impl From<Error> for soroban_sdk::Error {
-    #[inline(always)]
-    fn from(val: Error) -> soroban_sdk::Error {
-        <_ as From<&Error>>::from(&val)
-    }
-}
-impl From<&Error> for soroban_sdk::Error {
-    #[inline(always)]
-    fn from(val: &Error) -> soroban_sdk::Error {
-        soroban_sdk::Error::from_contract_error(*val as u32)
-    }
-}
-impl TryFrom<soroban_sdk::Error> for Error {
-    type Error = soroban_sdk::Error;
-    #[inline(always)]
-    fn try_from(error: soroban_sdk::Error) -> Result<Self, soroban_sdk::Error> {
-        if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
-            let code = error.get_code();
-            if matches!(code, 1..=21 | 23..=48 | 50..=56 | 58..=80 | 85..=91 | 95..=96 | 100..=102 | 106..=111 | 114..=125)
-            {
-                // SAFETY: Error is #[repr(u32)] and all valid discriminants are covered by the matches! guard above
-                Ok(unsafe { core::mem::transmute::<u32, Error>(code) })
-            } else {
-                Err(error)
-            }
-        } else {
-            Err(error)
-        }
-    }
-}
+// impl From<Error> for soroban_sdk::Error {
+//     #[inline(always)]
+//     fn from(val: Error) -> soroban_sdk::Error {
+//         <_ as From<&Error>>::from(&val)
+//     }
+// }
+// impl From<&Error> for soroban_sdk::Error {
+//     #[inline(always)]
+//     fn from(val: &Error) -> soroban_sdk::Error {
+//         soroban_sdk::Error::from_contract_error(*val.to_u32())
+//     }
+// }
+// impl TryFrom<soroban_sdk::Error> for Error {
+//     type Error = soroban_sdk::Error;
+//     #[inline(always)]
+//     fn try_from(error: soroban_sdk::Error) -> Result<Self, soroban_sdk::Error> {
+//         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
+//             let code = error.get_code();
+//             if matches!(code, 1..=21 | 23..=48 | 50..=56 | 58..=80 | 85..=91 | 95..=96 | 100..=102 | 106..=111 | 114..=125)
+//             {
+//                 // SAFETY: Error is #[repr(u32)] and all valid discriminants are covered by the matches! guard above
+//                 Ok(unsafe { core::mem::transmute::<u32, Error>(code) })
+//             } else {
+//                 Err(error)
+//             }
+//         } else {
+//             Err(error)
+//         }
+//     }
+// }
 impl TryFrom<&soroban_sdk::Error> for Error {
     type Error = soroban_sdk::Error;
     #[inline(always)]
@@ -498,12 +498,19 @@ impl From<Error> for soroban_sdk::InvokeError {
         <_ as From<&Error>>::from(&val)
     }
 }
+// impl From<&Error> for soroban_sdk::InvokeError {
+//     #[inline(always)]
+//     fn from(val: &Error) -> soroban_sdk::InvokeError {
+//         soroban_sdk::InvokeError::Contract(*val as u32)
+//     }
+// }
+
 impl From<&Error> for soroban_sdk::InvokeError {
-    #[inline(always)]
-    fn from(val: &Error) -> soroban_sdk::InvokeError {
-        soroban_sdk::InvokeError::Contract(*val as u32)
+    fn from(e: &Error) -> Self {
+        soroban_sdk::InvokeError::Contract(e.to_u32())
     }
 }
+
 impl TryFrom<soroban_sdk::InvokeError> for Error {
     type Error = soroban_sdk::InvokeError;
     #[inline(always)]
@@ -525,18 +532,18 @@ impl TryFrom<&soroban_sdk::InvokeError> for Error {
         <_ as TryFrom<soroban_sdk::InvokeError>>::try_from(*error)
     }
 }
-impl soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val> for Error {
-    type Error = soroban_sdk::ConversionError;
-    #[inline(always)]
-    fn try_from_val(
-        env: &soroban_sdk::Env,
-        val: &soroban_sdk::Val,
-    ) -> Result<Self, soroban_sdk::ConversionError> {
-        use soroban_sdk::TryIntoVal;
-        let error: soroban_sdk::Error = val.try_into_val(env)?;
-        error.try_into().map_err(|_| soroban_sdk::ConversionError)
-    }
-}
+// impl soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val> for Error {
+//     type Error = soroban_sdk::ConversionError;
+//     #[inline(always)]
+//     fn try_from_val(
+//         env: &soroban_sdk::Env,
+//         val: &soroban_sdk::Val,
+//     ) -> Result<Self, soroban_sdk::ConversionError> {
+//         use soroban_sdk::TryIntoVal;
+//         let error: soroban_sdk::Error = val.try_into_val(env)?;
+//         error.try_into().map_err(|_| soroban_sdk::ConversionError)
+//     }
+// }
 impl soroban_sdk::TryFromVal<soroban_sdk::Env, Error> for soroban_sdk::Val {
     type Error = soroban_sdk::ConversionError;
     #[inline(always)]
@@ -3275,7 +3282,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         // Validate forward_bps: must be between 1 and 10000
-        if forward_bps < 1 || forward_bps > 10000 {
+        if let Err(_) = Self::validate_bps(forward_bps) {
             return Err(Error::Feature(FeatureError::InvalidForwardBps));
         }
 
@@ -4177,7 +4184,9 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::MetadataTooLarge));
         }
         if interval == 0 {
-            return Err(Error::InvalidInterval);
+            // return Err(Error::InvalidInterval);
+            return Err(Error::Basic(BasicError::InvalidInterval));
+
         }
 
         let counter: u64 = env
@@ -4322,7 +4331,7 @@ impl PaymentContract {
 
             // Check customer spend limit (#282)
             if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
-                return Err(Error::SpendLimitExceeded);
+                return Err(Error::Feature(FeatureError::SpendLimitExceeded));
             }
 
             let token_client = token::Client::new(&env, &sub.token);
@@ -4431,7 +4440,7 @@ impl PaymentContract {
 
         // Check customer spend limit (#282)
         if let Err(_) = PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount) {
-            return Err(Error::SpendLimitExceeded);
+            return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
 
         // Attempt token transfer
@@ -4617,7 +4626,9 @@ impl PaymentContract {
 
         let mut amount = (units_billed as i128)
             .checked_mul(sub.price_per_unit)
-            .ok_or(Error::BillingOverflow)?;
+            // .ok_or(Error::BillingOverflow)?;
+            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+
         let mut cap_hit = false;
 
         if let Some(cap) = sub.billing_cap {
@@ -6181,8 +6192,8 @@ impl PaymentContract {
         }
 
         // Validate waiver_bps is between 0 and 10000 (100%)
-        if waiver_bps > 10000 {
-            return Err(Error::Basic(BasicError::InvalidTierThresholds)); // Reuse existing error
+        if let Err(_) = Self::validate_bps(waiver_bps) {
+            return Err(Error::Basic(BasicError::InvalidTierThresholds));
         }
 
         let waiver = FeeWaiver {
@@ -6648,7 +6659,7 @@ impl PaymentContract {
                 results.push_back(BatchResult {
                     payment_id: 0,
                     success: false,
-                    error_code: Some(e as u32),
+                    error_code: Some(e.to_u32()),
                 });
                 continue;
             }
@@ -6660,7 +6671,7 @@ impl PaymentContract {
                 results.push_back(BatchResult {
                     payment_id: 0,
                     success: false,
-                    error_code: Some(e as u32),
+                    error_code: Some(e.to_u32()),
                 });
                 continue;
             }
@@ -8460,11 +8471,9 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::ChannelExpired));
         }
 
-        if nonce <= channel.nonce {
-            return Err(Error::Feature(FeatureError::InvalidNonce));
         // Enforce strictly increasing nonce to prevent stale off-chain state replay
         if nonce <= channel.settled_nonce {
-            return Err(Error::InvalidNonce);
+            return Err(Error::Feature(FeatureError::InvalidNonce));
         }
 
         if merchant_amount > channel.deposited {
@@ -9417,6 +9426,15 @@ impl PaymentContract {
             false
         }
     }
+
+    fn validate_bps(bps: u32) -> Result<(), Error> {
+        if bps < 1 || bps > 10000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        };
+
+        Ok(())
+    }
+
 }
 
 mod test;

@@ -159,7 +159,7 @@ fn test_billing_overflow_returns_error() {
     client.report_usage(&merchant, &sub_id, &2u64);
 
     let result = client.try_execute_metered_billing(&sub_id);
-    assert_eq!(result, Err(Ok(Error::BillingOverflow)));
+    assert_eq!(result, Err(Ok(Error::Payment(PaymentError::BillingOverflow))));
 
     // Accumulated units must still be intact — the state was not mutated.
     let usage = client.get_current_usage(&sub_id);
@@ -267,7 +267,7 @@ fn test_set_billing_cap_unauthorized() {
 
     // Customer tries to set the cap — should be rejected
     let result = client.try_set_billing_cap(&customer, &sub_id, &500i128);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 
     // Cap must still be None
     assert_eq!(client.get_current_usage(&sub_id).billing_cap, None);
@@ -281,7 +281,7 @@ fn test_billing_on_nonexistent_subscription() {
     let (client, _admin, _merchant, _customer, _token) = setup(&env);
 
     let result = client.try_execute_metered_billing(&9999u64);
-    assert_eq!(result, Err(Ok(Error::MeteredSubscriptionNotFound)));
+    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound))));
 }
 
 /// report_usage on an unknown subscription_id must return
@@ -292,7 +292,7 @@ fn test_report_usage_on_nonexistent_subscription() {
     let (client, _admin, merchant, _customer, _token) = setup(&env);
 
     let result = client.try_report_usage(&merchant, &9999u64, &5u64);
-    assert_eq!(result, Err(Ok(Error::MeteredSubscriptionNotFound)));
+    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound))));
 }
 
 /// Accumulated units saturate at u64::MAX instead of wrapping. This ensures
