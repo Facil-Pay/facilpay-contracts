@@ -299,5 +299,8 @@ fn test_equal_nonce_replay_rejected() {
     let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
 
     let result = client.try_settle_channel(&channel_id, &500i128, &0u64, &sig_bn);
-    assert!(result.is_err(), "Equal nonce must be rejected; strictly increasing required");
+    assert!(
+        result.is_err(),
+        "Equal nonce must be rejected; strictly increasing required"
+    );
 }

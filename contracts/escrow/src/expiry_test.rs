@@ -29,8 +29,9 @@ fn test_expire_escrow_success() {
 
     env.ledger().set_timestamp(1000);
     // release_timestamp=2000, expiry_timestamp=3000
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true,
+    );
 
     assert!(!client.is_escrow_expired(&escrow_id));
 
@@ -50,8 +51,9 @@ fn test_expire_escrow_premature_fails() {
     let (client, _admin, customer, merchant, token) = setup(&env);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true,
+    );
 
     // Still before expiry
     env.ledger().set_timestamp(2500);
@@ -66,8 +68,9 @@ fn test_expire_disputed_escrow_fails() {
     let (client, _admin, customer, merchant, token) = setup(&env);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id =
-        client.create_escrow(&customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true);
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &2000_u64, &0_u64, &3000_u64, &true,
+    );
 
     client.dispute_escrow(&customer, &escrow_id);
 

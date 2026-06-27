@@ -684,7 +684,7 @@ pub struct ArbitratorVote {
 #[contracttype]
 pub struct RefundTier {
     pub days_from_purchase: u64,
-    pub max_refund_bps: u32 ,
+    pub max_refund_bps: u32,
 }
 
 #[derive(Clone)]

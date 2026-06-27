@@ -5,7 +5,10 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
-use crate::{FeatureError, Currency, Error, FeeConfig, FeeRebateConfig, PaymentContract, PaymentContractClient};
+use crate::{
+    Currency, Error, FeatureError, FeeConfig, FeeRebateConfig, PaymentContract,
+    PaymentContractClient,
+};
 
 /// Sets up env, contract, admin, token, and fee config.
 /// Returns (env, client, admin, token_addr, customer, merchant).
@@ -183,7 +186,10 @@ fn test_double_claim_guard() {
     client.claim_fee_rebate(&merchant);
 
     let result = client.try_claim_fee_rebate(&merchant);
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::RebateAlreadyClaimed))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::RebateAlreadyClaimed)))
+    );
 }
 
 /// Period resets automatically when rebate_period_seconds elapses on the next payment.

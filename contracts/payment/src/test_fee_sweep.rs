@@ -1,7 +1,7 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
-use crate::{FeatureError, Error, FeeConfig, PaymentContract, PaymentContractClient};
+use crate::{Error, FeatureError, FeeConfig, PaymentContract, PaymentContractClient};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -36,7 +36,10 @@ fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
 fn test_sweep_recipient_not_set() {
     let (_, client, admin, _) = setup();
     let result = client.try_sweep_platform_fees(&admin);
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::SweepRecipientNotSet))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::SweepRecipientNotSet)))
+    );
 }
 
 #[test]
@@ -45,7 +48,10 @@ fn test_nothing_to_sweep() {
     let recipient = Address::generate(&env);
     client.set_sweep_recipient(&admin, &recipient);
     let result = client.try_sweep_platform_fees(&admin);
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::NothingToSweep))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::NothingToSweep)))
+    );
 }
 
 #[test]
