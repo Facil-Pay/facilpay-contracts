@@ -45,7 +45,7 @@ fn test_close_expired_channel() {
 
     // Fast forward
     env.ledger().set_timestamp(expires_at + 1);
-    client.close_channel_expired(&channel_id);
+    client.close_channel_expired(&customer, &channel_id);
 
     assert_eq!(token_client.balance(&customer), 1000i128);
     let channel = client.get_channel(&channel_id);
@@ -300,4 +300,152 @@ fn test_equal_nonce_replay_rejected() {
 
     let result = client.try_settle_channel(&channel_id, &500i128, &0u64, &sig_bn);
     assert!(result.is_err(), "Equal nonce must be rejected; strictly increasing required");
+}
+
+fn setup_channel_env() -> (Env, PaymentContractClient<'static>, Address, Address, Address, u64) {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &1000i128);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let expires_at = 5000u64;
+    env.ledger().set_timestamp(expires_at - 100);
+
+    let dummy_pk = BytesN::<32>::from_array(&env, &[0u8; 32]);
+    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &expires_at, &dummy_pk);
+
+    (env, client, customer, merchant, token_id, channel_id)
+}
+
+#[test]
+fn third_party_close_is_rejected() {
+    let (env, client, _customer, _merchant, _token_id, channel_id) = setup_channel_env();
+    let third_party = Address::generate(&env);
+
+    let expires_at = 5000u64;
+    env.ledger().set_timestamp(expires_at + 1);
+
+    let result = client.try_close_channel_expired(&third_party, &channel_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::Unauthorized))),
+        "Third party should be unauthorized to close the channel"
+    );
+}
+
+#[test]
+fn opener_can_close_after_dispute_period() {
+    let (env, client, customer, _merchant, token_id, channel_id) = setup_channel_env();
+    let token_client = token::Client::new(&env, &token_id);
+
+    let expires_at = 5000u64;
+    env.ledger().set_timestamp(expires_at + 1);
+
+    client.close_channel_expired(&customer, &channel_id);
+
+    let channel = client.get_channel(&channel_id);
+    assert!(!channel.open, "Channel should be closed");
+    assert_eq!(token_client.balance(&customer), 1000i128, "Customer should receive full refund");
+}
+
+#[test]
+fn counterparty_can_close_immediately_on_agreement() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+    token_admin_client.mint(&customer, &1000i128);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let pk_bytes = signing_key.verifying_key().to_bytes();
+    let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
+
+    // Channel with no expiry — counterparty (merchant) can settle immediately via signed state
+    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &0u64, &customer_pk);
+
+    let merchant_amount: i128 = 400;
+    let nonce: u64 = 1;
+    let mut msg = Bytes::new(&env);
+    msg.append(&channel_id.to_xdr(&env));
+    msg.append(&merchant_amount.to_xdr(&env));
+    msg.append(&nonce.to_xdr(&env));
+    let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
+    let sig = signing_key.sign(&msg_vec);
+    let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
+
+    // Merchant submits valid signed state — channel closes immediately
+    client.settle_channel(&channel_id, &merchant_amount, &nonce, &sig_bn);
+
+    let channel = client.get_channel(&channel_id);
+    assert!(!channel.open, "Channel should be closed after settlement");
+}
+
+#[test]
+fn close_transfers_correct_balances_to_each_party() {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &1000i128);
+    let token_client = token::Client::new(&env, &token_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let pk_bytes = signing_key.verifying_key().to_bytes();
+    let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
+
+    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &0u64, &customer_pk);
+
+    let merchant_amount: i128 = 300;
+    let nonce: u64 = 1;
+    let mut msg = Bytes::new(&env);
+    msg.append(&channel_id.to_xdr(&env));
+    msg.append(&merchant_amount.to_xdr(&env));
+    msg.append(&nonce.to_xdr(&env));
+    let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
+    let sig = signing_key.sign(&msg_vec);
+    let sig_bn = BytesN::<64>::from_array(&env, &sig.to_bytes());
+
+    client.settle_channel(&channel_id, &merchant_amount, &nonce, &sig_bn);
+
+    assert_eq!(token_client.balance(&merchant), 300i128, "Merchant gets agreed amount");
+    assert_eq!(token_client.balance(&customer), 700i128, "Customer gets remainder");
 }

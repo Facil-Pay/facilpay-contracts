@@ -8519,12 +8519,18 @@ impl PaymentContract {
         Ok(())
     }
 
-    pub fn close_channel_expired(env: Env, channel_id: u64) -> Result<(), Error> {
+    pub fn close_channel_expired(env: Env, caller: Address, channel_id: u64) -> Result<(), Error> {
+        caller.require_auth();
+
         let mut channel: PaymentChannel = env
             .storage()
             .instance()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        if caller != channel.customer && caller != channel.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
 
         if !channel.open {
             return Err(Error::Feature(FeatureError::ChannelClosed));
