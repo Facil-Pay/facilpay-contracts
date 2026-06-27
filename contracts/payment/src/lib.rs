@@ -80,7 +80,8 @@ pub enum PaymentError {
     MetadataNotFound = 211, HashMismatch = 212, AlreadyFullyPaid = 213,
     InstallmentExceedsRemaining = 214, PartialPaymentNotFound = 215,
     MerchantRateLimitExceeded = 216, AmountRateLimitExceeded = 217,
-    PayoutScheduleNotFound = 218, PayoutNotYetDue = 219, NothingToSettle = 220, BillingOverflow = 221
+    PayoutScheduleNotFound = 218, PayoutNotYetDue = 219, NothingToSettle = 220, BillingOverflow = 221,
+    InvalidLineItem = 222
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,7 +161,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 500 && code <= 537 { return Ok(Error::Feature(unsafe { core::mem::transmute(code) })); }
             if code >= 400 && code <= 406 { return Ok(Error::Proposal(unsafe { core::mem::transmute(code) })); }
             if code >= 300 && code <= 314 { return Ok(Error::Subscription(unsafe { core::mem::transmute(code) })); }
-            if code >= 200 && code <= 221 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
+            if code >= 200 && code <= 222 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
             if code >= 100 && code <= 125 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
         }
         Err(error)
@@ -9351,8 +9352,8 @@ impl PaymentContract {
         // Validate line items and calculate subtotal
         let mut subtotal: i128 = 0;
         for item in items.iter() {
-            if item.quantity == 0 || item.amount < 0 {
-                return Err(Error::Basic(BasicError::InvalidAmount));
+            if item.quantity == 0 || item.unit_price <= 0 || item.amount <= 0 {
+                return Err(Error::Payment(PaymentError::InvalidLineItem));
             }
             subtotal = subtotal
                 .checked_add(item.amount)
