@@ -52,14 +52,20 @@ fn test_schedule_payment_flow_and_guards() {
     assert_eq!(token_client.balance(&client.address), 1_000);
 
     let early = client.try_execute_scheduled_payment(&payment_id);
-    assert_eq!(early.err(), Some(Ok(Error::Payment(PaymentError::NotYetDue))));
+    assert_eq!(
+        early.err(),
+        Some(Ok(Error::Payment(PaymentError::NotYetDue)))
+    );
 
     env.ledger().set_timestamp(151);
     client.execute_scheduled_payment(&payment_id);
     assert_eq!(token_client.balance(&merchant), 1_000);
 
     let second = client.try_execute_scheduled_payment(&payment_id);
-    assert_eq!(second.err(), Some(Ok(Error::Payment(PaymentError::AlreadyProcessed))));
+    assert_eq!(
+        second.err(),
+        Some(Ok(Error::Payment(PaymentError::AlreadyProcessed)))
+    );
 }
 
 #[test]
@@ -112,7 +118,10 @@ fn test_oracle_refresh_and_manual_fallback() {
     };
     client.set_oracle_rate_config(&admin, &stale_cfg);
     let stale = client.try_refresh_conversion_rate(&Currency::ETH);
-    assert_eq!(stale.err(), Some(Ok(Error::Basic(BasicError::OracleFeedStale))));
+    assert_eq!(
+        stale.err(),
+        Some(Ok(Error::Basic(BasicError::OracleFeedStale)))
+    );
 
     let disabled_cfg = OracleRateConfig {
         oracle_address: cfg.oracle_address,
@@ -169,7 +178,10 @@ fn test_cross_contract_condition_success_and_failure() {
         &bad_cond,
     );
     let eval = client.try_evaluate_condition(&payment_id2);
-    assert_eq!(eval.err(), Some(Ok(Error::Feature(FeatureError::ConditionEvaluationFailed))));
+    assert_eq!(
+        eval.err(),
+        Some(Ok(Error::Feature(FeatureError::ConditionEvaluationFailed)))
+    );
 
     let _ = admin;
 }

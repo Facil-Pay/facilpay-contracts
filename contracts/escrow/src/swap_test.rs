@@ -135,7 +135,10 @@ fn test_escrow_swap_below_minimum_fails() {
 
     // Executing should fail with SwapOutputBelowMinimum
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapOutputBelowMinimum))));
+    assert_eq!(
+        res,
+        Err(Ok(Error::Action(ActionError::SwapOutputBelowMinimum)))
+    );
 }
 
 #[test]
@@ -169,7 +172,10 @@ fn test_escrow_swap_double_execution_fails() {
 
     // Execute second time: fails with SwapAlreadyExecuted
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapAlreadyExecuted))));
+    assert_eq!(
+        res,
+        Err(Ok(Error::Action(ActionError::SwapAlreadyExecuted)))
+    );
 }
 
 #[test]

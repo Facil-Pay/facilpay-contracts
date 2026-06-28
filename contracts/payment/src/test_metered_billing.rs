@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    token, Address, Env, String,
+};
 
 fn setup(env: &Env) -> (PaymentContractClient, Address, Address, Address, Address) {
     let id = env.register(PaymentContract, ());
@@ -159,11 +162,17 @@ fn test_billing_overflow_returns_error() {
     client.report_usage(&merchant, &sub_id, &2u64);
 
     let result = client.try_execute_metered_billing(&sub_id);
-    assert_eq!(result, Err(Ok(Error::Payment(PaymentError::BillingOverflow))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Payment(PaymentError::BillingOverflow)))
+    );
 
     // Accumulated units must still be intact — the state was not mutated.
     let usage = client.get_current_usage(&sub_id);
-    assert_eq!(usage.accumulated_units, 2, "state must not change on overflow");
+    assert_eq!(
+        usage.accumulated_units, 2,
+        "state must not change on overflow"
+    );
 }
 
 /// Billing on a subscription with zero accumulated units returns 0 and does
@@ -189,8 +198,16 @@ fn test_execute_metered_billing_zero_units_no_transfer() {
     let amount = client.execute_metered_billing(&sub_id);
     assert_eq!(amount, 0i128);
 
-    assert_eq!(token_client.balance(&merchant), merchant_before, "merchant balance must not change");
-    assert_eq!(token_client.balance(&customer), customer_before, "customer balance must not change");
+    assert_eq!(
+        token_client.balance(&merchant),
+        merchant_before,
+        "merchant balance must not change"
+    );
+    assert_eq!(
+        token_client.balance(&customer),
+        customer_before,
+        "customer balance must not change"
+    );
 }
 
 /// Multiple sequential billing cycles each reset the counter independently.
@@ -246,7 +263,10 @@ fn test_cap_set_after_usage_is_respected() {
     client.set_billing_cap(&merchant, &sub_id, &800i128);
 
     let amount = client.execute_metered_billing(&sub_id);
-    assert_eq!(amount, 800i128, "cap set after usage accumulation must be honoured");
+    assert_eq!(
+        amount, 800i128,
+        "cap set after usage accumulation must be honoured"
+    );
 }
 
 /// set_billing_cap must be rejected for a caller that is not the subscription's
@@ -281,7 +301,10 @@ fn test_billing_on_nonexistent_subscription() {
     let (client, _admin, _merchant, _customer, _token) = setup(&env);
 
     let result = client.try_execute_metered_billing(&9999u64);
-    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound)))
+    );
 }
 
 /// report_usage on an unknown subscription_id must return
@@ -292,7 +315,10 @@ fn test_report_usage_on_nonexistent_subscription() {
     let (client, _admin, merchant, _customer, _token) = setup(&env);
 
     let result = client.try_report_usage(&merchant, &9999u64, &5u64);
-    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(SubscriptionError::MeteredNotFound)))
+    );
 }
 
 /// Accumulated units saturate at u64::MAX instead of wrapping. This ensures
@@ -318,7 +344,11 @@ fn test_report_usage_saturates_at_u64_max() {
     client.report_usage(&merchant, &sub_id, &1u64);
 
     let usage = client.get_current_usage(&sub_id);
-    assert_eq!(usage.accumulated_units, u64::MAX, "counter must saturate, not wrap");
+    assert_eq!(
+        usage.accumulated_units,
+        u64::MAX,
+        "counter must saturate, not wrap"
+    );
 }
 
 /// price_per_unit of 1 with a single reported unit produces exactly 1 token
@@ -355,12 +385,20 @@ fn test_two_subscriptions_track_usage_independently() {
     let (client, _admin, merchant, customer, token) = setup(&env);
 
     let sub_a = client.create_metered_subscription(
-        &merchant, &customer, &10i128,
-        &String::from_str(&env, "calls"), &token, &None,
+        &merchant,
+        &customer,
+        &10i128,
+        &String::from_str(&env, "calls"),
+        &token,
+        &None,
     );
     let sub_b = client.create_metered_subscription(
-        &merchant, &customer, &50i128,
-        &String::from_str(&env, "gb"), &token, &None,
+        &merchant,
+        &customer,
+        &50i128,
+        &String::from_str(&env, "gb"),
+        &token,
+        &None,
     );
 
     client.report_usage(&merchant, &sub_a, &4u64);
@@ -371,8 +409,11 @@ fn test_two_subscriptions_track_usage_independently() {
     assert_eq!(charge_a, 40i128);
 
     assert_eq!(client.get_current_usage(&sub_a).accumulated_units, 0);
-    assert_eq!(client.get_current_usage(&sub_b).accumulated_units, 2,
-        "sub_b must not be reset when sub_a is billed");
+    assert_eq!(
+        client.get_current_usage(&sub_b).accumulated_units,
+        2,
+        "sub_b must not be reset when sub_a is billed"
+    );
 }
 
 /// When the billing cap exactly equals the computed charge, the full amount is
@@ -428,5 +469,119 @@ fn test_last_reset_at_updated_after_billing() {
     client.execute_metered_billing(&sub_id);
 
     let usage = client.get_current_usage(&sub_id);
-    assert_eq!(usage.last_reset_at, 5_000, "last_reset_at must reflect the billing timestamp");
+    assert_eq!(
+        usage.last_reset_at, 5_000,
+        "last_reset_at must reflect the billing timestamp"
+    );
+}
+
+// ── Period-boundary / rollover tests (#344) ──────────────────────────────────
+
+/// At period rollover (execute_metered_billing called at period_end), accumulated
+/// units must be reset to zero so they do not carry into the next period.
+#[test]
+fn test_units_reset_to_zero_at_period_rollover() {
+    let env = Env::default();
+    env.ledger().set_timestamp(0);
+    let (client, _admin, merchant, customer, token) = setup(&env);
+
+    let sub_id = client.create_metered_subscription(
+        &merchant,
+        &customer,
+        &10i128,
+        &String::from_str(&env, "req"),
+        &token,
+        &None,
+    );
+
+    // Accumulate usage during the first period
+    client.report_usage(&merchant, &sub_id, &7u64);
+    assert_eq!(client.get_current_usage(&sub_id).accumulated_units, 7);
+
+    // Advance ledger to the period boundary and trigger billing (rollover)
+    env.ledger().set_timestamp(30 * 24 * 3600); // simulate 30-day period end
+    client.execute_metered_billing(&sub_id);
+
+    // After rollover, units must be zero — they must not carry over
+    let usage = client.get_current_usage(&sub_id);
+    assert_eq!(
+        usage.accumulated_units, 0,
+        "units must reset to zero after period rollover"
+    );
+}
+
+/// Usage reported in the new period (after rollover) must be billed correctly
+/// without contamination from the previous period.
+#[test]
+fn test_usage_in_new_period_billed_correctly() {
+    let env = Env::default();
+    env.ledger().set_timestamp(0);
+    let (client, _admin, merchant, customer, token) = setup(&env);
+
+    let sub_id = client.create_metered_subscription(
+        &merchant,
+        &customer,
+        &50i128,
+        &String::from_str(&env, "gb"),
+        &token,
+        &None,
+    );
+
+    // Period 1: 4 units → charge 200
+    client.report_usage(&merchant, &sub_id, &4u64);
+    env.ledger().set_timestamp(2_592_000); // ~30 days
+    let charge1 = client.execute_metered_billing(&sub_id);
+    assert_eq!(charge1, 200i128, "period 1 charge must be 4 * 50 = 200");
+
+    // Period 2: only 2 units reported after rollover → charge must be 100, not 300
+    client.report_usage(&merchant, &sub_id, &2u64);
+    env.ledger().set_timestamp(5_184_000); // ~60 days
+    let charge2 = client.execute_metered_billing(&sub_id);
+    assert_eq!(
+        charge2, 100i128,
+        "period 2 must only charge for 2 new units (2 * 50 = 100)"
+    );
+
+    // Counter reset again
+    assert_eq!(client.get_current_usage(&sub_id).accumulated_units, 0);
+}
+
+/// Usage accumulated before the period rollover must not be discarded — the full
+/// pre-rollover usage is charged when billing runs at period end.
+#[test]
+fn test_partial_period_usage_before_rollover_is_not_lost() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (client, _admin, merchant, customer, token) = setup(&env);
+
+    let sub_id = client.create_metered_subscription(
+        &merchant,
+        &customer,
+        &100i128,
+        &String::from_str(&env, "call"),
+        &token,
+        &None,
+    );
+
+    // Spread usage across the period in two separate report_usage calls
+    client.report_usage(&merchant, &sub_id, &3u64); // mid-period
+    env.ledger().set_timestamp(500_000);
+    client.report_usage(&merchant, &sub_id, &5u64); // near period end
+
+    assert_eq!(
+        client.get_current_usage(&sub_id).accumulated_units,
+        8,
+        "all reported units must be accumulated before rollover"
+    );
+
+    // Rollover — all 8 units from this period must be charged
+    env.ledger().set_timestamp(1_000_000); // period end
+    let amount = client.execute_metered_billing(&sub_id);
+    assert_eq!(
+        amount, 800i128,
+        "all 8 units must be billed at rollover (8 * 100 = 800)"
+    );
+
+    // Nothing carries to next period
+    assert_eq!(client.get_current_usage(&sub_id).accumulated_units, 0);
 }

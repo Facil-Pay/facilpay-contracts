@@ -1,7 +1,7 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-use crate::{SubscriptionError, Currency, Error, PaymentContract, PaymentContractClient};
+use crate::{Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address) {
     let env = Env::default();
@@ -86,7 +86,10 @@ fn test_subscription_already_in_group() {
 
     client.add_to_group(&owner, &group_id, &sub_id);
     let result = client.try_add_to_group(&owner, &group_id, &sub_id);
-    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::AlreadyInGroup))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(SubscriptionError::AlreadyInGroup)))
+    );
 }
 
 #[test]
@@ -110,7 +113,12 @@ fn test_group_size_limit() {
     // 21st should fail
     let sub_id = create_sub(&env, &client, &owner, &merchant, &token_addr);
     let result = client.try_add_to_group(&owner, &group_id, &sub_id);
-    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::GroupSizeLimitExceeded))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(
+            SubscriptionError::GroupSizeLimitExceeded
+        )))
+    );
 }
 
 #[test]
@@ -118,7 +126,10 @@ fn test_group_not_found() {
     let (env, client, _) = setup();
     let owner = Address::generate(&env);
     let result = client.try_add_to_group(&owner, &999, &1);
-    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::GroupNotFound))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(SubscriptionError::GroupNotFound)))
+    );
 }
 
 #[test]

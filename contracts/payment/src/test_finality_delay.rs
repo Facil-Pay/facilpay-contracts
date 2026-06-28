@@ -4,7 +4,9 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
-use crate::{FeatureError, Currency, Error, FinalityConfig, PaymentContract, PaymentContractClient};
+use crate::{
+    Currency, Error, FeatureError, FinalityConfig, PaymentContract, PaymentContractClient,
+};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address, Address) {
     let env = Env::default();
@@ -99,7 +101,10 @@ fn test_finalize_before_release_at_fails() {
     client.complete_payment(&admin, &payment_id);
 
     let result = client.try_finalize_pending_settlement(&payment_id);
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::SettlementNotReady))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::SettlementNotReady)))
+    );
 }
 
 #[test]
@@ -137,7 +142,10 @@ fn test_finalize_after_delay_succeeds() {
 
     // Double finalization should fail
     let result = client.try_finalize_pending_settlement(&payment_id);
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::SettlementAlreadyFinalized))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::SettlementAlreadyFinalized)))
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@ use soroban_sdk::{
     Address, Env,
 };
 
-use crate::{FeatureError, Currency, Error, PaymentContract, PaymentContractClient};
+use crate::{Currency, Error, FeatureError, PaymentContract, PaymentContractClient};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address) {
     let env = Env::default();
@@ -88,7 +88,10 @@ fn test_spend_limit_enforced_on_create_payment() {
         &0,
         &soroban_sdk::String::from_str(&env, ""),
     );
-    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::SpendLimitExceeded))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Feature(FeatureError::SpendLimitExceeded)))
+    );
 }
 
 #[test]

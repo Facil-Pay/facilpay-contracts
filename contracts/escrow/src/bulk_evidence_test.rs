@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::*;
-use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Address, Bytes, Env, Vec};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    token, Address, Bytes, Env, Vec,
+};
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
     env.mock_all_auths();
@@ -27,8 +30,7 @@ fn make_disputed_escrow(
     token: &Address,
 ) -> u64 {
     let escrow_id = client.create_escrow(
-        customer, merchant, &500i128, token,
-        &9999u64, &0u64, &0u64, &false,
+        customer, merchant, &500i128, token, &9999u64, &0u64, &0u64, &false,
     );
     client.dispute_escrow(customer, &escrow_id);
     escrow_id
@@ -131,8 +133,7 @@ fn test_batch_on_non_disputed_escrow_rejected() {
 
     // Create escrow but do NOT dispute it — status stays Locked.
     let escrow_id = client.create_escrow(
-        &customer, &merchant, &500i128, &token,
-        &9999u64, &0u64, &0u64, &false,
+        &customer, &merchant, &500i128, &token, &9999u64, &0u64, &0u64, &false,
     );
 
     let mut items: Vec<Bytes> = Vec::new(&env);
@@ -178,7 +179,11 @@ fn test_oversized_batch_leaves_no_partial_state() {
 
     // No page should have been written — the page is empty.
     let page = client.get_evidence_page(&escrow_id, &0u32);
-    assert_eq!(page.len(), 0u32, "no partial state should be stored on failure");
+    assert_eq!(
+        page.len(),
+        0u32,
+        "no partial state should be stored on failure"
+    );
 }
 
 #[test]
@@ -213,7 +218,10 @@ fn test_merchant_can_submit_batch() {
     items.push_back(Bytes::from_array(&env, &[0xbbu8; 32]));
 
     let result = client.try_submit_evidence_batch(&merchant, &escrow_id, &items);
-    assert!(result.is_ok(), "merchant should be allowed to submit evidence");
+    assert!(
+        result.is_ok(),
+        "merchant should be allowed to submit evidence"
+    );
 
     let page = client.get_evidence_page(&escrow_id, &0u32);
     assert_eq!(page.len(), 2u32);
@@ -311,5 +319,8 @@ fn test_batch_rejected_after_evidence_deadline() {
     items.push_back(Bytes::from_array(&env, &[0xffu8; 32]));
 
     let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
-    assert_eq!(result, Err(Ok(Error::Action(ActionError::EvidenceDeadlinePassed))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Action(ActionError::EvidenceDeadlinePassed)))
+    );
 }
