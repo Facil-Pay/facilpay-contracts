@@ -2197,8 +2197,8 @@ impl PaymentContract {
         let payment_id = counter + 1;
         let scheduled = ScheduledPayment {
             payment_id,
-            customer,
-            merchant,
+            customer: customer.clone(),
+            merchant: merchant.clone(),
             token,
             amount,
             scheduled_at,
@@ -2213,6 +2213,15 @@ impl PaymentContract {
             &DataKey::State(StateDataKey::ScheduledPaymentCounter),
             &payment_id,
         );
+
+        (PaymentCreated {
+            payment_id,
+            customer,
+            merchant,
+            amount,
+        })
+        .publish(&env);
+
         Ok(payment_id)
     }
 
@@ -7589,6 +7598,10 @@ impl PaymentContract {
             })
     }
 
+    pub fn get_merchant_total_volume(env: Env, merchant: Address) -> i128 {
+        PaymentContract::get_merchant_analytics(env, merchant).total_volume
+    }
+
     pub fn get_customer_analytics(env: Env, customer: Address) -> CustomerAnalytics {
         env.storage()
             .instance()
@@ -9210,6 +9223,7 @@ impl PaymentContract {
         let contract_address = env.current_contract_address();
         token_client.transfer(&customer, &contract_address, &amount);
 
+        let current_timestamp = env.ledger().timestamp();
         let payment = Payment {
             id: payment_id,
             customer: customer.clone(),
@@ -9218,7 +9232,7 @@ impl PaymentContract {
             token,
             currency: Currency::USDC,
             status: PaymentStatus::Pending,
-            created_at: env.ledger().timestamp(),
+            created_at: current_timestamp,
             expires_at: 0,
             metadata: String::from_str(&env, ""),
             notes: String::from_str(&env, ""),
@@ -9232,6 +9246,175 @@ impl PaymentContract {
             .instance()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
 
+        // Index by customer
+        let customer_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::Payments(customer.clone(), customer_count)),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::PaymentCount(customer.clone())),
+            &(customer_count + 1),
+        );
+
+        // Index by merchant
+        let merchant_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), merchant_count)),
+            &payment_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
+            &(merchant_count + 1),
+        );
+
+        // Update global analytics
+        let mut analytics: PaymentAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
+            .unwrap_or(PaymentAnalytics {
+                total_payments_created: 0,
+                total_payments_completed: 0,
+                total_payments_cancelled: 0,
+                total_payments_refunded: 0,
+                total_volume: 0,
+                total_refunded_volume: 0,
+                unique_customers: 0,
+                unique_merchants: 0,
+            });
+        analytics.total_payments_created += 1;
+        analytics.total_volume += amount;
+        if customer_count == 0 {
+            analytics.unique_customers += 1;
+        }
+        if merchant_count == 0 {
+            analytics.unique_merchants += 1;
+            let global_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Config(ConfigKey::GlobalMerchantCount))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::GlobalList(global_count)),
+                &merchant,
+            );
+            env.storage().instance().set(
+                &DataKey::Config(ConfigKey::GlobalMerchantCount),
+                &(global_count + 1),
+            );
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
+
+        // Update merchant analytics (per-merchant total volume)
+        let mut m_analytics: MerchantAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::Analytics(
+                merchant.clone(),
+            )))
+            .unwrap_or(MerchantAnalytics {
+                total_payments: 0,
+                total_volume: 0,
+                total_completed: 0,
+                total_cancelled: 0,
+                total_refunded: 0,
+                total_refunded_volume: 0,
+            });
+        m_analytics.total_payments += 1;
+        m_analytics.total_volume += amount;
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::Analytics(merchant.clone())),
+            &m_analytics,
+        );
+
+        // Update customer analytics
+        let mut c_analytics: CustomerAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::Analytics(
+                customer.clone(),
+            )))
+            .unwrap_or(CustomerAnalytics {
+                total_payments: 0,
+                total_volume: 0,
+                total_refunds: 0,
+                avg_transaction_size: 0,
+                peak_hour: 0,
+                top_merchant: None,
+                top_merchant_volume: 0,
+                first_payment_at: 0,
+                last_payment_at: 0,
+            });
+        c_analytics.total_payments += 1;
+        c_analytics.total_volume += amount;
+        c_analytics.avg_transaction_size =
+            c_analytics.total_volume / (c_analytics.total_payments as i128);
+        if c_analytics.first_payment_at == 0 {
+            c_analytics.first_payment_at = current_timestamp;
+        }
+        c_analytics.last_payment_at = current_timestamp;
+
+        // Track per-merchant volume
+        let prev_merchant_vol: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::MerchantVolume(
+                customer.clone(),
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let new_merchant_vol = prev_merchant_vol + amount;
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::MerchantVolume(
+                customer.clone(),
+                merchant.clone(),
+            )),
+            &new_merchant_vol,
+        );
+        if prev_merchant_vol == 0 {
+            let m_count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::MerchantCount(
+                    customer.clone(),
+                )))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::MerchantList(
+                    customer.clone(),
+                    m_count,
+                )),
+                &merchant,
+            );
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::MerchantCount(customer.clone())),
+                &(m_count + 1),
+            );
+        }
+        if new_merchant_vol > c_analytics.top_merchant_volume {
+            c_analytics.top_merchant_volume = new_merchant_vol;
+            c_analytics.top_merchant = Some(merchant.clone());
+        }
+        env.storage().instance().set(
+            &DataKey::Customer(CustomerDataKey::Analytics(customer.clone())),
+            &c_analytics,
+        );
+
         let config = PaymentSplitConfig {
             payment_id,
             recipients,
@@ -9241,6 +9424,14 @@ impl PaymentContract {
             &DataKey::Feature(FeatureKey::SplitConfig(payment_id)),
             &config,
         );
+
+        (PaymentCreated {
+            payment_id,
+            customer,
+            merchant,
+            amount,
+        })
+        .publish(&env);
 
         Ok(payment_id)
     }
