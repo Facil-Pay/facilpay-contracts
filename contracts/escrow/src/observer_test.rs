@@ -132,3 +132,68 @@ fn test_remove_observer_not_found() {
     let result = client.try_remove_observer(&customer, &escrow_id, &observer);
     assert_eq!(result, Err(Ok(Error::Action(ActionError::ObserverNotFound))));
 }
+
+// Customer can read their own escrow via get_escrow_details
+#[test]
+fn test_customer_can_read_escrow_details() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    let escrow = client.get_escrow_details(&customer, &escrow_id);
+    assert_eq!(escrow.customer, customer);
+}
+
+// Merchant can read escrow details they are party to
+#[test]
+fn test_merchant_can_read_escrow_details() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    let escrow = client.get_escrow_details(&merchant, &escrow_id);
+    assert_eq!(escrow.merchant, merchant);
+}
+
+// An active observer can read escrow details (no panic means access granted)
+#[test]
+fn test_observer_can_read_escrow_details() {
+    let env = Env::default();
+    let (client, _admin, customer, _merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &_merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    // Should not panic
+    client.get_escrow_details(&observer, &escrow_id);
+}
+
+// A stranger (not participant, not observer) is denied access
+#[test]
+fn test_stranger_cannot_read_escrow_details() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let stranger = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    let result = client.try_get_escrow_details(&stranger, &escrow_id);
+    assert!(matches!(result, Err(Ok(Error::Basic(BasicError::Unauthorized)))));
+}
+
+// An expired observer is denied access
+#[test]
+fn test_expired_observer_cannot_read_escrow_details() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &100_u64);
+
+    // Advance past the observer's expiry
+    env.ledger().set_timestamp(env.ledger().timestamp() + 200);
+
+    let result = client.try_get_escrow_details(&observer, &escrow_id);
+    assert!(matches!(result, Err(Ok(Error::Basic(BasicError::Unauthorized)))));
+}

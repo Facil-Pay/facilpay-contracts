@@ -4155,6 +4155,28 @@ impl EscrowContract {
             .unwrap_or(false)
     }
 
+    /// Returns the full escrow details. Access is restricted to the escrow
+    /// customer, merchant, or an active observer (granted via `add_observer`).
+    pub fn get_escrow_details(env: Env, caller: Address, escrow_id: u64) -> Result<Escrow, Error> {
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if caller == escrow.customer || caller == escrow.merchant {
+            return Ok(escrow);
+        }
+
+        if EscrowContract::verify_observer_access(env.clone(), escrow_id, caller) {
+            return Ok(escrow);
+        }
+
+        Err(Error::Basic(BasicError::Unauthorized))
+    }
+
     /// Grants a time-limited observer role for an escrow. Only the escrow
     /// customer, merchant, or an admin can grant.
     pub fn add_observer(
@@ -8445,8 +8467,8 @@ mod bulk_evidence_test;
 // #[cfg(test)]
 // mod multi_party_rollback_test;
 //
-// #[cfg(test)]
-// mod observer_test;
+#[cfg(test)]
+mod observer_test;
 //
 // mod health_check_test;
 //
