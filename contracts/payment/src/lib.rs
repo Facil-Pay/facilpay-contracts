@@ -163,6 +163,7 @@ pub enum SubscriptionError {
     GracePeriodExpired = 308, RetryTooEarly = 309, MeteredNotFound = 310,
     BillingCapExceeded = 311, GroupNotFound = 312, AlreadyInGroup = 313,
     GroupSizeLimitExceeded = 314, TrialExpired = 315, MaxTrialDurationExceeded = 316,
+    MerchantPaused = 317,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -327,6 +328,7 @@ pub enum MerchantDataKey {
     PendingSettlementIndex(Address, u64),
     VerificationLevel(Address),
     VerificationTierLimit(MerchantVerificationLevel),
+    MerchantPaused(Address),
 }
 
 // State and proposal data keys
@@ -4680,6 +4682,16 @@ impl PaymentContract {
                 return Err(Error::Subscription(SubscriptionError::RetryTooEarly));
             }
 
+            // Check merchant account is not paused
+            let merchant_paused: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(sub.merchant.clone())))
+                .unwrap_or(false);
+            if merchant_paused {
+                return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+            }
+
             // Check customer spend limit (#282)
             if let Err(_) =
                 PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount)
@@ -4696,7 +4708,7 @@ impl PaymentContract {
             if transfer_ok {
                 sub.payment_count += 1;
                 sub.retry_count = 0;
-                sub.next_payment_at = now + sub.interval;
+                sub.next_payment_at = sub.next_payment_at + sub.interval;
                 sub.status = SubscriptionStatus::Active;
 
                 if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
@@ -4782,6 +4794,16 @@ impl PaymentContract {
             return Err(Error::Subscription(SubscriptionError::Ended));
         }
 
+        // Check merchant account is not paused
+        let merchant_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(sub.merchant.clone())))
+            .unwrap_or(false);
+        if merchant_paused {
+            return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+        }
+
         // Check payment is due
         if now < sub.next_payment_at {
             return Err(Error::Subscription(SubscriptionError::PaymentNotDue));
@@ -4789,7 +4811,7 @@ impl PaymentContract {
 
         // Skip charge if still within trial period
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
-            sub.next_payment_at = now + sub.interval;
+            sub.next_payment_at = sub.next_payment_at + sub.interval;
             env.storage().instance().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -4825,7 +4847,7 @@ impl PaymentContract {
 
             sub.payment_count += 1;
             sub.retry_count = 0;
-            sub.next_payment_at = now + sub.interval;
+            sub.next_payment_at = sub.next_payment_at + sub.interval;
 
             // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
@@ -8099,6 +8121,41 @@ impl PaymentContract {
             unpaused_by: admin,
         })
         .publish(&env);
+        Ok(())
+    }
+
+    /// Pause a merchant account, blocking all new subscriptions and recurring payments.
+    pub fn pause_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantPaused(merchant.clone())),
+            &true,
+        );
+        Ok(())
+    }
+
+    /// Unpause a merchant account, allowing new subscriptions and recurring payments.
+    pub fn unpause_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::Merchant(MerchantDataKey::MerchantPaused(merchant)));
         Ok(())
     }
 
