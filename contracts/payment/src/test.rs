@@ -7429,3 +7429,66 @@ fn test_auto_escrow_rule_with_different_percentages() {
     assert_eq!(rule3.escrow_bps, 2000);
     assert_eq!(rule3.min_amount, 200);
 }
+
+#[test]
+fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_addr = env.register_stellar_asset_contract(admin.clone());
+    let token = token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &100_000);
+
+    env.ledger().set_timestamp(1000);
+    // Create active subscription
+    let sub_id = client.create_subscription(
+        &customer,
+        &merchant,
+        &100,
+        &token_addr,
+        &Currency::USDC,
+        &2592000,
+        &0,
+        &0,
+        &String::from_str(&env, ""),
+        &0,
+    );
+
+    let sub = client.get_subscription(&sub_id).unwrap();
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.payment_count, 0);
+
+    // Advance time to billing date
+    env.ledger().set_timestamp(1000 + 2592000);
+
+    // Admin pauses merchant
+    client.pause_merchant(&admin, &merchant);
+
+    // Try to execute payment — should fail with MerchantPaused error
+    let result = client.try_execute_recurring_payment(&sub_id);
+    assert!(result.is_err());
+    assert_eq!(
+        result,
+        Err(Ok(Error::Subscription(SubscriptionError::MerchantPaused)))
+    );
+
+    // Verify subscription is still in Active status (payment was not executed)
+    let sub = client.get_subscription(&sub_id).unwrap();
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.payment_count, 0);
+
+    // Admin unpauses merchant
+    client.unpause_merchant(&admin, &merchant);
+
+    // Now execute payment should succeed
+    client.execute_recurring_payment(&sub_id);
+    let sub = client.get_subscription(&sub_id).unwrap();
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.payment_count, 1);
+}
