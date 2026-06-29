@@ -167,6 +167,9 @@ pub enum RefundStatus {
     Processed,
 }
 
+// Issue #397: canonical reason codes, enforced by the type system on Refund and
+// on request_refund()'s signature, so get_reason_code_analytics() never sees a
+// free-form/inconsistent string for this field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[contracttype]
 pub enum RefundReasonCode {
