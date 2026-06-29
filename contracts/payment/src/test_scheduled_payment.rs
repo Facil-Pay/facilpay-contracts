@@ -128,3 +128,51 @@ fn test_schedule_payment_ten_years_in_past_rejected() {
         Err(Ok(Error::Payment(PaymentError::InvalidScheduleTime)))
     );
 }
+
+/// The admin must be able to cancel a customer's scheduled payment before its
+/// execution date, e.g. on the customer's behalf via a support request.
+#[test]
+fn test_admin_can_cancel_scheduled_payment() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (client, admin, merchant, customer, token) = setup(&env);
+
+    let payment_id = client.schedule_payment(&customer, &merchant, &token, &100i128, &10_000u64);
+    client.cancel_scheduled_payment(&admin, &payment_id);
+
+    let scheduled = client.get_scheduled_payment(&payment_id);
+    assert!(scheduled.cancelled);
+}
+
+/// A caller who is neither the original customer nor the admin must not be able
+/// to cancel a scheduled payment.
+#[test]
+fn test_unrelated_caller_cannot_cancel_scheduled_payment() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (client, _admin, merchant, customer, token) = setup(&env);
+
+    let payment_id = client.schedule_payment(&customer, &merchant, &token, &100i128, &10_000u64);
+
+    let stranger = Address::generate(&env);
+    let result = client.try_cancel_scheduled_payment(&stranger, &payment_id);
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
+}
+
+/// Once executed, a scheduled payment cannot be cancelled by the admin either.
+#[test]
+fn test_admin_cannot_cancel_already_executed_payment() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1_000);
+    let (client, admin, merchant, customer, token) = setup(&env);
+
+    let payment_id = client.schedule_payment(&customer, &merchant, &token, &100i128, &10_000u64);
+    env.ledger().set_timestamp(10_000);
+    client.execute_scheduled_payment(&payment_id);
+
+    let result = client.try_cancel_scheduled_payment(&admin, &payment_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Payment(PaymentError::AlreadyProcessed)))
+    );
+}
