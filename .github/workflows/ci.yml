@@ -29,3 +29,11 @@ jobs:
 
       - name: Build Contracts
         run: stellar contract build
+
+      - name: Check WASM Binary Sizes
+        run: |
+          MAX_SIZE=262144
+          for wasm in target/wasm32v1-none/release/*.wasm; do
+            size=$(wc -c < "$wasm")
+            [ "$size" -le "$MAX_SIZE" ] || (echo "$wasm is too large: $size bytes (limit: $MAX_SIZE)" && exit 1)
+          done

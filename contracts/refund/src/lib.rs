@@ -65,6 +65,10 @@ pub enum DataKey {
     // Payment refund caps
     PaymentRefundCap(u64),
     PaymentRefundUsage(u64),
+    // Issue #370: Customer-tier-based refund caps
+    CustomerTier(Address),
+    CustomerTierPolicy(Address, u32),
+    StrictTierPolicy(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,6 +243,8 @@ pub enum Error {
     VoucherAlreadyRedeemed = 54,
     EvidenceAlreadySubmitted = 55,
     CaseAlreadyEscalated = 56,
+    // Issue #370: Customer tier policy errors
+    TierPolicyNotFound = 57,
 }
 
 #[contractevent]
@@ -606,6 +612,13 @@ pub struct PaymentRefundCap {
     pub payment_id: u64,
     pub max_refund_count: u32,
     pub max_total_amount: i128,
+}
+
+// Issue #370: Per-tier refund cap for customer loyalty tiers
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundCap {
+    pub max_refund_bps: u32,
 }
 
 #[derive(Clone)]
@@ -3792,6 +3805,7 @@ impl RefundContract {
     fn validate_against_policy(
         env: &Env,
         merchant: &Address,
+        customer: &Address,
         amount: i128,
         original_amount: i128,
         payment_created_at: u64,
@@ -3819,6 +3833,34 @@ impl RefundContract {
 
         if !found_tier {
             return Err(Error::RefundWindowExpired);
+        }
+
+        // Issue #370: Override allowed_bps with customer tier policy if set
+        let tier_id_opt: Option<u32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerTier(customer.clone()));
+
+        if let Some(tier_id) = tier_id_opt {
+            let tier_cap_opt: Option<RefundCap> = env
+                .storage()
+                .instance()
+                .get(&DataKey::CustomerTierPolicy(merchant.clone(), tier_id));
+            match tier_cap_opt {
+                Some(cap) => {
+                    allowed_bps = cap.max_refund_bps;
+                }
+                None => {
+                    let strict: bool = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::StrictTierPolicy(merchant.clone()))
+                        .unwrap_or(false);
+                    if strict {
+                        return Err(Error::TierPolicyNotFound);
+                    }
+                }
+            }
         }
 
         // Check refund percentage using overflow-safe math
@@ -4131,6 +4173,7 @@ impl RefundContract {
             Self::validate_against_policy(
                 &env,
                 &merchant,
+                &customer,
                 amount,
                 original_payment_amount,
                 payment_created_at,
@@ -6735,6 +6778,77 @@ impl RefundContract {
 
         Ok(())
     }
+
+    // Issue #370: Customer tier management
+
+    pub fn set_customer_tier(
+        env: Env,
+        admin: Address,
+        customer: Address,
+        tier_id: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerTier(customer), &tier_id);
+        Ok(())
+    }
+
+    pub fn get_customer_tier(env: Env, customer: Address) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerTier(customer))
+    }
+
+    pub fn set_customer_tier_policy(
+        env: Env,
+        merchant: Address,
+        tier_id: u32,
+        max_refund_bps: u32,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if max_refund_bps > 10000 {
+            return Err(Error::InvalidAmount);
+        }
+        let cap = RefundCap { max_refund_bps };
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerTierPolicy(merchant, tier_id), &cap);
+        Ok(())
+    }
+
+    pub fn get_customer_tier_policy(env: Env, merchant: Address, tier_id: u32) -> Option<RefundCap> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerTierPolicy(merchant, tier_id))
+    }
+
+    pub fn set_strict_tier_policy(
+        env: Env,
+        merchant: Address,
+        strict: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::StrictTierPolicy(merchant), &strict);
+        Ok(())
+    }
+
+    pub fn get_strict_tier_policy(env: Env, merchant: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::StrictTierPolicy(merchant))
+            .unwrap_or(false)
+    }
 }
 
 mod test;
@@ -6781,3 +6895,6 @@ mod test_arbitration_timeout;
 
 #[cfg(test)]
 mod test_merchant_eligibility;
+
+#[cfg(test)]
+mod test_customer_tier_policy;

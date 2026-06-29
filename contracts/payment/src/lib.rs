@@ -181,7 +181,7 @@ pub enum SubscriptionError {
     GracePeriodExpired = 308, RetryTooEarly = 309, MeteredNotFound = 310,
     BillingCapExceeded = 311, GroupNotFound = 312, AlreadyInGroup = 313,
     GroupSizeLimitExceeded = 314, TrialExpired = 315, MaxTrialDurationExceeded = 316,
-    MerchantPaused = 317,
+    MerchantPaused = 317, UsageCapExceeded = 318,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -865,6 +865,7 @@ pub struct MeteredSubscription {
     pub accumulated_units: u64,
     pub billing_cap: Option<i128>,
     pub last_reset_at: u64,
+    pub max_units_per_period: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -4968,6 +4969,7 @@ impl PaymentContract {
         unit_name: String,
         token: Address,
         billing_cap: Option<i128>,
+        max_units_per_period: Option<u64>,
     ) -> Result<u64, Error> {
         merchant.require_auth();
 
@@ -4990,6 +4992,7 @@ impl PaymentContract {
             accumulated_units: 0,
             billing_cap,
             last_reset_at: now,
+            max_units_per_period,
         };
 
         env.storage().instance().set(
@@ -5022,6 +5025,12 @@ impl PaymentContract {
 
         if sub.merchant != merchant {
             return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if let Some(max_units) = sub.max_units_per_period {
+            if sub.accumulated_units.saturating_add(units) > max_units {
+                return Err(Error::Subscription(SubscriptionError::UsageCapExceeded));
+            }
         }
 
         sub.accumulated_units = sub.accumulated_units.saturating_add(units);
