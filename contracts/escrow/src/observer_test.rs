@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::*;
-use soroban_sdk::testutils::Ledger;
 use crate::*;
+use soroban_sdk::testutils::Ledger;
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
 fn setup(
@@ -32,14 +32,7 @@ fn create_escrow(
     token: &Address,
 ) -> u64 {
     client.create_escrow(
-        customer,
-        merchant,
-        &1000_i128,
-        token,
-        &5000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        customer, merchant, &1000_i128, token, &5000_u64, &0_u64, &0_u64, &false,
     )
 }
 
@@ -96,7 +89,10 @@ fn test_duplicate_active_observer_rejected() {
     client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
 
     let result = client.try_add_observer(&customer, &escrow_id, &observer, &3600_u64);
-    assert_eq!(result, Err(Ok(Error::Action(ActionError::ObserverAlreadyAdded))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Action(ActionError::ObserverAlreadyAdded)))
+    );
 }
 
 #[test]
@@ -130,7 +126,10 @@ fn test_remove_observer_not_found() {
 
     let escrow_id = create_escrow(&client, &customer, &merchant, &token);
     let result = client.try_remove_observer(&customer, &escrow_id, &observer);
-    assert_eq!(result, Err(Ok(Error::Action(ActionError::ObserverNotFound))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Action(ActionError::ObserverNotFound)))
+    );
 }
 
 // Customer can read their own escrow via get_escrow_details
@@ -178,7 +177,10 @@ fn test_stranger_cannot_read_escrow_details() {
     let escrow_id = create_escrow(&client, &customer, &merchant, &token);
 
     let result = client.try_get_escrow_details(&stranger, &escrow_id);
-    assert!(matches!(result, Err(Ok(Error::Basic(BasicError::Unauthorized)))));
+    assert!(matches!(
+        result,
+        Err(Ok(Error::Basic(BasicError::Unauthorized)))
+    ));
 }
 
 // An expired observer is denied access
@@ -195,5 +197,8 @@ fn test_expired_observer_cannot_read_escrow_details() {
     env.ledger().set_timestamp(env.ledger().timestamp() + 200);
 
     let result = client.try_get_escrow_details(&observer, &escrow_id);
-    assert!(matches!(result, Err(Ok(Error::Basic(BasicError::Unauthorized)))));
+    assert!(matches!(
+        result,
+        Err(Ok(Error::Basic(BasicError::Unauthorized)))
+    ));
 }

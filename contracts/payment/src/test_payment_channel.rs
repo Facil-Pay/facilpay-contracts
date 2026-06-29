@@ -305,7 +305,14 @@ fn test_equal_nonce_replay_rejected() {
     );
 }
 
-fn setup_channel_env() -> (Env, PaymentContractClient<'static>, Address, Address, Address, u64) {
+fn setup_channel_env() -> (
+    Env,
+    PaymentContractClient<'static>,
+    Address,
+    Address,
+    Address,
+    u64,
+) {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -327,7 +334,14 @@ fn setup_channel_env() -> (Env, PaymentContractClient<'static>, Address, Address
     env.ledger().set_timestamp(expires_at - 100);
 
     let dummy_pk = BytesN::<32>::from_array(&env, &[0u8; 32]);
-    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &expires_at, &dummy_pk);
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &expires_at,
+        &dummy_pk,
+    );
 
     (env, client, customer, merchant, token_id, channel_id)
 }
@@ -360,7 +374,11 @@ fn opener_can_close_after_dispute_period() {
 
     let channel = client.get_channel(&channel_id);
     assert!(!channel.open, "Channel should be closed");
-    assert_eq!(token_client.balance(&customer), 1000i128, "Customer should receive full refund");
+    assert_eq!(
+        token_client.balance(&customer),
+        1000i128,
+        "Customer should receive full refund"
+    );
 }
 
 #[test]
@@ -376,7 +394,9 @@ fn counterparty_can_close_immediately_on_agreement() {
     let merchant = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
     token_admin_client.mint(&customer, &1000i128);
 
@@ -390,7 +410,14 @@ fn counterparty_can_close_immediately_on_agreement() {
     let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
 
     // Channel with no expiry — counterparty (merchant) can settle immediately via signed state
-    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &0u64, &customer_pk);
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
 
     let merchant_amount: i128 = 400;
     let nonce: u64 = 1;
@@ -422,7 +449,9 @@ fn close_transfers_correct_balances_to_each_party() {
     let merchant = Address::generate(&env);
 
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
     token::StellarAssetClient::new(&env, &token_id).mint(&customer, &1000i128);
     let token_client = token::Client::new(&env, &token_id);
 
@@ -435,7 +464,14 @@ fn close_transfers_correct_balances_to_each_party() {
     let pk_bytes = signing_key.verifying_key().to_bytes();
     let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
 
-    let channel_id = client.open_channel(&customer, &merchant, &token_id, &1000i128, &0u64, &customer_pk);
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
 
     let merchant_amount: i128 = 300;
     let nonce: u64 = 1;
@@ -449,6 +485,14 @@ fn close_transfers_correct_balances_to_each_party() {
 
     client.settle_channel(&channel_id, &merchant_amount, &nonce, &sig_bn);
 
-    assert_eq!(token_client.balance(&merchant), 300i128, "Merchant gets agreed amount");
-    assert_eq!(token_client.balance(&customer), 700i128, "Customer gets remainder");
+    assert_eq!(
+        token_client.balance(&merchant),
+        300i128,
+        "Merchant gets agreed amount"
+    );
+    assert_eq!(
+        token_client.balance(&customer),
+        700i128,
+        "Customer gets remainder"
+    );
 }

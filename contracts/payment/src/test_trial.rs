@@ -301,7 +301,9 @@ fn trial_extension_capped_at_max_trial_duration() {
     let result = client.try_extend_trial(&merchant, &sub_id, &(2 * 86400u64));
     assert_eq!(
         result,
-        Err(Ok(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded))),
+        Err(Ok(Error::Subscription(
+            SubscriptionError::MaxTrialDurationExceeded
+        ))),
         "Extension beyond MAX_TRIAL_DURATION must be rejected"
     );
 }

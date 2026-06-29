@@ -105,7 +105,10 @@ pub enum DisputeKey {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Config(ConfigKey), Escrow(EscrowKey), Participant(ParticipantKey), Dispute(DisputeKey),
+    Config(ConfigKey),
+    Escrow(EscrowKey),
+    Participant(ParticipantKey),
+    Dispute(DisputeKey),
     VoteWeight(u64, Address),
     ReleaseThresholdBps(u64),
 }
@@ -522,8 +525,9 @@ pub struct MultiPartyEscrowCreated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowReleased {
     pub escrow_id: u64,
-    pub merchant: Address,
+    pub recipient: Address,
     pub amount: i128,
+    pub token: Address,
 }
 
 #[contractevent]
@@ -2426,9 +2430,10 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::MultiPartyCounter), &escrow_id);
 
         for p in escrow.participants.iter() {
-            env.storage()
-                .instance()
-                .set(&DataKey::VoteWeight(escrow_id, p.address.clone()), &p.share_bps);
+            env.storage().instance().set(
+                &DataKey::VoteWeight(escrow_id, p.address.clone()),
+                &p.share_bps,
+            );
         }
         env.storage()
             .instance()
@@ -2668,9 +2673,10 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::VoteWeight(escrow_id, participant.clone()), &weight_bps);
+        env.storage().instance().set(
+            &DataKey::VoteWeight(escrow_id, participant.clone()),
+            &weight_bps,
+        );
 
         WeightUpdated {
             escrow_id,
@@ -3067,8 +3073,9 @@ impl EscrowContract {
 
         EscrowReleased {
             escrow_id,
-            merchant: recipient,
+            recipient,
             amount: escrow.amount,
+            token: escrow.token,
         }
         .publish(&env);
 
@@ -5806,8 +5813,9 @@ impl EscrowContract {
 
                 EscrowReleased {
                     escrow_id,
-                    merchant: escrow.merchant,
+                    recipient: escrow.merchant.clone(),
                     amount: escrow.amount,
+                    token: escrow.token,
                 }
                 .publish(env);
             }
@@ -7541,6 +7549,80 @@ impl EscrowContract {
             }
         }
         history
+    }
+
+    /// Transfer escrow beneficiary to a new address. Callable only by the current beneficiary.
+    /// Records the transfer in BeneficiaryTransferHistory with timestamp.
+    pub fn transfer_beneficiary(
+        env: Env,
+        escrow_id: u64,
+        new_beneficiary: Address,
+    ) -> Result<(), Error> {
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Only the current beneficiary (merchant) may call this
+        escrow.merchant.require_auth();
+
+        match escrow.status {
+            EscrowStatus::Disputed | EscrowStatus::Resolved => {
+                return Err(Error::Action(ActionError::TransferNotAllowed));
+            }
+            _ => {}
+        }
+
+        if new_beneficiary == escrow.merchant {
+            return Err(Error::Action(ActionError::SameBeneficiary));
+        }
+
+        let old_beneficiary = escrow.merchant.clone();
+        let now = env.ledger().timestamp();
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Participant(
+                ParticipantKey::BeneficiaryTransferCount(escrow_id),
+            ))
+            .unwrap_or(0);
+
+        let transfer = BeneficiaryTransfer {
+            escrow_id,
+            from: old_beneficiary.clone(),
+            to: new_beneficiary.clone(),
+            transferred_at: now,
+            authorised_by: old_beneficiary.clone(),
+        };
+
+        env.storage().instance().set(
+            &DataKey::Participant(ParticipantKey::BeneficiaryTransferHistory(escrow_id, count)),
+            &transfer,
+        );
+        env.storage().instance().set(
+            &DataKey::Participant(ParticipantKey::BeneficiaryTransferCount(escrow_id)),
+            &(count + 1),
+        );
+
+        escrow.merchant = new_beneficiary.clone();
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        BeneficiaryTransferred {
+            escrow_id,
+            old_merchant: old_beneficiary,
+            new_merchant: new_beneficiary,
+        }
+        .publish(&env);
+
+        Ok(())
     }
 
     // ── MULTI-PARTY DISPUTE ────────────────────────────────────────────────

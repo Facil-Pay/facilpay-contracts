@@ -81,7 +81,10 @@ fn test_multi_party_escrow_weight_governance() {
     // Trying to release at 60% (6000 < 10000) should fail
     env.ledger().set_timestamp(1001);
     let release_res = client.try_release_multi_party_escrow(&escrow_id);
-    assert_eq!(release_res, Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet))));
+    assert_eq!(
+        release_res,
+        Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet)))
+    );
 
     // Update threshold to 60% (6000 bps)
     client.update_approval_threshold_bps(&admin, &escrow_id, &6000);
