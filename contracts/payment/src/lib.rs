@@ -64,6 +64,8 @@ pub enum PaymentKey {
     LargePaymentCounter,
 }
 
+pub const MAX_MEMO_VERSIONS: u32 = 10;
+
 #[derive(Clone)]
 #[contracttype]
 pub enum SubscriptionKey {
@@ -144,14 +146,30 @@ pub enum BasicError {
 #[repr(u32)]
 #[contracterror]
 pub enum PaymentError {
-    NotFound = 200, InvalidStatus = 201, AlreadyProcessed = 202, Expired = 203,
-    NotExpired = 204, NoExpiration = 205, TransferFailed = 206, RefundExceedsPayment = 207,
-    NotYetDue = 208, ScheduledPaymentCancelled = 209, MetadataAlreadySet = 210,
-    MetadataNotFound = 211, HashMismatch = 212, AlreadyFullyPaid = 213,
-    InstallmentExceedsRemaining = 214, PartialPaymentNotFound = 215,
-    MerchantRateLimitExceeded = 216, AmountRateLimitExceeded = 217,
-    PayoutScheduleNotFound = 218, PayoutNotYetDue = 219, NothingToSettle = 220, BillingOverflow = 221,
-    InvalidLineItem = 222
+    NotFound = 200,
+    InvalidStatus = 201,
+    AlreadyProcessed = 202,
+    Expired = 203,
+    NotExpired = 204,
+    NoExpiration = 205,
+    TransferFailed = 206,
+    RefundExceedsPayment = 207,
+    NotYetDue = 208,
+    ScheduledPaymentCancelled = 209,
+    MetadataAlreadySet = 210,
+    MetadataNotFound = 211,
+    HashMismatch = 212,
+    AlreadyFullyPaid = 213,
+    InstallmentExceedsRemaining = 214,
+    PartialPaymentNotFound = 215,
+    MerchantRateLimitExceeded = 216,
+    AmountRateLimitExceeded = 217,
+    PayoutScheduleNotFound = 218,
+    PayoutNotYetDue = 219,
+    NothingToSettle = 220,
+    BillingOverflow = 221,
+    InvalidLineItem = 222,
+    InvalidScheduleTime = 223,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -263,11 +281,21 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if code >= 500 && code <= 537 { return Ok(Error::Feature(unsafe { core::mem::transmute(code) })); }
-            if code >= 400 && code <= 406 { return Ok(Error::Proposal(unsafe { core::mem::transmute(code) })); }
-            if code >= 300 && code <= 316 { return Ok(Error::Subscription(unsafe { core::mem::transmute(code) })); }
-            if code >= 200 && code <= 222 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
-            if code >= 100 && code <= 125 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
+            if code >= 500 && code <= 539 {
+                return Ok(Error::Feature(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 400 && code <= 406 {
+                return Ok(Error::Proposal(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 300 && code <= 316 {
+                return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 200 && code <= 223 {
+                return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 100 && code <= 125 {
+                return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
+            }
         }
         Err(error)
     }
@@ -328,6 +356,7 @@ pub enum MerchantDataKey {
     PendingSettlementIndex(Address, u64),
     VerificationLevel(Address),
     VerificationTierLimit(MerchantVerificationLevel),
+    MerchantPaymentsPage(Address, u64),
     MerchantPaused(Address),
 }
 
@@ -2514,9 +2543,28 @@ impl PaymentContract {
             &payment_id,
         );
         env.storage().instance().set(
-            &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant)),
+            &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
             &(merchant_count + 1),
         );
+
+        // Paged merchant payment index (100 entries per page)
+        {
+            const PAGE_SIZE: u64 = 100;
+            let page_num = merchant_count / PAGE_SIZE;
+            let mut page: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    page_num,
+                )))
+                .unwrap_or_else(|| Vec::new(&env));
+            page.push_back(payment_id);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant, page_num)),
+                &page,
+            );
+        }
 
         // Update global analytics
         let mut analytics: PaymentAnalytics = env
@@ -4343,6 +4391,16 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Returns the payment IDs for the given merchant on the requested page (100 per page).
+    pub fn get_merchant_payments(env: Env, merchant: Address, page: u64) -> Vec<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                merchant, page,
+            )))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     fn is_valid_currency(currency: &Currency) -> bool {
         matches!(
             currency,
@@ -4606,7 +4664,9 @@ impl PaymentContract {
         let mut sub: Subscription = env
             .storage()
             .instance()
-            .get(&DataKey::Subscription(SubscriptionKey::Data(subscription_id)))
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
             .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
 
         if sub.merchant != merchant {
@@ -4626,22 +4686,29 @@ impl PaymentContract {
             .trial_data
             .period_seconds
             .checked_add(additional_seconds)
-            .ok_or(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded))?;
+            .ok_or(Error::Subscription(
+                SubscriptionError::MaxTrialDurationExceeded,
+            ))?;
 
         if new_total > MAX_TRIAL_DURATION {
-            return Err(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded));
+            return Err(Error::Subscription(
+                SubscriptionError::MaxTrialDurationExceeded,
+            ));
         }
 
         sub.trial_data.ends_at = sub
             .trial_data
             .ends_at
             .checked_add(additional_seconds)
-            .ok_or(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded))?;
+            .ok_or(Error::Subscription(
+                SubscriptionError::MaxTrialDurationExceeded,
+            ))?;
         sub.trial_data.period_seconds = new_total;
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Subscription(SubscriptionKey::Data(subscription_id)), &sub);
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
 
         Ok(())
     }
@@ -7269,6 +7336,28 @@ impl PaymentContract {
                 &(merchant_count + 1),
             );
 
+            // Paged merchant payment index (100 entries per page)
+            {
+                const PAGE_SIZE: u64 = 100;
+                let page_num = merchant_count / PAGE_SIZE;
+                let mut page: Vec<u64> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                        entry.merchant.clone(),
+                        page_num,
+                    )))
+                    .unwrap_or_else(|| Vec::new(&env));
+                page.push_back(payment_id);
+                env.storage().instance().set(
+                    &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                        entry.merchant.clone(),
+                        page_num,
+                    )),
+                    &page,
+                );
+            }
+
             // Deduct fee
             let (net_amount, fee_amount) = PaymentContract::deduct_fee(
                 &env,
@@ -8781,6 +8870,26 @@ impl PaymentContract {
         let current_time = env.ledger().timestamp();
 
         if let Some(existing) = existing_memo {
+            // Archive current version into sliding-window history (capped at MAX_MEMO_VERSIONS)
+            let mut history: Vec<PaymentMemo> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Payment(PaymentKey::MemoVersion(payment_id)))
+                .unwrap_or_else(|| Vec::new(&env));
+            if history.len() >= MAX_MEMO_VERSIONS {
+                // Drop oldest entry by rebuilding without index 0
+                let mut trimmed = Vec::new(&env);
+                for i in 1..history.len() {
+                    trimmed.push_back(history.get(i).unwrap());
+                }
+                history = trimmed;
+            }
+            history.push_back(existing.clone());
+            env.storage().instance().set(
+                &DataKey::Payment(PaymentKey::MemoVersion(payment_id)),
+                &history,
+            );
+
             // Memo already set - emit update event with new version
             let new_version = existing.version + 1;
 
