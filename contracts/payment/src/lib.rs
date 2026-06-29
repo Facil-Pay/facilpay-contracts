@@ -2309,7 +2309,14 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::ScheduledPaymentCancelled));
         }
         if caller != scheduled.customer {
-            return Err(Error::Basic(BasicError::Unauthorized));
+            let stored_admin: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Config(ConfigKey::Admin))
+                .ok_or(Error::Basic(BasicError::Unauthorized))?;
+            if caller != stored_admin {
+                return Err(Error::Basic(BasicError::Unauthorized));
+            }
         }
 
         let token_client = token::Client::new(&env, &scheduled.token);
