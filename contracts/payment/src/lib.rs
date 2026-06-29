@@ -221,6 +221,7 @@ pub enum FeatureError {
     ChannelNotExpired = 517,
     InvalidSplitShares = 518,
     TooManyRecipients = 519,
+    InvalidCounterparty = 530,
     SplitConfigNotFound = 520,
     SplitAlreadyExecuted = 521,
     LoyaltyNotConfigured = 522,
@@ -9178,6 +9179,11 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
+        // Validate counterparty address is not zero address
+        if Self::is_zero_address(&env, &merchant) {
+            return Err(Error::Feature(FeatureError::InvalidCounterparty));
+        }
+
         let token_client = token::Client::new(&env, &token);
         let contract_address = env.current_contract_address();
         token_client.transfer(&customer, &contract_address, &amount);
@@ -9351,6 +9357,22 @@ impl PaymentContract {
             pk[i] = xdr.get(12 + (i as u32)).unwrap();
         }
         BytesN::from_array(env, &pk)
+    }
+
+    fn is_zero_address(env: &Env, address: &Address) -> bool {
+        let xdr = address.to_xdr(env);
+        // Check if it's a Contract address with all-zero bytes
+        // Contract address type is 0x00 in the XDR
+        if xdr.get(0).unwrap() == 0 && xdr.get(4).unwrap() == 0 {
+            // Check if all 32 bytes are zero
+            for i in 0..32 {
+                if xdr.get(12 + (i as u32)).unwrap() != 0 {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
     }
 
     pub fn create_split_payment(

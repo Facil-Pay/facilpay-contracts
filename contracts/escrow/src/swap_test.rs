@@ -260,3 +260,121 @@ fn test_escrow_swap_config_not_found_fails() {
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
     assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapConfigNotFound))));
 }
+
+#[test]
+fn swap_rolls_back_when_second_leg_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let target_token = Address::generate(&env);
+    let oracle = env.register(MockSwapOracle, ());
+    let oracle_client = MockSwapOracleClient::new(&env, &oracle);
+
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+
+    // Set rate to 1.2 (12_000_000) -> output = 1200
+    oracle_client.set_rate(&12_000_000_i128);
+
+    // Configure swap (min_output = 1300)
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1300_i128, &oracle);
+
+    // Get initial escrow state
+    let escrow_before = client.get_escrow(&escrow_id);
+    assert_eq!(escrow_before.token, token);
+    assert_eq!(escrow_before.amount, 1000_i128);
+
+    // Executing should fail with SwapOutputBelowMinimum
+    let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
+    assert_eq!(
+        res,
+        Err(Ok(Error::Action(ActionError::SwapOutputBelowMinimum)))
+    );
+
+    // Verify escrow state is unchanged (rollback)
+    let escrow_after = client.get_escrow(&escrow_id);
+    assert_eq!(escrow_after.token, token);
+    assert_eq!(escrow_after.amount, 1000_i128);
+
+    // Verify swap config is not marked as executed
+    let config = client.get_swap_config(&escrow_id).unwrap();
+    assert_eq!(config.executed, false);
+}
+
+#[test]
+fn both_legs_succeed_funds_exchanged_correctly() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let target_token = Address::generate(&env);
+    let oracle = env.register(MockSwapOracle, ());
+    let oracle_client = MockSwapOracleClient::new(&env, &oracle);
+
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+
+    // Set rate to 1.5 (15_000_000)
+    oracle_client.set_rate(&15_000_000_i128);
+
+    // Configure swap by merchant (min_output = 1400)
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1400_i128, &oracle);
+
+    // Execute swap
+    let output = client.execute_escrow_swap(&merchant, &escrow_id);
+    assert_eq!(output, 1500_i128); // 1000 * 15_000_000 / 10_000_000 = 1500
+
+    // Verify updated escrow - funds exchanged correctly
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.token, target_token);
+    assert_eq!(escrow.amount, 1500_i128);
+
+    // Verify config executed
+    let config = client.get_swap_config(&escrow_id).unwrap();
+    assert_eq!(config.executed, true);
+}
+
+#[test]
+fn swap_cannot_be_claimed_by_non_participant() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let non_participant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let target_token = Address::generate(&env);
+    let oracle = env.register(MockSwapOracle, ());
+
+    client.initialize(&admin);
+
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+
+    client.configure_escrow_swap(&merchant, &escrow_id, &target_token, &1400_i128, &oracle);
+
+    // Non-participant tries to execute swap: fails with Unauthorized
+    let res = client.try_execute_escrow_swap(&non_participant, &escrow_id);
+    assert_eq!(res, Err(Ok(Error::Basic(BasicError::Unauthorized))));
+}
