@@ -6898,3 +6898,6 @@ mod test_merchant_eligibility;
 
 #[cfg(test)]
 mod test_customer_tier_policy;
+
+#[cfg(test)]
+mod test_voucher_expiry;

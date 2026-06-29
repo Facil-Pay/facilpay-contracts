@@ -3105,7 +3105,14 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         match escrow.status {
-            EscrowStatus::Locked | EscrowStatus::Disputed => {
+            EscrowStatus::Locked => {
+                let current_time = env.ledger().timestamp();
+                if current_time < escrow.created_at + escrow.min_hold_period {
+                    return Err(Error::Escrow(EscrowError::ReleaseOnHoldPeriod));
+                }
+                escrow.status = EscrowStatus::Resolved;
+            }
+            EscrowStatus::Disputed => {
                 escrow.status = EscrowStatus::Resolved;
             }
             EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
@@ -9136,6 +9143,9 @@ mod bulk_evidence_test;
 //
 #[cfg(test)]
 mod observer_test;
+//
+#[cfg(test)]
+mod hold_period_test;
 //
 // mod health_check_test;
 //

@@ -218,7 +218,7 @@ fn test_extend_expiry_not_after_current_fails() {
 fn test_extend_expiry_released_escrow_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, customer, merchant, token) = setup(&env);
+    let (client, admin, customer, merchant, token) = setup(&env);
 
     env.ledger().set_timestamp(1000);
     let escrow_id = client.create_escrow(
@@ -226,7 +226,7 @@ fn test_extend_expiry_released_escrow_fails() {
     );
 
     env.ledger().set_timestamp(1600);
-    client.release_escrow(&escrow_id);
+    client.release_escrow(&admin, &escrow_id, &false);
 
     let result = client.try_extend_escrow_expiry(&customer, &escrow_id, &4000_u64);
     assert!(result.is_err());
