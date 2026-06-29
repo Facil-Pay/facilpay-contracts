@@ -2344,6 +2344,8 @@ impl EscrowContract {
             a.total_value_locked += amount;
         });
 
+        // Issue #398: emitting this event is what lets dashboards subscribe to
+        // new-escrow notifications via Horizon instead of polling known escrow IDs.
         EscrowCreated {
             escrow_id,
             customer,
