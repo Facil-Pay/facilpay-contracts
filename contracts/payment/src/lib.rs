@@ -43,6 +43,7 @@ pub enum ConfigKey {
     GlobalMerchantCount,
     PauseStateKey,
     MinSplitAmount,
+    SchemaVersion,
     AllowedTokens,
 }
 
@@ -141,6 +142,7 @@ pub enum BasicError {
     TierLimitsNotConfigured = 123,
     InvalidInterval = 124,
     InvalidBps = 125,
+    SchemaAlreadyAtTarget = 126,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1790,6 +1792,7 @@ const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
 const ENTERPRISE_VOLUME_THRESHOLD: i128 = 100_000;
+const INITIAL_SCHEMA_VERSION: u32 = 1;
 
 #[contractimpl]
 impl PaymentContract {
@@ -1814,7 +1817,41 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::Admin), &admin);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &INITIAL_SCHEMA_VERSION,
+        );
         (AdminAdded { admin }).publish(&env);
+    }
+
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::SchemaVersion))
+            .unwrap_or(INITIAL_SCHEMA_VERSION)
+    }
+
+    pub fn migrate_schema(env: Env, admin: Address, target_version: u32) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+
+        let current = Self::get_schema_version(env.clone());
+        if current >= target_version {
+            return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+        }
+
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &target_version,
+        );
+        Ok(())
     }
 
     pub fn set_merchant_verification_level(
@@ -10785,3 +10822,6 @@ mod test_payment_forward;
 
 #[cfg(test)]
 mod test_scheduled_payment;
+
+#[cfg(test)]
+mod schema_version_test;

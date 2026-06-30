@@ -3,7 +3,7 @@
 use crate::*;
 use soroban_sdk::testutils::Ledger;
 use crate::*;
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env};
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
     env.mock_all_auths();
@@ -15,6 +15,129 @@ fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address
     let merchant = Address::generate(env);
     let token = Address::generate(env);
     (client, admin, customer, merchant, token)
+}
+
+// ── SCHEMA VERSION ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_schema_version_initialized_to_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _customer, _merchant, _token) = setup(&env);
+
+    assert_eq!(client.get_schema_version(), 1);
+}
+
+#[test]
+fn test_schema_version_increments_after_migration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+
+    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.begin_migration(&admin);
+    client.migrate_escrow(&admin, &1);
+    client.complete_migration(&admin);
+
+    assert_eq!(client.get_schema_version(), 2);
+}
+
+#[test]
+fn test_begin_migration_rejects_when_schema_already_at_target() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+
+    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.begin_migration(&admin);
+    client.migrate_escrow(&admin, &1);
+    client.complete_migration(&admin);
+
+    let result = client.try_begin_migration(&admin);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::SchemaAlreadyAtTarget)))
+    );
+}
+
+#[test]
+fn test_initiate_clawback_rejects_zero_delay() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let reason_hash = BytesN::from_array(&env, &[1u8; 32]);
+
+    let result = client.try_initiate_clawback(&admin, &escrow_id, &reason_hash, &0_u64);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::ClawbackDelayTooShort)))
+    );
+}
+
+#[test]
+fn test_sub_account_fee_bps_override() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, customer, merchant, token) = setup(&env);
+
+    client.set_escrow_fee_config(
+        &admin,
+        &EscrowFeeConfig {
+            fee_bps: 500,
+            fee_recipient: admin.clone(),
+            enabled: true,
+        },
+    );
+
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let label = BytesN::from_array(&env, &[1u8; 32]);
+
+    let fee_free_id = client.create_sub_account(&merchant, &escrow_id, &label, &200, &Some(0));
+    let premium_id = client.create_sub_account(
+        &merchant,
+        &escrow_id,
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &300,
+        &Some(1000),
+    );
+    let inherited_id = client.create_sub_account(
+        &merchant,
+        &escrow_id,
+        &BytesN::from_array(&env, &[3u8; 32]),
+        &100,
+        &None,
+    );
+
+    assert_eq!(
+        client.get_sub_account(&escrow_id, &fee_free_id).unwrap().fee_bps_override,
+        Some(0)
+    );
+    assert_eq!(
+        client.get_sub_account(&escrow_id, &premium_id).unwrap().fee_bps_override,
+        Some(1000)
+    );
+    assert!(
+        client
+            .get_sub_account(&escrow_id, &inherited_id)
+            .unwrap()
+            .fee_bps_override
+            .is_none()
+    );
+
+    client.set_sub_account_fee_override(&merchant, &escrow_id, &inherited_id, &Some(250));
+    assert_eq!(
+        client
+            .get_sub_account(&escrow_id, &inherited_id)
+            .unwrap()
+            .fee_bps_override,
+        Some(250)
+    );
 }
 
 // ── MIGRATION FLOW ────────────────────────────────────────────────────────────
