@@ -34,6 +34,7 @@ pub enum ConfigKey {
     InsuranceConfig,
     TimeLockConfig,
     AdminClawbackEscrow(u64),
+    SchemaVersion,
 }
 
 #[derive(Clone)]
@@ -129,6 +130,7 @@ pub enum BasicError {
     InvalidMerkleProof = 109,
     RootAlreadyCommitted = 110,
     InvalidBps = 111,
+    SchemaAlreadyAtTarget = 112,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -162,6 +164,7 @@ pub enum EscrowError {
     NewExpiryNotAfterCurrent = 224,
     RenewalPeriodTooShort = 225,
     RenewalPeriodTooLong = 226,
+    ClawbackDelayTooShort = 227,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -223,10 +226,10 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 314 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 221 {
+            if code >= 200 && code <= 227 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 100 && code <= 111 {
+            if code >= 100 && code <= 112 {
                 return Ok(Error::Basic(unsafe { core::mem::transmute(code) }));
             }
         }
@@ -914,6 +917,7 @@ pub struct EscrowSubAccount {
     pub amount: i128,
     pub released: bool,
     pub release_condition: Option<String>,
+    pub fee_bps_override: Option<i128>,
 }
 
 #[derive(Clone)]
@@ -1509,6 +1513,10 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
     total
 }
 
+const INITIAL_SCHEMA_VERSION: u32 = 1;
+const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
+const MIN_CLAWBACK_DELAY: u64 = 86_400;
+
 #[contract]
 pub struct EscrowContract;
 
@@ -1531,7 +1539,18 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::AdminMultiSig), &config);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &INITIAL_SCHEMA_VERSION,
+        );
         AdminAdded { admin }.publish(&env);
+    }
+
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::SchemaVersion))
+            .unwrap_or(INITIAL_SCHEMA_VERSION)
     }
 
     pub fn set_escrow_fee_config(
@@ -2028,8 +2047,8 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
-        if delay_seconds < 86400 {
-            panic!("delay_seconds must be at least 86400");
+        if delay_seconds < MIN_CLAWBACK_DELAY {
+            return Err(Error::Escrow(EscrowError::ClawbackDelayTooShort));
         }
 
         if !env
@@ -2893,17 +2912,16 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+
         // Check if this is being called from execute_queued_action
 
-        if let Some(config) = env
-            .storage()
-            .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::Config(ConfigKey::AdminMultiSig))
-        {
-            if config.admins.contains(&admin) && early_release {
-                // Admin force release requires time-lock
-                return Err(Error::Basic(BasicError::Unauthorized));
-            }
+        if config.admins.contains(&admin) && early_release {
+            // Admin force release requires time-lock
+            return Err(Error::Basic(BasicError::Unauthorized));
         }
 
         Self::internal_release_escrow(env, admin, escrow_id, early_release, None)
@@ -6606,6 +6624,10 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        if Self::get_schema_version(env.clone()) >= MIGRATION_TARGET_SCHEMA_VERSION {
+            return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+        }
+
         if let Some(status) = env
             .storage()
             .instance()
@@ -6776,6 +6798,10 @@ impl EscrowContract {
         env.storage().instance().set(
             &DataKey::Dispute(DisputeKey::EscrowMigrationStatus),
             &status,
+        );
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &MIGRATION_TARGET_SCHEMA_VERSION,
         );
 
         Ok(())
@@ -8627,12 +8653,17 @@ impl EscrowContract {
         EscrowHealth::Healthy
     }
 
+    fn effective_sub_account_fee_bps(sub: &EscrowSubAccount, parent_fee_bps: i128) -> i128 {
+        sub.fee_bps_override.unwrap_or(parent_fee_bps)
+    }
+
     pub fn create_sub_account(
         env: Env,
         merchant: Address,
         escrow_id: u64,
         label_hash: BytesN<32>,
         amount: i128,
+        fee_bps_override: Option<i128>,
     ) -> Result<u64, Error> {
         merchant.require_auth();
 
@@ -8668,6 +8699,7 @@ impl EscrowContract {
             amount,
             released: false,
             release_condition: None,
+            fee_bps_override,
         };
 
         env.storage().instance().set(
@@ -8680,6 +8712,39 @@ impl EscrowContract {
         );
 
         Ok(sub_id)
+    }
+
+    pub fn set_sub_account_fee_override(
+        env: Env,
+        merchant: Address,
+        escrow_id: u64,
+        sub_id: u64,
+        fee_bps_override: Option<i128>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if merchant != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let mut sub: EscrowSubAccount = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::SubAccount(escrow_id, sub_id)))
+            .ok_or(Error::Escrow(EscrowError::SubAccountNotFound))?;
+
+        if sub.released {
+            return Err(Error::Escrow(EscrowError::SubAccountAlreadyReleased));
+        }
+
+        sub.fee_bps_override = fee_bps_override;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::SubAccount(escrow_id, sub_id)),
+            &sub,
+        );
+
+        Ok(())
     }
 
     pub fn fund_sub_account(
@@ -8753,11 +8818,25 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::SubAccountAlreadyReleased));
         }
 
+        let fee_bps = Self::effective_sub_account_fee_bps(&sub, escrow.fee_bps);
+        let fee_amount = (sub.amount * fee_bps) / 10000;
+        let merchant_amount = sub.amount - fee_amount;
+
+        if fee_amount > 0 {
+            let fee_config = Self::get_escrow_fee_config(env.clone());
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &fee_config.fee_recipient,
+                fee_amount,
+            )?;
+        }
+
         EscrowContract::transfer_if_token_contract(
             &env,
             &escrow.token,
             &escrow.merchant,
-            sub.amount,
+            merchant_amount,
         )?;
 
         sub.released = true;
@@ -9145,7 +9224,8 @@ mod expiry_test;
 //
 #[cfg(test)]
 mod bulk_evidence_test;
-// mod migration_test;
+#[cfg(test)]
+mod migration_test;
 //
 // #[cfg(test)]
 // mod multi_party_rollback_test;

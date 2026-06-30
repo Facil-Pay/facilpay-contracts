@@ -135,6 +135,7 @@ pub enum SystemKey {
     // Per-customer refund cooldown
     CustomerRefundCooldown(Address),
     RefundCooldownConfig,
+    SchemaVersion,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +246,7 @@ pub enum Error {
     CaseAlreadyEscalated = 56,
     // Issue #370: Customer tier policy errors
     TierPolicyNotFound = 57,
+    SchemaAlreadyAtTarget = 58,
 }
 
 #[contractevent]
@@ -1194,12 +1196,17 @@ pub struct RefundContract;
 #[contractimpl]
 impl RefundContract {
     const BATCH_DECISION_LIMIT: u32 = 50;
+    const INITIAL_SCHEMA_VERSION: u32 = 1;
 
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(
+            &SystemKey::SchemaVersion,
+            &Self::INITIAL_SCHEMA_VERSION,
+        );
 
         // Set default refund policy (30 days, 100% refund)
         let mut default_tiers = Vec::new(&env);
@@ -1223,6 +1230,35 @@ impl RefundContract {
         Self::set_inherit_from_parent_inner(&env, &admin, false);
         Self::set_requires_admin_approval_inner(&env, &admin, true);
         Self::set_auto_approve_below_inner(&env, &admin, 0);
+    }
+
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&SystemKey::SchemaVersion)
+            .unwrap_or(Self::INITIAL_SCHEMA_VERSION)
+    }
+
+    pub fn migrate_schema(env: Env, admin: Address, target_version: u32) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let current = Self::get_schema_version(env.clone());
+        if current >= target_version {
+            return Err(Error::SchemaAlreadyAtTarget);
+        }
+
+        env.storage()
+            .instance()
+            .set(&SystemKey::SchemaVersion, &target_version);
+        Ok(())
     }
 
     pub fn request_refund(
@@ -6905,3 +6941,6 @@ mod test_customer_tier_policy;
 
 #[cfg(test)]
 mod test_voucher_expiry;
+
+#[cfg(test)]
+mod schema_version_test;
