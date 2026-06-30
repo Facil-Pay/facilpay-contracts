@@ -69,6 +69,7 @@ pub enum DataKey {
     CustomerTier(Address),
     CustomerTierPolicy(Address, u32),
     StrictTierPolicy(Address),
+    AppealWindowSeconds,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,6 +170,7 @@ pub enum RefundStatus {
     Approved,
     Rejected,
     Processed,
+    PendingAppeal,
 }
 
 // Issue #397: canonical reason codes, enforced by the type system on Refund and
@@ -606,6 +608,8 @@ pub struct Refund {
     pub approved_at: Option<u64>,
     pub rejected_at: Option<u64>,
     pub processed_at: Option<u64>,
+    pub rejected_by: Option<Address>,
+    pub appeal_deadline: Option<u64>,
     // Issue #199: TTL expiry
     pub expires_at: Option<u64>,
 }
@@ -1241,6 +1245,9 @@ impl RefundContract {
         Self::set_inherit_from_parent_inner(&env, &admin, false);
         Self::set_requires_admin_approval_inner(&env, &admin, true);
         Self::set_auto_approve_below_inner(&env, &admin, 0);
+        env.storage()
+            .instance()
+            .set(&DataKey::AppealWindowSeconds, &604800u64);
     }
 
     pub fn request_refund(
@@ -1314,46 +1321,99 @@ impl RefundContract {
         // Require admin authentication
         admin.require_auth();
 
-        // Retrieve refund from storage
+        Self::begin_refund_rejection(&env, admin, refund_id, rejection_reason)
+    }
+
+    pub fn finalize_denial(env: Env, refund_id: u64) -> Result<(), Error> {
         let mut refund: Refund = env
             .storage()
             .instance()
             .get(&DataKey::Refund(refund_id))
             .ok_or(Error::RefundNotFound)?;
 
-        // Check refund status is Requested
-        if refund.status != RefundStatus::Requested {
+        if refund.status != RefundStatus::PendingAppeal {
+            return Err(Error::RefundNotRejected);
+        }
+
+        let appeal_deadline = refund
+            .appeal_deadline
+            .ok_or(Error::RefundNotRejected)?;
+        let now = env.ledger().timestamp();
+        if now < appeal_deadline {
             return Err(Error::InvalidStatus);
         }
 
-        Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
+        Self::remove_from_status_index(&env, RefundStatus::PendingAppeal, refund_id)?;
 
-        // Update refund status to Rejected
         refund.status = RefundStatus::Rejected;
-        // Issue #147: Set rejected_at timestamp
-        refund.rejected_at = Some(env.ledger().timestamp());
-
-        // Store updated refund back to storage
+        refund.rejected_at = Some(now);
         env.storage()
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
-        env.storage().instance().set(
-            &SystemKey::RefundRejectedAt(refund_id),
-            &env.ledger().timestamp(),
-        );
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundRejectedAt(refund_id), &now);
 
-        // Emit RefundRejected event
+        let rejected_by = refund
+            .rejected_by
+            .clone()
+            .unwrap_or(env.current_contract_address());
+
         (RefundRejected {
             refund_id,
-            rejected_by: admin,
-            rejected_at: env.ledger().timestamp(),
-            rejection_reason,
+            rejected_by,
+            rejected_at: now,
+            rejection_reason: soroban_sdk::String::from_str(&env, "appeal window expired"),
         })
         .publish(&env);
 
-        // Issue #144: Invoke notification hooks
         Self::invoke_hooks(&env, RefundEventType::Rejected, refund_id);
+
+        Ok(())
+    }
+
+    fn begin_refund_rejection(
+        env: &Env,
+        admin: Address,
+        refund_id: u64,
+        rejection_reason: String,
+    ) -> Result<(), Error> {
+        let mut refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::InvalidStatus);
+        }
+
+        Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
+
+        let appeal_window: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AppealWindowSeconds)
+            .unwrap_or(604800);
+        let now = env.ledger().timestamp();
+
+        refund.status = RefundStatus::PendingAppeal;
+        refund.rejected_by = Some(admin.clone());
+        refund.appeal_deadline = Some(now.saturating_add(appeal_window));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
+        Self::add_to_status_index(env, RefundStatus::PendingAppeal, refund_id);
+
+        (RefundRejected {
+            refund_id,
+            rejected_by: admin,
+            rejected_at: now,
+            rejection_reason,
+        })
+        .publish(env);
 
         Ok(())
     }
@@ -1375,7 +1435,9 @@ impl RefundContract {
         if refund.customer != customer {
             return Err(Error::Unauthorized);
         }
-        if refund.status != RefundStatus::Rejected {
+        if refund.status != RefundStatus::Rejected
+            && refund.status != RefundStatus::PendingAppeal
+        {
             return Err(Error::RefundNotRejected);
         }
         if env
@@ -1386,14 +1448,28 @@ impl RefundContract {
             return Err(Error::AppealAlreadyFiled);
         }
 
-        let rejected_at: u64 = env
-            .storage()
-            .instance()
-            .get(&SystemKey::RefundRejectedAt(refund_id))
-            .ok_or(Error::RefundNotRejected)?;
         let now = env.ledger().timestamp();
-        if now > rejected_at.saturating_add(72 * 60 * 60) {
-            return Err(Error::AppealWindowExpired);
+        if refund.status == RefundStatus::PendingAppeal {
+            let appeal_deadline = refund
+                .appeal_deadline
+                .ok_or(Error::RefundNotRejected)?;
+            if now > appeal_deadline {
+                return Err(Error::AppealWindowExpired);
+            }
+        } else {
+            let rejected_at: u64 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::RefundRejectedAt(refund_id))
+                .ok_or(Error::RefundNotRejected)?;
+            let appeal_window: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AppealWindowSeconds)
+                .unwrap_or(604800);
+            if now > rejected_at.saturating_add(appeal_window) {
+                return Err(Error::AppealWindowExpired);
+            }
         }
 
         let counter: u64 = env
@@ -1477,11 +1553,14 @@ impl RefundContract {
                 .instance()
                 .get(&DataKey::Refund(appeal.refund_id))
                 .ok_or(Error::RefundNotFound)?;
-            if refund.status != RefundStatus::Rejected {
+            if refund.status != RefundStatus::Rejected
+                && refund.status != RefundStatus::PendingAppeal
+            {
                 return Err(Error::RefundNotRejected);
             }
 
-            Self::remove_from_status_index(&env, RefundStatus::Rejected, refund.id)?;
+            let prior_status = refund.status.clone();
+            Self::remove_from_status_index(&env, prior_status, refund.id)?;
             refund.status = RefundStatus::Approved;
             env.storage()
                 .instance()
@@ -1903,6 +1982,63 @@ impl RefundContract {
             &ArbitrationKey::ArbitratorReputation(arbitrator),
             &reputation,
         );
+
+        Ok(())
+    }
+
+    pub fn assign_arbitrator(
+        env: Env,
+        admin: Address,
+        case_id: u64,
+        arbitrator: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::RefundNotFound)?;
+        if case.status != ArbitrationStatus::Open {
+            return Err(Error::InvalidStatus);
+        }
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+            .ok_or(Error::RefundNotFound)?;
+
+        if let Some(denied_by) = refund.rejected_by.clone() {
+            if arbitrator == denied_by {
+                // denied_by cannot arbitrate their own denial decision
+                return Err(Error::Unauthorized);
+            }
+        }
+
+        let arbitrators: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorList)
+            .unwrap_or(Vec::new(&env));
+        if !arbitrators.contains(&arbitrator) {
+            return Err(Error::NotArbitrator);
+        }
+
+        if !case.arbitrators.contains(&arbitrator) {
+            case.arbitrators.push_back(arbitrator);
+            env.storage()
+                .instance()
+                .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
+        }
 
         Ok(())
     }
@@ -3121,6 +3257,10 @@ impl RefundContract {
                             pending_count += 1;
                             pending_amount += refund.amount;
                         }
+                        RefundStatus::PendingAppeal => {
+                            pending_count += 1;
+                            pending_amount += refund.amount;
+                        }
                     }
                 }
             }
@@ -4332,6 +4472,8 @@ impl RefundContract {
             },
             rejected_at: None,
             processed_at: None,
+            rejected_by: None,
+            appeal_deadline: None,
             // Issue #199: TTL expiry
             expires_at: ttl_expires_at,
         };
@@ -5997,34 +6139,12 @@ impl RefundContract {
 
         for refund_id in refund_ids.iter() {
             let result = (|| -> Result<(), Error> {
-                let mut refund: Refund = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::Refund(refund_id))
-                    .ok_or(Error::RefundNotFound)?;
-                if refund.status != RefundStatus::Requested {
-                    return Err(Error::InvalidStatus);
-                }
-                Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
-                refund.status = RefundStatus::Rejected;
-                refund.rejected_at = Some(env.ledger().timestamp());
-                env.storage()
-                    .instance()
-                    .set(&DataKey::Refund(refund_id), &refund);
-                Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
-                env.storage().instance().set(
-                    &SystemKey::RefundRejectedAt(refund_id),
-                    &env.ledger().timestamp(),
-                );
-                (RefundRejected {
+                Self::begin_refund_rejection(
+                    &env,
+                    admin.clone(),
                     refund_id,
-                    rejected_by: admin.clone(),
-                    rejected_at: env.ledger().timestamp(),
-                    rejection_reason: soroban_sdk::String::from_str(&env, "batch rejection"),
-                })
-                .publish(&env);
-                Self::invoke_hooks(&env, RefundEventType::Rejected, refund_id);
-                Ok(())
+                    soroban_sdk::String::from_str(&env, "batch rejection"),
+                )
             })();
             match result {
                 Ok(()) => succeeded.push_back(refund_id),
