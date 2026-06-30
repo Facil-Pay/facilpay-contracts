@@ -288,6 +288,8 @@ pub struct TriggerRegistered {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RefundApproved {
     pub refund_id: u64,
+    pub payment_id: u64,
+    pub amount: i128,
     pub approved_by: Address,
     pub approved_at: u64,
 }
@@ -4353,6 +4355,8 @@ impl RefundContract {
 
         (RefundApproved {
             refund_id,
+            payment_id: refund.payment_id,
+            amount: refund.amount,
             approved_by,
             approved_at: env.ledger().timestamp(),
         })

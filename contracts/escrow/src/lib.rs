@@ -183,6 +183,7 @@ pub enum ActionError {
     BatchReleaseSizeLimitExceeded = 312,
     EvidenceDeadlinePassed = 313,
     ApprovalsThresholdNotMet = 314,
+    InsufficientCollateral = 315,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -703,6 +704,7 @@ pub struct DisputeConfig {
     pub collateral_token: Address,
     pub collateral_amount: i128,
     pub collateral_enabled: bool,
+    pub min_collateral_ratio_bps: u32,
 }
 
 #[derive(Clone)]
@@ -3163,6 +3165,12 @@ impl EscrowContract {
         // Handle collateral
         let config = Self::get_dispute_config(env.clone());
         if config.collateral_enabled && config.collateral_amount > 0 {
+            // Validate collateral-to-loan ratio
+            // Formula: collateral_amount * 10000 >= escrow_amount * min_collateral_ratio_bps
+            if config.collateral_amount * 10000 < escrow.amount * config.min_collateral_ratio_bps as i128 {
+                return Err(Error::Action(ActionError::InsufficientCollateral));
+            }
+
             let token_client = token::Client::new(&env, &config.collateral_token);
             token_client.transfer(
                 &caller,
@@ -7108,6 +7116,7 @@ impl EscrowContract {
                 collateral_token: env.current_contract_address(),
                 collateral_amount: 0,
                 collateral_enabled: false,
+                min_collateral_ratio_bps: 15000, // Default 150%
             })
     }
 
