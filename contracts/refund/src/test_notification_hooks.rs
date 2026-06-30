@@ -13,6 +13,8 @@ pub struct MockSubscriber;
 
 #[contractimpl]
 impl MockSubscriber {
+    pub fn ping(_env: Env) {}
+
     pub fn on_refund_event(_env: Env, _event_type: RefundEventType, _refund_id: u64) {
         // Mock implementation - does nothing but doesn't fail
     }
@@ -24,9 +26,20 @@ pub struct FailingSubscriber;
 
 #[contractimpl]
 impl FailingSubscriber {
+    pub fn ping(_env: Env) {}
+
     pub fn on_refund_event(_env: Env, _event_type: RefundEventType, _refund_id: u64) {
         panic!("Intentional failure");
     }
+}
+
+// Hook contract missing ping() — registration must be rejected
+#[contract]
+pub struct SubscriberWithoutPing;
+
+#[contractimpl]
+impl SubscriberWithoutPing {
+    pub fn on_refund_event(_env: Env, _event_type: RefundEventType, _refund_id: u64) {}
 }
 
 fn setup_test_env<'a>() -> (Env, RefundContractClient<'a>, Address, Address) {
@@ -37,11 +50,15 @@ fn setup_test_env<'a>() -> (Env, RefundContractClient<'a>, Address, Address) {
     let client = RefundContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
-    let subscriber = Address::generate(&env);
+    let subscriber = env.register_contract(None, MockSubscriber);
 
     client.initialize(&admin);
 
     (env, client, admin, subscriber)
+}
+
+fn register_mock_subscriber(env: &Env) -> Address {
+    env.register_contract(None, MockSubscriber)
 }
 
 #[test]
@@ -68,8 +85,8 @@ fn test_register_notification_hook() {
 fn test_register_multiple_hooks() {
     let (env, client, _admin, _subscriber) = setup_test_env();
 
-    let subscriber1 = Address::generate(&env);
-    let subscriber2 = Address::generate(&env);
+    let subscriber1 = register_mock_subscriber(&env);
+    let subscriber2 = register_mock_subscriber(&env);
 
     let mut events1 = Vec::new(&env);
     events1.push_back(RefundEventType::Requested);
@@ -97,7 +114,7 @@ fn test_max_hooks_per_event() {
 
     // Register 10 hooks (max limit)
     for i in 0..10 {
-        let subscriber = Address::generate(&env);
+        let subscriber = register_mock_subscriber(&env);
         let mut events = Vec::new(&env);
         events.push_back(RefundEventType::Requested);
 
@@ -106,7 +123,7 @@ fn test_max_hooks_per_event() {
     }
 
     // Try to register 11th hook - should fail
-    let subscriber11 = Address::generate(&env);
+    let subscriber11 = register_mock_subscriber(&env);
     let mut events = Vec::new(&env);
     events.push_back(RefundEventType::Requested);
 
@@ -141,7 +158,7 @@ fn test_deregister_hook_not_owner() {
     let hook_id = client.register_notification_hook(&subscriber, &events);
 
     // Try to deregister with different address
-    let other_subscriber = Address::generate(&env);
+    let other_subscriber = register_mock_subscriber(&env);
     let result = client.try_deregister_hook(&other_subscriber, &hook_id);
     assert_eq!(result, Err(Ok(Error::HookNotOwnedBySubscriber)));
 }
@@ -376,6 +393,30 @@ fn test_multiple_hooks_same_event() {
     );
 
     assert_eq!(refund_id, 1);
+}
+
+#[test]
+fn test_register_notification_hook_invalid_address() {
+    let (env, client, _admin, _subscriber) = setup_test_env();
+
+    let invalid_subscriber = Address::generate(&env);
+    let mut events = Vec::new(&env);
+    events.push_back(RefundEventType::Requested);
+
+    let result = client.try_register_notification_hook(&invalid_subscriber, &events);
+    assert_eq!(result, Err(Ok(Error::InvalidHookAddress)));
+}
+
+#[test]
+fn test_register_notification_hook_missing_ping() {
+    let (env, client, _admin, _subscriber) = setup_test_env();
+
+    let subscriber = env.register_contract(None, SubscriberWithoutPing);
+    let mut events = Vec::new(&env);
+    events.push_back(RefundEventType::Requested);
+
+    let result = client.try_register_notification_hook(&subscriber, &events);
+    assert_eq!(result, Err(Ok(Error::InvalidHookAddress)));
 }
 
 #[test]
