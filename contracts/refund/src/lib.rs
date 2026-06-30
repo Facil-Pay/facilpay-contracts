@@ -228,6 +228,8 @@ pub enum Error {
     HookNotFound = 41,
     MaxHooksPerEventReached = 42,
     HookNotOwnedBySubscriber = 43,
+    // Issue #373: Invalid notification hook subscriber address
+    InvalidHookAddress = 58,
     // Issue #148: Customer eligibility errors
     CustomerBlockedFromRefund = 44,
     EligibilityEntryNotFound = 45,
@@ -844,6 +846,8 @@ pub struct CustomerRefundRateLimit {
     pub request_count: u32,
     pub max_requests_per_window: u32,
     pub window_seconds: u64,
+    /// When true, per-customer limits are not refreshed from global config on window reset.
+    pub custom_override: bool,
 }
 
 #[derive(Clone)]
@@ -851,6 +855,10 @@ pub struct CustomerRefundRateLimit {
 pub struct GlobalRefundRateLimit {
     pub max_requests_per_window: u32,
     pub window_seconds: u64,
+    /// Config applied to windows that start at or after `next_config_effective_at`.
+    pub next_max_requests_per_window: u32,
+    pub next_window_seconds: u64,
+    pub next_config_effective_at: u64,
 }
 
 /// Configuration for platform fee deduction on refund processing
@@ -1186,6 +1194,16 @@ pub struct RefundCooldownEnforced {
     pub last_refund_at: u64,
     pub cooldown_seconds: u64,
     pub available_at: u64,
+}
+
+/// Event emitted when the global refund rate limit config is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitUpdated {
+    pub admin: Address,
+    pub new_window_seconds: u64,
+    pub new_max_refunds: u32,
+    pub effective_at: u64,
 }
 
 #[contract]
@@ -1738,10 +1756,12 @@ impl RefundContract {
                 request_count: 0,
                 max_requests_per_window: max_per_window,
                 window_seconds,
+                custom_override: true,
             });
 
         limit.max_requests_per_window = max_per_window;
         limit.window_seconds = window_seconds;
+        limit.custom_override = true;
 
         env.storage()
             .instance()
@@ -1759,6 +1779,7 @@ impl RefundContract {
                 request_count: 0,
                 max_requests_per_window: 0,
                 window_seconds: 0,
+                custom_override: false,
             })
     }
 
@@ -1770,15 +1791,79 @@ impl RefundContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
+        if max_per_window == 0 || window_seconds == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
         let limit = GlobalRefundRateLimit {
             max_requests_per_window: max_per_window,
             window_seconds,
+            next_max_requests_per_window: max_per_window,
+            next_window_seconds: window_seconds,
+            next_config_effective_at: 0,
         };
 
         env.storage()
             .instance()
             .set(&DataKey::GlobalRefundRateLimit, &limit);
         Ok(())
+    }
+
+    /// Update the global refund rate limit without disrupting in-progress windows.
+    /// New parameters apply only to windows that start at or after the update timestamp;
+    /// the current window's request count and duration are preserved.
+    pub fn update_rate_limit(
+        env: Env,
+        admin: Address,
+        new_window_seconds: u64,
+        new_max_refunds: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if new_max_refunds == 0 || new_window_seconds == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let updated = match env
+            .storage()
+            .instance()
+            .get::<DataKey, GlobalRefundRateLimit>(&DataKey::GlobalRefundRateLimit)
+        {
+            Some(mut existing) => {
+                existing.next_max_requests_per_window = new_max_refunds;
+                existing.next_window_seconds = new_window_seconds;
+                existing.next_config_effective_at = now;
+                existing
+            }
+            None => GlobalRefundRateLimit {
+                max_requests_per_window: new_max_refunds,
+                window_seconds: new_window_seconds,
+                next_max_requests_per_window: new_max_refunds,
+                next_window_seconds: new_window_seconds,
+                next_config_effective_at: 0,
+            },
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::GlobalRefundRateLimit, &updated);
+
+        (RateLimitUpdated {
+            admin,
+            new_window_seconds,
+            new_max_refunds,
+            effective_at: now,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_global_refund_rate_limit(env: Env) -> Option<GlobalRefundRateLimit> {
+        env.storage()
+            .instance()
+            .get(&DataKey::GlobalRefundRateLimit)
     }
 
     pub fn register_arbitrator(env: Env, admin: Address, arbitrator: Address) -> Result<(), Error> {
@@ -3972,7 +4057,7 @@ impl RefundContract {
         admin.require_auth();
         let limit = Self::get_batch_refund_limit(env.clone());
         if refund_ids.len() > limit {
-            // Return single error result indicating batch too large
+            // Batch-level validation failure: reject the entire batch without processing.
             let mut results = Vec::new(&env);
             results.push_back(BatchRefundResult {
                 refund_id: 0,
@@ -3983,6 +4068,8 @@ impl RefundContract {
             return results;
         }
 
+        // Per-item failures are isolated; valid items are processed and invalid items
+        // return an error entry in the results vector without blocking other items.
         let mut results = Vec::new(&env);
         for refund_id in refund_ids.iter() {
             let result = Self::approve_refund_internal(&env, admin.clone(), refund_id);
@@ -4022,6 +4109,7 @@ impl RefundContract {
         admin.require_auth();
         let limit = Self::get_batch_refund_limit(env.clone());
         if refund_ids.len() > limit {
+            // Batch-level validation failure: reject the entire batch without processing.
             let mut results = Vec::new(&env);
             results.push_back(BatchRefundResult {
                 refund_id: 0,
@@ -4032,6 +4120,8 @@ impl RefundContract {
             return results;
         }
 
+        // Per-item failures are isolated; valid items are processed and invalid items
+        // return an error entry in the results vector without blocking other items.
         let mut results = Vec::new(&env);
         for refund_id in refund_ids.iter() {
             let amount = env
@@ -4901,6 +4991,17 @@ impl RefundContract {
         }
     }
 
+    fn effective_global_rate_limit(global: &GlobalRefundRateLimit, now: u64) -> (u32, u64) {
+        if global.next_config_effective_at > 0 && now >= global.next_config_effective_at {
+            (
+                global.next_max_requests_per_window,
+                global.next_window_seconds,
+            )
+        } else {
+            (global.max_requests_per_window, global.window_seconds)
+        }
+    }
+
     fn check_and_update_customer_refund_rate_limit(
         env: &Env,
         customer: Address,
@@ -4918,23 +5019,32 @@ impl RefundContract {
         if global_limit_opt.is_none() && customer_limit_opt.is_none() {
             return Ok(());
         }
+        let now = env.ledger().timestamp();
         let mut limit = match customer_limit_opt {
             Some(l) => l,
             None => {
-                let g = global_limit_opt.unwrap();
+                let g = global_limit_opt.as_ref().unwrap();
+                let (max_requests, window_seconds) = Self::effective_global_rate_limit(g, now);
                 CustomerRefundRateLimit {
                     customer: customer.clone(),
-                    window_start: env.ledger().timestamp(),
+                    window_start: now,
                     request_count: 0,
-                    max_requests_per_window: g.max_requests_per_window,
-                    window_seconds: g.window_seconds,
+                    max_requests_per_window: max_requests,
+                    window_seconds,
+                    custom_override: false,
                 }
             }
         };
-        let now = env.ledger().timestamp();
         if now >= limit.window_start + limit.window_seconds {
             limit.window_start = now;
             limit.request_count = 0;
+            if !limit.custom_override {
+                if let Some(ref g) = global_limit_opt {
+                    let (max_requests, window_seconds) = Self::effective_global_rate_limit(g, now);
+                    limit.max_requests_per_window = max_requests;
+                    limit.window_seconds = window_seconds;
+                }
+            }
         }
         if limit.request_count >= limit.max_requests_per_window {
             return Err(Error::RefundRateLimitExceeded);
@@ -5387,6 +5497,18 @@ impl RefundContract {
     // Issue #144: Notification hook functions
     const MAX_HOOKS_PER_EVENT: u32 = 10;
 
+    /// Verify the subscriber address is a reachable contract that implements `ping()`.
+    fn validate_notification_hook_subscriber(env: &Env, subscriber: &Address) -> Result<(), Error> {
+        match env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+            subscriber,
+            &Symbol::new(env, "ping"),
+            ().into_val(env),
+        ) {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::InvalidHookAddress),
+        }
+    }
+
     /// Register a notification hook for specific refund events
     pub fn register_notification_hook(
         env: Env,
@@ -5399,6 +5521,8 @@ impl RefundContract {
         if events.is_empty() {
             return Err(Error::InvalidAmount); // Reusing error for invalid input
         }
+
+        Self::validate_notification_hook_subscriber(&env, &subscriber)?;
 
         // Check max hooks per event type
         for event_type in events.iter() {
