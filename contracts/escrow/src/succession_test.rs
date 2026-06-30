@@ -1,7 +1,29 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String};
+
+fn setup() -> (Env, EscrowContractClient<'static>, Address) {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    (env, client, admin)
+}
+
+fn zero_address(env: &Env) -> Address {
+    Address::from_string(
+        env,
+        &String::from_str(
+            env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ),
+    )
+}
 
 fn setup() -> (Env, EscrowContractClient<'static>, Address) {
     let env = Env::default();
@@ -91,5 +113,58 @@ fn test_only_one_pending_succession_plan_allowed() {
     client.designate_successor(&admin, &first_successor, &60_u64);
 
     let result = client.try_designate_successor(&admin, &second_successor, &120_u64);
-    assert_eq!(result, Err(Ok(Error::SuccessionPlanExists)));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::SuccessionPlanExists)))
+    );
+}
+
+#[test]
+fn succession_to_zero_address_is_rejected() {
+    let (env, client, admin) = setup();
+    let zero = zero_address(&env);
+
+    env.ledger().set_timestamp(12_000);
+    let result = client.try_designate_successor(&admin, &zero, &60_u64);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::InvalidAddress)))
+    );
+    assert!(client.get_succession_plan().is_none());
+}
+
+#[test]
+fn succession_to_self_is_rejected() {
+    let (env, client, admin) = setup();
+
+    env.ledger().set_timestamp(14_000);
+    let result = client.try_designate_successor(&admin, &admin, &60_u64);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Action(ActionError::SameBeneficiary)))
+    );
+    assert!(client.get_succession_plan().is_none());
+}
+
+#[test]
+fn valid_succession_transfer_completes() {
+    let (env, client, admin) = setup();
+    let successor = Address::generate(&env);
+
+    env.ledger().set_timestamp(16_000);
+    client.designate_successor(&admin, &successor, &120_u64);
+
+    let plan = client.get_succession_plan().unwrap();
+    assert_eq!(plan.successor, successor);
+    assert!(!plan.activated);
+
+    env.ledger().set_timestamp(16_120);
+    client.activate_succession(&successor);
+
+    let config = client.get_multisig_config();
+    assert!(config.admins.contains(&successor));
+    assert_eq!(config.total_admins, 2);
+
+    let plan = client.get_succession_plan().unwrap();
+    assert!(plan.activated);
 }

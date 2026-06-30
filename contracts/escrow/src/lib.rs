@@ -65,6 +65,7 @@ pub enum EscrowKey {
     SubAccount(u64, u64),
     SubAccountCounter(u64),
     EscrowHierarchy(u64),
+    ReleaseMultisig(u64),
 }
 
 #[derive(Clone)]
@@ -101,6 +102,9 @@ pub enum DisputeKey {
     EscrowSwapConfig(u64),
     Observer(u64, u64),
     ObserverCount(u64),
+    EscalationQueue(u64),
+    EscalationQueueIndex,
+    EscalationDeadline(u64),
 }
 
 #[derive(Clone)]
@@ -130,6 +134,8 @@ pub enum BasicError {
     InvalidMerkleProof = 109,
     RootAlreadyCommitted = 110,
     InvalidBps = 111,
+    InsufficientAdmins = 112,
+    InvalidAddress = 113,
     SchemaAlreadyAtTarget = 112,
 }
 
@@ -164,6 +170,8 @@ pub enum EscrowError {
     NewExpiryNotAfterCurrent = 224,
     RenewalPeriodTooShort = 225,
     RenewalPeriodTooLong = 226,
+    InvalidThreshold = 227,
+    SuccessionPlanExists = 228,
     ClawbackDelayTooShort = 227,
 }
 
@@ -226,6 +234,10 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 314 {
                 return Ok(Error::Action(unsafe { core::mem::transmute(code) }));
             }
+            if code >= 200 && code <= 228 {
+                return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
+            }
+            if code >= 100 && code <= 113 {
             if code >= 200 && code <= 227 {
                 return Ok(Error::Escrow(unsafe { core::mem::transmute(code) }));
             }
@@ -1067,6 +1079,21 @@ pub struct MultiSigConfig {
     pub required_signatures: u32,
     pub total_admins: u32,
     pub proposal_ttl: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MultisigConfiguration {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowReleaseMultisig {
+    pub signers: Vec<Address>,
+    pub threshold: u32,
+    pub approvals: Vec<Address>,
 }
 
 #[derive(Clone)]
@@ -1920,13 +1947,20 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
+        if Self::is_zero_address(&env, &successor) {
+            return Err(Error::Basic(BasicError::InvalidAddress));
+        }
+        if successor == admin {
+            return Err(Error::Action(ActionError::SameBeneficiary));
+        }
+
         if let Some(existing) = env
             .storage()
             .instance()
             .get::<DataKey, SuccessionPlan>(&DataKey::Config(ConfigKey::AdminSuccessionPlan))
         {
             if !existing.activated {
-                return Err(Error::Escrow(EscrowError::InvalidStatus));
+                return Err(Error::Escrow(EscrowError::SuccessionPlanExists));
             }
         }
 
@@ -2222,6 +2256,34 @@ impl EscrowContract {
             min_hold_period,
             expiry_timestamp,
             auto_refund_on_expiry,
+            None,
+        )
+    }
+
+    pub fn create_escrow_with_multisig(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+        multisig: MultisigConfiguration,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        Self::internal_create_escrow(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            release_timestamp,
+            min_hold_period,
+            expiry_timestamp,
+            auto_refund_on_expiry,
+            Some(multisig),
         )
     }
 
@@ -2235,6 +2297,7 @@ impl EscrowContract {
         min_hold_period: u64,
         expiry_timestamp: u64,
         auto_refund_on_expiry: bool,
+        multisig: Option<MultisigConfiguration>,
     ) -> Result<u64, Error> {
         // Block new escrow creation during migration
         if let Some(status) = env
@@ -2259,6 +2322,12 @@ impl EscrowContract {
             && expiry_timestamp <= current_timestamp.saturating_add(min_hold_period)
         {
             return Err(Error::Escrow(EscrowError::EscrowAlreadyExpired));
+        }
+
+        if let Some(config) = &multisig {
+            if !config.signers.is_empty() {
+                Self::validate_release_multisig_threshold(config.threshold, &config.signers)?;
+            }
         }
 
         let counter: u64 = env
@@ -2312,6 +2381,20 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Counter), &escrow_id);
+
+        if let Some(config) = multisig {
+            if !config.signers.is_empty() {
+                let release_multisig = EscrowReleaseMultisig {
+                    signers: config.signers,
+                    threshold: config.threshold,
+                    approvals: Vec::new(&env),
+                };
+                env.storage().instance().set(
+                    &DataKey::Escrow(EscrowKey::ReleaseMultisig(escrow_id)),
+                    &release_multisig,
+                );
+            }
+        }
 
         // Index by customer
         let customer_count: u64 = env
@@ -2730,7 +2813,7 @@ impl EscrowContract {
         }
 
         if let Err(_) = Self::validate_bps(threshold_bps) {
-            return Err(Error::Escrow(EscrowError::InvalidStatus));
+            return Err(Error::Escrow(EscrowError::InvalidThreshold));
         }
 
         let mut escrow: MultiPartyEscrow = env
@@ -2904,6 +2987,50 @@ impl EscrowContract {
             .expect("Escrow not found")
     }
 
+    pub fn approve_escrow_release(env: Env, signer: Address, escrow_id: u64) -> Result<(), Error> {
+        signer.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        let mut release_multisig: EscrowReleaseMultisig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::ReleaseMultisig(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if !release_multisig.signers.contains(&signer) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if release_multisig.approvals.contains(&signer) {
+            return Err(Error::Basic(BasicError::DuplicateApproval));
+        }
+
+        release_multisig.approvals.push_back(signer.clone());
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::ReleaseMultisig(escrow_id)),
+            &release_multisig,
+        );
+
+        ParticipantApproved {
+            escrow_id,
+            approver: signer,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     pub fn release_escrow(
         env: Env,
         admin: Address,
@@ -2912,6 +3039,8 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
 
+        if EscrowContract::verify_observer_access(env.clone(), escrow_id, admin.clone()) {
+            return Err(Error::Basic(BasicError::Unauthorized));
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -2995,6 +3124,18 @@ impl EscrowContract {
         let current_time: u64 = env.ledger().timestamp();
 
         Self::can_release_escrow(env.clone(), escrow_id, early_release)?;
+
+        if let Some(release_multisig) = env
+            .storage()
+            .instance()
+            .get::<DataKey, EscrowReleaseMultisig>(&DataKey::Escrow(EscrowKey::ReleaseMultisig(
+                escrow_id,
+            )))
+        {
+            if (release_multisig.approvals.len() as u32) < release_multisig.threshold {
+                return Err(Error::Action(ActionError::ApprovalsThresholdNotMet));
+            }
+        }
 
         let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
         if escrow.status == EscrowStatus::Locked {
@@ -3646,6 +3787,10 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        let deadline = now.saturating_add(escrow.escalation_timeout);
+        Self::enqueue_escalation(&env, escrow_id, deadline);
+
         DisputeEscalated {
             escrow_id,
             level: escrow.escalation_level,
@@ -3818,7 +3963,78 @@ impl EscrowContract {
         })
         .publish(&env);
 
+        Self::dequeue_escalation(&env, escrow_id);
+
         Ok(())
+    }
+
+    /// Processes expired escalation deadlines using the indexed queue rather than
+    /// scanning all escrows. Only buckets with deadline ≤ current ledger time are read.
+    pub fn process_escalation_timeouts(env: Env, limit: u32) -> u32 {
+        let now = env.ledger().timestamp();
+        let index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscalationQueueIndex))
+            .unwrap_or(Vec::new(&env));
+
+        let mut processed = 0u32;
+        let mut remaining_index = Vec::new(&env);
+        let mut i = 0u32;
+        let len = index.len();
+
+        while i < len {
+            let deadline = index.get(i).unwrap();
+            if deadline > now {
+                remaining_index.push_back(deadline);
+                i += 1;
+                while i < len {
+                    remaining_index.push_back(index.get(i).unwrap());
+                    i += 1;
+                }
+                break;
+            }
+
+            let ids: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Dispute(DisputeKey::EscalationQueue(deadline)))
+                .unwrap_or(Vec::new(&env));
+
+            let mut remaining_ids = Vec::new(&env);
+            let mut j = 0u32;
+            while j < ids.len() {
+                let escrow_id = ids.get(j).unwrap();
+                if processed >= limit {
+                    remaining_ids.push_back(escrow_id);
+                } else if Self::trigger_timeout_resolution(env.clone(), escrow_id).is_ok() {
+                    processed += 1;
+                } else {
+                    remaining_ids.push_back(escrow_id);
+                }
+                j += 1;
+            }
+
+            if !remaining_ids.is_empty() {
+                env.storage().instance().set(
+                    &DataKey::Dispute(DisputeKey::EscalationQueue(deadline)),
+                    &remaining_ids,
+                );
+                remaining_index.push_back(deadline);
+            } else {
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::Dispute(DisputeKey::EscalationQueue(deadline)));
+            }
+            i += 1;
+        }
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::EscalationQueueIndex),
+            &remaining_index,
+        );
+
+        processed
     }
 
     pub fn resolve_dispute(
@@ -3875,6 +4091,8 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        Self::dequeue_escalation(&env, escrow_id);
 
         // Transfer main escrow funds
         let recipient = if release_to_merchant {
@@ -5991,7 +6209,7 @@ impl EscrowContract {
                     .get(&DataKey::Config(ConfigKey::AdminMultiSig))
                     .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
                 if required == 0 || required > config.total_admins {
-                    return Err(Error::Escrow(EscrowError::InvalidStatus));
+                    return Err(Error::Escrow(EscrowError::InvalidThreshold));
                 }
                 config.required_signatures = required;
                 env.storage()
@@ -6005,10 +6223,10 @@ impl EscrowContract {
                     .get(&DataKey::Config(ConfigKey::AdminMultiSig))
                     .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
                 if new_threshold == 0 {
-                    return Err(Error::Escrow(EscrowError::InvalidStatus));
+                    return Err(Error::Escrow(EscrowError::InvalidThreshold));
                 }
                 if new_threshold > config.total_admins {
-                    return Err(Error::Escrow(EscrowError::InvalidStatus));
+                    return Err(Error::Basic(BasicError::InsufficientAdmins));
                 }
                 config.required_signatures = new_threshold;
                 env.storage()
@@ -9042,6 +9260,7 @@ impl EscrowContract {
             parent_escrow.min_hold_period,
             parent_escrow.expiry_timestamp,
             parent_escrow.auto_refund_on_expiry,
+            None,
         )?;
 
         // Update parent children list
@@ -9157,6 +9376,141 @@ impl EscrowContract {
         }
     }
 
+    fn is_zero_address(env: &Env, address: &Address) -> bool {
+        let xdr = address.to_xdr(env);
+        if xdr.get(0).unwrap() == 0 && xdr.get(4).unwrap() == 0 {
+            for i in 0..32 {
+                if xdr.get(12 + (i as u32)).unwrap() != 0 {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn enqueue_escalation(env: &Env, escrow_id: u64, deadline: u64) {
+        Self::dequeue_escalation(env, escrow_id);
+
+        let mut ids: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscalationQueue(deadline)))
+            .unwrap_or(Vec::new(env));
+        ids.push_back(escrow_id);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::EscalationQueue(deadline)),
+            &ids,
+        );
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::EscalationDeadline(escrow_id)),
+            &deadline,
+        );
+        Self::insert_escalation_queue_index(env, deadline);
+    }
+
+    fn dequeue_escalation(env: &Env, escrow_id: u64) {
+        let deadline: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscalationDeadline(escrow_id)));
+        let Some(deadline) = deadline else {
+            return;
+        };
+
+        if let Some(ids) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Vec<u64>>(&DataKey::Dispute(DisputeKey::EscalationQueue(
+                deadline,
+            )))
+        {
+            let mut remaining = Vec::new(env);
+            for id in ids.iter() {
+                if id != escrow_id {
+                    remaining.push_back(id);
+                }
+            }
+            if remaining.is_empty() {
+                env.storage()
+                    .instance()
+                    .remove(&DataKey::Dispute(DisputeKey::EscalationQueue(deadline)));
+                Self::remove_escalation_queue_index(env, deadline);
+            } else {
+                env.storage().instance().set(
+                    &DataKey::Dispute(DisputeKey::EscalationQueue(deadline)),
+                    &remaining,
+                );
+            }
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Dispute(DisputeKey::EscalationDeadline(escrow_id)));
+    }
+
+    fn insert_escalation_queue_index(env: &Env, deadline: u64) {
+        let mut index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscalationQueueIndex))
+            .unwrap_or(Vec::new(env));
+
+        for d in index.iter() {
+            if d == deadline {
+                return;
+            }
+        }
+
+        let mut inserted = false;
+        let mut new_index = Vec::new(env);
+        for d in index.iter() {
+            if !inserted && d > deadline {
+                new_index.push_back(deadline);
+                inserted = true;
+            }
+            new_index.push_back(d);
+        }
+        if !inserted {
+            new_index.push_back(deadline);
+        }
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::EscalationQueueIndex),
+            &new_index,
+        );
+    }
+
+    fn remove_escalation_queue_index(env: &Env, deadline: u64) {
+        let index: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscalationQueueIndex))
+            .unwrap_or(Vec::new(env));
+
+        let mut new_index = Vec::new(env);
+        for d in index.iter() {
+            if d != deadline {
+                new_index.push_back(d);
+            }
+        }
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::EscalationQueueIndex),
+            &new_index,
+        );
+    }
+
+    fn validate_release_multisig_threshold(
+        threshold: u32,
+        signers: &Vec<Address>,
+    ) -> Result<(), Error> {
+        if threshold == 0 || threshold > signers.len() as u32 {
+            return Err(Error::Escrow(EscrowError::InvalidThreshold));
+        }
+        Ok(())
+    }
+
     fn validate_bps(bps: u32) -> Result<(), Error> {
         if bps < 1 || bps > 10000 {
             return Err(Error::Basic(BasicError::InvalidBps));
@@ -9220,6 +9574,7 @@ mod expiry_test;
 // mod multisig_threshold_test;
 //
 // #[cfg(test)]
+// #[cfg(test)]
 // mod escalation_timeout_test;
 //
 #[cfg(test)]
@@ -9235,6 +9590,12 @@ mod observer_test;
 //
 #[cfg(test)]
 mod hold_period_test;
+
+#[cfg(test)]
+mod succession_test;
+
+#[cfg(test)]
+mod escalation_timeout_test;
 //
 // mod health_check_test;
 //
