@@ -156,6 +156,47 @@ fn test_merchant_can_read_escrow_details() {
 
 // An active observer can read escrow details (no panic means access granted)
 #[test]
+fn observer_can_read_escrow_state() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let escrow = client.get_escrow_details(&observer, &escrow_id);
+    assert_eq!(escrow.id, escrow_id);
+    assert_eq!(escrow.customer, customer);
+}
+
+#[test]
+fn observer_cannot_release_escrow() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let result = client.try_release_escrow(&observer, &escrow_id, &false);
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::NotAnAdmin))));
+}
+
+#[test]
+fn observer_cannot_open_dispute() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let result = client.try_dispute_escrow(&observer, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
+}
+
+// An active observer can read escrow details (no panic means access granted)
+#[test]
 fn test_observer_can_read_escrow_details() {
     let env = Env::default();
     let (client, _admin, customer, _merchant, token) = setup(&env);

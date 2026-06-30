@@ -43,6 +43,8 @@ pub enum ConfigKey {
     GlobalMerchantCount,
     PauseStateKey,
     MinSplitAmount,
+    SchemaVersion,
+    AllowedTokens,
 }
 
 #[derive(Clone)]
@@ -140,6 +142,7 @@ pub enum BasicError {
     TierLimitsNotConfigured = 123,
     InvalidInterval = 124,
     InvalidBps = 125,
+    SchemaAlreadyAtTarget = 126,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -170,6 +173,7 @@ pub enum PaymentError {
     BillingOverflow = 221,
     InvalidLineItem = 222,
     InvalidScheduleTime = 223,
+    TokenNotAllowed = 224,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -291,7 +295,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             if code >= 300 && code <= 316 {
                 return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
-            if code >= 200 && code <= 223 {
+            if code >= 200 && code <= 224 {
                 return Ok(Error::Payment(unsafe { core::mem::transmute(code) }));
             }
             if code >= 100 && code <= 125 {
@@ -359,6 +363,9 @@ pub enum MerchantDataKey {
     VerificationTierLimit(MerchantVerificationLevel),
     MerchantPaymentsPage(Address, u64),
     MerchantPaused(Address),
+    MerchantActiveSubscriptions(Address, u64),
+    MerchantActiveSubscriptionCount(Address),
+    ActiveSubscriptionIndex(u64),
 }
 
 // State and proposal data keys
@@ -1785,6 +1792,7 @@ const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
 const ENTERPRISE_VOLUME_THRESHOLD: i128 = 100_000;
+const INITIAL_SCHEMA_VERSION: u32 = 1;
 
 #[contractimpl]
 impl PaymentContract {
@@ -1809,7 +1817,41 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::Admin), &admin);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &INITIAL_SCHEMA_VERSION,
+        );
         (AdminAdded { admin }).publish(&env);
+    }
+
+    pub fn get_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::SchemaVersion))
+            .unwrap_or(INITIAL_SCHEMA_VERSION)
+    }
+
+    pub fn migrate_schema(env: Env, admin: Address, target_version: u32) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+
+        let current = Self::get_schema_version(env.clone());
+        if current >= target_version {
+            return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
+        }
+
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::SchemaVersion),
+            &target_version,
+        );
+        Ok(())
     }
 
     pub fn set_merchant_verification_level(
@@ -2460,6 +2502,10 @@ impl PaymentContract {
         expiration_duration: u64,
         metadata: String,
     ) -> Result<u64, Error> {
+        if !PaymentContract::is_token_allowed(env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
+        }
+
         // Validate currency
         if !PaymentContract::is_valid_currency(&currency) {
             return Err(Error::Basic(BasicError::InvalidCurrency));
@@ -4410,6 +4456,240 @@ impl PaymentContract {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    pub fn add_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tokens.contains(&token) {
+            tokens.push_back(token);
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::AllowedTokens), &tokens);
+        }
+
+        Ok(())
+    }
+
+    pub fn remove_allowed_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated = Vec::new(&env);
+        for entry in tokens.iter() {
+            if entry != token {
+                updated.push_back(entry);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::AllowedTokens), &updated);
+
+        Ok(())
+    }
+
+    pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn is_token_allowed(env: &Env, token: &Address) -> bool {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::AllowedTokens))
+            .unwrap_or_else(|| Vec::new(env));
+        tokens.contains(token)
+    }
+
+    const ACTIVE_SUBSCRIPTION_PAGE_SIZE: u64 = 100;
+
+    fn merchant_active_subscription_count(env: &Env, merchant: &Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(
+                MerchantDataKey::MerchantActiveSubscriptionCount(merchant.clone()),
+            ))
+            .unwrap_or(0)
+    }
+
+    fn set_active_subscription_at(
+        env: &Env,
+        merchant: &Address,
+        flat_index: u64,
+        subscription_id: u64,
+    ) {
+        let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let mut page: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                merchant.clone(),
+                page_num,
+            )))
+            .unwrap_or_else(|| Vec::new(env));
+
+        let page_offset_u32 = page_offset as u32;
+        while page.len() <= page_offset_u32 {
+            page.push_back(0);
+        }
+        page.set(page_offset_u32, subscription_id);
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                merchant.clone(),
+                page_num,
+            )),
+            &page,
+        );
+    }
+
+    fn active_subscription_at(env: &Env, merchant: &Address, flat_index: u64) -> Option<u64> {
+        let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let page: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                merchant.clone(),
+                page_num,
+            )))?;
+        let page_offset_u32 = page_offset as u32;
+        if page_offset_u32 < page.len() {
+            Some(page.get(page_offset_u32).unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn remove_active_subscription_page_entry(env: &Env, merchant: &Address, flat_index: u64) {
+        let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
+        let page_offset_u32 = page_offset as u32;
+        let mut page: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                merchant.clone(),
+                page_num,
+            )))
+            .unwrap_or_else(|| Vec::new(env));
+
+        if page_offset_u32 < page.len() {
+            let mut rebuilt = Vec::new(env);
+            for i in 0..page.len() {
+                if i != page_offset_u32 {
+                    rebuilt.push_back(page.get(i).unwrap());
+                }
+            }
+            if rebuilt.is_empty() {
+                env.storage().instance().remove(&DataKey::Merchant(
+                    MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
+                ));
+            } else {
+                env.storage().instance().set(
+                    &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                        merchant.clone(),
+                        page_num,
+                    )),
+                    &rebuilt,
+                );
+            }
+        }
+    }
+
+    fn add_to_merchant_active_subscriptions(env: &Env, merchant: &Address, subscription_id: u64) {
+        let count = Self::merchant_active_subscription_count(env, merchant);
+        Self::set_active_subscription_at(env, merchant, count, subscription_id);
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::ActiveSubscriptionIndex(subscription_id)),
+            &count,
+        );
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptionCount(
+                merchant.clone(),
+            )),
+            &(count + 1),
+        );
+    }
+
+    fn remove_from_merchant_active_subscriptions(
+        env: &Env,
+        merchant: &Address,
+        subscription_id: u64,
+    ) {
+        let count = Self::merchant_active_subscription_count(env, merchant);
+        if count == 0 {
+            return;
+        }
+
+        let index: u64 = match env.storage().instance().get(&DataKey::Merchant(
+            MerchantDataKey::ActiveSubscriptionIndex(subscription_id),
+        )) {
+            Some(i) => i,
+            None => return,
+        };
+        let last_index = count - 1;
+
+        if index != last_index {
+            if let Some(last_id) = Self::active_subscription_at(env, merchant, last_index) {
+                Self::set_active_subscription_at(env, merchant, index, last_id);
+                env.storage().instance().set(
+                    &DataKey::Merchant(MerchantDataKey::ActiveSubscriptionIndex(last_id)),
+                    &index,
+                );
+            }
+        }
+
+        Self::remove_active_subscription_page_entry(env, merchant, last_index);
+        env.storage().instance().remove(&DataKey::Merchant(
+            MerchantDataKey::ActiveSubscriptionIndex(subscription_id),
+        ));
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptionCount(
+                merchant.clone(),
+            )),
+            &last_index,
+        );
+    }
+
+    /// Returns active subscription IDs for a merchant (100 per page).
+    pub fn get_merchant_subscriptions(env: Env, merchant: Address, page: u64) -> Vec<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
+                merchant, page,
+            )))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     fn is_valid_currency(currency: &Currency) -> bool {
         matches!(
             currency,
@@ -4638,6 +4918,8 @@ impl PaymentContract {
             &DataKey::Merchant(MerchantDataKey::SubscriptionCount(merchant.clone())),
             &(m_count + 1),
         );
+
+        Self::add_to_merchant_active_subscriptions(&env, &merchant, sub_id);
 
         (SubscriptionCreated {
             subscription_id: sub_id,
@@ -5197,6 +5479,8 @@ impl PaymentContract {
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
+
+        Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
 
         // Emit TrialCancelled if cancelled during trial
         let now = env.ledger().timestamp();
@@ -10538,3 +10822,6 @@ mod test_payment_forward;
 
 #[cfg(test)]
 mod test_scheduled_payment;
+
+#[cfg(test)]
+mod schema_version_test;
