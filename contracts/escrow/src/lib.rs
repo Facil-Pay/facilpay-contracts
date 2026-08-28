@@ -1659,6 +1659,7 @@ impl EscrowContract {
         config: EscrowFeeConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_escrow_fee_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -1734,6 +1735,7 @@ impl EscrowContract {
         to: Address,
     ) -> Result<i128, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "withdraw_escrow_fees")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -1804,6 +1806,7 @@ impl EscrowContract {
         data: Bytes,
     ) -> Result<String, Error> {
         proposer.require_auth();
+        Self::require_not_paused(&env, "propose_action")?;
 
         let config: MultiSigConfig = env
             .storage()
@@ -1874,6 +1877,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn approve_action(env: Env, approver: Address, proposal_id: String) -> Result<(), Error> {
         approver.require_auth();
+        Self::require_not_paused(&env, "approve_action")?;
 
         let config: MultiSigConfig = env
             .storage()
@@ -1935,6 +1939,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn execute_action(env: Env, proposal_id: String) -> Result<(), Error> {
+        Self::require_not_paused(&env, "execute_action")?;
         let config: MultiSigConfig = env
             .storage()
             .instance()
@@ -1988,6 +1993,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn reject_action(env: Env, rejecter: Address, proposal_id: String) -> Result<(), Error> {
         rejecter.require_auth();
+        Self::require_not_paused(&env, "reject_action")?;
 
         let config: MultiSigConfig = env
             .storage()
@@ -2040,6 +2046,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn add_admin(env: Env, caller: Address, new_admin: Address) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "add_admin")?;
 
         let mut config: MultiSigConfig = env
             .storage()
@@ -2083,6 +2090,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn add_trusted_bridge(env: Env, caller: Address, bridge: Address) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "add_trusted_bridge")?;
 
         let config: MultiSigConfig = env
             .storage()
@@ -2119,6 +2127,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn remove_admin(env: Env, caller: Address, admin: Address) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "remove_admin")?;
 
         let mut config: MultiSigConfig = env
             .storage()
@@ -2198,6 +2207,7 @@ impl EscrowContract {
         delay_seconds: u64,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "designate_successor")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -2257,6 +2267,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn activate_succession(env: Env, successor: Address) -> Result<(), Error> {
         successor.require_auth();
+        Self::require_not_paused(&env, "activate_succession")?;
 
         let mut plan: SuccessionPlan = env
             .storage()
@@ -2316,6 +2327,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn revoke_succession(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "revoke_succession")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -2375,6 +2387,7 @@ impl EscrowContract {
         delay_seconds: u64,
     ) -> Result<u64, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "initiate_clawback")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -2458,6 +2471,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn execute_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "execute_clawback")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -2520,6 +2534,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn cancel_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "cancel_clawback")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -2596,6 +2611,7 @@ impl EscrowContract {
         auto_refund_on_expiry: bool,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow")?;
         Self::internal_create_escrow(
             env,
             customer,
@@ -2642,6 +2658,7 @@ impl EscrowContract {
         multisig: MultisigConfiguration,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow_with_multisig")?;
         Self::internal_create_escrow(
             env,
             customer,
@@ -2860,6 +2877,7 @@ impl EscrowContract {
         release_timestamp: u64,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_multi_party_escrow")?;
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
@@ -2973,6 +2991,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn approve_release(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "approve_release")?;
 
         if !env
             .storage()
@@ -3061,6 +3080,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn release_multi_party_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "release_multi_party_escrow")?;
         if !env
             .storage()
             .instance()
@@ -3170,6 +3190,7 @@ impl EscrowContract {
         weight_bps: u32,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_participant_weight")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -3248,6 +3269,7 @@ impl EscrowContract {
         threshold_bps: u32,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "update_approval_threshold_bps")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -3307,6 +3329,7 @@ impl EscrowContract {
         release_timestamp: u64,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_multi_token_escrow")?;
 
         if tokens.len() == 0 {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
@@ -3385,6 +3408,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn release_multi_token_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "release_multi_token_escrow")?;
         let mut escrow: MultiTokenEscrow = env
             .storage()
             .instance()
@@ -3480,6 +3504,7 @@ impl EscrowContract {
         escrow_id: u64,
     ) -> Result<(), Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "cancel_multi_party_escrow")?;
 
         let mut escrow: MultiPartyEscrow = env
             .storage()
@@ -3532,6 +3557,7 @@ impl EscrowContract {
         escrow_id: u64,
     ) -> Result<(), Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "cancel_multi_token_escrow")?;
 
         let mut escrow: MultiTokenEscrow = env
             .storage()
@@ -3600,6 +3626,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn approve_escrow_release(env: Env, signer: Address, escrow_id: u64) -> Result<(), Error> {
         signer.require_auth();
+        Self::require_not_paused(&env, "approve_escrow_release")?;
 
         if !env
             .storage()
@@ -3662,6 +3689,7 @@ impl EscrowContract {
         early_release: bool,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "release_escrow")?;
 
         if EscrowContract::verify_observer_access(env.clone(), escrow_id, admin.clone()) {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -3897,6 +3925,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn refund_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "refund_escrow")?;
 
         if !env
             .storage()
@@ -3961,6 +3990,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn dispute_escrow(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "dispute_escrow")?;
 
         // Check if escrow exists
         if !env
@@ -4097,6 +4127,7 @@ impl EscrowContract {
         ipfs_hash: String,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "submit_evidence")?;
         if !env
             .storage()
             .instance()
@@ -4137,6 +4168,7 @@ impl EscrowContract {
         merkle_root: BytesN<32>,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "commit_evidence_root")?;
         if !env
             .storage()
             .instance()
@@ -4187,6 +4219,7 @@ impl EscrowContract {
         leaf_index: u32,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "submit_evidence_with_proof")?;
         if !env
             .storage()
             .instance()
@@ -4412,6 +4445,7 @@ impl EscrowContract {
         evidence_items: Vec<Bytes>,
     ) -> Result<u32, Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "submit_evidence_batch")?;
 
         if !env
             .storage()
@@ -4509,6 +4543,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn escalate_dispute(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "escalate_dispute")?;
         if !env
             .storage()
             .instance()
@@ -4554,6 +4589,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn auto_resolve_dispute(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "auto_resolve_dispute")?;
         if !env
             .storage()
             .instance()
@@ -4619,6 +4655,7 @@ impl EscrowContract {
         favor: AutoResolveFavor,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_escalation_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -4673,6 +4710,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn trigger_timeout_resolution(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "trigger_timeout_resolution")?;
         if !env
             .storage()
             .instance()
@@ -5042,6 +5080,7 @@ impl EscrowContract {
         reason_hash: BytesN<32>,
     ) -> Result<u64, Error> {
         appellant.require_auth();
+        Self::require_not_paused(&env, "file_dispute_appeal")?;
 
         // Check if escrow exists and is in Resolved or Released status from initial dispute
         if !env
@@ -5356,6 +5395,7 @@ impl EscrowContract {
     /// * `AlreadyProcessed` - the appeal has already been resolved or expired.
     /// * `TimeoutNotReached` - the appeal deadline has not yet passed.
     pub fn expire_appeal(env: Env, appeal_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "expire_appeal")?;
         let mut appeal = env
             .storage()
             .instance()
@@ -5675,6 +5715,7 @@ impl EscrowContract {
         duration_seconds: u64,
     ) -> Result<(), Error> {
         granter.require_auth();
+        Self::require_not_paused(&env, "add_observer")?;
 
         if !env
             .storage()
@@ -5750,6 +5791,7 @@ impl EscrowContract {
         observer: Address,
     ) -> Result<(), Error> {
         granter.require_auth();
+        Self::require_not_paused(&env, "remove_observer")?;
 
         if !env
             .storage()
@@ -5889,6 +5931,7 @@ impl EscrowContract {
         config: ReputationConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_reputation_config")?;
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::ReputationConfig), &config);
@@ -6011,6 +6054,7 @@ impl EscrowContract {
         config: TenureReputationConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_tenure_reputation_config")?;
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::TenureConfig), &config);
@@ -6059,6 +6103,7 @@ impl EscrowContract {
     /// `base_score` plus the duration-weighted bonus to the participant's
     /// reputation. Disputed escrows are ineligible and receive nothing.
     pub fn apply_tenure_bonus(env: Env, escrow_id: u64, participant: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env, "apply_tenure_bonus")?;
         let config =
             Self::get_tenure_config(env.clone()).ok_or(Error::Escrow(EscrowError::NotFound))?;
 
@@ -6171,6 +6216,7 @@ impl EscrowContract {
         milestones: Vec<VestingMilestone>,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_vesting_escrow")?;
 
         // Validate timestamps
         let current_timestamp = env.ledger().timestamp();
@@ -6432,6 +6478,7 @@ impl EscrowContract {
         max_acceleration_bps: u32,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_vesting_acceleration_config")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -6489,6 +6536,7 @@ impl EscrowContract {
         schedule_id: u64,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "mark_milestone_complete")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -6650,6 +6698,7 @@ impl EscrowContract {
     /// * InsufficientVestedAmount - If there's no vested amount to release
     pub fn release_vested_amount(env: Env, admin: Address, escrow_id: u64) -> Result<i128, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "release_vested_amount")?;
 
         // Check if escrow exists
         if !env
@@ -6743,6 +6792,7 @@ impl EscrowContract {
         milestone_id: u64,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "approve_milestone")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -6803,6 +6853,7 @@ impl EscrowContract {
     /// * `MilestoneAlreadyReleased` - Milestone was already released
     /// * `MilestoneOverflow` - Release would exceed the escrow's locked amount
     pub fn release_milestone(env: Env, escrow_id: u64, milestone_id: u64) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "release_milestone")?;
         let mut vesting_schedule = env
             .storage()
             .instance()
@@ -6912,6 +6963,7 @@ impl EscrowContract {
         milestone: VestingMilestone,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "add_milestone")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -7325,6 +7377,7 @@ impl EscrowContract {
         data: Bytes,
     ) -> Result<u64, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "queue_action")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -7383,6 +7436,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn execute_queued_action(env: Env, action_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "execute_queued_action")?;
         let mut action: TimeLockAction = env
             .storage()
             .instance()
@@ -7454,6 +7508,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn cancel_queued_action(env: Env, admin: Address, action_id: u64) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "cancel_queued_action")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -7528,6 +7583,7 @@ impl EscrowContract {
         config: TimeLockConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_timelock_config")?;
 
         let multisig_config = Self::get_multisig_config(env.clone());
         if !multisig_config.admins.contains(&admin) {
@@ -7623,6 +7679,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn reset_analytics(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "reset_analytics")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8108,6 +8165,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn begin_migration(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "begin_migration")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8161,6 +8219,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn migrate_escrow(env: Env, admin: Address, escrow_id: u64) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "migrate_escrow")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8227,6 +8286,7 @@ impl EscrowContract {
         escrow_ids: Vec<u64>,
     ) -> Result<u32, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "migrate_escrow_batch")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8298,6 +8358,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn complete_migration(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "complete_migration")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8411,6 +8472,7 @@ impl EscrowContract {
         config: InsuranceConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_insurance_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -8439,6 +8501,7 @@ impl EscrowContract {
         config: WatchdogConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_watchdog_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -8484,6 +8547,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn opt_into_insurance(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "opt_into_insurance")?;
         let config: InsuranceConfig = env
             .storage()
             .instance()
@@ -8539,6 +8603,7 @@ impl EscrowContract {
         amount: i128,
     ) -> Result<u64, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "file_insurance_claim")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -8601,6 +8666,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn approve_claim(env: Env, admin: Address, claim_id: u64) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "approve_claim")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
@@ -8710,6 +8776,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn trigger_watchdog_release(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "trigger_watchdog_release")?;
         if !Self::is_watchdog_eligible(env.clone(), escrow_id) {
             return Err(Error::Action(ActionError::NotReady));
         }
@@ -8764,6 +8831,7 @@ impl EscrowContract {
         config: ReputationDecayConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "update_decay_config")?;
         let ms = Self::get_multisig_config(env.clone());
         if !ms.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8792,6 +8860,7 @@ impl EscrowContract {
         config: DisputeConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_dispute_config")?;
         if let Some(ms) = env
             .storage()
             .instance()
@@ -8847,6 +8916,7 @@ impl EscrowContract {
         config: EvidenceDeadlineConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_evidence_deadline_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -8921,6 +8991,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn apply_reputation_decay(env: Env, address: Address) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "apply_reputation_decay")?;
         let mut rep = EscrowContract::get_or_default_reputation(&env, &address);
         let config = EscrowContract::get_or_default_decay_config(&env);
         let now = env.ledger().timestamp();
@@ -9004,6 +9075,7 @@ impl EscrowContract {
         condition: OracleCondition,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "attach_oracle_condition")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -9056,6 +9128,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn auto_resolve_with_oracle(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "auto_resolve_with_oracle")?;
         if !env
             .storage()
             .instance()
@@ -9128,6 +9201,7 @@ impl EscrowContract {
         condition: OnChainCondition,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_conditional_escrow")?;
 
         let counter: u64 = env
             .storage()
@@ -9210,6 +9284,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn evaluate_and_release(env: Env, escrow_id: u64) -> Result<bool, Error> {
+        Self::require_not_paused(&env, "evaluate_and_release")?;
         let mut conditional: ConditionalEscrow = env
             .storage()
             .instance()
@@ -9351,6 +9426,7 @@ impl EscrowContract {
         new_merchant: Address,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "transfer_escrow_beneficiary")?;
 
         if !env
             .storage()
@@ -9463,6 +9539,7 @@ impl EscrowContract {
         escrow_id: u64,
         new_beneficiary: Address,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "transfer_beneficiary")?;
         if !env
             .storage()
             .instance()
@@ -9550,6 +9627,7 @@ impl EscrowContract {
         escrow_id: u64,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "dispute_multi_party_escrow")?;
 
         let mut escrow: MultiPartyEscrow = env
             .storage()
@@ -9624,6 +9702,7 @@ impl EscrowContract {
         favor_merchant: bool,
     ) -> Result<(), Error> {
         voter.require_auth();
+        Self::require_not_paused(&env, "vote_on_multi_party_dispute")?;
 
         let escrow: MultiPartyEscrow = env
             .storage()
@@ -9696,6 +9775,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn resolve_multi_party_dispute(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "resolve_multi_party_dispute")?;
         let mut escrow: MultiPartyEscrow = env
             .storage()
             .instance()
@@ -10048,6 +10128,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn set_batch_limit(env: Env, admin: Address, limit: u32) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_batch_limit")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -10081,6 +10162,7 @@ impl EscrowContract {
         default_expiry_seconds: u64,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_global_expiry_config")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -10132,6 +10214,7 @@ impl EscrowContract {
     /// # Errors
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn expire_escrow(env: Env, escrow_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "expire_escrow")?;
         if !env
             .storage()
             .instance()
@@ -10183,6 +10266,7 @@ impl EscrowContract {
         config: EscrowRenewalConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_renewal_config")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -10210,6 +10294,7 @@ impl EscrowContract {
         new_expiry_timestamp: u64,
     ) -> Result<(), Error> {
         caller.require_auth();
+        Self::require_not_paused(&env, "extend_escrow_expiry")?;
 
         if !env
             .storage()
@@ -10337,6 +10422,7 @@ impl EscrowContract {
         description: String,
     ) -> Result<u64, Error> {
         owner.require_auth();
+        Self::require_not_paused(&env, "create_template")?;
 
         let counter: u64 = env
             .storage()
@@ -10387,6 +10473,7 @@ impl EscrowContract {
         template_id: u64,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow_from_template")?;
 
         let template: EscrowTemplate = env
             .storage()
@@ -10440,6 +10527,7 @@ impl EscrowContract {
         request: BatchReleaseRequest,
     ) -> Result<BatchReleaseResult, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "batch_release_escrows")?;
 
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
@@ -10491,6 +10579,7 @@ impl EscrowContract {
     /// Returns `Err(Error)` when the operation cannot be completed.
     pub fn deactivate_template(env: Env, owner: Address, template_id: u64) -> Result<(), Error> {
         owner.require_auth();
+        Self::require_not_paused(&env, "deactivate_template")?;
 
         let mut template: EscrowTemplate = env
             .storage()
@@ -10576,6 +10665,7 @@ impl EscrowContract {
         config: StaleThresholdConfig,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "set_stale_threshold")?;
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -10714,6 +10804,7 @@ impl EscrowContract {
         fee_bps_override: Option<i128>,
     ) -> Result<u64, Error> {
         merchant.require_auth();
+        Self::require_not_paused(&env, "create_sub_account")?;
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
 
@@ -10784,6 +10875,7 @@ impl EscrowContract {
         fee_bps_override: Option<i128>,
     ) -> Result<(), Error> {
         merchant.require_auth();
+        Self::require_not_paused(&env, "set_sub_account_fee_override")?;
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
         if merchant != escrow.merchant {
@@ -10831,6 +10923,7 @@ impl EscrowContract {
         amount: i128,
     ) -> Result<(), Error> {
         funder.require_auth();
+        Self::require_not_paused(&env, "fund_sub_account")?;
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
 
@@ -10894,6 +10987,7 @@ impl EscrowContract {
         sub_id: u64,
     ) -> Result<(), Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "release_sub_account")?;
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
 
@@ -11008,6 +11102,7 @@ impl EscrowContract {
         oracle: Address,
     ) -> Result<(), Error> {
         merchant.require_auth();
+        Self::require_not_paused(&env, "configure_escrow_swap")?;
 
         if !env
             .storage()
@@ -11058,6 +11153,7 @@ impl EscrowContract {
     pub fn execute_escrow_swap(env: Env, caller: Address, escrow_id: u64) -> Result<i128, Error> {
         // Authenticate the caller to follow standard signature verification pattern.
         caller.require_auth();
+        Self::require_not_paused(&env, "execute_escrow_swap")?;
 
         if !env
             .storage()
@@ -11159,6 +11255,7 @@ impl EscrowContract {
         merchant: Address,
     ) -> Result<u64, Error> {
         admin.require_auth();
+        Self::require_not_paused(&env, "create_child_escrow")?;
         let config = Self::get_multisig_config(env.clone());
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
