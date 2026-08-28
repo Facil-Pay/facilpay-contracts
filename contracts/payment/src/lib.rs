@@ -4,7 +4,7 @@
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, FromVal, IntoVal, InvokeError, String, Symbol, TryFromVal, Val, Vec,
+    Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3116,6 +3116,7 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
             env.clone(),
@@ -3177,6 +3178,7 @@ impl PaymentContract {
         admin: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "complete_escrowed_payment")?;
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -3246,6 +3248,7 @@ impl PaymentContract {
         caller: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "cancel_escrowed_payment")?;
         caller.require_auth();
         if !env
             .storage()
@@ -3303,6 +3306,7 @@ impl PaymentContract {
         payment_id: u64,
         reason: String,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "dispute_escrowed_payment")?;
         caller.require_auth();
         if !env
             .storage()
@@ -11048,6 +11052,8 @@ impl PaymentContract {
         expires_at: u64,
         customer_pk: BytesN<32>,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "open_channel")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Basic(BasicError::InvalidAmount));
@@ -11126,6 +11132,7 @@ impl PaymentContract {
         channel_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "top_up_channel")?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Basic(BasicError::InvalidAmount));
@@ -11195,6 +11202,8 @@ impl PaymentContract {
         nonce: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "settle_channel")?;
+        
         let mut channel: PaymentChannel = env
             .storage()
             .instance()
@@ -11286,6 +11295,7 @@ impl PaymentContract {
     /// Returns an error if the caller is not a channel participant, the channel
     /// is not found, already closed, or not yet expired.
     pub fn close_channel_expired(env: Env, caller: Address, channel_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "close_channel_expired")?;
         caller.require_auth();
 
         let mut channel: PaymentChannel = env
@@ -11502,6 +11512,25 @@ impl PaymentContract {
             &(merchant_count + 1),
         );
 
+        // Paged merchant payment index (100 entries per page)
+        {
+            const PAGE_SIZE: u64 = 100;
+            let page_num = merchant_count / PAGE_SIZE;
+            let mut page: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    page_num,
+                )))
+                .unwrap_or_else(|| Vec::new(&env));
+            page.push_back(payment_id);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant.clone(), page_num)),
+                &page,
+            );
+        }
+
         // Update global analytics
         let mut analytics: PaymentAnalytics = env
             .storage()
@@ -11690,11 +11719,16 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SplitAlreadyExecuted));
         }
 
-        let payment: Payment = env
+        let mut payment: Payment = env
             .storage()
             .instance()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
+
+        // Prevent double-spending: ensure payment is still Pending
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
 
         let token_client = token::Client::new(&env, &payment.token);
         let contract_address = env.current_contract_address();
@@ -11708,6 +11742,13 @@ impl PaymentContract {
         env.storage().instance().set(
             &DataKey::Feature(FeatureKey::SplitConfig(payment_id)),
             &config,
+        );
+
+        // Mark payment as Completed to prevent subsequent complete_payment calls
+        payment.status = PaymentStatus::Completed;
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Data(payment_id)),
+            &payment,
         );
 
         Ok(())
