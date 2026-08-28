@@ -53,7 +53,10 @@ fn missing_tier_policy_falls_back_to_default_cap() {
         &RefundReasonCode::CustomerRequest,
         &0u64,
     );
-    assert_eq!(refund_id, 1u64, "refund must succeed using default cap fallback");
+    assert_eq!(
+        refund_id, 1u64,
+        "refund must succeed using default cap fallback"
+    );
 }
 
 /// When strict tier policy mode is enabled for a merchant and a customer has a

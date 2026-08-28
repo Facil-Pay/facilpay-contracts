@@ -5769,7 +5769,12 @@ fn test_calculate_fee_respects_tier() {
     client.set_fee_config(&admin, &fee_config);
 
     // Standard tier: fee = 10_000 * 1000 / 10_000 = 1000
-    let fee_standard = client.calculate_fee(&10_000_i128, &merchant);
+    let fee_standard = client.calculate_fee(
+        &10_000_i128,
+        &merchant,
+        &Address::generate(&env),
+        &Currency::USDC,
+    );
     assert_eq!(fee_standard, 1000);
 }
 
@@ -6617,7 +6622,7 @@ fn test_calculate_fee_with_waiver() {
     // Calculate fee for 1000 amount
     // Without waiver: 1000 * 200 / 10000 = 20
     // With 50% waiver: 1000 * 100 / 10000 = 10
-    let fee = client.calculate_fee(&1000, &merchant);
+    let fee = client.calculate_fee(&1000, &merchant, &Address::generate(&env), &Currency::USDC);
     assert_eq!(fee, 10);
 }
 
@@ -6633,7 +6638,7 @@ fn test_calculate_fee_with_100_percent_waiver() {
     client.grant_fee_waiver(&admin, &merchant, &10000, &1000000000, &reason);
 
     // Calculate fee for 1000 amount - should be zero
-    let fee = client.calculate_fee(&1000, &merchant);
+    let fee = client.calculate_fee(&1000, &merchant, &Address::generate(&env), &Currency::USDC);
     assert_eq!(fee, 0);
 }
 
@@ -6664,7 +6669,7 @@ fn test_calculate_fee_respects_min_fee_with_waiver() {
     // Calculate fee for small amount that would be below min_fee
     // 2% * (1 - 0.99) = 0.02% = 2 bps
     // 100 * 2 / 10000 = 0.02, but min_fee is 100, so fee should be 100
-    let fee = client.calculate_fee(&100, &merchant);
+    let fee = client.calculate_fee(&100, &merchant, &Address::generate(&env), &Currency::USDC);
     assert_eq!(fee, 100); // Min fee still applies
 }
 
@@ -6683,7 +6688,10 @@ fn test_waiver_with_no_fee_config() {
     assert_eq!(client.get_effective_fee_bps(&merchant), 0);
 
     // Calculate fee should return 0
-    assert_eq!(client.calculate_fee(&1000, &merchant), 0);
+    assert_eq!(
+        client.calculate_fee(&1000, &merchant, &Address::generate(&env), &Currency::USDC),
+        0
+    );
 }
 
 #[test]
@@ -7444,6 +7452,7 @@ fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
     let token_addr = env.register_stellar_asset_contract(admin.clone());
     let token = token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &100_000);
+    token::Client::new(&env, &token_addr).approve(&customer, &contract_id, &100_000, &100_000);
 
     env.ledger().set_timestamp(1000);
     // Create active subscription
@@ -7460,7 +7469,7 @@ fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
         &0,
     );
 
-    let sub = client.get_subscription(&sub_id).unwrap();
+    let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.payment_count, 0);
 
@@ -7479,7 +7488,7 @@ fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
     );
 
     // Verify subscription is still in Active status (payment was not executed)
-    let sub = client.get_subscription(&sub_id).unwrap();
+    let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.payment_count, 0);
 
@@ -7488,7 +7497,7 @@ fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
 
     // Now execute payment should succeed
     client.execute_recurring_payment(&sub_id);
-    let sub = client.get_subscription(&sub_id).unwrap();
+    let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.payment_count, 1);
 }

@@ -6825,17 +6825,17 @@ impl RefundContract {
         Ok(())
     }
 
-    pub fn get_customer_tier_policy(env: Env, merchant: Address, tier_id: u32) -> Option<RefundCap> {
+    pub fn get_customer_tier_policy(
+        env: Env,
+        merchant: Address,
+        tier_id: u32,
+    ) -> Option<RefundCap> {
         env.storage()
             .instance()
             .get(&DataKey::CustomerTierPolicy(merchant, tier_id))
     }
 
-    pub fn set_strict_tier_policy(
-        env: Env,
-        merchant: Address,
-        strict: bool,
-    ) -> Result<(), Error> {
+    pub fn set_strict_tier_policy(env: Env, merchant: Address, strict: bool) -> Result<(), Error> {
         merchant.require_auth();
         env.storage()
             .instance()

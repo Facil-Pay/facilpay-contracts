@@ -38,6 +38,7 @@ fn test_report_usage_accumulates() {
         &String::from_str(&env, "api_call"),
         &token,
         &None,
+        &None,
     );
 
     client.report_usage(&merchant, &sub_id, &5u64);
@@ -60,6 +61,7 @@ fn test_report_usage_unauthorized() {
         &String::from_str(&env, "api_call"),
         &token,
         &None,
+        &None,
     );
 
     let result = client.try_report_usage(&stranger, &sub_id, &5u64);
@@ -77,6 +79,7 @@ fn test_execute_metered_billing_charges_and_resets() {
         &100i128,
         &String::from_str(&env, "gb"),
         &token,
+        &None,
         &None,
     );
 
@@ -107,6 +110,7 @@ fn test_billing_cap_limits_charge() {
         &String::from_str(&env, "gb"),
         &token,
         &Some(500i128),
+        &None,
     );
 
     // 10 units * 100 = 1000, but cap is 500
@@ -130,6 +134,7 @@ fn test_set_billing_cap() {
         &10i128,
         &String::from_str(&env, "req"),
         &token,
+        &None,
         &None,
     );
 
@@ -155,6 +160,7 @@ fn test_billing_overflow_returns_error() {
         &i128::MAX,
         &String::from_str(&env, "op"),
         &token,
+        &None,
         &None,
     );
 
@@ -188,6 +194,7 @@ fn test_execute_metered_billing_zero_units_no_transfer() {
         &100i128,
         &String::from_str(&env, "req"),
         &token,
+        &None,
         &None,
     );
 
@@ -224,6 +231,7 @@ fn test_sequential_billing_cycles_charge_independently() {
         &String::from_str(&env, "call"),
         &token,
         &None,
+        &None,
     );
 
     // Cycle 1: 5 units → charge 50
@@ -254,6 +262,7 @@ fn test_cap_set_after_usage_is_respected() {
         &String::from_str(&env, "gb"),
         &token,
         &None,
+        &None,
     );
 
     // Report 20 units (would be 2000 uncapped)
@@ -282,6 +291,7 @@ fn test_set_billing_cap_unauthorized() {
         &10i128,
         &String::from_str(&env, "req"),
         &token,
+        &None,
         &None,
     );
 
@@ -335,6 +345,7 @@ fn test_report_usage_saturates_at_u64_max() {
         &String::from_str(&env, "op"),
         &token,
         &None,
+        &None,
     );
 
     // Push counter to u64::MAX
@@ -365,6 +376,7 @@ fn test_single_unit_at_price_one_transfers_exactly_one_token() {
         &String::from_str(&env, "event"),
         &token,
         &None,
+        &None,
     );
 
     client.report_usage(&merchant, &sub_id, &1u64);
@@ -391,6 +403,7 @@ fn test_two_subscriptions_track_usage_independently() {
         &String::from_str(&env, "calls"),
         &token,
         &None,
+        &None,
     );
     let sub_b = client.create_metered_subscription(
         &merchant,
@@ -398,6 +411,7 @@ fn test_two_subscriptions_track_usage_independently() {
         &50i128,
         &String::from_str(&env, "gb"),
         &token,
+        &None,
         &None,
     );
 
@@ -431,6 +445,7 @@ fn test_billing_cap_equal_to_charge_no_cap_hit() {
         &String::from_str(&env, "unit"),
         &token,
         &Some(500i128), // cap == 5 units * 100
+        &None,
     );
 
     client.report_usage(&merchant, &sub_id, &5u64);
@@ -459,6 +474,7 @@ fn test_last_reset_at_updated_after_billing() {
         &10i128,
         &String::from_str(&env, "call"),
         &token,
+        &None,
         &None,
     );
 
@@ -492,6 +508,7 @@ fn test_units_reset_to_zero_at_period_rollover() {
         &String::from_str(&env, "req"),
         &token,
         &None,
+        &None,
     );
 
     // Accumulate usage during the first period
@@ -524,6 +541,7 @@ fn test_usage_in_new_period_billed_correctly() {
         &50i128,
         &String::from_str(&env, "gb"),
         &token,
+        &None,
         &None,
     );
 
@@ -560,6 +578,7 @@ fn test_partial_period_usage_before_rollover_is_not_lost() {
         &100i128,
         &String::from_str(&env, "call"),
         &token,
+        &None,
         &None,
     );
 
