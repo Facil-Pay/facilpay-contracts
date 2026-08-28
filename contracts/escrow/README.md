@@ -19,6 +19,60 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
 ---
 
+## Admin Succession
+
+Succession lets the current multisig admin set hand control of the contract to a new admin address after a time delay, without requiring the successor to already be part of the multisig.
+
+### Designating a Successor
+
+Any existing admin can designate a successor:
+
+```
+designate_successor(admin, successor, delay_seconds) -> ()
+```
+
+- `admin` must be a current member of the multisig admin set (enforced via `require_auth` and an admin-list check)
+- `successor` cannot be the zero address (`InvalidAddress`) and cannot be the same address as `admin` (`SameBeneficiary`)
+- Only one pending (non-activated) succession plan may exist at a time — designating while a plan is already pending returns `SuccessionPlanExists`
+- The plan becomes activatable at `activatable_after = now + delay_seconds`
+
+### Activating Succession
+
+Once the delay has elapsed, the designated successor — not the original admin — activates the plan themselves:
+
+```
+activate_succession(successor) -> ()
+```
+
+- Must be called and authorized by the `successor` address named in the plan; any other caller gets `Unauthorized`
+- Fails with `NotReady` if called before `activatable_after`
+- Fails with `AlreadyProcessed` if the plan was already activated
+- On success, the successor is added to the multisig admin set (if not already present) and the plan is marked `activated`
+
+### Revoking a Pending Succession
+
+Any current admin (not only the one who designated it) can revoke a plan before it activates:
+
+```
+revoke_succession(admin) -> ()
+```
+
+- `admin` must be a current multisig admin
+- Fails with `AlreadyProcessed` if the plan has already been activated — an activated succession cannot be undone by revocation
+- Removes the stored plan entirely, allowing a new one to be designated
+
+### Interaction with Disputes
+
+Succession only adds a new address to the multisig admin set — it does not read, lock, or modify any escrow, dispute, or appeal state. Designating, activating, or revoking a succession plan has no effect on disputes that are in flight, and an in-flight dispute has no effect on succession: the two are independent. The newly added admin can act on future admin-gated calls (e.g. `resolve_dispute`, `set_batch_limit`) once activated, exactly like any other admin.
+
+### Queries
+
+| Function                  | Returns                              |
+| -------------------------- | ------------------------------------ |
+| `get_succession_plan()`   | `Option<SuccessionPlan>` — the current pending or last-activated plan, if any |
+
+---
+
 ## Sub-Accounts
 
 Sub-accounts allow a merchant to split a single escrow into smaller, independently releasable allocations. Each sub-account represents a designated portion of the parent escrow's funds that can be released to the merchant on its own schedule, without requiring the entire escrow to be released at once.
