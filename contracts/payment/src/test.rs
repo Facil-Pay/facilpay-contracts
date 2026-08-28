@@ -899,6 +899,64 @@ fn test_redeem_points_fails_when_points_are_expired() {
 }
 
 #[test]
+fn test_redeem_points_cumulative_50_percent_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 10,
+            expiry_seconds: 3600,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let first = client.redeem_points(&customer, &30, &payment_id);
+    assert_eq!(first, 300);
+
+    let second = client.redeem_points(&customer, &30, &payment_id);
+    assert_eq!(second, 200);
+
+    let third = client.try_redeem_points(&customer, &1, &payment_id);
+    assert_eq!(
+        third,
+        Err(Ok(Error::Feature(FeatureError::InsufficientPoints)))
+    );
+}
+
+#[test]
 fn test_complete_payment_event_emission() {
     let env = Env::default();
     env.mock_all_auths();
@@ -2445,6 +2503,76 @@ fn test_payment_expired_event_emitted() {
 
     let last_event = events.last().unwrap();
     let _data = &last_event.2;
+}
+
+#[test]
+fn test_expire_payment_refunds_only_deposited_installments() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    let token_client = token::Client::new(&env, &token);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let pool_funder = Address::generate(&env);
+    let amount = 1000_i128;
+    let expiration_duration = 10_u64;
+
+    token_admin_client.mint(&customer, &amount);
+    token_admin_client.mint(&pool_funder, &amount);
+    token_client.approve(&customer, &contract_id, &amount, &1000);
+
+    // Unrelated tokens sitting in the contract pool.
+    token_client.transfer(&pool_funder, &contract_id, &amount);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &Currency::USDC,
+        &expiration_duration,
+        &String::from_str(&env, ""),
+    );
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+
+    let customer_before = token_client.balance(&customer);
+    client.expire_payment(&payment_id);
+    let customer_after = token_client.balance(&customer);
+
+    assert_eq!(customer_after - customer_before, 0);
+    assert_eq!(token_client.balance(&contract_id), amount);
+
+    let payment_id2 = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &Currency::USDC,
+        &expiration_duration,
+        &String::from_str(&env, ""),
+    );
+    client.pay_installment(&customer, &payment_id2, &300);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+
+    let customer_before2 = token_client.balance(&customer);
+    client.expire_payment(&payment_id2);
+    let customer_after2 = token_client.balance(&customer);
+
+    assert_eq!(customer_after2 - customer_before2, 300);
+    assert_eq!(token_client.balance(&contract_id), amount);
 }
 
 #[test]

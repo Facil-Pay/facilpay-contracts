@@ -1686,6 +1686,7 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+        Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
         env.storage()
             .instance()
             .set(&SystemKey::RefundRejectedAt(refund_id), &now);
@@ -1958,6 +1959,7 @@ impl RefundContract {
                     .instance()
                     .set(&DataKey::Refund(refund.id), &refund);
                 Self::add_to_status_index(&env, RefundStatus::Rejected, refund.id);
+                Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
             }
         }
 
@@ -2908,6 +2910,7 @@ impl RefundContract {
                 .instance()
                 .set(&DataKey::Refund(case.refund_id), &refund);
             Self::add_to_status_index(&env, RefundStatus::Rejected, refund.id);
+            Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
         }
 
         // Distribute fees according to configuration
@@ -4024,6 +4027,8 @@ impl RefundContract {
                     match refund.status {
                         RefundStatus::Approved => {
                             total_approved += 1;
+                            pending_count += 1;
+                            pending_amount += refund.amount;
                         }
                         RefundStatus::Rejected => {
                             total_rejected += 1;
@@ -5715,6 +5720,14 @@ impl RefundContract {
         // Deduct platform fee from refund amount
         let (net_refund_amount, _fee_amount) =
             Self::deduct_refund_fee(env, refund_id, refund.amount, &refund.token)?;
+
+        if net_refund_amount > 0 {
+            token::Client::new(env, &refund.token).transfer(
+                &env.current_contract_address(),
+                &refund.customer,
+                &net_refund_amount,
+            );
+        }
 
         // Enforce merchant refund quota if configured
         if let Some(mut quota) = env
@@ -7912,6 +7925,7 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(&env, RefundStatus::Rejected, refund_id);
+        Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
 
         (RefundRejected {
             refund_id,
@@ -8512,6 +8526,8 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
         }
 
+        Self::clear_arbitration_votes(&env, case_id);
+
         case.arbitrators = senior_list;
         case.votes_for_refund = 0;
         case.votes_against_refund = 0;
@@ -8658,6 +8674,40 @@ impl RefundContract {
             &DataKey::PaymentRefundUsage(payment_id),
             &(new_count, new_amount),
         );
+    }
+
+    fn release_payment_refund_usage(env: &Env, payment_id: u64, refund_amount: i128) {
+        let (current_count, current_amount): (u32, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundUsage(payment_id))
+            .unwrap_or((0u32, 0i128));
+
+        let new_count = current_count.saturating_sub(1u32);
+        let new_amount = current_amount.saturating_sub(refund_amount);
+
+        env.storage().instance().set(
+            &DataKey::PaymentRefundUsage(payment_id),
+            &(new_count, new_amount),
+        );
+    }
+
+    fn clear_arbitration_votes(env: &Env, case_id: u64) {
+        let voters: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorsVoted(case_id))
+            .unwrap_or_else(|| Vec::new(env));
+
+        for voter in voters.iter() {
+            env.storage()
+                .instance()
+                .remove(&ArbitrationKey::ArbitratorVote(case_id, voter.clone()));
+        }
+
+        env.storage()
+            .instance()
+            .remove(&ArbitrationKey::ArbitratorsVoted(case_id));
     }
 
     fn validate_bps(bps: u32) -> Result<(), Error> {

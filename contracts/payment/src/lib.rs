@@ -3602,14 +3602,14 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::NotExpired));
         }
 
-        // Transfer token amount back to customer (automatic refund)
+        // Refund only what was actually deposited for this payment (installments),
+        // not the contract's shared pooled balance.
+        let deposited = PaymentContract::get_payment_deposited_amount(&env, payment_id);
         let token_client = token::Client::new(&env, &payment.token);
         let contract_address = env.current_contract_address();
-
-        // Check if contract has sufficient balance (in case of partial payments)
         let contract_balance = token_client.balance(&contract_address);
-        let refund_amount = if contract_balance >= payment.amount {
-            payment.amount
+        let refund_amount = if deposited <= contract_balance {
+            deposited
         } else {
             contract_balance
         };
@@ -4247,10 +4247,24 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let mut discount = (points as i128) * (config.redemption_rate as i128);
+        let existing_discount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
+            .unwrap_or(0);
+
         let max_discount = payment.amount / 2;
-        if discount > max_discount {
-            discount = max_discount;
+        if existing_discount >= max_discount {
+            return Err(Error::Feature(FeatureError::InsufficientPoints));
+        }
+
+        let mut discount = (points as i128) * (config.redemption_rate as i128);
+        let remaining_capacity = max_discount - existing_discount;
+        if discount > remaining_capacity {
+            discount = remaining_capacity;
+        }
+        if discount <= 0 {
+            return Err(Error::Feature(FeatureError::InsufficientPoints));
         }
 
         balance.points -= points;
@@ -4260,11 +4274,6 @@ impl PaymentContract {
             &balance,
         );
 
-        let existing_discount: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
-            .unwrap_or(0);
         env.storage().instance().set(
             &DataKey::Payment(PaymentKey::Discount(payment_id)),
             &(existing_discount + discount),
@@ -5718,8 +5727,10 @@ impl PaymentContract {
             }
 
             // Check customer spend limit (#282)
+            let charge_amount =
+                PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
             if let Err(_) =
-                PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount)
+                PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
             {
                 return Err(Error::Feature(FeatureError::SpendLimitExceeded));
             }
@@ -5727,7 +5738,12 @@ impl PaymentContract {
             let token_client = token::Client::new(&env, &sub.token);
             let contract_address = env.current_contract_address();
             let transfer_ok = token_client
-                .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+                .try_transfer_from(
+                    &contract_address,
+                    &sub.customer,
+                    &sub.merchant,
+                    &charge_amount,
+                )
                 .is_ok();
 
             if transfer_ok {
@@ -5757,7 +5773,7 @@ impl PaymentContract {
                 (RecurringPaymentExecuted {
                     subscription_id,
                     payment_count: sub.payment_count,
-                    amount: sub.amount,
+                    amount: charge_amount,
                     next_payment_at: sub.next_payment_at,
                 })
                 .publish(&env);
@@ -5845,8 +5861,10 @@ impl PaymentContract {
         }
 
         // Check customer spend limit (#282)
+        let charge_amount =
+            PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
         if let Err(_) =
-            PaymentContract::check_and_update_spend_limit(&env, &sub.customer, sub.amount)
+            PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
         {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
@@ -5856,7 +5874,12 @@ impl PaymentContract {
         let contract_address = env.current_contract_address();
 
         let transfer_ok = token_client
-            .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+            .try_transfer_from(
+                &contract_address,
+                &sub.customer,
+                &sub.merchant,
+                &charge_amount,
+            )
             .is_ok();
 
         if transfer_ok {
@@ -5887,7 +5910,7 @@ impl PaymentContract {
             (RecurringPaymentExecuted {
                 subscription_id,
                 payment_count: sub.payment_count,
-                amount: sub.amount,
+                amount: charge_amount,
                 next_payment_at: sub.next_payment_at,
             })
             .publish(&env);
@@ -6338,12 +6361,48 @@ impl PaymentContract {
             sub.ends_at += pause_duration;
         }
 
-        sub.status = SubscriptionStatus::Active;
-
         if sub.pause_data.proration_enabled {
             // Proration formula: (Full Amount * Remaining Time in Cycle) / Cycle Duration
             let remaining_time = sub.next_payment_at - now;
-            let prorated_amount = (sub.amount * remaining_time as i128) / sub.interval as i128;
+            let prorated_amount =
+                (sub.amount * remaining_time as i128) / sub.interval as i128;
+
+            if prorated_amount > 0 {
+                let merchant_paused: bool = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                        sub.merchant.clone(),
+                    )))
+                    .unwrap_or(false);
+                if merchant_paused {
+                    return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+                }
+
+                if let Err(_) = PaymentContract::check_and_update_spend_limit(
+                    &env,
+                    &sub.customer,
+                    prorated_amount,
+                ) {
+                    return Err(Error::Feature(FeatureError::SpendLimitExceeded));
+                }
+
+                let token_client = token::Client::new(&env, &sub.token);
+                let contract_address = env.current_contract_address();
+                let transfer_ok = token_client
+                    .try_transfer_from(
+                        &contract_address,
+                        &sub.customer,
+                        &sub.merchant,
+                        &prorated_amount,
+                    )
+                    .is_ok();
+                if !transfer_ok {
+                    return Err(Error::Payment(PaymentError::TransferFailed));
+                }
+
+                sub.payment_count += 1;
+            }
 
             (SubscriptionResumedProrated {
                 subscription_id,
@@ -6360,16 +6419,12 @@ impl PaymentContract {
             .publish(&env);
         }
 
+        sub.status = SubscriptionStatus::Active;
+
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
-
-        (SubscriptionResumed {
-            subscription_id,
-            next_payment_at: sub.next_payment_at,
-        })
-        .publish(&env);
 
         Ok(())
     }
@@ -6552,11 +6607,18 @@ impl PaymentContract {
         }
 
         // Attempt the payment
+        let charge_amount =
+            PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
         let token_client = token::Client::new(&env, &sub.token);
         let contract_address = env.current_contract_address();
 
         let transfer_ok = token_client
-            .try_transfer_from(&contract_address, &sub.customer, &sub.merchant, &sub.amount)
+            .try_transfer_from(
+                &contract_address,
+                &sub.customer,
+                &sub.merchant,
+                &charge_amount,
+            )
             .is_ok();
 
         if transfer_ok {
@@ -6586,7 +6648,7 @@ impl PaymentContract {
             (RecurringPaymentExecuted {
                 subscription_id,
                 payment_count: sub.payment_count,
-                amount: sub.amount,
+                amount: charge_amount,
                 next_payment_at: sub.next_payment_at,
             })
             .publish(&env);
@@ -6698,6 +6760,48 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Sum of installment deposits actually received for a pending payment.
+    fn get_payment_deposited_amount(env: &Env, payment_id: u64) -> i128 {
+        let installment_counter: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
+                payment_id,
+            )))
+            .unwrap_or(0);
+
+        let mut total_deposited = 0i128;
+        for i in 1..=installment_counter {
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get::<DataKey, PartialPaymentRecord>(&DataKey::State(
+                    StateDataKey::PartialPaymentRecord(payment_id, i),
+                ))
+            {
+                total_deposited += record.amount_paid;
+            }
+        }
+        total_deposited
+    }
+
+    /// Apply an active subscription group's discount_bps to a billing amount.
+    fn get_discounted_subscription_amount(env: &Env, subscription_id: u64, amount: i128) -> i128 {
+        if let Some(group_id) = env.storage().instance().get::<DataKey, u64>(
+            &DataKey::Subscription(SubscriptionKey::GroupMembership(subscription_id)),
+        ) {
+            if let Some(group) = env.storage().instance().get::<DataKey, SubscriptionGroup>(
+                &DataKey::Subscription(SubscriptionKey::Group(group_id)),
+            ) {
+                if group.active && group.discount_bps > 0 {
+                    let bps = group.discount_bps.min(10_000) as i128;
+                    return amount * (10_000 - bps) / 10_000;
+                }
+            }
+        }
+        amount
     }
 
     /// Internal function to enter dunning for a subscription.

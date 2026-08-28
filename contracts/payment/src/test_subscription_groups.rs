@@ -1,7 +1,7 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-use crate::{Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError};
+use crate::{Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError, SubscriptionStatus};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address) {
     let env = Env::default();
@@ -149,4 +149,102 @@ fn test_get_group_next_billing() {
 
     let next = client.get_group_next_billing(&group_id);
     assert!(next > 0);
+}
+
+#[test]
+fn test_group_discount_applied_on_recurring_payment() {
+    let (env, client, admin) = setup();
+    let owner = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&owner, &100_000);
+    soroban_sdk::token::Client::new(&env, &token_addr).approve(
+        &owner,
+        &client.address,
+        &100_000,
+        &10_000,
+    );
+
+    env.ledger().set_timestamp(1000);
+    let sub_amount = 1000_i128;
+    let sub_id = client.create_subscription(
+        &owner,
+        &merchant,
+        &sub_amount,
+        &token_addr,
+        &Currency::USDC,
+        &2592000,
+        &0,
+        &0,
+        &String::from_str(&env, ""),
+        &0,
+    );
+
+    // 10% group discount
+    let group_id = client.create_subscription_group(&owner, &1000);
+    client.add_to_group(&owner, &group_id, &sub_id);
+
+    let merchant_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&merchant);
+    env.ledger().set_timestamp(1000 + 2592000);
+    client.execute_recurring_payment(&sub_id);
+    let merchant_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&merchant);
+
+    let expected_charge = sub_amount * 9000 / 10000;
+    assert_eq!(merchant_after - merchant_before, expected_charge);
+}
+
+#[test]
+fn test_resume_subscription_charges_prorated_amount() {
+    let (env, client, admin) = setup();
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token.mint(&customer, &100_000);
+    soroban_sdk::token::Client::new(&env, &token_addr).approve(
+        &customer,
+        &client.address,
+        &100_000,
+        &10_000,
+    );
+
+    let interval = 2_592_000_u64;
+    let sub_amount = 1000_i128;
+    env.ledger().set_timestamp(1000);
+    let sub_id = client.create_subscription(
+        &customer,
+        &merchant,
+        &sub_amount,
+        &token_addr,
+        &Currency::USDC,
+        &interval,
+        &0,
+        &0,
+        &String::from_str(&env, ""),
+        &0,
+    );
+    client.set_subscription_proration(&customer, &sub_id, &true);
+
+    let pause_at = 1000 + interval / 2;
+    env.ledger().set_timestamp(pause_at);
+    client.pause_subscription(&customer, &sub_id);
+
+    let resume_at = pause_at + interval / 2;
+    env.ledger().set_timestamp(resume_at);
+
+    let merchant_before = soroban_sdk::token::Client::new(&env, &token_addr).balance(&merchant);
+    client.resume_subscription(&customer, &sub_id);
+    let merchant_after = soroban_sdk::token::Client::new(&env, &token_addr).balance(&merchant);
+
+    let expected_proration = sub_amount / 2;
+    assert_eq!(merchant_after - merchant_before, expected_proration);
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Active);
+    assert_eq!(sub.payment_count, 1);
 }

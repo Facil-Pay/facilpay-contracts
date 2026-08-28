@@ -231,8 +231,8 @@ fn test_get_merchant_refund_summary_counts_current_statuses_and_amounts() {
     assert_eq!(summary.total_approved, 1);
     assert_eq!(summary.total_rejected, 1);
     assert_eq!(summary.total_amount_refunded, 80);
-    assert_eq!(summary.pending_count, 2);
-    assert_eq!(summary.pending_amount, 140);
+    assert_eq!(summary.pending_count, 3);
+    assert_eq!(summary.pending_amount, 200);
 
     let empty_summary = client.get_merchant_refund_summary(&empty_merchant);
     assert_eq!(empty_summary.total_requests, 0);

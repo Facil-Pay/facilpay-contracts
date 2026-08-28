@@ -347,59 +347,121 @@ Once the case is open, the registered arbitrator panel can vote on whether the r
 
 If the case is not resolved before its timeout window, it falls back to the configured default outcome rather than remaining indefinitely open. That timeout path still settles the stake so the funds do not remain locked up. Arbitration reputation is tracked alongside each case as well: a vote aligned with the final outcome improves an arbitrator's score, while a minority vote lowers it, and the contract also records total cases and average resolution time.
 
-## 🔔 Notification Hooks
-
-Notification hooks let an external contract (an off-chain listener's on-chain relay, another Facil-Pay contract, etc.) subscribe to refund lifecycle events and receive a call when they occur.
-
-### Triggering Events
-
-A hook is registered against one or more `RefundEventType` variants. Each variant is fired from exactly one place in the contract:
-
-| Event       | Fired By                                                                                     |
-| ----------- | ---------------------------------------------------------------------------------------------- |
-| `Requested` | `request_refund()`, right after the refund is created in `Requested` status                    |
-| `Approved`  | `approve_refund()`, when the refund moves to `Approved` status                                  |
-| `Rejected`  | `finalize_denial()`, when a `PendingAppeal` refund's appeal window expires and it becomes `Rejected` — **not** `reject_refund()` itself, which only moves the refund from `Requested` to `PendingAppeal` |
-| `Processed` | `process_refund()`, when an approved refund is processed and fees are deducted                  |
-| `Escalated` | `escalate_to_arbitration()`, when a rejected refund is escalated to an arbitration case          |
-
-### Hook Interface
-
-A subscriber is any deployed contract that implements two entry points:
-
-```
-ping() -> ()
-on_refund_event(event_type: RefundEventType, refund_id: u64) -> ()
-```
-
-- `ping()` takes no arguments and returns nothing. It exists purely so registration can verify the address is a reachable contract; it does not need any real implementation beyond existing.
-- `on_refund_event()` is the actual notification callback, invoked with the event type and the affected refund's ID.
-
-### Registering and Deregistering
-
-```
-register_notification_hook(subscriber, events) -> hook_id
-deregister_hook(subscriber, hook_id)
-```
-
-- The `subscriber` address itself must authorize the registration call (`subscriber.require_auth()`) — a third party cannot register a hook on a contract's behalf
-- `events` must be non-empty
-- Registration calls `ping()` on `subscriber` to confirm it is a reachable contract; if the call fails or `subscriber` doesn't implement `ping()`, registration is rejected with `InvalidHookAddress`
-- Each event type accepts at most 10 active hooks (`MaxHooksPerEventReached` once the limit is hit)
-- Only the original `subscriber` can deregister its own hook (`HookNotOwnedBySubscriber` otherwise); deregistering marks the hook inactive rather than deleting it
-
-### Failure Handling
-
-Hook invocation is isolated from the triggering operation: the contract calls `on_refund_event()` via `try_invoke_contract`, so a panicking or reverting subscriber cannot block or roll back the refund action that triggered it. If a hook call fails, the contract emits a `HookInvocationFailed` event (`hook_id`, `subscriber`, `event_type`, `refund_id`) and continues — the refund operation itself still succeeds.
-
-### Queries
-
-| Function                          | Returns                                              |
-| ---------------------------------- | ----------------------------------------------------- |
-| `get_hooks_for_event(event_type)` | Active hooks registered for a given event type        |
-| `get_subscriber_hooks(subscriber)` | All hooks (active and inactive) owned by a subscriber |
-
 ---
+
+## 🔒 Arbitration Stake Requirement
+
+### Overview & Purpose
+
+To discourage frivolous dispute escalations and ensure escalating parties have financial commitment ("skin in the game"), the refund contract supports a configurable staking/bonding requirement. When enabled by the contract admin, any party escalating a refund dispute to arbitration must deposit a designated token stake in addition to the case fee pool. The contract holds this stake in escrow for the duration of the arbitration proceedings.
+
+### Stake Amount & Configuration
+
+Arbitration staking is configured globally by the contract admin via `set_arbitration_stake_config(admin, config)`:
+
+```rust
+pub struct ArbitrationStakeConfig {
+    pub token: Address,   // Token contract address used for staking
+    pub amount: i128,      // Required stake amount per case (must be > 0 when enabled)
+    pub enabled: bool,     // Toggle flag enabling or disabling the stake requirement
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `token` | `Address` | Stellar token address in which the stake must be denominated. |
+| `amount` | `i128` | Required stake amount per case. Must be strictly positive (`> 0`) when `enabled` is `true`. |
+| `enabled` | `bool` | Enables (`true`) or disables (`false`) the stake deposit requirement on arbitration escalation. |
+
+#### Configuration Rules & Behavior
+
+- **Validation**: When `enabled: true`, setting `amount <= 0` will revert with `CoreError::InvalidAmount`.
+- **Admin Authorization**: Only the contract admin can set or update the stake configuration via `set_arbitration_stake_config()`.
+- **Disabled/Unconfigured Staking**: If staking is not configured or `enabled: false`, disputes can be escalated without transferring any stake, and no stake record is stored (`get_arbitration_stake(case_id)` returns `None`).
+- **Querying Config**: The current configuration can be retrieved via `get_arbitration_stake_config()`.
+
+### Stake Lifecycle
+
+```
+                  ┌──────────────────────────────┐
+                  │   escalate_to_arbitration    │
+                  │   (Staking enabled by admin) │
+                  └──────────────┬───────────────┘
+                                 │
+                     [StakeDeposited Event]
+                     [Held in Contract Escrow]
+                                 │
+                  ┌──────────────┴───────────────┐
+                  ▼                              ▼
+        [close_arbitration_case]      [trigger_arbitration_timeout]
+        (Quorum reached & decided)    (Timeout deadline exceeded)
+                  │                              │
+         ┌────────┴────────┐            ┌────────┴────────┐
+         ▼                 ▼            ▼                 ▼
+    Staker Won        Staker Lost  Staker Won        Staker Lost
+   (!approved)        (approved)   (!default)        (default)
+         │                 │            │                 │
+         ▼                 ▼            ▼                 ▼
+   [StakeReturned]  [StakeForfeited][StakeReturned]  [StakeForfeited]
+   (Transferred to  (Transferred to (Transferred to  (Transferred to
+       staker)          treasury)       staker)          treasury)
+```
+
+### Deposit Conditions
+
+When `escalate_to_arbitration(caller, refund_id, token, fee_pool)` is executed:
+1. The contract checks if `ArbitrationStakeConfig` is present in instance storage and `enabled == true`.
+2. If enabled, the contract transfers `config.amount` of `config.token` from the caller (`staker`) into the contract's escrow address.
+3. An `ArbitrationStake` record is created and stored under `ArbitrationKey::ArbitrationStake(case_id)`:
+   - `case_id`: Unique identifier for the arbitration case.
+   - `staker`: Address of the party who deposited the stake.
+   - `amount`: Quantity of tokens held in escrow.
+   - `deposited_at`: Ledger timestamp at deposit.
+   - `returned`: Set to `false`.
+4. A `StakeDeposited` event (`case_id`, `staker`, `amount`) is emitted.
+
+### Return Conditions
+
+The full escrowed stake amount is returned to the original `staker` under the following conditions:
+
+1. **Dispute Decided in Staker's Favor**: When the case is closed via `close_arbitration_case()` and the arbitrator panel's majority vote supports the staker's position (e.g. `!approved` when the merchant escalated to uphold a refund rejection):
+   - The contract transfers `stake.amount` of `config.token` from escrow back to `stake.staker`.
+   - Emits a `StakeReturned { case_id, winner: stake.staker, amount }` event.
+   - Updates `stake.returned` to `true`.
+2. **Timeout Decided in Staker's Favor**: When an overdue dispute is settled via `trigger_arbitration_timeout()` and the default outcome results in the staker winning (i.e. `default_outcome == false`):
+   - The contract transfers `stake.amount` back to `stake.staker`.
+   - Emits `StakeReturned { case_id, winner: stake.staker, amount }`.
+   - Updates `stake.returned` to `true`.
+3. **Missing Treasury Fallback**: If forfeiture conditions are met but no `treasury_address` is configured in `ArbitrationFeeConfig`, the stake falls back to being returned to the `staker` to avoid permanently locked funds.
+
+### Forfeiture Conditions
+
+The deposited stake is forfeited and transferred to the protocol treasury under the following conditions:
+
+1. **Dispute Decided Against Staker**: When the case is closed via `close_arbitration_case()` and the majority vote goes against the staker (e.g. `approved == true`, overturning the merchant's rejection and ordering a refund):
+   - The contract transfers `stake.amount` of `config.token` to the configured `treasury_address` (from `ArbitrationFeeConfig`).
+   - Emits a `StakeForfeited { case_id, loser: stake.staker, amount }` event.
+   - Updates `stake.returned` to `true` (indicating the stake is settled).
+2. **Timeout Decided Against Staker**: When `trigger_arbitration_timeout()` executes for an unresolved case and the default outcome goes against the staker (i.e. `default_outcome == true`):
+   - The contract transfers `stake.amount` to `treasury_address`.
+   - Emits `StakeForfeited { case_id, loser: stake.staker, amount }`.
+   - Updates `stake.returned` to `true`.
+
+### Stake Queries & Data Structures
+
+- `get_arbitration_stake(case_id)` — Returns the `Option<ArbitrationStake>` for a given arbitration case:
+
+```rust
+pub struct ArbitrationStake {
+    pub case_id: u64,         // Arbitration case ID
+    pub staker: Address,       // Address of the depositing party
+    pub amount: i128,          // Amount deposited
+    pub deposited_at: u64,     // Timestamp when stake was locked
+    pub returned: bool,        // True if returned to staker or forfeited to treasury
+}
+```
+
+- `get_arbitration_stake_config()` — Returns the active `Option<ArbitrationStakeConfig>`.
 
 ## 🔗 Links
 
