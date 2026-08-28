@@ -347,6 +347,60 @@ Once the case is open, the registered arbitrator panel can vote on whether the r
 
 If the case is not resolved before its timeout window, it falls back to the configured default outcome rather than remaining indefinitely open. That timeout path still settles the stake so the funds do not remain locked up. Arbitration reputation is tracked alongside each case as well: a vote aligned with the final outcome improves an arbitrator's score, while a minority vote lowers it, and the contract also records total cases and average resolution time.
 
+## 🔔 Notification Hooks
+
+Notification hooks let an external contract (an off-chain listener's on-chain relay, another Facil-Pay contract, etc.) subscribe to refund lifecycle events and receive a call when they occur.
+
+### Triggering Events
+
+A hook is registered against one or more `RefundEventType` variants. Each variant is fired from exactly one place in the contract:
+
+| Event       | Fired By                                                                                     |
+| ----------- | ---------------------------------------------------------------------------------------------- |
+| `Requested` | `request_refund()`, right after the refund is created in `Requested` status                    |
+| `Approved`  | `approve_refund()`, when the refund moves to `Approved` status                                  |
+| `Rejected`  | `finalize_denial()`, when a `PendingAppeal` refund's appeal window expires and it becomes `Rejected` — **not** `reject_refund()` itself, which only moves the refund from `Requested` to `PendingAppeal` |
+| `Processed` | `process_refund()`, when an approved refund is processed and fees are deducted                  |
+| `Escalated` | `escalate_to_arbitration()`, when a rejected refund is escalated to an arbitration case          |
+
+### Hook Interface
+
+A subscriber is any deployed contract that implements two entry points:
+
+```
+ping() -> ()
+on_refund_event(event_type: RefundEventType, refund_id: u64) -> ()
+```
+
+- `ping()` takes no arguments and returns nothing. It exists purely so registration can verify the address is a reachable contract; it does not need any real implementation beyond existing.
+- `on_refund_event()` is the actual notification callback, invoked with the event type and the affected refund's ID.
+
+### Registering and Deregistering
+
+```
+register_notification_hook(subscriber, events) -> hook_id
+deregister_hook(subscriber, hook_id)
+```
+
+- The `subscriber` address itself must authorize the registration call (`subscriber.require_auth()`) — a third party cannot register a hook on a contract's behalf
+- `events` must be non-empty
+- Registration calls `ping()` on `subscriber` to confirm it is a reachable contract; if the call fails or `subscriber` doesn't implement `ping()`, registration is rejected with `InvalidHookAddress`
+- Each event type accepts at most 10 active hooks (`MaxHooksPerEventReached` once the limit is hit)
+- Only the original `subscriber` can deregister its own hook (`HookNotOwnedBySubscriber` otherwise); deregistering marks the hook inactive rather than deleting it
+
+### Failure Handling
+
+Hook invocation is isolated from the triggering operation: the contract calls `on_refund_event()` via `try_invoke_contract`, so a panicking or reverting subscriber cannot block or roll back the refund action that triggered it. If a hook call fails, the contract emits a `HookInvocationFailed` event (`hook_id`, `subscriber`, `event_type`, `refund_id`) and continues — the refund operation itself still succeeds.
+
+### Queries
+
+| Function                          | Returns                                              |
+| ---------------------------------- | ----------------------------------------------------- |
+| `get_hooks_for_event(event_type)` | Active hooks registered for a given event type        |
+| `get_subscriber_hooks(subscriber)` | All hooks (active and inactive) owned by a subscriber |
+
+---
+
 ## 🔗 Links
 
 - [Root README](../../README.md)
