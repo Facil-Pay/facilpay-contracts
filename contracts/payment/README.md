@@ -224,11 +224,68 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 
 ### Payment Forwarding
 
-| Function                                                        | Description                                                                            |
-| --------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `set_payment_forward(admin, merchant, forward_to, forward_bps)` | Configure a merchant's payments to forward `forward_bps` basis points to `forward_to`. |
-| `remove_payment_forward(merchant)`                              | Remove the forwarding configuration for a merchant.                                    |
-| `get_forward_config(merchant)`                                  | Retrieve the `PaymentForwardConfig` for a merchant.                                    |
+| Function                                              | Description                                                                            |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `set_payment_forward(merchant, forward_to, forward_bps)` | Configure a merchant's payments to forward `forward_bps` basis points to `forward_to`. |
+| `remove_payment_forward(merchant)`                    | Remove the forwarding configuration for a merchant.                                    |
+| `get_forward_config(merchant)`                        | Retrieve the `PaymentForwardConfig` for a merchant.                                    |
+
+#### How Payment Forwarding Works
+
+Payment forwarding lets a merchant automatically route a fixed percentage of every
+completed payment to a third-party address (`forward_to`), in addition to the normal
+merchant settlement. It is configured per-merchant and applied automatically at payment
+completion — integrators do not need to do anything special when calling `complete_payment`.
+
+**Who can set up a forward**
+
+- `set_payment_forward` and `remove_payment_forward` are authorized by the **merchant
+  themselves** via `require_auth()` on the `merchant` argument. The admin does **not**
+  configure forwarding on a merchant's behalf.
+- The caller must be the merchant whose address will be the source of the forward. The
+  `forward_to` address is unconstrained (it may be any address, including another merchant
+  or an external wallet).
+- The supplied `forward_bps` must be between `1` and `10000` (inclusive); `0` and values
+  above `10000` revert with `InvalidForwardBps`. A value of `10000` forwards the entire
+  merchant net amount.
+
+**Cycle / depth protection**
+
+- Forwarding chains are validated to prevent infinite transfer loops. When a forward is
+  set, the contract walks the existing forward chain beginning at `forward_to` up to a
+  maximum depth (default `5`, configurable via `MaxForwardDepth`). If the chain eventually
+  returns to the configuring `merchant`, or exceeds the maximum depth, the call reverts
+  with `ForwardLoop`. This means a merchant cannot configure a forward that would route
+  funds back to itself (directly or transitively).
+
+**Do fees apply to forwarding?**
+
+- Forwarding does **not** add a separate forwarding fee. The platform fee is deducted
+  first from the gross charged amount (via `deduct_fee`), producing the merchant's net
+  amount. The forwarded portion is calculated only from that **post-fee net amount**:
+  `forward_amount = merchant_net_amount * forward_bps / 10000`.
+- `forward_to` therefore receives a share of the merchant's already-fee-reduced proceeds;
+  the platform fee is never double-charged on the forwarded amount. The merchant keeps the
+  remainder (`merchant_net_amount - forward_amount`).
+- If `forward_amount` computes to `0` (e.g. a tiny net amount with a small `forward_bps`),
+  no transfer and no `PaymentForwarded` event occurs, but the payment still completes.
+
+**Interaction with merchant pause state**
+
+- `set_payment_forward` / `remove_payment_forward` are guarded only by the **contract-wide
+  pause** (`require_not_paused`). They are **not** blocked by a per-merchant pause
+  (`require_merchant_not_paused` is not enforced for these functions), so a paused merchant
+  can still configure or remove its forwarding settings. If the contract is globally paused
+  or the individual function is paused, these calls revert.
+- Forwarding is applied inside `complete_payment`, which also only checks the contract-wide
+  pause — **not** the merchant pause — so a paused merchant's *already-created* pending
+  payments still complete and still forward as configured.
+- However, a paused merchant **cannot receive new payments**: `create_payment` enforces
+  `require_merchant_not_paused`, so no new payment (and therefore no new forwarding event)
+  can be created while the merchant is paused. In practice, forwarding only fires on
+  payments created before the merchant was paused.
+- If a merchant's forwarding config is removed or the `forward_to` address is later paused,
+  removal simply stops future forwards; it does not retroactively affect completed payments.
 
 ### Routing
 
