@@ -175,6 +175,74 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `reset_circuit_breaker()` — Admin manually resets the circuit breaker.
 - `check_circuit_breaker()` — Returns true if the circuit breaker is active.
 
+#### How the Circuit Breaker Works
+
+The circuit breaker is an automatic kill switch that halts new refund requests
+when the ratio of refunded value to paid value spikes over a short window —
+protecting the contract (and merchant treasuries) against a runaway refund event,
+a compromised approver, or a buggy integration.
+
+**Configuration**
+
+The admin installs it with `set_circuit_breaker_config(admin, config)`:
+
+```rust
+pub struct CircuitBreakerConfig {
+    pub max_refund_rate_bps: u32,        // trip threshold, in basis points (e.g. 1000 = 10%)
+    pub measurement_window_seconds: u64, // rolling window over which volume is summed
+    pub cooldown_seconds: u64,           // how long the breaker stays tripped before auto-reset
+    pub enabled: bool,                   // master on/off switch
+}
+```
+
+If no config has ever been set, or `enabled` is `false`, the breaker is inert:
+requests are never evaluated or blocked, and `check_circuit_breaker()` returns
+`false`.
+
+**What trips it**
+
+The check runs inside `request_refund` (before the customer rate-limit, fraud and
+policy checks). For each request the contract maintains, per rolling
+`measurement_window_seconds` window, a running sum of requested refund amounts and
+a running sum of the corresponding original payment amounts. When a window
+elapses (or on first use) both sums reset and the window restarts at the current
+ledger time.
+
+For the incoming request it computes
+`rate_bps = (window_refund_volume + refund_amount) * 10000 / (window_payment_volume + payment_amount)`.
+If that value is **greater than** `max_refund_rate_bps`, the breaker trips:
+
+- `CircuitBreakerState` is updated — `tripped = true`, `tripped_at = now`,
+  `trip_count += 1`, `last_refund_rate_bps = rate_bps`,
+  `resets_at = now + cooldown_seconds`;
+- a `CircuitBreakerTrippedEvent { refund_rate_bps, tripped_at }` is emitted;
+- the triggering `request_refund` call itself reverts with
+  `CircuitBreakerTripped` (error `29`). Its amounts are **not** added to the
+  window totals.
+
+**What it blocks while tripped**
+
+Only `request_refund`. Every new refund request reverts with
+`CircuitBreakerTripped` until the breaker resets. Refunds
+that were already `Requested`, `Approved`, or `Processed` before the trip are
+unaffected — approvals, processing, appeals, arbitration and admin overrides do
+not consult the breaker.
+
+**How it resets**
+
+- **Automatically** — the next `request_refund` received at or after `resets_at`
+  clears the tripped state (`tripped = false`, `tripped_at`/`resets_at` cleared)
+  and proceeds against a fresh measurement window. `trip_count` is retained as a
+  historical counter.
+- **Manually** — the admin calls `reset_circuit_breaker(admin)`, which clears the
+  tripped state immediately and emits `CircuitBreakerResetEvent { reset_by,
+  reset_at }`. Use this to restore service before the cooldown elapses (e.g. after
+  raising `max_refund_rate_bps` or confirming the spike was legitimate).
+
+`get_circuit_breaker_state()` returns the full state (tripped flag, trip count,
+last observed rate, auto-reset timestamp); `check_circuit_breaker()` is a
+read-only helper returning `true` only while tripped and still within cooldown.
+
 ### Fraud Detection
 
 - `check_fraud_signals()` — Checks an address for fraud signals.
@@ -201,6 +269,54 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `check_refund_eligibility()` — Returns the eligibility rule for a merchant-customer pair.
 - `remove_refund_eligibility()` — Merchant removes an eligibility entry.
 - `get_merchant_eligibility_list()` — Returns all eligibility entries for a merchant.
+
+#### Merchant Eligibility Rules
+
+Beyond the time/percentage caps of a refund policy, a merchant can maintain an
+explicit **allow / block list** that decides *which customers may open a refund
+request at all* against that merchant. This is the customer-eligibility registry.
+
+**How a rule is determined**
+
+- Entries are keyed by the **(merchant, customer)** pair, so a rule only applies to
+  that one customer under that one merchant. The same customer can be blocked by
+  merchant A and unaffected under merchant B.
+- `set_refund_eligibility(merchant, customer, rule, reason_hash)` creates or
+  overwrites the entry. `rule` is `EligibilityRule::Allow` or
+  `EligibilityRule::Block`; `reason_hash` is an opaque `BytesN<32>` for off-chain
+  reason text (pass the zero hash if unused). The call requires the merchant's
+  authorization. Re-calling it for an existing pair updates the rule in place
+  without creating a duplicate list entry, and emits
+  `EligibilitySet { merchant, customer, rule }`.
+- `check_refund_eligibility(merchant, customer)` returns the stored rule and
+  **defaults to `Allow` when no entry exists** — customers are eligible unless a
+  merchant explicitly blocks them. There is no global block list; blocking is
+  always per merchant.
+- `get_merchant_eligibility_list(merchant)` returns every `RefundEligibilityEntry`
+  for the merchant (`customer`, `merchant`, `rule`, `reason_hash`, `set_at`).
+
+**What makes a customer ineligible**
+
+Only an explicit `Block` entry. During `request_refund`, after the fraud check and
+before policy validation, the contract reads the (merchant, customer) rule; if it
+is `Block`, the call reverts with `CustomerBlockedFromRefund` (error `44`). An
+`Allow` entry or no entry lets the request proceed to the normal policy checks.
+
+**Removing a rule**
+
+`remove_refund_eligibility(merchant, customer)` deletes the entry (the merchant's
+list is compacted) and emits `EligibilityRemoved { merchant, customer }`. After
+removal the pair falls back to the `Allow` default. Removing an entry that does
+not exist reverts with `EligibilityEntryNotFound` (error `45`). To un-block a
+customer you can either remove the entry or overwrite it with `Allow`.
+
+**Effect on refunds already in flight**
+
+The eligibility rule is consulted **only at `request_refund` time**. Blocking a
+customer afterwards does not claw back or freeze a refund they already submitted —
+an existing `Requested`/`Approved` refund can still be approved and processed. The
+block only prevents *new* requests. Likewise, switching a customer from `Block`
+back to `Allow` (or removing the entry) immediately lets them request again.
 
 ### Admin Override
 
@@ -261,6 +377,68 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `get_customer_tier_policy()` — Gets the refund cap for a specific customer tier.
 - `set_strict_tier_policy()` — Merchant enables/disables strict tier policy enforcement.
 - `get_strict_tier_policy()` — Checks if strict tier policy is enabled.
+
+#### How the Customer Tier Policy Works
+
+Customer tiers let a merchant apply a **different maximum refund percentage** to
+different classes of customer (for example a stricter cap for a "high refund risk"
+tier, or a more generous cap for a loyalty tier), on top of the merchant's normal
+time-based refund policy.
+
+**How a customer's tier is determined**
+
+- The **contract admin** assigns tiers with
+  `set_customer_tier(admin, customer, tier_id)`, where `tier_id` is an arbitrary
+  `u32` chosen by the operator. `get_customer_tier(customer)` returns it, or
+  `None` if unassigned.
+- A tier is a property of the **customer address globally** — it is not
+  merchant-scoped and a customer has at most one tier id at a time. Re-calling
+  `set_customer_tier` overwrites it.
+- Merchants do not set tiers; they only define what each tier id *means* for their
+  own refunds.
+
+**Which policy knob varies by tier**
+
+Only the **refund cap** — `max_refund_bps`, the maximum share of the original
+payment that may be refunded. A merchant registers a per-tier cap with
+`set_customer_tier_policy(merchant, tier_id, max_refund_bps)` (merchant auth;
+`max_refund_bps` must be ≤ `10000` or the call reverts with `InvalidAmount`).
+Stored as a `RefundCap { max_refund_bps }` keyed by `(merchant, tier_id)` and
+readable via `get_customer_tier_policy`.
+
+The **refund window** (the `days_from_purchase` tiers of the merchant's
+`set_refund_policy`) is *not* tier-specific. Eligibility by age is always decided
+by the merchant's time-based policy first; a tier cap only tightens or loosens the
+percentage allowed once the request is inside the window.
+
+Resolution order inside `request_refund` → `validate_against_policy`:
+
+1. The merchant's time-based policy picks `allowed_bps` from the first tier whose
+   `days_from_purchase` covers the payment's age. If none does, the refund is
+   rejected with `RefundWindowExpired` (error `11`).
+2. If the customer has a tier assigned **and** the merchant has a
+   `set_customer_tier_policy` entry for that `tier_id`, that tier cap
+   **replaces** `allowed_bps` (it can be higher or lower than the time-based
+   value).
+3. If the customer has a tier but the merchant has **no** matching tier policy
+   entry:
+   - **default (non-strict):** the tier is ignored and the time-based
+     `allowed_bps` stands;
+   - **strict mode** (`set_strict_tier_policy(merchant, true)`): the request is
+     rejected with `TierPolicyNotFound` (error `57`).
+4. Customers with **no** tier assigned are never affected by strict mode — only
+   the time-based policy applies.
+5. Finally, if the requested `amount / original_amount` exceeds the resolved
+   `allowed_bps`, the request is rejected with `RefundExceedsPolicy` (error `12`).
+
+**Effect of tier changes on refunds already in flight**
+
+The customer's tier and the tier cap are read **only when `request_refund` runs**.
+Reassigning a customer's tier, changing a tier's `max_refund_bps`, or toggling
+strict mode afterwards does **not** re-evaluate refunds that were already
+submitted — an existing `Requested`/`Approved` refund keeps the cap that applied
+at request time through approval and processing. Only refund requests created
+after the change use the new tier or cap.
 
 ---
 
