@@ -40,9 +40,9 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. |
 | `complete_payment(admin, payment_id)`                                                        | Admin releases a `Pending` payment to the merchant. For amounts above the configured large-payment threshold a multi-sig proposal is auto-created instead.   |
-| `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment in full, returning tokens to the customer.                                                                                 |
+| `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment, marking it `Refunded` and returning any installments already collected via `pay_installment` to the customer.             |
 | `partial_refund(admin, payment_id, refund_amount)`                                           | Admin issues a partial refund on a `Completed` payment, returning only `refund_amount` to the customer.                                                      |
-| `cancel_payment(caller, payment_id)`                                                         | Customer or admin cancels a `Pending` payment and returns funds.                                                                                             |
+| `cancel_payment(caller, payment_id)`                                                         | Customer or merchant cancels a `Pending` payment, marking it `Cancelled` and returning any installments already collected via `pay_installment`.             |
 | `get_payment(payment_id)`                                                                    | Retrieve the full `Payment` record by ID. Panics if not found.                                                                                               |
 | `check_payment_customer(payment_id, customer)`                                               | Returns `true` if the payment exists, belongs to `customer`, and is `Completed` (used for cross-contract verification).                                      |
 | `expire_payment(payment_id)`                                                                 | Anyone can call this once a payment is past its expiration timestamp; tokens are returned to the customer.                                                   |
@@ -76,6 +76,14 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `finalize_installment_payment(payment_id)`               | Mark a fully-paid installment payment as `Completed` and release funds to the merchant. |
 | `get_installment_history(payment_id)`                    | Return all installment records for a payment.                                           |
 | `get_outstanding_balance(payment_id)`                    | Return the remaining unpaid balance of an installment payment.                          |
+
+`pay_installment` moves real tokens from the customer into the contract while the payment
+stays `Pending`. If such a payment is later refunded (`refund_payment`) or cancelled
+(`cancel_payment`) before it is finalized, the contract transfers the sum of all
+installments recorded for that payment back to the customer before flipping the status to
+`Refunded` / `Cancelled`. Only the amount actually deposited for **that** payment is
+returned — unrelated funds pooled in the contract are never touched — and a payment with no
+installment history transfers nothing. `expire_payment` already behaves this way.
 
 ### Escrowed Payments
 
@@ -165,11 +173,89 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 
 | Function                                                                                                               | Description                                                                                |
 | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `create_metered_subscription(merchant, customer, token, price_per_unit, unit_name, billing_cap, max_units_per_period)` | Create a usage-based subscription billed per reported unit. Returns the `subscription_id`. |
+| `create_metered_subscription(merchant, customer, price_per_unit, unit_name, token, billing_cap, max_units_per_period)` | Create a usage-based subscription billed per reported unit. Returns the `subscription_id`. |
 | `report_usage(merchant, subscription_id, units)`                                                                       | Merchant reports consumed units to be billed in the next cycle.                            |
 | `execute_metered_billing(subscription_id)`                                                                             | Bill the customer for all accumulated usage since the last billing cycle.                  |
-| `set_billing_cap(admin, subscription_id, cap)`                                                                         | Set an upper billing limit per cycle to protect the customer.                              |
+| `set_billing_cap(merchant, subscription_id, cap)`                                                                      | Set an upper billing limit per cycle to protect the customer.                              |
 | `get_current_usage(subscription_id)`                                                                                   | Return the current accumulated usage for a metered subscription.                           |
+
+#### How Metered Billing Works
+
+Metered billing charges a customer for **what they actually consume** instead of a fixed
+recurring amount. A metered subscription keeps a running counter of usage units; a billing
+call converts that counter into a token charge and resets it. It is a separate mechanism
+from `create_subscription` / `execute_recurring_payment` — metered subscriptions have their
+own ID space (starting at `1`, tracked by `MeteredCounter`) and their own storage, and are
+**not** touched by the recurring-payment scheduler or the dunning machinery.
+
+**Setting up a metered subscription**
+
+- `create_metered_subscription` is authorized by the **merchant** (`require_auth` on the
+  `merchant` argument) and reverts while the contract or that merchant is paused. It stores
+  `price_per_unit` (token base units charged per unit), a free-text `unit_name` (e.g.
+  `"api_call"`, `"gb"`), the settlement `token`, an optional `billing_cap`, and an optional
+  `max_units_per_period`.
+- The customer must keep a token allowance (`approve`) for the contract large enough to
+  cover each billing cycle — billing pulls funds with `transfer_from`.
+
+**Reporting usage**
+
+- `report_usage(merchant, subscription_id, units)` is the only way usage enters the
+  contract. It is authorized by the **subscription's merchant**; any other caller is
+  rejected with `Unauthorized`, and an unknown `subscription_id` returns
+  `SubscriptionError::MeteredNotFound`.
+- Reported units are **added** to `accumulated_units`, so multiple reports within a cycle
+  accumulate (`report_usage(5)` then `report_usage(3)` ⇒ `accumulated_units == 8`). The
+  addition is **saturating** — the counter never wraps past `u64::MAX`.
+- If `max_units_per_period` is set, a report that would push `accumulated_units` above that
+  ceiling is rejected with `UsageCapExceeded` and nothing is recorded.
+- Each successful report emits `UsageReported { subscription_id, units, accumulated }`.
+
+**How the billed amount is computed**
+
+When `execute_metered_billing(subscription_id)` runs:
+
+1. `units_billed = accumulated_units` at call time. If it is `0`, the call returns `0`
+   immediately — no tokens move and no event is emitted.
+2. `amount = units_billed * price_per_unit`, using checked multiplication. If the product
+   would overflow `i128`, the call returns `PaymentError::BillingOverflow` and **leaves all
+   subscription state unchanged** (the accumulated units are preserved so the merchant can
+   lower `price_per_unit` and retry).
+3. If a `billing_cap` is set and `amount > cap`, the charge is clamped to `cap` and a
+   `BillingCapReached { subscription_id, cap }` event is emitted. `amount == cap` is **not**
+   treated as hitting the cap (the full amount transfers, no cap event). The cap is applied
+   to whatever units are pending at billing time, so a cap added by `set_billing_cap` after
+   usage has already accumulated still limits that next charge.
+4. The final `amount` is transferred `customer → merchant` with `transfer_from` on the
+   subscription's token.
+5. `accumulated_units` is reset to `0` and `last_reset_at` is set to the current ledger
+   timestamp.
+6. `MeteredBillingExecuted { subscription_id, amount, units_billed }` is emitted and
+   `amount` is returned.
+
+`set_billing_cap(merchant, subscription_id, cap)` is merchant-authorized (customer or any
+other caller ⇒ `Unauthorized`) and sets `billing_cap = Some(cap)` for all future cycles.
+`get_current_usage` returns the full `MeteredSubscription` record — `accumulated_units`,
+`billing_cap`, `last_reset_at`, `price_per_unit`, `unit_name`, `max_units_per_period`.
+
+**Billing cycle boundaries**
+
+- There is **no on-chain scheduler** for metered billing. A "cycle" is just the span
+  between two `execute_metered_billing` calls; whoever operates the subscription (typically
+  the merchant, off-chain) decides when to run it — e.g. once per calendar month.
+- `execute_metered_billing` is **permissionless**: it takes no caller and requires no auth
+  (it only checks that the subscription's merchant is not paused). Funds can still only
+  flow from the customer to that merchant, for units the merchant itself reported, bounded
+  by the customer's token allowance and the optional cap.
+- Each billing call closes the current cycle: it charges for **exactly** the units
+  accumulated since the previous reset and then zeroes the counter. Units reported after a
+  billing call belong only to the next cycle — cycles never double-count or roll a balance
+  forward (`report 5 → bill (50) → report 3 → bill (30)`).
+- `last_reset_at` records when the most recent cycle closed and is the authoritative marker
+  of the current cycle's start. There is no stored `period_end`; period length is a policy
+  choice of the operator, not enforced by the contract.
+- Usage accumulated but not yet billed when a cycle "should" have ended is never lost — the
+  next `execute_metered_billing` still charges for all of it.
 
 ### Dunning (Failed Payment Recovery)
 
@@ -497,6 +583,7 @@ Key types referenced by the functions above:
 - **`PaymentStatus`** — `Pending | Completed | Refunded | PartialRefunded | Cancelled`
 - **`Currency`** — `XLM | USDC | USDT | BTC | ETH`
 - **`Subscription`** — full subscription record including trial, pause, and dunning state.
+- **`MeteredSubscription`** — usage-based subscription record: `subscription_id`, `merchant`, `customer`, `token`, `price_per_unit`, `unit_name`, `accumulated_units`, `billing_cap`, `last_reset_at`, `max_units_per_period`.
 - **`PaymentChannel`** — off-chain channel state including deposited balance and settlement nonce.
 - **`MultiSigConfig`** — admin list, required signatures, and proposal TTL.
 

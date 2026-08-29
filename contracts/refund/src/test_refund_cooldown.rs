@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger as _},
+    Address, Env, String,
+};
 
 #[test]
 fn test_refund_cooldown_blocks_second_request() {
@@ -26,19 +29,17 @@ fn test_refund_cooldown_blocks_second_request() {
     );
 
     env.ledger().set_timestamp(1000);
-    client
-        .request_refund(
-            &merchant,
-            &1u64,
-            &customer,
-            &100i128,
-            &1000i128,
-            &token,
-            &String::from_str(&env, "first"),
-            &RefundReasonCode::Other,
-            &1000u64,
-        )
-        .unwrap();
+    client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "first"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
 
     env.ledger().set_timestamp(2000);
     let result = client.try_request_refund(
@@ -81,32 +82,28 @@ fn test_refund_cooldown_allows_after_window() {
     );
 
     env.ledger().set_timestamp(1000);
-    client
-        .request_refund(
-            &merchant,
-            &1u64,
-            &customer,
-            &100i128,
-            &1000i128,
-            &token,
-            &String::from_str(&env, "first"),
-            &RefundReasonCode::Other,
-            &1000u64,
-        )
-        .unwrap();
+    client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "first"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
 
     env.ledger().set_timestamp(5000);
-    client
-        .request_refund(
-            &merchant,
-            &2u64,
-            &customer,
-            &100i128,
-            &1000i128,
-            &token,
-            &String::from_str(&env, "second"),
-            &RefundReasonCode::Other,
-            &1000u64,
-        )
-        .unwrap();
+    client.request_refund(
+        &merchant,
+        &2u64,
+        &customer,
+        &100i128,
+        &1000i128,
+        &token,
+        &String::from_str(&env, "second"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
 }
