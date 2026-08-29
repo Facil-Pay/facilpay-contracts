@@ -67,7 +67,10 @@ fn test_circuit_breaker_trips_when_rate_exceeded() {
         &RefundReasonCode::Other,
         &0u64,
     );
-    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircuitBreakerTripped))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Core(CoreError::CircuitBreakerTripped)))
+    );
 
     let state = client.get_circuit_breaker_state();
     assert!(state.tripped);
@@ -108,7 +111,10 @@ fn test_tripped_breaker_blocks_new_requests() {
         &RefundReasonCode::Other,
         &0u64,
     );
-    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircuitBreakerTripped))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Core(CoreError::CircuitBreakerTripped)))
+    );
 }
 
 #[test]

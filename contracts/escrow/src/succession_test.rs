@@ -115,10 +115,7 @@ fn succession_to_zero_address_is_rejected() {
 
     env.ledger().set_timestamp(12_000);
     let result = client.try_designate_successor(&admin, &zero, &60_u64);
-    assert_eq!(
-        result,
-        Err(Ok(Error::Basic(BasicError::InvalidAddress)))
-    );
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::InvalidAddress))));
     assert!(client.get_succession_plan().is_none());
 }
 
@@ -128,10 +125,7 @@ fn succession_to_self_is_rejected() {
 
     env.ledger().set_timestamp(14_000);
     let result = client.try_designate_successor(&admin, &admin, &60_u64);
-    assert_eq!(
-        result,
-        Err(Ok(Error::Action(ActionError::SameBeneficiary)))
-    );
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::SameBeneficiary))));
     assert!(client.get_succession_plan().is_none());
 }
 

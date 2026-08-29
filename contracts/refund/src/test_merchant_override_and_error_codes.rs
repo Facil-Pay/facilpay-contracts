@@ -1,9 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{
-    testutils::Address as _, testutils::Ledger, Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String};
 
 fn setup(env: &Env) -> (RefundContractClient, Address) {
     let contract_id = env.register(RefundContract, ());
@@ -92,7 +90,7 @@ fn test_error_code_101_overlap_across_contracts() {
     // Same numeric code, different semantic meanings
 
     let payment_101 = 101u32; // MetadataTooLarge
-    let escrow_101 = 101u32;  // NotAnAdmin
+    let escrow_101 = 101u32; // NotAnAdmin
 
     assert_eq!(payment_101, escrow_101);
     // This overlap can cause confusion when debugging cross-contract calls
@@ -155,16 +153,16 @@ fn test_auto_refund_blocked_by_merchant_override_flag() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
     // Set up an auto-refund trigger that would normally fire
-    let condition = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: env.ledger().timestamp() + 1000,
-        }
-    );
+    let condition = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: env.ledger().timestamp() + 1000,
+    });
 
     let trigger_id = client.register_auto_refund_trigger(
         &merchant,
@@ -201,15 +199,15 @@ fn test_merchant_override_prevents_timeout_auto_refund() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
-    let condition = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: deadline,
-        }
-    );
+    let condition = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: deadline,
+    });
 
     let trigger_id = client.register_auto_refund_trigger(
         &merchant,
@@ -248,22 +246,18 @@ fn test_merchant_override_flag_persistence() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
-    let condition = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: deadline,
-        }
-    );
+    let condition = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: deadline,
+    });
 
-    let trigger_id = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id,
-        &condition,
-        &7500u32,
-    );
+    let trigger_id =
+        client.register_auto_refund_trigger(&merchant, &payment_id, &condition, &7500u32);
 
     // There is no dedicated "deactivate" entry point; the only way a trigger
     // becomes inactive today is by firing through `evaluate_auto_refund`.
@@ -295,27 +289,23 @@ fn test_contract_state_auto_refund_respects_merchant_override() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
     let state_key = BytesN::from_array(&env, &[0u8; 32]);
     let expected_value = Bytes::new(&env);
 
-    let condition = AutoRefundCondition::ContractStateMatch(
-        ContractStateMatchCondition {
-            contract: external_contract,
-            key: state_key,
-            expected: expected_value,
-        }
-    );
+    let condition = AutoRefundCondition::ContractStateMatch(ContractStateMatchCondition {
+        contract: external_contract,
+        key: state_key,
+        expected: expected_value,
+    });
 
-    let trigger_id = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id,
-        &condition,
-        &6000u32,
-    );
+    let trigger_id =
+        client.register_auto_refund_trigger(&merchant, &payment_id, &condition, &6000u32);
 
     let trigger = client.get_auto_refund_trigger(&trigger_id);
     assert_eq!(trigger.trigger_id, trigger_id);
@@ -340,22 +330,18 @@ fn test_merchant_override_creates_audit_log() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
-    let condition = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: env.ledger().timestamp() + 2000,
-        }
-    );
+    let condition = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: env.ledger().timestamp() + 2000,
+    });
 
-    let _trigger_id = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id,
-        &condition,
-        &8000u32,
-    );
+    let _trigger_id =
+        client.register_auto_refund_trigger(&merchant, &payment_id, &condition, &8000u32);
 
     // When merchant sets override, it should create an audit entry
     // Current implementation doesn't have this feature
@@ -388,33 +374,21 @@ fn test_multiple_triggers_selective_override() {
     client.set_payment_contract_address(&admin, &payment_contract);
 
     // Trigger 1: left pending (not evaluated)
-    let condition_1 = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: env.ledger().timestamp() + 1000,
-        }
-    );
+    let condition_1 = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: env.ledger().timestamp() + 1000,
+    });
 
-    let trigger_1 = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id_1,
-        &condition_1,
-        &5000u32,
-    );
+    let trigger_1 =
+        client.register_auto_refund_trigger(&merchant, &payment_id_1, &condition_1, &5000u32);
 
     // Trigger 2: fires once its deadline has passed
     let deadline_2 = env.ledger().timestamp() + 1000;
-    let condition_2 = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: deadline_2,
-        }
-    );
+    let condition_2 = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: deadline_2,
+    });
 
-    let trigger_2 = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id_2,
-        &condition_2,
-        &5000u32,
-    );
+    let trigger_2 =
+        client.register_auto_refund_trigger(&merchant, &payment_id_2, &condition_2, &5000u32);
 
     env.ledger().with_mut(|li| {
         li.timestamp = deadline_2 + 1;
@@ -443,7 +417,9 @@ fn test_merchant_override_flag_with_refund_policy() {
 
     let payment_contract = install_mock_payment_contract(
         &env,
-        &[sample_payment(&env, payment_id, &merchant, &customer, &token)],
+        &[sample_payment(
+            &env, payment_id, &merchant, &customer, &token,
+        )],
     );
     client.set_payment_contract_address(&admin, &payment_contract);
 
@@ -464,18 +440,12 @@ fn test_merchant_override_flag_with_refund_policy() {
     client.set_refund_policy(&merchant, &tiers);
 
     // Register auto-refund trigger
-    let condition = AutoRefundCondition::FulfillmentTimeout(
-        FulfillmentTimeoutCondition {
-            fulfillment_deadline: env.ledger().timestamp() + 5000,
-        }
-    );
+    let condition = AutoRefundCondition::FulfillmentTimeout(FulfillmentTimeoutCondition {
+        fulfillment_deadline: env.ledger().timestamp() + 5000,
+    });
 
-    let trigger_id = client.register_auto_refund_trigger(
-        &merchant,
-        &payment_id,
-        &condition,
-        &10000u32,
-    );
+    let trigger_id =
+        client.register_auto_refund_trigger(&merchant, &payment_id, &condition, &10000u32);
 
     // Verify policy exists
     let policy = client.get_refund_policy(&merchant).unwrap();

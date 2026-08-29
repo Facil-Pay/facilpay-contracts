@@ -1,7 +1,9 @@
 #![cfg(test)]
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
-use crate::{Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError, SubscriptionStatus};
+use crate::{
+    Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError, SubscriptionStatus,
+};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address) {
     let env = Env::default();

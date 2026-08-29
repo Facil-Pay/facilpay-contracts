@@ -31,7 +31,7 @@ fn create_completed_payment_with_fee(
     client.set_fee_config(
         admin,
         &FeeConfig {
-            fee_bps: 100,      // 1 %
+            fee_bps: 100, // 1 %
             min_fee: 0,
             max_fee: 0,
             treasury: admin.clone(),

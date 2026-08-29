@@ -241,7 +241,10 @@ fn test_settle_channel_rejects_negative_merchant_amount() {
     );
 
     let channel = client.get_channel(&channel_id);
-    assert!(channel.open, "channel must remain open on rejected settlement");
+    assert!(
+        channel.open,
+        "channel must remain open on rejected settlement"
+    );
 }
 
 #[test]

@@ -1,8 +1,11 @@
 #![cfg(test)]
 
 use crate::*;
-use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
 use crate::*;
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    token, Address, Env,
+};
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
     env.mock_all_auths();
@@ -29,8 +32,7 @@ fn make_disputed_escrow(
 ) -> u64 {
     env.ledger().set_timestamp(1000);
     let escrow_id = client.create_escrow(
-        customer, merchant, &1000i128, token,
-        &9000u64, &0u64, &0u64, &false,
+        customer, merchant, &1000i128, token, &9000u64, &0u64, &0u64, &false,
     );
     client.dispute_escrow(customer, &escrow_id);
     escrow_id
@@ -62,7 +64,10 @@ fn test_trigger_timeout_fails_before_deadline() {
     // Only 100s elapsed, timeout=300
     env.ledger().set_timestamp(1600);
     let result = client.try_trigger_timeout_resolution(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::TimeoutNotReached))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::TimeoutNotReached)))
+    );
 }
 
 #[test]

@@ -1082,7 +1082,8 @@ fn test_status_queries_and_counts() {
     // Rejection first enters the appeal window (PendingAppeal); advance past
     // it and finalize so r2 reaches the terminal Rejected status.
     let r2_refund = client.get_refund(&r2);
-    env.ledger().set_timestamp(r2_refund.appeal_deadline.unwrap());
+    env.ledger()
+        .set_timestamp(r2_refund.appeal_deadline.unwrap());
     client.finalize_denial(&r2);
 
     assert_eq!(
@@ -1403,7 +1404,10 @@ fn test_reason_code_analytics_cache_invalidated_on_process_within_window() {
 
     // Populate the cache for the full window before this refund is processed.
     let analytics = client.get_reason_code_analytics(&0u64, &u64::MAX);
-    assert_eq!(analytics.get(0).unwrap(), (RefundReasonCode::ProductDefect, 1u64));
+    assert_eq!(
+        analytics.get(0).unwrap(),
+        (RefundReasonCode::ProductDefect, 1u64)
+    );
 
     client.approve_refund(&admin, &refund_id);
     client.process_refund(&admin, &refund_id);
