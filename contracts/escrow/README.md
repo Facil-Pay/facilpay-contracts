@@ -245,5 +245,82 @@ set_sub_account_fee_override(merchant, escrow_id, sub_id, fee_bps_override)
 | `SubAccountFundingExceedsEscrow`    | 216  | Total sub-account allocations would exceed the parent escrow amount  |
 
 ---
+
+## Swap Flow
+
+Escrow swaps are a controlled token conversion for a locked escrow. They are designed for a merchant or admin to convert an escrow's current `source_token` into a new `target_token` while preserving the escrow's lifecycle and preventing accidental low-value swaps.
+
+### Who can configure and execute a swap
+
+- `configure_escrow_swap(merchant_or_admin, escrow_id, target_token, min_output, oracle)`
+  - allowed for the escrow merchant or any current admin
+  - the escrow must still be in the `Locked` state
+  - the swap config is stored per escrow and can only be executed once
+- `execute_escrow_swap(caller, escrow_id)`
+  - allowed for the same callers as above
+  - checks the previously configured oracle and minimum output threshold
+  - updates the escrow token and amount in place after successful execution
+
+### Supported tokens and pricing
+
+- The escrow's source token is the token already stored on the escrow record.
+- The target token is arbitrary as long as it is a valid `Address`; the contract does not hard-code a whitelist. In practice, this is used for a configured conversion path such as USDC -> EURC or USDC -> XLM depending on the oracle and target address.
+- Pricing is taken from the configured oracle via `get_rate()`, which returns a `1e7` fixed-point value. The contract computes:
+
+```rust
+output_amount = (escrow.amount * rate) / 10_000_000;
+```
+
+- `min_output_amount` acts as slippage protection. If `output_amount < min_output_amount`, execution reverts with `SwapOutputBelowMinimum` and the escrow is not mutated.
+- The swap is not a true on-chain AMM swap; it is a contract-level conversion that updates the escrow's recorded `token` and `amount` to the newly computed value once the oracle output is accepted.
+
+### Execution guarantees
+
+- `SwapAlreadyExecuted` rejects a second execution of the same escrow swap.
+- `SwapConfigNotFound` rejects attempts to execute before configuration.
+- `Unauthorized` rejects non-merchant, non-admin callers.
+- The escrow's status must remain `Locked` during execution; once executed, the change is persisted to storage and the config is marked as executed.
+
+---
+
+## Health Monitoring
+
+The escrow contract exposes a health check for off-chain monitoring and admin review rather than for on-chain settlement. The public surface is `get_escrow_health(escrow_id)` and `get_stale_escrows(limit)`, backed by `set_stale_threshold(...)`.
+
+### What it verifies
+
+`get_escrow_health` classifies a single escrow using the configured thresholds:
+
+- `Disputed` if the escrow status is already in dispute
+- `Expired` if `expiry_timestamp != 0` and `now >= expiry_timestamp`
+- `NearExpiry` if the escrow is still active but within the configured safety window
+- `Stale` if the escrow has been inactive longer than `inactivity_seconds`
+- `Healthy` otherwise
+
+The health report also includes:
+
+- `last_activity` — the escrow's last recorded activity timestamp
+- `seconds_until_expiry` — the remaining time until expiry, or `None` if the escrow has no expiry
+
+### Intended caller
+
+This is primarily for:
+
+- off-chain monitoring services and indexers
+- admin dashboards checking stale or near-expiry escrows
+- operational automation that decides whether to escalate or investigate a lock
+
+The contract is intentionally read-only here; health checks do not mutate escrow state or resolve disputes. They are a verification and reporting utility, not an approval or release path.
+
+### Threshold configuration
+
+`set_stale_threshold(admin, config)` stores:
+
+- `inactivity_seconds` — how long an escrow can remain idle before it is considered stale
+- `near_expiry_buffer_seconds` — how close to expiry it must be before it is labelled `NearExpiry`
+
+If no threshold has been configured, `get_escrow_health` and `get_stale_escrows` panic with `StaleThresholdNotConfigured`.
+
+---
 [⬅ Back to Main README](../../README.md)
 
