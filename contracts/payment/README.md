@@ -59,6 +59,24 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `get_payment_count_by_merchant(merchant)`  | Total number of payments for a merchant.                   |
 | `get_merchant_payments(merchant, page)`    | Alternative paginated index of payment IDs for a merchant. |
 
+### Analytics
+
+Payment analytics are exposed through read-only query functions. Aggregate records are maintained independently for the whole payment contract, for each merchant, and for each customer; querying one scope does not combine or leak records from another scope. Amount and volume fields use the token amount type `i128`, while counts and timestamps use unsigned integers.
+
+| Function | Scope and return value |
+| --- | --- |
+| `get_payment_analytics()` | **Contract-wide.** Returns `PaymentAnalytics`: `total_payments_created`, `total_payments_completed`, `total_payments_cancelled`, `total_payments_refunded`, `total_volume`, `total_refunded_volume`, `unique_customers`, and `unique_merchants`. |
+| `get_merchant_analytics(merchant)` | **Per merchant.** Returns `MerchantAnalytics`: `total_payments`, `total_volume`, `total_completed`, `total_cancelled`, `total_refunded`, and `total_refunded_volume` for the supplied merchant address. |
+| `get_merchant_total_volume(merchant)` | **Per merchant.** Returns the merchant's `total_volume` as `i128`. |
+| `get_customer_analytics(customer)` | **Per customer.** Returns `CustomerAnalytics`: `total_payments`, `total_volume`, `total_refunds`, `avg_transaction_size`, `peak_hour`, `top_merchant`, `top_merchant_volume`, `first_payment_at`, and `last_payment_at`. `top_merchant` is the merchant with the greatest recorded customer volume, when one exists. |
+| `get_customer_top_merchants(customer, limit)` | **Per customer.** Returns up to `limit` `(merchant, total_volume)` pairs, sorted by descending customer spending volume. |
+| `get_customer_monthly_volume(customer, month_timestamp)` | **Per customer and month.** Returns the customer's total spending volume for the month bucket beginning at `month_timestamp` as `i128`. |
+| `get_merchant_analytics_range(merchant, from, to)` | **Per merchant and hour.** Returns recorded `AnalyticsBucket` values for hourly buckets in the half-open range `[from, to)`. Each bucket contains `bucket_start`, `bucket_end`, `total_payments`, `total_volume`, `total_refunds`, and `failed_count`. It returns an error when `from >= to`. |
+| `get_platform_analytics_daily(day_timestamp)` | **Contract-wide and day.** Returns the `AnalyticsBucket` for the epoch-aligned day containing `day_timestamp`, with daily `total_payments`, `total_volume`, `total_refunds`, and `failed_count` plus the bucket boundaries. |
+| `get_top_merchants_by_volume(limit)` | **Contract-wide ranking.** Returns up to `limit` `(merchant, total_volume)` pairs for all registered merchants, sorted by descending total volume. |
+
+If a requested aggregate has no recorded data, the contract returns a zero-valued default for that aggregate. The daily platform query accepts any timestamp in the target day, while monthly customer queries must use the start timestamp of the intended month bucket.
+
 ### Scheduled Payments
 
 | Function                                                            | Description                                                                            |
