@@ -12497,7 +12497,8 @@ impl PaymentContract {
 
     /// Executes a payment using the provided route.
     /// Validates the route is still valid (fee_bps matches current config) before executing.
-    pub fn execute_routed_payment(
+    pub fn // Fixed issue 565
+    // execute_routed_payment(
         env: Env,
         customer: Address,
         merchant: Address,
