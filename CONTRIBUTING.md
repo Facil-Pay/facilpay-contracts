@@ -4,7 +4,7 @@ Thank you for your interest in contributing to FacilPay! We welcome contribution
 
 ## 📜 Code of Conduct
 
-By participating in this project, you agree to maintain a respectful and inclusive environment for all contributors.
+This project follows the [Contributor Covenant Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code. Please report unacceptable behavior to the project maintainers.
 
 ## 🚀 Getting Started
 
@@ -38,6 +38,44 @@ Before you begin, ensure you have:
    ```bash
    cargo test --workspace
    ```
+### Makefile Targets
+
+The root `Makefile` provides several helpful targets to streamline development. Run these using `make <target>`.
+
+| Target | Description | When to Use |
+|--------|-------------|-------------|
+| `build` | Compiles the smart contracts using `stellar contract build` and checks the WASM sizes. | Use this whenever you want to compile your code and verify the output artifacts don't exceed size limits. |
+| `test` | Runs the full `build` target, followed by `cargo test` to execute all tests. | Use this to verify that your contracts compile successfully and all tests pass. |
+| `fmt` | Runs `cargo fmt --all` to format the workspace code. | Use this before committing to ensure your code adheres to standard Rust formatting guidelines. |
+| `clean` | Runs `cargo clean` to remove the generated `target/` directory and build artifacts. | Use this to free up disk space or if you want to ensure a completely fresh build from scratch. |
+| `check-size` | Checks the size of compiled `.wasm` artifacts against the `262144` bytes limit. | Runs automatically during `make build`. Use this manually if you just want to verify sizes without recompiling. |
+
+### WASM Size Limit
+
+Soroban networks enforce a maximum contract deployment size of **256 KB** (262,144 bytes). The `check-size` target enforces this limit to ensure contracts remain deployable on Stellar.
+
+**Why this limit exists:** Soroban caps WASM blob size to keep ledger storage manageable and maintain network performance. A contract that exceeds it will be rejected at deployment by the Stellar network.
+
+**If `make build` or `make check-size` fails with a size error:**
+
+1. Check which contract exceeded the limit — the error message prints the file path and size.
+2. **Build in release mode** — the default `stellar contract build` already compiles with optimizations.
+3. **Strip debug symbols** — add `strip = true` to the release profile in `Cargo.toml`:
+   ```toml
+   [profile.release]
+   strip = true
+   ```
+4. **Optimize for size** — add `opt-level = "z"` and `lto = true` in the release profile:
+   ```toml
+   [profile.release]
+   opt-level = "z"
+   lto = true
+   ```
+5. **Audit dependencies** — run `cargo bloat --crates` to identify large dependencies and consider lighter alternatives.
+6. **Minimize contract exports** — only export the Soroban functions you need; avoid pulling in unused SDK features.
+7. **Remove unused code** — use `cargo deadlinks` or review for dead code that the linker may still include.
+
+After making changes, run `make build` to re-check the size.
 
 ## 🔄 Development Workflow
 

@@ -1,26 +1,28 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, token, Address, Env, String};
 
-fn setup(env: &Env) -> (RefundContractClient, Address) {
+fn setup(env: &Env) -> (RefundContractClient, Address, Address) {
     let contract_id = env.register(RefundContract, ());
     let client = RefundContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     env.mock_all_auths();
     client.initialize(&admin);
-    (client, admin)
+    (client, admin, contract_id)
 }
 
 fn create_refund_and_issue_voucher(
     env: &Env,
     client: &RefundContractClient,
     admin: &Address,
+    contract_id: &Address,
     expiry_seconds: u64,
 ) -> (u64, u64) {
     let merchant = Address::generate(env);
     let customer = Address::generate(env);
-    let token = Address::generate(env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    token::StellarAssetClient::new(env, &token).mint(contract_id, &1_000_000);
     let amount = 1000_i128;
     let payment_id = 1_u64;
     let reason = String::from_str(env, "defective product");
@@ -45,11 +47,11 @@ fn create_refund_and_issue_voucher(
 fn test_redeem_voucher_before_expiry_succeeds() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin) = setup(&env);
+    let (client, admin, contract_id) = setup(&env);
 
     // Issue a voucher expiring 1000s from now
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, 1000);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
 
     // Redeem before expiry (at t=1500, expires at t=2000)
     env.ledger().set_timestamp(1500);
@@ -68,11 +70,11 @@ fn test_redeem_voucher_before_expiry_succeeds() {
 fn test_redeem_expired_voucher_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin) = setup(&env);
+    let (client, admin, contract_id) = setup(&env);
 
     // Issue a voucher expiring 500s from t=1000 → expires at t=1500
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, 500);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 500);
 
     // Advance past expiry
     env.ledger().set_timestamp(1501);
@@ -88,11 +90,11 @@ fn test_redeem_expired_voucher_fails() {
 fn test_redeem_voucher_at_exact_expiry_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin) = setup(&env);
+    let (client, admin, contract_id) = setup(&env);
 
     // Issue a voucher expiring 300s from t=1000 → expires at t=1300
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, 300);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 300);
 
     // At exactly the expiry timestamp the voucher is expired (> check uses >)
     env.ledger().set_timestamp(1300);
@@ -112,10 +114,10 @@ fn test_redeem_voucher_at_exact_expiry_fails() {
 fn test_already_redeemed_voucher_cannot_be_redeemed_again() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin) = setup(&env);
+    let (client, admin, contract_id) = setup(&env);
 
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, 1000);
+    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
 
     let customer = client.get_voucher(&voucher_id).unwrap().customer;
 

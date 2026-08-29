@@ -115,7 +115,7 @@ fn test_refund_count_cap_exceeded() {
         &0,
     );
     assert!(res3.is_err());
-    assert_eq!(res3.unwrap_err().unwrap(), Error::RefundCountCapExceeded);
+    assert_eq!(res3.unwrap_err().unwrap(), Error::Ext(ExtError::RefundCountCapExceeded));
 }
 
 #[test]
@@ -183,7 +183,7 @@ fn test_refund_amount_cap_exceeded() {
         &0,
     );
     assert!(res3.is_err());
-    assert_eq!(res3.unwrap_err().unwrap(), Error::RefundAmountCapExceeded);
+    assert_eq!(res3.unwrap_err().unwrap(), Error::Ext(ExtError::RefundAmountCapExceeded));
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn test_cumulative_amount_enforcement() {
         &0,
     );
     assert!(res3.is_err());
-    assert_eq!(res3.unwrap_err().unwrap(), Error::RefundAmountCapExceeded);
+    assert_eq!(res3.unwrap_err().unwrap(), Error::Ext(ExtError::RefundAmountCapExceeded));
 
     // But 250 should succeed (cumulative: 1000)
     let res4 = client.try_request_refund(
@@ -464,7 +464,7 @@ fn test_unauthorized_set_cap() {
     // Attempt to set cap as non-admin
     let res = client.try_set_payment_refund_cap(&unauthorized, &cap);
     assert!(res.is_err());
-    assert_eq!(res.unwrap_err().unwrap(), Error::Unauthorized);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Core(CoreError::Unauthorized));
 }
 
 #[test]
@@ -487,7 +487,7 @@ fn test_invalid_payment_id_cap() {
 
     let res = client.try_set_payment_refund_cap(&admin, &cap);
     assert!(res.is_err());
-    assert_eq!(res.unwrap_err().unwrap(), Error::InvalidPaymentId);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Core(CoreError::InvalidPaymentId));
 }
 
 #[test]
@@ -541,7 +541,7 @@ fn test_exact_boundary_amount() {
         &0,
     );
     assert!(res2.is_err());
-    assert_eq!(res2.unwrap_err().unwrap(), Error::RefundAmountCapExceeded);
+    assert_eq!(res2.unwrap_err().unwrap(), Error::Ext(ExtError::RefundAmountCapExceeded));
 }
 
 #[test]
@@ -609,5 +609,5 @@ fn test_exact_boundary_count() {
         &0,
     );
     assert!(res3.is_err());
-    assert_eq!(res3.unwrap_err().unwrap(), Error::RefundCountCapExceeded);
+    assert_eq!(res3.unwrap_err().unwrap(), Error::Ext(ExtError::RefundCountCapExceeded));
 }

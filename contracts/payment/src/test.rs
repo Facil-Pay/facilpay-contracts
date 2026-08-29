@@ -172,6 +172,37 @@ fn test_trigger_advances_period_and_resets_accumulated() {
 }
 
 #[test]
+fn test_complete_payment_honors_payout_schedule() {
+    let env = Env::default();
+    let (client, admin, contract_id) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &token).mint(&customer, &250);
+    token::Client::new(&env, &token).approve(&customer, &contract_id, &250, &10000);
+
+    client.set_payout_schedule(&merchant, &PayoutFrequency::Daily, &token);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &250,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    assert_eq!(client.get_accumulated_balance(&merchant), 250);
+    assert_eq!(token::Client::new(&env, &token).balance(&merchant), 0);
+}
+
+#[test]
 #[should_panic]
 fn test_rate_limit_exceeded_within_window() {
     let env = Env::default();
@@ -864,6 +895,64 @@ fn test_redeem_points_fails_when_points_are_expired() {
     assert_eq!(
         result.unwrap_err().unwrap(),
         Error::Feature(FeatureError::PointsExpired)
+    );
+}
+
+#[test]
+fn test_redeem_points_cumulative_50_percent_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_contract_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_contract_id);
+    let token_user_client = token::Client::new(&env, &token_contract_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let amount = 1000_i128;
+
+    client.initialize(&admin);
+    client.configure_loyalty(
+        &admin,
+        &LoyaltyConfig {
+            points_per_unit: 10,
+            redemption_rate: 10,
+            expiry_seconds: 3600,
+            active: true,
+        },
+    );
+
+    token_client.mint(&customer, &amount);
+    token_user_client.approve(&customer, &contract_id, &amount, &1000);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token_contract_id,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    let first = client.redeem_points(&customer, &30, &payment_id);
+    assert_eq!(first, 300);
+
+    let second = client.redeem_points(&customer, &30, &payment_id);
+    assert_eq!(second, 200);
+
+    let third = client.try_redeem_points(&customer, &1, &payment_id);
+    assert_eq!(
+        third,
+        Err(Ok(Error::Feature(FeatureError::InsufficientPoints)))
     );
 }
 
@@ -2414,6 +2503,76 @@ fn test_payment_expired_event_emitted() {
 
     let last_event = events.last().unwrap();
     let _data = &last_event.2;
+}
+
+#[test]
+fn test_expire_payment_refunds_only_deposited_installments() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    let token_client = token::Client::new(&env, &token);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let pool_funder = Address::generate(&env);
+    let amount = 1000_i128;
+    let expiration_duration = 10_u64;
+
+    token_admin_client.mint(&customer, &amount);
+    token_admin_client.mint(&pool_funder, &amount);
+    token_client.approve(&customer, &contract_id, &amount, &1000);
+
+    // Unrelated tokens sitting in the contract pool.
+    token_client.transfer(&pool_funder, &contract_id, &amount);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &Currency::USDC,
+        &expiration_duration,
+        &String::from_str(&env, ""),
+    );
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+
+    let customer_before = token_client.balance(&customer);
+    client.expire_payment(&payment_id);
+    let customer_after = token_client.balance(&customer);
+
+    assert_eq!(customer_after - customer_before, 0);
+    assert_eq!(token_client.balance(&contract_id), amount);
+
+    let payment_id2 = client.create_payment(
+        &customer,
+        &merchant,
+        &amount,
+        &token,
+        &Currency::USDC,
+        &expiration_duration,
+        &String::from_str(&env, ""),
+    );
+    client.pay_installment(&customer, &payment_id2, &300);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + expiration_duration + 1);
+
+    let customer_before2 = token_client.balance(&customer);
+    client.expire_payment(&payment_id2);
+    let customer_after2 = token_client.balance(&customer);
+
+    assert_eq!(customer_after2 - customer_before2, 300);
+    assert_eq!(token_client.balance(&contract_id), amount);
 }
 
 #[test]
@@ -4107,9 +4266,12 @@ fn test_complete_escrowed_payment_releases_escrow_and_merchant_funds() {
     let admin = Address::generate(&env);
     let amount = 1_000_i128;
 
-    let escrow_admin = Address::generate(&env);
     payment_client.initialize(&admin);
-    escrow_client.initialize(&escrow_admin);
+    escrow_client.initialize(&admin);
+    // `complete_escrowed_payment` releases escrow as its own contract
+    // identity, so it must be registered as a trusted bridge to bypass the
+    // escrow admin early-release timelock.
+    escrow_client.add_trusted_bridge(&admin, &payment_contract_id);
     token_admin_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
 
@@ -5124,6 +5286,18 @@ fn test_fee_deducted_from_payment_amount() {
     };
     client.set_fee_config(&admin, &fee_config);
 
+    // Disable risk-based fee surcharges so only `fee_bps` determines the fee.
+    client.set_risk_fee_config(
+        &admin,
+        &RiskFeeConfig {
+            base_fee_bps: 0,
+            large_amount_threshold: i128::MAX,
+            large_amount_surcharge_bps: 0,
+            new_customer_surcharge_bps: 0,
+            high_risk_currency_surcharge: 0,
+        },
+    );
+
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);
 
@@ -5457,7 +5631,7 @@ fn test_manual_override_allows_downgrade() {
     client.manually_set_merchant_tier(&admin, &merchant, &FeeTier::Standard);
     assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Standard);
 
-    // Subsequent completion can auto-upgrade back up based on cumulative volume.
+    // Subsequent completion should not auto-upgrade while volume stays below baseline.
     let second = client.create_payment(
         &customer,
         &merchant,
@@ -5468,7 +5642,7 @@ fn test_manual_override_allows_downgrade() {
         &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &second);
-    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Standard);
 }
 
 #[test]
@@ -5598,6 +5772,18 @@ fn test_withdraw_fees_to_treasury() {
         active: true,
     };
     client.set_fee_config(&admin, &fee_config);
+
+    // Disable risk-based fee surcharges so only `fee_bps` determines the fee.
+    client.set_risk_fee_config(
+        &admin,
+        &RiskFeeConfig {
+            base_fee_bps: 0,
+            large_amount_threshold: i128::MAX,
+            large_amount_surcharge_bps: 0,
+            new_customer_surcharge_bps: 0,
+            high_risk_currency_surcharge: 0,
+        },
+    );
 
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);
@@ -7452,7 +7638,7 @@ fn test_recurring_billing_blocked_when_merchant_paused_mid_cycle() {
     let token_addr = env.register_stellar_asset_contract(admin.clone());
     let token = token::StellarAssetClient::new(&env, &token_addr);
     token.mint(&customer, &100_000);
-    token::Client::new(&env, &token_addr).approve(&customer, &contract_id, &100_000, &100_000);
+    token::Client::new(&env, &token_addr).approve(&customer, &contract_id, &100_000, &10000);
 
     env.ledger().set_timestamp(1000);
     // Create active subscription

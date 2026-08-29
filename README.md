@@ -48,6 +48,13 @@ cargo test --workspace
 cargo test -p escrow
 cargo test -p payment
 cargo test -p refund
+
+# Test a single test file or function within a contract
+cargo test -p refund test_arbitration_fees
+cargo test -p escrow test_dispute_resolution
+
+# Run tests matching a pattern
+cargo test -p payment test_fee
 ```
 
 ## 📂 Contract Overview
@@ -100,8 +107,12 @@ Recommended migration path:
 
 ## 🔗 Links
 
-<!-- - [Website](https://facilpay.com) coming soon -->
-<!-- - [Documentation](https://docs.facilpay.com) coming soon -->
+- [Storage Versioning Guide](docs/STORAGE_VERSIONING.md)
 - Telegram: https://t.me/+afM9uh7GGtVkYmZk
 - [API Repository](https://github.com/facilpay/facilpay-api)
 - [SDK Repository](https://github.com/facilpay/facilpay-sdk)
+
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

@@ -44,7 +44,6 @@ fn test_initiate_clawback_success() {
 }
 
 #[test]
-#[should_panic]
 fn test_initiate_clawback_too_short_delay() {
     let env = Env::default();
     let contract_id = env.register(EscrowContract, ());
@@ -70,9 +69,13 @@ fn test_initiate_clawback_too_short_delay() {
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
-    let delay = 86399_u64; // just under 24h
+    let delay = 0_u64;
 
-    client.initiate_clawback(&admin, &escrow_id, &reason_hash, &delay);
+    let result = client.try_initiate_clawback(&admin, &escrow_id, &reason_hash, &delay);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::ClawbackDelayTooShort)))
+    );
 }
 
 #[test]

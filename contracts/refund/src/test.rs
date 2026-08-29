@@ -482,8 +482,10 @@ fn test_reject_requested_refund_successfully() {
 
     client.reject_refund(&admin, &refund_id, &rejection_reason);
 
+    // Rejection first enters the appeal window (PendingAppeal); it only
+    // finalizes to Rejected once the window closes via finalize_denial.
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.status, RefundStatus::PendingAppeal);
 }
 
 #[test]
@@ -811,8 +813,10 @@ fn test_reject_refund_with_empty_reason() {
 
     client.reject_refund(&admin, &refund_id, &rejection_reason);
 
+    // Rejection first enters the appeal window (PendingAppeal); it only
+    // finalizes to Rejected once the window closes via finalize_denial.
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.status, RefundStatus::PendingAppeal);
 }
 
 #[test]
@@ -846,8 +850,10 @@ fn test_reject_refund_with_detailed_reason() {
 
     client.reject_refund(&admin, &refund_id, &rejection_reason);
 
+    // Rejection first enters the appeal window (PendingAppeal); it only
+    // finalizes to Rejected once the window closes via finalize_denial.
     let refund = client.get_refund(&refund_id);
-    assert_eq!(refund.status, RefundStatus::Rejected);
+    assert_eq!(refund.status, RefundStatus::PendingAppeal);
 }
 
 #[test]
@@ -1072,6 +1078,12 @@ fn test_status_queries_and_counts() {
     client.reject_refund(&admin, &r2, &String::from_str(&env, "No"));
     client.approve_refund(&admin, &r3);
     client.process_refund(&admin, &r3);
+
+    // Rejection first enters the appeal window (PendingAppeal); advance past
+    // it and finalize so r2 reaches the terminal Rejected status.
+    let r2_refund = client.get_refund(&r2);
+    env.ledger().set_timestamp(r2_refund.appeal_deadline.unwrap());
+    client.finalize_denial(&r2);
 
     assert_eq!(
         client.get_refund_count_by_status(&RefundStatus::Requested),
@@ -1325,7 +1337,7 @@ fn test_reason_code_analytics_sorted_by_frequency() {
         &0_u64,
     );
 
-    let analytics = client.get_reason_code_analytics();
+    let analytics = client.get_reason_code_analytics(&0u64, &u64::MAX);
     assert_eq!(analytics.len(), 6);
 
     assert_eq!(
@@ -1349,6 +1361,74 @@ fn test_reason_code_analytics_sorted_by_frequency() {
         (RefundReasonCode::Unauthorized, 0u64),
     );
     assert_eq!(analytics.get(5).unwrap(), (RefundReasonCode::Other, 0u64));
+}
+
+#[test]
+fn test_reason_code_analytics_cache_invalidated_on_process_within_window() {
+    // Issue #382: a cached window's analytics must reflect refunds processed
+    // inside that window, but a cached window can otherwise be served without
+    // rescanning the whole refund history.
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "cache-test");
+
+    env.mock_all_auths();
+    client.set_fraud_config(
+        &admin,
+        &FraudConfig {
+            max_refund_rate_bps: 10000,
+            min_transactions_for_check: 100,
+            enabled: false,
+        },
+    );
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+
+    // Populate the cache for the full window before this refund is processed.
+    let analytics = client.get_reason_code_analytics(&0u64, &u64::MAX);
+    assert_eq!(analytics.get(0).unwrap(), (RefundReasonCode::ProductDefect, 1u64));
+
+    client.approve_refund(&admin, &refund_id);
+    client.process_refund(&admin, &refund_id);
+
+    let refund_id2 = client.request_refund(
+        &merchant,
+        &2u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    client.approve_refund(&admin, &refund_id2);
+    client.process_refund(&admin, &refund_id2);
+
+    // The cache entry covering this refund's requested_at must have been
+    // invalidated by processing, so the recount reflects both refunds.
+    let analytics_after = client.get_reason_code_analytics(&0u64, &u64::MAX);
+    assert_eq!(
+        analytics_after.get(0).unwrap(),
+        (RefundReasonCode::ProductDefect, 2u64),
+    );
 }
 
 #[test]
@@ -2051,7 +2131,10 @@ fn test_file_appeal_after_window_expires_should_fail() {
     );
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "rejected"));
 
-    env.ledger().set_timestamp(1_000 + 72 * 60 * 60 + 1);
+    // Default appeal window is 7 days (604800s); there is no admin setter
+    // for it, so advance just past that default rather than an assumed
+    // 72-hour window.
+    env.ledger().set_timestamp(1_000 + 604800 + 1);
     client.file_appeal(
         &customer,
         &refund_id,

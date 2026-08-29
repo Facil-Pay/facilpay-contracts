@@ -17,6 +17,7 @@ fn test_set_refund_policy_successfully() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     let tiers = Vec::from_array(
         &env,
         [RefundTier {
@@ -163,7 +164,7 @@ fn test_apply_inactive_policy_template_returns_template_inactive() {
     client.deactivate_policy_template(&admin, &template_id);
 
     let result = client.try_apply_template_to_merchant(&admin, &merchant, &template_id);
-    assert_eq!(result, Err(Ok(Error::TemplateInactive)));
+    assert_eq!(result, Err(Ok(Error::Ext(ExtError::TemplateInactive))));
 }
 
 #[test]
@@ -346,7 +347,7 @@ fn test_refund_window_expired_should_fail() {
         &payment_created_at,
     );
 
-    assert_eq!(result, Err(Ok(Error::RefundWindowExpired)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::RefundWindowExpired))));
 }
 
 #[test]
@@ -386,7 +387,7 @@ fn test_refund_percentage_exceeds_policy_should_fail() {
         &env.ledger().timestamp(),
     );
 
-    assert_eq!(result, Err(Ok(Error::RefundExceedsPolicy)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::RefundExceedsPolicy))));
 }
 
 #[test]
@@ -403,6 +404,7 @@ fn test_auto_approve_below_threshold() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     // Set policy with auto-approve for amounts <= 500
     let tiers = Vec::from_array(
         &env,
@@ -413,6 +415,7 @@ fn test_auto_approve_below_threshold() {
     );
     client.set_refund_policy(&merchant, &tiers);
     client.set_requires_admin_approval(&merchant, &false);
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     client.set_auto_approve_below(&merchant, &500i128);
 
     // Request refund for 300 (should be auto-approved)
@@ -437,6 +440,30 @@ fn test_auto_approve_below_threshold() {
 }
 
 #[test]
+fn test_auto_approve_threshold_cannot_exceed_ceiling() {
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    client.initialize(&admin);
+
+    env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &500i128);
+
+    let result = client.try_set_auto_approve_below(&merchant, &600i128);
+
+    assert_eq!(
+        result,
+        Err(Ok(Error::Core(
+            CoreError::AutoApproveThresholdExceedsCeiling
+        )))
+    );
+}
+
+#[test]
 fn test_refund_with_inactive_policy_should_fail() {
     let env = Env::default();
     let contract_id = env.register(RefundContract, ());
@@ -450,6 +477,7 @@ fn test_refund_with_inactive_policy_should_fail() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     // Set a policy
     let tiers = Vec::from_array(
         &env,
@@ -476,7 +504,7 @@ fn test_refund_with_inactive_policy_should_fail() {
         &env.ledger().timestamp(),
     );
 
-    assert_eq!(result, Err(Ok(Error::PolicyInactive)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::PolicyInactive))));
 }
 
 #[test]
@@ -694,6 +722,7 @@ fn test_request_refund_uses_global_default_when_no_merchant_policy() {
     };
     client.set_default_refund_policy(&admin, &default_policy);
     client.set_requires_admin_approval(&admin, &false);
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     client.set_auto_approve_below(&admin, &200i128);
 
     // No merchant-specific policy set; amount (100) <= auto_approve_below (200) → auto-approved
@@ -726,6 +755,7 @@ fn test_request_refund_returns_policy_not_found_when_no_policy_at_all() {
 
     client.initialize(&admin);
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Remove the default policy that initialize() set, and set NO merchant policy
     client.remove_default_refund_policy(&admin);
@@ -742,7 +772,7 @@ fn test_request_refund_returns_policy_not_found_when_no_policy_at_all() {
         &env.ledger().timestamp(),
     );
 
-    assert_eq!(result, Err(Ok(Error::PolicyNotFound)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::PolicyNotFound))));
 }
 
 #[test]
@@ -758,6 +788,7 @@ fn test_default_policy_change_does_not_affect_pending_refunds() {
 
     client.initialize(&admin);
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Submit a refund using the current default (set by initialize())
     let refund_id = client.request_refund(
@@ -792,6 +823,7 @@ fn test_default_policy_change_does_not_affect_pending_refunds() {
     };
     client.set_default_refund_policy(&admin, &new_default);
     client.set_requires_admin_approval(&admin, &false);
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     client.set_auto_approve_below(&admin, &1000i128);
 
     // The already-stored refund must NOT be retroactively changed

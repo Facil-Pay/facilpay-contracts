@@ -36,6 +36,11 @@ fn setup_env() -> (
     let admin = Address::generate(&env);
 
     payment_client.initialize(&admin);
+    escrow_client.initialize(&admin);
+    // `complete_escrowed_payment` releases escrow as its own contract
+    // identity, so it must be registered as a trusted bridge to bypass the
+    // escrow admin early-release timelock.
+    escrow_client.add_trusted_bridge(&admin, &payment_contract_id);
     token_admin_client.mint(&customer, &2000_i128);
     token::Client::new(&env, &token_contract_id).approve(
         &customer,

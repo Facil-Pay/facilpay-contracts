@@ -117,3 +117,41 @@ fn test_check_escalation_timeout_false_before_escalation() {
     env.ledger().set_timestamp(999_999);
     assert!(!client.check_escalation_timeout(&escrow_id));
 }
+
+#[test]
+fn test_process_escalation_timeouts_uses_queue() {
+    let env = Env::default();
+    let (client, admin, customer, merchant, token) = setup(&env);
+    client.set_escalation_config(&admin, &300u64, &AutoResolveFavor::Customer);
+
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    env.ledger().set_timestamp(1500);
+    client.escalate_dispute(&customer, &escrow_id);
+    env.ledger().set_timestamp(1500 + 301);
+
+    let processed = client.process_escalation_timeouts(&10_u32);
+    assert_eq!(processed, 1);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+#[test]
+fn test_process_escalation_timeouts_skips_future_deadlines() {
+    let env = Env::default();
+    let (client, admin, customer, merchant, token) = setup(&env);
+    client.set_escalation_config(&admin, &300u64, &AutoResolveFavor::Customer);
+
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    env.ledger().set_timestamp(2000);
+    client.escalate_dispute(&customer, &escrow_id);
+    env.ledger().set_timestamp(2200);
+
+    let processed = client.process_escalation_timeouts(&10_u32);
+    assert_eq!(processed, 0);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Disputed);
+}

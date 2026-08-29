@@ -359,6 +359,69 @@ fn test_escalation_without_stake_config() {
 }
 
 #[test]
+fn test_customer_stake_returned_when_refund_approved() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let arbitrator1 = Address::generate(&env);
+    let arbitrator2 = Address::generate(&env);
+    let arbitrator3 = Address::generate(&env);
+
+    let (token_client, token_admin) = create_token_contract(&env, &admin);
+    let (stake_token_client, stake_token_admin) = create_token_contract(&env, &admin);
+
+    token_admin.mint(&customer, &10000);
+    stake_token_admin.mint(&customer, &10000);
+
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    client.register_arbitrator(&admin, &arbitrator1);
+    client.register_arbitrator(&admin, &arbitrator2);
+    client.register_arbitrator(&admin, &arbitrator3);
+
+    let stake_config = ArbitrationStakeConfig {
+        token: stake_token_client.address.clone(),
+        amount: 5000,
+        enabled: true,
+    };
+    client.set_arbitration_stake_config(&admin, &stake_config);
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &1000i128,
+        &10000i128,
+        &token_client.address,
+        &String::from_str(&env, "Test refund"),
+        &RefundReasonCode::Other,
+        &1000u64,
+    );
+    client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Rejected"));
+
+    let fee_pool = 1000i128;
+    let case_id =
+        client.escalate_to_arbitration(&customer, &refund_id, &token_client.address, &fee_pool);
+
+    let stake = client.get_arbitration_stake(&case_id).unwrap();
+    assert_eq!(stake.staker, customer);
+
+    let hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    client.cast_arbitration_vote(&arbitrator1, &case_id, &true, &hash);
+    client.cast_arbitration_vote(&arbitrator2, &case_id, &true, &hash);
+    client.cast_arbitration_vote(&arbitrator3, &case_id, &true, &hash);
+    client.close_arbitration_case(&case_id);
+
+    let stake_after = client.get_arbitration_stake(&case_id).unwrap();
+    assert_eq!(stake_after.returned, true);
+}
+
+#[test]
 fn test_escalation_with_disabled_stake() {
     let env = Env::default();
     env.mock_all_auths();

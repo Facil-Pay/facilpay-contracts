@@ -15,7 +15,7 @@ fn setup(env: &Env) -> (RefundContractClient, Address) {
 fn make_policy(env: &Env, merchant: &Address, client: &RefundContractClient) {
     let tiers = Vec::from_array(
         env,
-        &[RefundTier {
+        [RefundTier {
             days_from_purchase: 30,
             max_refund_bps: 10000,
         }],
@@ -91,7 +91,7 @@ fn missing_tier_policy_returns_error_when_strict_mode_enabled() {
     );
     assert_eq!(
         result,
-        Err(Ok(Error::TierPolicyNotFound)),
+        Err(Ok(Error::Ext(ExtError::TierPolicyNotFound))),
         "strict mode must reject refunds when tier policy is missing"
     );
 }
@@ -130,7 +130,7 @@ fn existing_tier_policy_applied_correctly() {
     );
     assert_eq!(
         result,
-        Err(Ok(Error::RefundExceedsPolicy)),
+        Err(Ok(Error::Core(CoreError::RefundExceedsPolicy))),
         "refund exceeding tier cap must be rejected"
     );
 

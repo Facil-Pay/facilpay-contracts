@@ -20,6 +20,7 @@ fn test_single_level_inheritance() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Parent sets their own policy
     let tiers = Vec::from_array(
@@ -128,6 +129,7 @@ fn test_child_override_priority() {
     );
     client.set_refund_policy(&child_merchant, &child_tiers);
     client.set_requires_admin_approval(&child_merchant, &false);
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     client.set_auto_approve_below(&child_merchant, &100i128);
 
     // Child policy should be returned, not parent's
@@ -168,7 +170,7 @@ fn test_max_depth_enforcement() {
 
     // This should fail - creates depth > 5
     let result = client.try_set_merchant_parent(&admin, &merchant_f, &merchant_e);
-    assert_eq!(result, Err(Ok(Error::MaxInheritanceDepth)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::MaxInheritanceDepth))));
 }
 
 #[test]
@@ -190,7 +192,7 @@ fn test_circular_reference_rejection_direct() {
 
     // Try to set B → A (circular)
     let result = client.try_set_merchant_parent(&admin, &merchant_b, &merchant_a);
-    assert_eq!(result, Err(Ok(Error::CircularInheritance)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircularInheritance))));
 }
 
 #[test]
@@ -214,7 +216,7 @@ fn test_circular_reference_rejection_indirect() {
 
     // Try to set A → C (creates cycle: C → B → A → C)
     let result = client.try_set_merchant_parent(&admin, &merchant_a, &merchant_c);
-    assert_eq!(result, Err(Ok(Error::CircularInheritance)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircularInheritance))));
 }
 
 #[test]
@@ -232,7 +234,7 @@ fn test_self_parent_rejection() {
 
     // Try to set A → A
     let result = client.try_set_merchant_parent(&admin, &merchant_a, &merchant_a);
-    assert_eq!(result, Err(Ok(Error::CircularInheritance)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircularInheritance))));
 }
 
 #[test]
@@ -407,7 +409,7 @@ fn test_set_merchant_parent_requires_admin() {
 
     // Non-admin tries to set parent
     let result = client.try_set_merchant_parent(&non_admin, &child, &parent);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::Unauthorized))));
 }
 
 #[test]
@@ -442,7 +444,7 @@ fn test_inheritance_chain_max_depth_error() {
     // Add one more to exceed max depth
     let m6 = Address::generate(&env);
     let result = client.try_set_merchant_parent(&admin, &m6, &m5);
-    assert_eq!(result, Err(Ok(Error::MaxInheritanceDepth)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::MaxInheritanceDepth))));
 }
 
 #[test]
@@ -469,7 +471,7 @@ fn test_inheritance_chain_circular_error() {
     // Since set_merchant_parent prevents cycles, this test verifies the error handling
     // by checking that setting m1's parent to m3 is rejected
     let result = client.try_set_merchant_parent(&admin, &m1, &m3);
-    assert_eq!(result, Err(Ok(Error::CircularInheritance)));
+    assert_eq!(result, Err(Ok(Error::Core(CoreError::CircularInheritance))));
 }
 
 #[test]
@@ -485,6 +487,7 @@ fn test_parent_updates_existing_policy() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Child sets policy first (no parent yet)
     let tiers = Vec::from_array(

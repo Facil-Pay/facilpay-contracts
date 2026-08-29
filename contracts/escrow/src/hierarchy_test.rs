@@ -1,19 +1,26 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, token, Address, Env};
+
+fn setup_token(env: &Env, admin: &Address, customer: &Address) -> Address {
+    let token_addr = env.register_stellar_asset_contract(admin.clone());
+    let token_admin = token::StellarAssetClient::new(env, &token_addr);
+    token_admin.mint(customer, &1_000_000);
+    token_addr
+}
 
 #[test]
 fn test_two_level_hierarchy_success() {
     let env = Env::default();
-    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = setup_token(&env, &admin, &customer);
 
     client.initialize(&admin);
 
@@ -48,14 +55,14 @@ fn test_two_level_hierarchy_success() {
 #[test]
 fn test_depth_limit_enforced() {
     let env = Env::default();
-    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = setup_token(&env, &admin, &customer);
 
     client.initialize(&admin);
 
@@ -88,14 +95,14 @@ fn test_depth_limit_enforced() {
 #[test]
 fn test_get_escrow_hierarchy() {
     let env = Env::default();
-    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = setup_token(&env, &admin, &customer);
 
     client.initialize(&admin);
 
@@ -136,7 +143,7 @@ fn test_get_escrow_hierarchy() {
 #[test]
 fn test_create_child_escrow_validation() {
     let env = Env::default();
-    env.mock_all_auths();
+    env.mock_all_auths_allowing_non_root_auth();
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
 
@@ -144,7 +151,7 @@ fn test_create_child_escrow_validation() {
     let unauthorized_caller = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = setup_token(&env, &admin, &customer);
 
     client.initialize(&admin);
 

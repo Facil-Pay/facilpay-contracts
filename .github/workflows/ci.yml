@@ -15,6 +15,15 @@ jobs:
           target: wasm32-unknown-unknown
           components: clippy, rustfmt
 
+      - name: Cache Cargo registry and build artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Install Stellar CLI
         run: curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --dir ~/.cargo/bin
 
@@ -25,7 +34,14 @@ jobs:
         run: cargo clippy -- -D warnings
 
       - name: Run Tests
-        run: cargo test --workspace
+        run: cargo test --workspace 2>&1 | tee test-output.txt
+
+      - name: Upload test output artifact
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-output
+          path: test-output.txt
 
       - name: Build Contracts
         run: stellar contract build

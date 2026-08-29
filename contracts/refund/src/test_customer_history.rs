@@ -110,11 +110,21 @@ fn test_lifecycle_timestamps_on_reject() {
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Invalid"));
 
+    // Rejection first enters the appeal window (PendingAppeal); rejected_at
+    // isn't set until finalize_denial closes the window out.
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::PendingAppeal);
+    assert_eq!(refund.rejected_at, None);
+
+    let finalize_at = refund.appeal_deadline.unwrap();
+    env.ledger().set_timestamp(finalize_at);
+    client.finalize_denial(&refund_id);
+
     let refund = client.get_refund(&refund_id);
 
     // Verify rejected_at is set
     assert!(refund.rejected_at.is_some());
-    assert_eq!(refund.rejected_at.unwrap(), 100);
+    assert_eq!(refund.rejected_at.unwrap(), finalize_at);
 
     // Verify other timestamps
     assert!(refund.requested_at < refund.rejected_at.unwrap());

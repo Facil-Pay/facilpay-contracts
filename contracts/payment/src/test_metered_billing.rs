@@ -444,7 +444,7 @@ fn test_billing_cap_equal_to_charge_no_cap_hit() {
         &100i128,
         &String::from_str(&env, "unit"),
         &token,
-        &Some(500i128), // cap == 5 units * 100
+        &Some(500i128), // cap == 5 units * 100,
         &None,
     );
 

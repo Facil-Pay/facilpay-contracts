@@ -1,9 +1,8 @@
 #![cfg(test)]
 
 use crate::*;
-use crate::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 fn setup(
     env: &Env,
@@ -21,7 +20,9 @@ fn setup(
     client.initialize(&admin);
     let customer = Address::generate(env);
     let merchant = Address::generate(env);
-    let token = Address::generate(env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin = token::StellarAssetClient::new(env, &token);
+    token_admin.mint(&customer, &1_000_000);
     (client, admin, customer, merchant, token)
 }
 
@@ -201,4 +202,58 @@ fn test_expired_observer_cannot_read_escrow_details() {
         result,
         Err(Ok(Error::Basic(BasicError::Unauthorized)))
     ));
+}
+
+#[test]
+fn observer_can_read_escrow_state() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let escrow = client.get_escrow_details(&observer, &escrow_id);
+    assert_eq!(escrow.id, escrow_id);
+    assert_eq!(escrow.customer, customer);
+    assert_eq!(escrow.merchant, merchant);
+    assert_eq!(escrow.amount, 1000);
+}
+
+#[test]
+fn observer_cannot_release_escrow() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let result = client.try_release_escrow(&observer, &escrow_id, &false);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::Unauthorized)))
+    );
+
+    let escrow = client.get_escrow_details(&observer, &escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+}
+
+#[test]
+fn observer_cannot_open_dispute() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let observer = Address::generate(&env);
+    let escrow_id = create_escrow(&client, &customer, &merchant, &token);
+
+    client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
+
+    let result = client.try_dispute_escrow(&observer, &escrow_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::Unauthorized)))
+    );
+
+    let escrow = client.get_escrow_details(&observer, &escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
 }

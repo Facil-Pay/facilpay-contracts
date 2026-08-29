@@ -185,3 +185,71 @@ fn test_trigger_arbitration_timeout_blocked_by_quorum() {
     // Should be blocked because quorum (3 votes) is already reached
     client.trigger_arbitration_timeout(&case_id);
 }
+
+// ── Test 4: timeout settles the arbitration stake ──────────────────────────────
+
+#[test]
+fn test_trigger_arbitration_timeout_settles_stake() {
+    let (env, client, contract_id, admin, merchant, customer, _arb1, _arb2, _arb3, token_client) =
+        setup();
+
+    let treasury = Address::generate(&env);
+    let (stake_token_client, stake_token_admin) = create_token_contract(&env, &admin);
+    stake_token_admin.mint(&merchant, &10_000);
+
+    // Enable staking so escalation deposits a stake for the merchant.
+    client.set_arbitration_stake_config(
+        &admin,
+        &ArbitrationStakeConfig {
+            token: stake_token_client.address.clone(),
+            amount: 5_000,
+            enabled: true,
+        },
+    );
+
+    // Configure a treasury to receive forfeited stakes. `fee_per_case` must stay
+    // at or below the escalation fee that `create_open_case` pays (300).
+    client.set_arbitration_fee_config(
+        &admin,
+        &ArbitrationFeeConfig {
+            arbitrator_share_bps: 7000,
+            treasury_share_bps: 3000,
+            treasury_address: treasury.clone(),
+            fee_token: token_client.address.clone(),
+            fee_per_case: 100,
+        },
+    );
+
+    client.set_arbitration_timeout(&admin, &100u64);
+
+    let (refund_id, case_id) = create_open_case(
+        &env,
+        &client,
+        &contract_id,
+        &admin,
+        &merchant,
+        &customer,
+        &token_client,
+    );
+
+    // The stake was deposited on escalation and hasn't been resolved yet.
+    let stake_before = client.get_arbitration_stake(&case_id).unwrap();
+    assert_eq!(stake_before.staker, merchant);
+    assert_eq!(stake_before.returned, false);
+
+    // No arbitrators vote — quorum is never reached, so the case must be
+    // resolved by the timeout default instead.
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_arbitration_timeout(&case_id);
+
+    // Default outcome favors the customer, so the refund is approved and the
+    // merchant (staker) is the losing/non-defaulting party — their stake is
+    // forfeited to the treasury rather than left stuck forever.
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Approved);
+
+    let stake_after = client.get_arbitration_stake(&case_id).unwrap();
+    assert_eq!(stake_after.returned, true);
+    assert_eq!(stake_token_client.balance(&treasury), 5_000);
+    assert_eq!(stake_token_client.balance(&merchant), 10_000 - 5_000);
+}

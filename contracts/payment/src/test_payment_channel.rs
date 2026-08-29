@@ -183,6 +183,68 @@ fn test_settle_channel_invalid_nonce() {
 }
 
 #[test]
+fn test_settle_channel_rejects_negative_merchant_amount() {
+    // Issue #385: a negative merchant_amount would make
+    // customer_refund = deposited - merchant_amount exceed the deposit,
+    // letting the two parties claim more than was ever deposited.
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_id);
+
+    let contract_id = env.register(PaymentContract, ());
+    let client = PaymentContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    token_admin_client.mint(&customer, &1000i128);
+
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
+    let pk_bytes = signing_key.verifying_key().to_bytes();
+    let customer_pk = BytesN::<32>::from_array(&env, &pk_bytes);
+
+    let channel_id = client.open_channel(
+        &customer,
+        &merchant,
+        &token_id,
+        &1000i128,
+        &0u64,
+        &customer_pk,
+    );
+
+    let merchant_amount: i128 = -500;
+    let nonce: u64 = 1;
+    let mut msg = Bytes::new(&env);
+    msg.append(&channel_id.to_xdr(&env));
+    msg.append(&merchant_amount.to_xdr(&env));
+    msg.append(&nonce.to_xdr(&env));
+
+    let msg_vec: alloc::vec::Vec<u8> = msg.iter().collect();
+    let signature = signing_key.sign(&msg_vec);
+    let sig_bn = BytesN::<64>::from_array(&env, &signature.to_bytes());
+
+    let result = client.try_settle_channel(&channel_id, &merchant_amount, &nonce, &sig_bn);
+    assert!(
+        result.is_err(),
+        "negative merchant_amount must be rejected before it can inflate the customer refund past the deposit"
+    );
+
+    let channel = client.get_channel(&channel_id);
+    assert!(channel.open, "channel must remain open on rejected settlement");
+}
+
+#[test]
 fn test_stale_nonce_replay_rejected() {
     // Demonstrate that a stale off-chain state (lower nonce) cannot be replayed
     // once the channel has been settled with a higher nonce.
