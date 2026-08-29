@@ -4665,6 +4665,11 @@ impl PaymentContract {
             }
         }
 
+        // #557: return any installments the customer already paid toward this
+        // still-Pending payment before it becomes Refunded. A payment with no
+        // installment history transfers nothing.
+        PaymentContract::return_collected_installments(env, &payment, payment_id);
+
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
@@ -4862,6 +4867,11 @@ impl PaymentContract {
                 return Err(Error::Payment(PaymentError::InvalidStatus));
             }
         }
+
+        // #557: return any installments the customer already paid toward this
+        // still-Pending payment before it becomes Cancelled. A payment with no
+        // installment history transfers nothing.
+        PaymentContract::return_collected_installments(env, &payment, payment_id);
 
         env.storage()
             .instance()
@@ -6781,6 +6791,42 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Returns any installment deposits already collected for a still-`Pending`
+    /// payment back to the customer, and returns the amount actually transferred.
+    ///
+    /// `pay_installment` moves real tokens into the contract while the payment
+    /// stays `Pending`. The refund and cancel paths call this helper first so a
+    /// partially-paid payment does not strand the customer's funds in the
+    /// contract when it is marked `Refunded` / `Cancelled` (#557).
+    fn return_collected_installments(env: &Env, payment: &Payment, payment_id: u64) -> i128 {
+        let deposited = PaymentContract::get_payment_deposited_amount(env, payment_id);
+        if deposited <= 0 {
+            return 0;
+        }
+
+        let token_client = token::Client::new(env, &payment.token);
+        let contract_address = env.current_contract_address();
+        let contract_balance = token_client.balance(&contract_address);
+        let refund_amount = if deposited <= contract_balance {
+            deposited
+        } else {
+            contract_balance
+        };
+
+        if refund_amount > 0 {
+            token_client.transfer(&contract_address, &payment.customer, &refund_amount);
+
+            // Clear the cached outstanding balance so a later query recomputes
+            // against the now-terminal payment instead of returning stale data.
+            env.storage().instance().set(
+                &DataKey::Payment(PaymentKey::OutstandingBalance(payment_id)),
+                &payment.amount,
+            );
+        }
+
+        refund_amount
     }
 
     /// Sum of installment deposits actually received for a pending payment.
@@ -12886,6 +12932,9 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_installment_refund;
 
 mod test_fee_sweep;
 #[cfg(test)]

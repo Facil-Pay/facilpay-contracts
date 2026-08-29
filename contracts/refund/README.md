@@ -202,6 +202,52 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `remove_refund_eligibility()` — Merchant removes an eligibility entry.
 - `get_merchant_eligibility_list()` — Returns all eligibility entries for a merchant.
 
+#### Merchant Eligibility Rules
+
+Each merchant maintains its **own** allow/block list of customers for refunds. This is the
+first gate a refund request passes through and is completely independent of the tiered
+refund policy, the refund window, quotas, and fraud checks — it is a hard yes/no on whether
+this merchant will entertain a refund from this customer at all.
+
+**What makes a customer eligible or ineligible**
+
+- Eligibility is stored per `(merchant, customer)` pair as an `EligibilityRule`, which is
+  either `Allow` or `Block`.
+- `set_refund_eligibility(merchant, customer, rule, reason_hash)` is authorized by the
+  **merchant** (`require_auth` on the `merchant` argument). `reason_hash` is a
+  `BytesN<32>` for an off-chain audit note (e.g. a hash of the reason for a block); pass
+  the zero hash when there is nothing to record. Calling it again for the same pair
+  overwrites the previous rule in place — it does not create a second list entry.
+- `check_refund_eligibility(merchant, customer)` returns the current rule. When **no entry
+  exists** the pair defaults to `Allow`, so customers are eligible unless a merchant has
+  explicitly blocked them.
+- Eligibility is strictly merchant-scoped: blocking a customer under merchant A has no
+  effect on that customer's refunds from merchant B.
+- `remove_refund_eligibility(merchant, customer)` deletes the entry (reverting the pair to
+  the default `Allow`) and returns `EligibilityEntryNotFound` if there was nothing to
+  remove. `get_merchant_eligibility_list(merchant)` returns every stored
+  `RefundEligibilityEntry` for the merchant, each carrying `customer`, `merchant`, `rule`,
+  `reason_hash`, and `set_at`.
+- An admin can effectively override a merchant's block by calling `set_refund_eligibility`
+  for the pair with `Allow` (tests exercise this via `mock_all_auths`); there is no
+  separate admin-only eligibility entry.
+
+**Enforcement point**
+
+The check runs inside `request_refund`, after fraud screening and before the policy
+validation. If the effective rule is `Block`, the request fails immediately with
+`CustomerBlockedFromRefund` (`ExtError::CustomerBlockedFromRefund`) and no refund record is
+created. `Allow` (or no entry) lets the request continue to policy evaluation.
+
+**What happens to refunds already in flight if a customer is later blocked**
+
+Eligibility is evaluated **only at `request_refund` time**. Blocking a customer afterwards
+does **not** claw back or freeze refunds that were already created — `process_refund` does
+not re-check eligibility, so any `Pending` or `Approved` refund continues through its normal
+lifecycle. A block only prevents that customer from opening **new** refund requests with
+that merchant; unblock (via `Allow` or `remove_refund_eligibility`) restores their ability
+to request again.
+
 ### Admin Override
 
 - `admin_override_policy()` — Admin overrides a refund decision with audit logging.
@@ -262,6 +308,55 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `set_strict_tier_policy()` — Merchant enables/disables strict tier policy enforcement.
 - `get_strict_tier_policy()` — Checks if strict tier policy is enabled.
 
+#### How the Customer Tier Policy Works
+
+Customer tier policies let a merchant cap refunds differently for different classes of
+customer (for example: `1` = platinum, `2` = standard, `3` = bronze). The tier only changes
+**the maximum refundable percentage** — it never changes the refund *window*, approval
+routing, quotas, fees, or any other policy knob. Everything else still comes from the
+merchant's base `set_refund_policy` tiers (or the inherited / default policy).
+
+**How a customer's tier is determined**
+
+- A tier is a single `u32` assigned to a customer address by the **contract admin** via
+  `set_customer_tier(admin, customer, tier_id)`. Non-admin callers get `Unauthorized`.
+- The assignment is **global to the contract**, not per-merchant: `get_customer_tier`
+  takes only the customer address. There is no automatic tiering from spend or history —
+  the admin sets it explicitly, and it stays until the admin changes it.
+- A customer with no assignment has **no tier**; `get_customer_tier` returns `None`.
+
+**Which knob varies by tier**
+
+- `set_customer_tier_policy(merchant, tier_id, max_refund_bps)` is authorized by the
+  **merchant** and stores a `RefundCap { max_refund_bps }` (0–10000 bps; values above
+  10000 are rejected with `InvalidAmount`) for that `(merchant, tier_id)` pair.
+- During `request_refund` the contract first resolves the base allowed percentage from the
+  merchant policy's day-based tiers, then — if the customer has a tier assigned — **replaces**
+  that allowed percentage with the tier's `max_refund_bps`. The requested
+  `amount / original_amount` is then checked against the resulting cap; exceeding it returns
+  `RefundExceedsPolicy`.
+- The day-based refund window still applies first. If the payment is already outside every
+  policy tier's `days_from_purchase`, the request fails with `RefundWindowExpired` before
+  the tier cap is even consulted.
+
+**Missing tier policy — fallback vs. strict mode**
+
+- If the customer has a tier but the merchant has **no** `set_customer_tier_policy` entry
+  for that tier, the default behaviour is to **fall back** to the base merchant policy cap
+  (the refund proceeds as if no tier were assigned).
+- `set_strict_tier_policy(merchant, true)` changes this: a missing tier policy entry then
+  causes `request_refund` to fail with `TierPolicyNotFound` instead of falling back.
+  `get_strict_tier_policy` reports the current setting (default `false`).
+
+**Effect on refunds already in flight**
+
+Tier and tier-policy values are read **only at `request_refund` time** and the resulting
+cap is baked into the created `Refund` as its fixed `amount`. Re-tiering a customer,
+editing a `set_customer_tier_policy` cap, or toggling strict mode afterwards has **no
+effect** on refunds that are already `Pending`, `Approved`, or `Processed` — `process_refund`
+does not re-evaluate tier policy. The new values apply only to refund requests created
+after the change.
+
 ---
 
 ## 📡 Events
@@ -321,6 +416,15 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | Event                                       | Topic Name | Payload Fields | Fires When                                                           |
 | ------------------------------------------- | ---------- | -------------- | -------------------------------------------------------------------- |
 | (Policy changes tracked via function calls) | —          | —              | Use `get_refund_policy_history()` to audit policy versions over time |
+
+### Eligibility & Tier Policy Events
+
+| Event                | Topic Name           | Payload Fields                 | Fires When                                                                              |
+| -------------------- | -------------------- | ----------------------------- | -------------------------------------------------------------------------------------- |
+| `EligibilitySet`     | `EligibilitySet`     | `merchant`, `customer`, `rule` | `set_refund_eligibility()` stores or overwrites an allow/block rule for a customer      |
+| `EligibilityRemoved` | `EligibilityRemoved` | `merchant`, `customer`         | `remove_refund_eligibility()` deletes a customer's eligibility entry                    |
+
+Customer tier changes (`set_customer_tier`, `set_customer_tier_policy`, `set_strict_tier_policy`) do **not** emit events — query the current values with the corresponding `get_*` functions.
 
 ### Contract Control Events
 
