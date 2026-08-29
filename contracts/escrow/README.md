@@ -24,6 +24,28 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 - Appeal expiry applies only after the dispute has entered the Appeal round. An appeal can be filed only while the dispute round is not Final and the time since `dispute_started_at` is still within the 72-hour appeal window. The appeal stores `appeal_deadline = filed_at + 259200`, and if that deadline passes without a resolution, `expire_appeal` rejects the pending appeal, advances the dispute round to Final, and leaves the prior outcome as the effective final disposition.
 
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
+
+---
+
+## Batch Release
+
+The contract supports releasing multiple escrows in a single call via `batch_release_escrows`. This is useful for merchants or admins managing high volumes of transactions.
+
+### Size Limits
+
+To ensure transaction sizes remain within Soroban gas and resource limits, there is a hard limit of **20 escrows** per batch release request. Attempting to pass more than 20 IDs will revert the entire transaction with a `BatchReleaseSizeLimitExceeded` error.
+
+### Partial-Failure Semantics
+
+Batch releases are designed with partial-failure semantics: **one bad escrow does not revert the entire call**. If an escrow in the batch fails to release (e.g., due to it not being releasable yet, invalid status, or not found), the failure is recorded and the loop continues to the next escrow. 
+
+The function returns a structure containing:
+- `succeeded`: A list of escrow IDs that were successfully released.
+- `failed`: A list of escrow IDs that failed to release.
+- `errors`: A list of error codes corresponding to each failure, allowing callers to programmatically handle or retry specific failures.
+
+This approach guarantees that valid escrows are processed even if the batch contains invalid or un-releasable ones.
+
 ---
 
 ## Verification
