@@ -358,11 +358,95 @@ other caller ⇒ `Unauthorized`) and sets `billing_cap = Some(cap)` for all futu
 
 | Function                                              | Description                                                                            |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `create_subscription_group(admin, merchant, name)`    | Create a named group of subscriptions for coordinated billing. Returns the `group_id`. |
-| `add_to_group(admin, group_id, subscription_id)`      | Add a subscription to a group.                                                         |
-| `remove_from_group(admin, group_id, subscription_id)` | Remove a subscription from a group.                                                    |
+| `create_subscription_group(owner, discount_bps)`      | Create a subscription group with a bundle discount in basis points. Returns `group_id`. |
+| `add_to_group(owner, group_id, subscription_id)`      | Add a subscription to a group (max 20 subscriptions per group).                         |
+| `remove_from_group(owner, group_id, subscription_id)` | Remove a subscription from a group.                                                    |
 | `get_subscription_group(group_id)`                    | Retrieve the `SubscriptionGroup` record.                                               |
 | `get_group_next_billing(group_id)`                    | Return the earliest next billing timestamp across all subscriptions in the group.      |
+
+#### How Subscription Groups Work
+
+Subscription groups allow grouping up to 20 subscriptions under a group owner address to apply bundle discounts across member subscriptions and enable group-level billing coordination.
+
+**Scope & Purpose**
+
+- **Bundle Discounts**: A group configures a discount rate in basis points (`discount_bps`). When `execute_recurring_payment` processes a member subscription, the discount is automatically applied to the billing amount: `discounted_amount = amount * (10000 - discount_bps) / 10000`.
+- **Billing Coordination**: `get_group_next_billing` queries the earliest `next_payment_at` timestamp across all subscriptions in the group, enabling callers to determine when any member subscription next requires billing execution.
+
+**Data Structure & Storage**
+
+- Groups are represented by the `SubscriptionGroup` struct (`contracts/payment/src/lib.rs`, lines 1747–1753):
+  - `group_id`: Unique `u64` identifier.
+  - `owner`: `Address` of the group owner (authorized to add or remove members).
+  - `subscription_ids`: `Vec<u64>` containing member subscription IDs (maximum 20).
+  - `discount_bps`: `u32` discount rate in basis points (e.g. `500` for 5%, `1000` for 10%).
+  - `active`: `bool` indicating whether group discounts are active (initialized to `true`).
+- **Storage Keys** (`contracts/payment/src/lib.rs`, lines 75–83):
+  - `DataKey::Subscription(SubscriptionKey::GroupCounter)`: Auto-incrementing counter tracking total created groups.
+  - `DataKey::Subscription(SubscriptionKey::Group(group_id))`: Stores `SubscriptionGroup` record.
+  - `DataKey::Subscription(SubscriptionKey::GroupMembership(subscription_id))`: Maps a subscription ID to its `group_id` (`u64`) for $O(1)$ group membership lookups.
+
+**Group Creation & Membership Mechanics**
+
+- **`create_subscription_group(owner, discount_bps)`** (`contracts/payment/src/lib.rs`, lines 12086–12114):
+  - Authorization: Requires `owner.require_auth()`.
+  - Increments `GroupCounter` starting at `1` and returns `group_id`.
+  - Initializes `SubscriptionGroup` with `active: true` and an empty `subscription_ids` list.
+- **`add_to_group(owner, group_id, subscription_id)`** (`contracts/payment/src/lib.rs`, lines 12132–12172):
+  - Authorization: Requires `owner.require_auth()`. Rejects with `Error::Basic(BasicError::Unauthorized)` (discriminant `100`) if caller is not the group owner.
+  - Group Existence: Rejects with `Error::Subscription(SubscriptionError::GroupNotFound)` (discriminant `312`) if `group_id` does not exist.
+  - Capacity Limit: Rejects with `Error::Subscription(SubscriptionError::GroupSizeLimitExceeded)` (discriminant `314`) if the group already contains 20 subscriptions (`group.subscription_ids.len() >= 20`).
+  - Exclusive Membership: Rejects with `Error::Subscription(SubscriptionError::AlreadyInGroup)` (discriminant `313`) if `subscription_id` is already assigned to any group (`GroupMembership(subscription_id)` exists).
+  - Appends `subscription_id` to `group.subscription_ids` and sets `GroupMembership(subscription_id) -> group_id`.
+- **`remove_from_group(owner, group_id, subscription_id)`** (`contracts/payment/src/lib.rs`, lines 12186–12218):
+  - Authorization: Requires `owner.require_auth()`. Rejects with `Error::Basic(BasicError::Unauthorized)` (discriminant `100`) if caller is not the group owner.
+  - Group Existence: Rejects with `Error::Subscription(SubscriptionError::GroupNotFound)` (discriminant `312`) if `group_id` does not exist.
+  - Removes `subscription_id` from `group.subscription_ids` and deletes the `GroupMembership(subscription_id)` storage entry.
+- **`get_subscription_group(group_id)`** (`contracts/payment/src/lib.rs`, lines 12227–12231):
+  - Returns `Option<SubscriptionGroup>` for the given group ID.
+- **`get_group_next_billing(group_id)`** (`contracts/payment/src/lib.rs`, lines 12240–12266):
+  - Scans member subscriptions and returns the earliest `next_payment_at` timestamp, or `0` if the group has no member subscriptions or is not found.
+
+**Group Pause / Cancel & State Propagation**
+
+- **Contract Implementation Detail**: The smart contract currently **does not** implement group-level pause or cancel functions (such as `pause_subscription_group` or `cancel_subscription_group`).
+- Pause (`pause_subscription`, lines 6286–6329) and cancel (`cancel_subscription`, lines 6215–6279) operate strictly on **individual subscriptions** (`subscription_id`).
+- Pausing or cancelling an individual subscription updates that specific subscription's `status` (`SubscriptionStatus::Paused` or `SubscriptionStatus::Cancelled`).
+- There is no automatic cascading or state propagation from groups to member subscriptions. If an individual subscription within a group is paused or cancelled, its membership mapping remains in `group.subscription_ids` unless manually removed via `remove_from_group`.
+- Group discount evaluation (`get_discounted_subscription_amount`, lines 6803–6825) checks `group.active && group.discount_bps > 0`. Because `group.active` is initialized to `true` and no contract function exists to deactivate a group, the group discount remains active for all member subscriptions as long as they are active and belong to the group.
+
+**Error Types & Discriminants**
+
+| Error Variant | Enum Type | Discriminant | Description |
+| --- | --- | --- | --- |
+| `Unauthorized` | `BasicError` | `100` | Raised when a non-owner calls `add_to_group` or `remove_from_group` |
+| `GroupNotFound` | `SubscriptionError` | `312` | Raised when `group_id` does not exist in contract storage |
+| `AlreadyInGroup` | `SubscriptionError` | `313` | Raised when adding a subscription that already belongs to a group |
+| `GroupSizeLimitExceeded` | `SubscriptionError` | `314` | Raised when attempting to add a 21st subscription to a group (limit 20) |
+
+**Code Example**
+
+```rust
+// 1. Create a subscription group with a 10% bundle discount (1000 bps)
+let group_id = client.create_subscription_group(&owner, &1000);
+
+// 2. Add individual subscriptions to the group
+client.add_to_group(&owner, &group_id, &sub_id_1);
+client.add_to_group(&owner, &group_id, &sub_id_2);
+
+// 3. Query the earliest next billing timestamp across group member subscriptions
+let next_billing = client.get_group_next_billing(&group_id);
+
+// 4. Executing recurring payment applies the 10% group discount automatically
+client.execute_recurring_payment(&sub_id_1);
+
+// 5. Remove a subscription from the group when needed
+client.remove_from_group(&owner, &group_id, &sub_id_2);
+
+// Note: Pause and cancel operate on individual subscriptions, not group-wide
+client.pause_subscription(&customer, &sub_id_1);
+client.cancel_subscription(&customer, &sub_id_1);
+```
 
 ### Payment Channels
 
