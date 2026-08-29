@@ -35,7 +35,10 @@ fn escrow_refundable_after_hold_period_elapsed() {
     // Advance past hold period: 1000 + 500 = 1500
     env.ledger().set_timestamp(1501);
     let result = client.try_refund_escrow(&customer, &escrow_id);
-    assert!(result.is_ok(), "refund should succeed after hold period has elapsed");
+    assert!(
+        result.is_ok(),
+        "refund should succeed after hold period has elapsed"
+    );
 
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Resolved);
@@ -56,7 +59,10 @@ fn escrow_not_refundable_before_hold_period_elapsed() {
     // Attempt refund before hold period expires (at exactly t=1000, hold period = 500s)
     env.ledger().set_timestamp(1400);
     let result = client.try_refund_escrow(&customer, &escrow_id);
-    assert!(result.is_err(), "refund should fail before hold period has elapsed");
+    assert!(
+        result.is_err(),
+        "refund should fail before hold period has elapsed"
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, FromVal, IntoVal, InvokeError, String, Symbol, TryFromVal, Val, Vec,
+    Bytes, BytesN, Env, String, Symbol, TryFromVal, Val, Vec,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -182,12 +182,25 @@ pub enum PaymentError {
 #[repr(u32)]
 #[contracterror]
 pub enum SubscriptionError {
-    NotFound = 300, NotActive = 301, PaymentNotDue = 302, MaxRetriesExceeded = 303,
-    Ended = 304, DunningNotFound = 305, NotInDunning = 306, RetryNotDue = 307,
-    GracePeriodExpired = 308, RetryTooEarly = 309, MeteredNotFound = 310,
-    BillingCapExceeded = 311, GroupNotFound = 312, AlreadyInGroup = 313,
-    GroupSizeLimitExceeded = 314, TrialExpired = 315, MaxTrialDurationExceeded = 316,
-    MerchantPaused = 317, UsageCapExceeded = 318,
+    NotFound = 300,
+    NotActive = 301,
+    PaymentNotDue = 302,
+    MaxRetriesExceeded = 303,
+    Ended = 304,
+    DunningNotFound = 305,
+    NotInDunning = 306,
+    RetryNotDue = 307,
+    GracePeriodExpired = 308,
+    RetryTooEarly = 309,
+    MeteredNotFound = 310,
+    BillingCapExceeded = 311,
+    GroupNotFound = 312,
+    AlreadyInGroup = 313,
+    GroupSizeLimitExceeded = 314,
+    TrialExpired = 315,
+    MaxTrialDurationExceeded = 316,
+    MerchantPaused = 317,
+    UsageCapExceeded = 318,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3116,6 +3129,7 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
             env.clone(),
@@ -3177,6 +3191,7 @@ impl PaymentContract {
         admin: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "complete_escrowed_payment")?;
         admin.require_auth();
         let config: MultiSigConfig = env
             .storage()
@@ -3246,6 +3261,7 @@ impl PaymentContract {
         caller: Address,
         payment_id: u64,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "cancel_escrowed_payment")?;
         caller.require_auth();
         if !env
             .storage()
@@ -3303,6 +3319,7 @@ impl PaymentContract {
         payment_id: u64,
         reason: String,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "dispute_escrowed_payment")?;
         caller.require_auth();
         if !env
             .storage()
@@ -4648,6 +4665,11 @@ impl PaymentContract {
             }
         }
 
+        // #557: return any installments the customer already paid toward this
+        // still-Pending payment before it becomes Refunded. A payment with no
+        // installment history transfers nothing.
+        PaymentContract::return_collected_installments(env, &payment, payment_id);
+
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
@@ -4845,6 +4867,11 @@ impl PaymentContract {
                 return Err(Error::Payment(PaymentError::InvalidStatus));
             }
         }
+
+        // #557: return any installments the customer already paid toward this
+        // still-Pending payment before it becomes Cancelled. A payment with no
+        // installment history transfers nothing.
+        PaymentContract::return_collected_installments(env, &payment, payment_id);
 
         env.storage()
             .instance()
@@ -5720,7 +5747,9 @@ impl PaymentContract {
             let merchant_paused: bool = env
                 .storage()
                 .instance()
-                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(sub.merchant.clone())))
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                    sub.merchant.clone(),
+                )))
                 .unwrap_or(false);
             if merchant_paused {
                 return Err(Error::Subscription(SubscriptionError::MerchantPaused));
@@ -5839,7 +5868,9 @@ impl PaymentContract {
         let merchant_paused: bool = env
             .storage()
             .instance()
-            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(sub.merchant.clone())))
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                sub.merchant.clone(),
+            )))
             .unwrap_or(false);
         if merchant_paused {
             return Err(Error::Subscription(SubscriptionError::MerchantPaused));
@@ -6762,6 +6793,42 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Returns any installment deposits already collected for a still-`Pending`
+    /// payment back to the customer, and returns the amount actually transferred.
+    ///
+    /// `pay_installment` moves real tokens into the contract while the payment
+    /// stays `Pending`. The refund and cancel paths call this helper first so a
+    /// partially-paid payment does not strand the customer's funds in the
+    /// contract when it is marked `Refunded` / `Cancelled` (#557).
+    fn return_collected_installments(env: &Env, payment: &Payment, payment_id: u64) -> i128 {
+        let deposited = PaymentContract::get_payment_deposited_amount(env, payment_id);
+        if deposited <= 0 {
+            return 0;
+        }
+
+        let token_client = token::Client::new(env, &payment.token);
+        let contract_address = env.current_contract_address();
+        let contract_balance = token_client.balance(&contract_address);
+        let refund_amount = if deposited <= contract_balance {
+            deposited
+        } else {
+            contract_balance
+        };
+
+        if refund_amount > 0 {
+            token_client.transfer(&contract_address, &payment.customer, &refund_amount);
+
+            // Clear the cached outstanding balance so a later query recomputes
+            // against the now-terminal payment instead of returning stale data.
+            env.storage().instance().set(
+                &DataKey::Payment(PaymentKey::OutstandingBalance(payment_id)),
+                &payment.amount,
+            );
+        }
+
+        refund_amount
+    }
+
     /// Sum of installment deposits actually received for a pending payment.
     fn get_payment_deposited_amount(env: &Env, payment_id: u64) -> i128 {
         let installment_counter: u32 = env
@@ -7628,12 +7695,17 @@ impl PaymentContract {
         let effective_fee_bps =
             PaymentContract::get_effective_fee_bps(env.clone(), merchant.clone());
 
+        // Risk-based surcharge applied at completion time by `deduct_fee`.
+        let risk_surcharge_bps =
+            PaymentContract::risk_surcharge_bps(&env, &customer, amount, &currency);
+
         PaymentContract::compute_fee_amount(
             amount,
             effective_fee_bps,
             &FeeTier::Standard, // Tier already applied in get_effective_fee_bps
             config.min_fee,
             config.max_fee,
+            risk_surcharge_bps,
         )
     }
 
@@ -7812,6 +7884,7 @@ impl PaymentContract {
             &record.fee_tier,
             config.min_fee,
             config.max_fee,
+            risk_surcharge_bps,
         );
 
         if fee <= 0 {
@@ -7856,16 +7929,18 @@ impl PaymentContract {
         (net_amount, fee)
     }
 
-    /// Computes the fee amount applying tier discount and min/max clamping.
+    /// Computes the fee amount applying the tier discount, adding the
+    /// risk-based surcharge, then clamping to min/max.
     fn compute_fee_amount(
         amount: i128,
         fee_bps: u32,
         tier: &FeeTier,
         min_fee: i128,
         max_fee: i128,
+        risk_surcharge_bps: u32,
     ) -> i128 {
         let discount = PaymentContract::get_tier_discount_bps(tier);
-        let effective_bps = fee_bps - (fee_bps * discount) / 10000;
+        let effective_bps = fee_bps - (fee_bps * discount) / 10000 + risk_surcharge_bps;
         let raw_fee = (amount * (effective_bps as i128)) / 10000;
 
         let fee = if min_fee > 0 && raw_fee < min_fee {
@@ -7884,6 +7959,51 @@ impl PaymentContract {
         } else {
             fee
         }
+    }
+
+    /// Risk-based fee surcharge (in bps) applied to a payment on top of the
+    /// tier/waiver-adjusted platform fee.
+    ///
+    /// Opt-in: returns 0 unless an admin has explicitly configured a
+    /// `RiskFeeConfig`. Both the preview path (`calculate_fee`) and the
+    /// deduction path (`deduct_fee`) call this so they stay in sync. Surcharge
+    /// components: large amount, new customer (fewer than 3 prior payments),
+    /// and high-risk currency (BTC/ETH).
+    fn risk_surcharge_bps(env: &Env, customer: &Address, amount: i128, currency: &Currency) -> u32 {
+        let config: RiskFeeConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
+        {
+            Some(c) => c,
+            None => return 0,
+        };
+
+        let mut surcharge: u32 = 0;
+
+        if amount > config.large_amount_threshold {
+            surcharge += config.large_amount_surcharge_bps;
+        }
+
+        let customer_payment_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+        if customer_payment_count < 3 {
+            surcharge += config.new_customer_surcharge_bps;
+        }
+
+        match currency {
+            Currency::BTC | Currency::ETH => {
+                surcharge += config.high_risk_currency_surcharge;
+            }
+            _ => {}
+        }
+
+        surcharge
     }
 
     fn get_tier_discount_bps(tier: &FeeTier) -> u32 {
@@ -8618,9 +8738,6 @@ impl PaymentContract {
         }
 
         let mut results = Vec::new(&env);
-        let mut groups: Vec<(Address, Address, i128)> = Vec::new(&env); // (token, merchant, total_net_amount)
-
-        let contract_address = env.current_contract_address();
 
         for entry in entries.iter() {
             // Validate currency
@@ -8713,7 +8830,7 @@ impl PaymentContract {
                 amount: entry.amount,
                 token: entry.token.clone(),
                 currency: entry.currency.clone(),
-                status: PaymentStatus::Completed, // Completed immediately
+                status: PaymentStatus::Pending, // completed via do_complete_payment below
                 created_at: current_timestamp,
                 expires_at,
                 metadata: entry.metadata.clone(),
@@ -8870,20 +8987,6 @@ impl PaymentContract {
             if !found {
                 groups.push_back((entry.token.clone(), entry.merchant.clone(), net_amount));
             }
-
-            results.push_back(BatchResult {
-                payment_id,
-                success: true,
-                error_code: None,
-            });
-        }
-
-        // Now, execute aggregated transfers
-        for group in groups.iter() {
-            let (token, merchant, total_net) = group;
-            let token_client = token::Client::new(&env, &token);
-            // Transfer from contract to merchant (contract authorizes itself)
-            token_client.transfer(&contract_address, &merchant, &total_net);
         }
 
         Ok(results)
@@ -9888,7 +9991,9 @@ impl PaymentContract {
         }
         env.storage()
             .instance()
-            .remove(&DataKey::Merchant(MerchantDataKey::MerchantPaused(merchant)));
+            .remove(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                merchant,
+            )));
         Ok(())
     }
 
@@ -10452,10 +10557,10 @@ impl PaymentContract {
     /// Returns an error if the proposal is not found, expired, has insufficient
     /// approvals, or the payment is not in pending status.
     pub fn execute_large_payment(env: Env, payment_id: u64) -> Result<(), Error> {
-        let config: MultiSigConfig = env
-            .storage()
+        // Ensure multi-sig has been initialised.
+        env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .get::<DataKey, MultiSigConfig>(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
         let mut proposal: LargePaymentProposal = env
@@ -10478,8 +10583,7 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::InsufficientApprovals));
         }
 
-        // Get the payment and execute it
-        let mut payment: Payment = env
+        let payment: Payment = env
             .storage()
             .instance()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
@@ -10489,33 +10593,16 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
 
-        // Execute the payment — transfer from customer to merchant using their approval
-        let token_client = token::Client::new(&env, &payment.token);
-        let contract_address = env.current_contract_address();
-        token_client.transfer_from(
-            &contract_address,
-            &payment.customer,
-            &payment.merchant,
-            &payment.amount,
-        );
-
-        payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        // Run the same completion path as a normal payment: platform fee
+        // deduction (incl. risk surcharge), finality-delay hold, payment
+        // forwarding, loyalty/rebate accrual, auto-escrow and analytics.
+        PaymentContract::do_complete_payment(&env, payment_id)?;
 
         proposal.executed = true;
         env.storage().instance().set(
             &DataKey::State(StateDataKey::LargePaymentProposal(payment_id)),
             &proposal,
         );
-
-        (PaymentCompleted {
-            payment_id,
-            merchant: payment.merchant,
-            amount: payment.amount,
-        })
-        .publish(&env);
 
         (LargePaymentExecuted { payment_id }).publish(&env);
 
@@ -11048,6 +11135,8 @@ impl PaymentContract {
         expires_at: u64,
         customer_pk: BytesN<32>,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "open_channel")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Basic(BasicError::InvalidAmount));
@@ -11126,6 +11215,7 @@ impl PaymentContract {
         channel_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "top_up_channel")?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Basic(BasicError::InvalidAmount));
@@ -11195,6 +11285,8 @@ impl PaymentContract {
         nonce: u64,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "settle_channel")?;
+        
         let mut channel: PaymentChannel = env
             .storage()
             .instance()
@@ -11286,6 +11378,7 @@ impl PaymentContract {
     /// Returns an error if the caller is not a channel participant, the channel
     /// is not found, already closed, or not yet expired.
     pub fn close_channel_expired(env: Env, caller: Address, channel_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "close_channel_expired")?;
         caller.require_auth();
 
         let mut channel: PaymentChannel = env
@@ -11502,6 +11595,25 @@ impl PaymentContract {
             &(merchant_count + 1),
         );
 
+        // Paged merchant payment index (100 entries per page)
+        {
+            const PAGE_SIZE: u64 = 100;
+            let page_num = merchant_count / PAGE_SIZE;
+            let mut page: Vec<u64> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
+                    merchant.clone(),
+                    page_num,
+                )))
+                .unwrap_or_else(|| Vec::new(&env));
+            page.push_back(payment_id);
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant.clone(), page_num)),
+                &page,
+            );
+        }
+
         // Update global analytics
         let mut analytics: PaymentAnalytics = env
             .storage()
@@ -11617,10 +11729,7 @@ impl PaymentContract {
                 )))
                 .unwrap_or(0);
             env.storage().instance().set(
-                &DataKey::Customer(CustomerDataKey::MerchantList(
-                    customer.clone(),
-                    m_count,
-                )),
+                &DataKey::Customer(CustomerDataKey::MerchantList(customer.clone(), m_count)),
                 &merchant,
             );
             env.storage().instance().set(
@@ -11690,11 +11799,16 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SplitAlreadyExecuted));
         }
 
-        let payment: Payment = env
+        let mut payment: Payment = env
             .storage()
             .instance()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
+
+        // Prevent double-spending: ensure payment is still Pending
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
 
         let token_client = token::Client::new(&env, &payment.token);
         let contract_address = env.current_contract_address();
@@ -11708,6 +11822,13 @@ impl PaymentContract {
         env.storage().instance().set(
             &DataKey::Feature(FeatureKey::SplitConfig(payment_id)),
             &config,
+        );
+
+        // Mark payment as Completed to prevent subsequent complete_payment calls
+        payment.status = PaymentStatus::Completed;
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Data(payment_id)),
+            &payment,
         );
 
         Ok(())
@@ -12463,7 +12584,8 @@ impl PaymentContract {
 
     /// Executes a payment using the provided route.
     /// Validates the route is still valid (fee_bps matches current config) before executing.
-    pub fn execute_routed_payment(
+    pub fn // Fixed issue 565
+    // execute_routed_payment(
         env: Env,
         customer: Address,
         merchant: Address,
@@ -12810,6 +12932,9 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_installment_refund;
 
 mod test_fee_sweep;
 #[cfg(test)]

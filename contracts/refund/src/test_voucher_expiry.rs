@@ -60,7 +60,10 @@ fn test_redeem_voucher_before_expiry_succeeds() {
         &voucher_id,
         &1_u64,
     );
-    assert!(result.is_ok(), "redeeming a valid unexpired voucher should succeed");
+    assert!(
+        result.is_ok(),
+        "redeeming a valid unexpired voucher should succeed"
+    );
 }
 
 #[test]
@@ -101,7 +104,10 @@ fn test_redeem_voucher_at_exact_expiry_fails() {
         &1_u64,
     );
     // timestamp(1300) > expires_at(1300) is false, so it should succeed at exactly the boundary
-    assert!(result.is_ok(), "voucher should still be valid at exactly the expiry timestamp");
+    assert!(
+        result.is_ok(),
+        "voucher should still be valid at exactly the expiry timestamp"
+    );
 }
 
 #[test]

@@ -6827,7 +6827,7 @@ impl RefundContract {
         let config: RefundCooldownConfig = match env
             .storage()
             .instance()
-            .get(&SystemKey::RefundCooldownConfig)
+            .get::<SystemKey, RefundCooldownConfig>(&SystemKey::RefundCooldownConfig)
         {
             Some(c) if c.enabled => c,
             _ => return Ok(()),
