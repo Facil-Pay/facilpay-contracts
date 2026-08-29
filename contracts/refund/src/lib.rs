@@ -2896,6 +2896,16 @@ impl RefundContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Refund(case.refund_id), &refund);
+
+            (RefundApproved {
+                refund_id: case.refund_id,
+                payment_id: refund.payment_id,
+                amount: refund.amount,
+                approved_by: env.current_contract_address(),
+                approved_at: env.ledger().timestamp(),
+            })
+            .publish(&env);
+            Self::invoke_hooks(&env, RefundEventType::Approved, case.refund_id);
         } else if refund.status == RefundStatus::PendingAppeal {
             // The arbitration panel upheld the rejection, so it's final now
             // — no need to wait out the rest of the appeal window.
@@ -2907,6 +2917,18 @@ impl RefundContract {
                 .set(&DataKey::Refund(case.refund_id), &refund);
             Self::add_to_status_index(&env, RefundStatus::Rejected, refund.id);
             Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
+
+            (RefundRejected {
+                refund_id: case.refund_id,
+                rejected_by: env.current_contract_address(),
+                rejected_at: refund.rejected_at.unwrap(),
+                rejection_reason: soroban_sdk::String::from_str(
+                    &env,
+                    "arbitration case decided against refund",
+                ),
+            })
+            .publish(&env);
+            Self::invoke_hooks(&env, RefundEventType::Rejected, case.refund_id);
         }
 
         // Distribute fees according to configuration
@@ -3287,6 +3309,16 @@ impl RefundContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Refund(case.refund_id), &refund);
+
+            (RefundApproved {
+                refund_id: case.refund_id,
+                payment_id: refund.payment_id,
+                amount: refund.amount,
+                approved_by: env.current_contract_address(),
+                approved_at: env.ledger().timestamp(),
+            })
+            .publish(&env);
+            Self::invoke_hooks(&env, RefundEventType::Approved, case.refund_id);
         }
 
         // Handle stake return or forfeiture, same as the quorum-vote path —
@@ -8850,8 +8882,8 @@ mod test_payment_refund_cap;
 #[cfg(test)]
 mod test_circuit_breaker;
 
-// #[cfg(test)]
-// mod test_versioning;
+#[cfg(test)]
+mod test_versioning;
 
 #[cfg(test)]
 mod test_batch;
