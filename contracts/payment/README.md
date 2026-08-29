@@ -629,6 +629,68 @@ completion — integrators do not need to do anything special when calling `comp
 | `get_effective_fee_for_payment(payment_id)`         | Return the effective fee that would apply to a specific payment.                   |
 | `calculate_risk_score(customer, merchant, amount)`  | Compute a fraud-risk score for a potential payment.                                |
 
+#### Fee Rebate
+
+Fee rebates allow merchants to earn back a percentage of platform fees based on their payment volume. Rebates are configured by the admin and claimed by merchants.
+
+**Configuration**
+
+- **`configure_fee_rebate(admin, config)`**: Sets the rebate programme parameters. The `FeeRebateConfig` includes:
+  - `threshold_volume`: Minimum payment volume (in token units) a merchant must reach before rebates accrue
+  - `rebate_bps`: Rebate rate in basis points (e.g., `2000` for 20% of fees rebated)
+  - `rebate_period_seconds`: Length of the accrual period in seconds (e.g., `86400` for 24 hours)
+  - `active`: Whether the rebate programme is enabled
+
+**How Rebates Accrue**
+
+- Rebates accrue **only on volume above the threshold**. If `threshold_volume` is 5000 and a merchant processes 6000 in volume, rebates apply only to the 1000 above the threshold.
+- The rebate amount is calculated as: `rebate = fee_amount * rebate_bps / 10000`
+- Volume and accrued rebates are tracked per merchant over the configured `rebate_period_seconds`
+- When the period elapses (on the next payment after `now > period_start + rebate_period_seconds`), the `period_volume` counter resets and a new accrual period begins
+
+**Claiming Rebates**
+
+- **`claim_fee_rebate(merchant)`**: The merchant calls this to transfer their accrued rebate balance from the contract to their address. Returns the amount claimed.
+- After a successful claim, the merchant's `accrued_rebate` resets to `0`
+- Attempting to claim again before new volume accrues returns `RebateAlreadyClaimed`
+- **`get_rebate_accrual(merchant)`**: Returns the merchant's current accrual state, including `accrued_rebate`, `period_volume`, and period timing
+
+**Interaction with Platform Fees**
+
+- Rebates are calculated from the platform fee that was deducted from payments (see `set_fee_config`)
+- The contract must hold sufficient tokens to pay out rebates; this is typically ensured by minting tokens to the contract address during setup
+- Rebates are independent of fee waivers — a merchant with a fee waiver pays no fees and therefore earns no rebates
+
+#### Fee Sweep
+
+Fee sweeping allows the admin to transfer accumulated platform fees from the contract to a designated recipient address. This is used to move fees out of the contract on a scheduled basis.
+
+**Setting the Sweep Recipient**
+
+- **`set_sweep_recipient(admin, recipient)`**: Designates the address that receives swept fees. Only the admin can set this.
+- The recipient can be changed at any time by calling `set_sweep_recipient` again with a new address
+- If no recipient is set, `sweep_platform_fees` returns `SweepRecipientNotSet`
+
+**Sweeping Fees**
+
+- **`sweep_platform_fees(admin)`**: Transfers the entire accumulated platform fee balance to the configured recipient. Returns the amount swept.
+- After a successful sweep, the contract's accumulated fee balance resets to `0`
+- Attempting to sweep when the balance is `0` returns `NothingToSweep`
+- **`get_sweepable_balance()`**: Returns the current fee balance available for sweeping
+
+**Sweep History**
+
+- Every successful sweep is recorded in a history log
+- **`get_sweep_history(limit)`**: Returns up to `limit` of the most recent sweep records, ordered by most recent first
+- Each record includes: `sweep_id` (sequential, starting at 1), `recipient`, `amount`, and timestamp
+- The history is append-only and persists across multiple sweeps
+
+**Interaction with Platform Fees**
+
+- Sweeping operates on the same fee balance that accumulates from `set_fee_config` — it is the accumulated total of all platform fees deducted from payments
+- Sweeping does not affect individual payment records or merchant fee records
+- The sweep recipient can be any address (e.g., a treasury wallet, multi-sig, or external account)
+
 ### Rate Limiting & Fraud Controls
 
 | Function                                            | Description                                                             |
