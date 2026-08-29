@@ -10,6 +10,13 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 - clawback: Reverts the funds back to the original sender if the escrow conditions expire or fundamentally fail.
 - approve_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
 - add_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
+- is_escrow_released: Verifies whether an escrow exists and has been released.
+- is_escrow_disputed: Verifies whether an escrow exists and is currently in dispute.
+- get_escrow_status: Queries the current lifecycle status of an escrow.
+- get_escrow_parties: Queries the customer and merchant addresses for an escrow.
+- get_escrow_amount: Queries the locked token amount held in an escrow.
+- verify_escrow_participant: Verifies if a given address is a valid participant (customer or merchant) of an escrow.
+- verify_observer_access: Verifies whether an observer has active, non-expired read-only access.
 
 The escrow dispute flow has two separate timeout paths, and they apply in different dispute rounds.
 
@@ -17,6 +24,57 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 - Appeal expiry applies only after the dispute has entered the Appeal round. An appeal can be filed only while the dispute round is not Final and the time since `dispute_started_at` is still within the 72-hour appeal window. The appeal stores `appeal_deadline = filed_at + 259200`, and if that deadline passes without a resolution, `expire_appeal` rejects the pending appeal, advances the dispute round to Final, and leaves the prior outcome as the effective final disposition.
 
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
+---
+
+## Verification
+
+The escrow contract provides a dedicated State Verification Interface and access-control verification mechanisms. These allow external contracts, off-chain integrators, and internal methods to verify escrow status, validate participant identities, verify observer access windows, and validate cryptographic evidence proofs.
+
+### Verifier Roles
+
+1. **Public & External Verifiers (Read-Only)**:
+   - External contracts, cross-contract callers, client dApps, and indexers can verify escrow states and participant roles without requiring authentication or gas-intensive authorizations.
+   - Used to verify state preconditions (e.g., confirming funds are `Released` before fulfilling an off-chain order, or ensuring an address is a registered participant before initiating a multi-party flow).
+
+2. **Internal Contract Verifier (Guards & Access Control)**:
+   - The contract internally executes verification checks before performing state modifications or exposing sensitive data:
+     - **Escrow Inspection Guard (`get_escrow_details`)**: Verifies that the caller is either the `customer`, the `merchant`, or an active observer with valid access (`verify_observer_access`).
+     - **Observer Management Guard (`add_observer` / `remove_observer`)**: Verifies that the granter is either an escrow participant (`verify_escrow_participant`) or a multisig admin.
+     - **Dispute Evidence Verifier (`submit_evidence_with_proof`)**: Verifies cryptographic Keccak-256 Merkle proofs against pre-committed roots.
+     - **Release Protection Guard (`release_escrow`)**: Verifies that the caller is an authorized admin or trusted bridge and rejects callers holding observer roles.
+
+### Verification Functions and Inputs
+
+| Function | Inputs | Return Type | Description |
+| :--- | :--- | :--- | :--- |
+| `is_escrow_released` | `escrow_id: u64` | `bool` | Returns `true` if the escrow exists and its status is `Released`. Returns `false` for non-existent IDs or unreleased escrows. |
+| `is_escrow_disputed` | `escrow_id: u64` | `bool` | Returns `true` if the escrow exists and its status is `Disputed`. Returns `false` for non-existent IDs or non-disputed escrows. |
+| `get_escrow_status` | `escrow_id: u64` | `Result<EscrowStatus, Error>` | Returns the exact `EscrowStatus` (`Locked`, `Released`, `Disputed`, `Resolved`, etc.) or `EscrowNotFound` if not found. |
+| `get_escrow_parties` | `escrow_id: u64` | `Result<(Address, Address), Error>` | Returns the `(customer, merchant)` tuple or `EscrowNotFound`. |
+| `get_escrow_amount` | `escrow_id: u64` | `Result<i128, Error>` | Returns the locked token amount or `EscrowNotFound`. |
+| `verify_escrow_participant` | `escrow_id: u64`, `address: Address` | `bool` | Returns `true` if `address` matches either `escrow.customer` or `escrow.merchant`. Returns `false` for non-existent IDs or non-matching addresses. |
+| `verify_observer_access` | `escrow_id: u64`, `observer: Address` | `bool` | Returns `true` if `observer` has an active grant where `now < expires_at`. Returns `false` if unassigned or expired. |
+| `get_escrow_details` | `caller: Address`, `escrow_id: u64` | `Result<Escrow, Error>` | Requires `caller.require_auth()`. Returns full `Escrow` struct if caller passes participant or observer verification; returns `Unauthorized` otherwise. |
+| `submit_evidence_with_proof` | `caller: Address`, `escrow_id: u64`, `evidence: Bytes`, `proof: Vec<BytesN<32>>`, `leaf_index: u32` | `Result<(), Error>` | Verifies `keccak256(evidence)` against committed Merkle root using proof and leaf index. Returns `InvalidMerkleProof` if verification fails. |
+
+### State Effects: Passed vs. Failed Verification
+
+- **Read-Only Verification (`is_escrow_released`, `is_escrow_disputed`, `verify_escrow_participant`, `verify_observer_access`)**:
+  - **Passed (`true`)**: Indicates the condition is satisfied. No contract state or storage is altered.
+  - **Failed (`false`)**: Indicates the condition is not satisfied (e.g., escrow does not exist, status does not match, or address is not a participant). No state is modified and no error is thrown.
+- **State Query Verification (`get_escrow_status`, `get_escrow_parties`, `get_escrow_amount`)**:
+  - **Passed (`Ok(value)`)**: Returns requested escrow metadata. No state mutations occur.
+  - **Failed (`Err(EscrowError::NotFound)`)**: Operation returns a not-found error without modifying contract state.
+- **Access Control Verification (`get_escrow_details`, `add_observer`, `remove_observer`)**:
+  - **Passed**: The caller is authorized to view sensitive escrow records or grant/revoke observer roles.
+  - **Failed**: Fails with `Error::Basic(BasicError::Unauthorized)` or `Error::Basic(BasicError::NotAnAdmin)`. Transaction reverts with zero state mutations.
+- **Observer Expiry Verification**:
+  - `verify_observer_access` automatically begins returning `false` once `env.ledger().timestamp() >= observer.expires_at`.
+  - Expired observer entries remain stored in historical observer records (`get_observers`) but lose read access to `get_escrow_details` immediately without requiring an on-chain cleanup transaction.
+- **Merkle Proof Evidence Verification**:
+  - **Passed**: Evidence entry is validated against `EvidenceCommitment.merkle_root` and recorded on-chain in dispute history.
+  - **Failed**: Reverts with `Error::Basic(BasicError::InvalidMerkleProof)`. No evidence is stored and no event is emitted.
+
 ---
 
 ## Admin Succession
@@ -166,3 +224,4 @@ set_sub_account_fee_override(merchant, escrow_id, sub_id, fee_bps_override)
 
 ---
 [⬅ Back to Main README](../../README.md)
+

@@ -11607,8 +11607,8 @@ mod multi_party_weight_test;
 // #[cfg(test)]
 // mod dispute_appeal_test;
 //
-// #[cfg(test)]
-// mod verification_test;
+#[cfg(test)]
+mod verification_test;
 //
 // #[cfg(test)]
 // mod timelock_test;
