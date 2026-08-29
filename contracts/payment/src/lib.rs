@@ -3448,6 +3448,74 @@ impl PaymentContract {
             &dispute,
         );
 
+        if favor_customer {
+            let mut analytics: PaymentAnalytics = env
+                .storage()
+                .instance()
+                .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
+                .unwrap_or(PaymentAnalytics {
+                    total_payments_created: 0,
+                    total_payments_completed: 0,
+                    total_payments_cancelled: 0,
+                    total_payments_refunded: 0,
+                    total_volume: 0,
+                    total_refunded_volume: 0,
+                    unique_customers: 0,
+                    unique_merchants: 0,
+                });
+            analytics.total_payments_refunded += 1;
+            analytics.total_refunded_volume += payment.amount;
+            env.storage()
+                .instance()
+                .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
+
+            let mut m_analytics: MerchantAnalytics = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::Analytics(
+                    payment.merchant.clone(),
+                )))
+                .unwrap_or(MerchantAnalytics {
+                    total_payments: 0,
+                    total_volume: 0,
+                    total_completed: 0,
+                    total_cancelled: 0,
+                    total_refunded: 0,
+                    total_refunded_volume: 0,
+                });
+            m_analytics.total_refunded += 1;
+            m_analytics.total_refunded_volume += payment.amount;
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
+                &m_analytics,
+            );
+
+            let mut c_analytics: CustomerAnalytics = env
+                .storage()
+                .instance()
+                .get(&DataKey::Customer(CustomerDataKey::Analytics(
+                    payment.customer.clone(),
+                )))
+                .unwrap_or(PaymentContract::default_customer_analytics());
+            c_analytics.total_refunds += payment.amount;
+            env.storage().instance().set(
+                &DataKey::Customer(CustomerDataKey::Analytics(payment.customer.clone())),
+                &c_analytics,
+            );
+
+            let now = env.ledger().timestamp();
+            PaymentContract::update_merchant_bucket(
+                &env,
+                payment.merchant.clone(),
+                now,
+                0,
+                0,
+                payment.amount,
+                0,
+            );
+            PaymentContract::update_platform_daily_bucket(&env, now, 0, payment.amount, 0);
+        }
+
         (PaymentDisputeResolved {
             payment_id,
             favor_customer,
