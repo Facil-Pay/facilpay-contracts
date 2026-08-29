@@ -361,6 +361,44 @@ to request again.
 - `get_voucher()` — Gets a refund voucher by ID.
 - `get_customer_vouchers()` — Gets all refund vouchers issued to a customer.
 
+#### Voucher expiry and value handling
+
+A voucher is created with a concrete TTL at issue time:
+
+```rust
+let now = env.ledger().timestamp();
+let voucher = RefundVoucher {
+    issued_at: now,
+    expires_at: now.saturating_add(expiry_seconds),
+    redeemed: false,
+};
+```
+
+The contract treats the expiry check as `now > expires_at`:
+
+- redemption succeeds while `now <= expires_at`
+- redemption fails once the timestamp moves past the stored expiry
+- equality is still valid, so the voucher remains usable at the exact `expires_at` boundary
+
+This is enforced in `redeem_refund_voucher()` by rejecting with `VoucherExpired` when the ledger time is past the voucher's expiry. The value itself is not automatically reclaimed or reissued once a voucher expires; the voucher simply stops being redeemable. There is no on-chain “refund the expired amount back to merchant/treasury” flow in the contract; the unredeemed value is effectively dead credit unless a new voucher is created or a different manual process handles it.
+
+#### Policy inheritance and merchant ancestry
+
+Refund policy inheritance is a separate but related mechanism for merchants organized in a parent/child hierarchy. A merchant can be assigned a parent via `set_merchant_parent(admin, merchant, parent)`, and the contract checks for:
+
+- self-parent loops (`merchant == parent`)
+- circular ancestry chains
+- maximum inheritance depth (`MAX_INHERITANCE_DEPTH = 5`)
+
+The effective policy is resolved via `get_effective_refund_policy(merchant)`, which walks the ancestry chain and returns the first active policy it finds. In practical terms:
+
+- a merchant with an active policy sees their own policy first
+- if they do not have a policy, or their policy is inactive and inheritance is enabled, the parent chain is consulted
+- `set_inherit_from_parent(merchant, false)` disables fall-through to a parent when the merchant's local policy is inactive
+- `get_policy_inheritance_chain(merchant)` returns the explicit ancestry path for auditing
+
+This is distinct from voucher redemption: inheritance is about the merchant refund policy that governs future refund decisions, while vouchers are per-refund credit instruments with their own expiry and redemption logic.
+
 ### Payment Refund Caps
 
 - `set_payment_refund_cap()` — Admin sets a refund cap on a specific payment.

@@ -1,4 +1,16 @@
+"""One-off migration helper for the payment contract refactor.
+
+This script was used to rewrite contracts/payment/src/lib.rs by applying a set of
+regex-based substitutions to produce the refactored storage shapes and error enums.
+It is not part of the runtime contract logic and is not required for ordinary builds or
+tests in the current tree.
+
+Status: historical maintenance script; it has already been applied to the source. It is
+safe to keep only as an archival reference, but it is not needed for normal development.
+"""
+
 import re
+
 
 def refactor():
     with open("contracts/payment/src/lib.rs", "r") as f:
