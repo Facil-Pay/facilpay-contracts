@@ -175,6 +175,74 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `reset_circuit_breaker()` — Admin manually resets the circuit breaker.
 - `check_circuit_breaker()` — Returns true if the circuit breaker is active.
 
+#### How the Circuit Breaker Works
+
+The circuit breaker is an automatic kill switch that halts new refund requests
+when the ratio of refunded value to paid value spikes over a short window —
+protecting the contract (and merchant treasuries) against a runaway refund event,
+a compromised approver, or a buggy integration.
+
+**Configuration**
+
+The admin installs it with `set_circuit_breaker_config(admin, config)`:
+
+```rust
+pub struct CircuitBreakerConfig {
+    pub max_refund_rate_bps: u32,        // trip threshold, in basis points (e.g. 1000 = 10%)
+    pub measurement_window_seconds: u64, // rolling window over which volume is summed
+    pub cooldown_seconds: u64,           // how long the breaker stays tripped before auto-reset
+    pub enabled: bool,                   // master on/off switch
+}
+```
+
+If no config has ever been set, or `enabled` is `false`, the breaker is inert:
+requests are never evaluated or blocked, and `check_circuit_breaker()` returns
+`false`.
+
+**What trips it**
+
+The check runs inside `request_refund` (before the customer rate-limit, fraud and
+policy checks). For each request the contract maintains, per rolling
+`measurement_window_seconds` window, a running sum of requested refund amounts and
+a running sum of the corresponding original payment amounts. When a window
+elapses (or on first use) both sums reset and the window restarts at the current
+ledger time.
+
+For the incoming request it computes
+`rate_bps = (window_refund_volume + refund_amount) * 10000 / (window_payment_volume + payment_amount)`.
+If that value is **greater than** `max_refund_rate_bps`, the breaker trips:
+
+- `CircuitBreakerState` is updated — `tripped = true`, `tripped_at = now`,
+  `trip_count += 1`, `last_refund_rate_bps = rate_bps`,
+  `resets_at = now + cooldown_seconds`;
+- a `CircuitBreakerTrippedEvent { refund_rate_bps, tripped_at }` is emitted;
+- the triggering `request_refund` call itself reverts with
+  `CircuitBreakerTripped` (error `29`). Its amounts are **not** added to the
+  window totals.
+
+**What it blocks while tripped**
+
+Only `request_refund`. Every new refund request reverts with
+`CircuitBreakerTripped` until the breaker resets. Refunds
+that were already `Requested`, `Approved`, or `Processed` before the trip are
+unaffected — approvals, processing, appeals, arbitration and admin overrides do
+not consult the breaker.
+
+**How it resets**
+
+- **Automatically** — the next `request_refund` received at or after `resets_at`
+  clears the tripped state (`tripped = false`, `tripped_at`/`resets_at` cleared)
+  and proceeds against a fresh measurement window. `trip_count` is retained as a
+  historical counter.
+- **Manually** — the admin calls `reset_circuit_breaker(admin)`, which clears the
+  tripped state immediately and emits `CircuitBreakerResetEvent { reset_by,
+  reset_at }`. Use this to restore service before the cooldown elapses (e.g. after
+  raising `max_refund_rate_bps` or confirming the spike was legitimate).
+
+`get_circuit_breaker_state()` returns the full state (tripped flag, trip count,
+last observed rate, auto-reset timestamp); `check_circuit_breaker()` is a
+read-only helper returning `true` only while tripped and still within cooldown.
+
 ### Fraud Detection
 
 - `check_fraud_signals()` — Checks an address for fraud signals.

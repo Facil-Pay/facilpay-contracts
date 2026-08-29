@@ -187,6 +187,73 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `get_subscriptions_by_merchant(merchant, page)`                                                                                     | Paginated list of subscription IDs for a merchant.                                                              |
 | `get_merchant_subscriptions(merchant, page)`                                                                                        | Alternative paginated index of subscription IDs for a merchant.                                                 |
 
+#### How Free Trials Work
+
+A subscription can begin with an optional **free trial** by passing a non-zero
+`trial_period_seconds` to `create_subscription`. A trial is a delay on the *first
+charge* only — the subscription is `Active` from the moment it is created, but the
+customer is not billed until the trial ends. Trial state lives on the subscription
+record as `trial_data` (`period_seconds`, `ends_at`, `converted`).
+
+**Starting a trial**
+
+- `trial_period_seconds` is the trial length in seconds. Passing `0` means "no
+  trial": `trial_data.period_seconds` and `trial_data.ends_at` are both `0`, and
+  `trial_data.converted` stays `false`.
+- With a non-zero value, `trial_data.ends_at` is set to
+  `created_at + trial_period_seconds` and a `TrialStarted { subscription_id,
+  trial_ends_at }` event is emitted alongside the usual `SubscriptionCreated`
+  event.
+- `interval` must still be non-zero even when a trial is set, otherwise the call
+  reverts with `InvalidInterval` (error `124`) — the billing clock and pause
+  proration math divide by the interval.
+- `next_payment_at` is initialised to `created_at + interval` as normal; the trial
+  check is layered on top when a cycle becomes due.
+
+**Duration and extension**
+
+- The trial runs until `trial_data.ends_at`. There is no minimum length; the
+  maximum *total* trial length is `MAX_TRIAL_DURATION` = **90 days**.
+- Only the subscription's merchant can lengthen an active trial, via
+  `extend_trial(merchant, subscription_id, additional_seconds)`. This adds
+  `additional_seconds` to both `trial_data.ends_at` and
+  `trial_data.period_seconds`.
+- Extension is rejected when:
+  - the caller is not the subscription's merchant — `Unauthorized` (error `100`);
+  - the trial has already expired (`now >= trial_data.ends_at`) — `TrialExpired`
+    (error `315`);
+  - the new total trial length would exceed 90 days —
+    `MaxTrialDurationExceeded` (error `316`).
+- There is no "shorten trial" call. To end a trial early, the customer cancels
+  (see below); otherwise it simply expires.
+
+**The trial-to-paid transition**
+
+- The transition is driven by `execute_recurring_payment`, which an off-chain
+  keeper / cron calls once a cycle is due. There is **no separate "convert" call**,
+  and the customer does **not** need to take any action to convert to a paid
+  subscription.
+- While `now < trial_data.ends_at`, a due `execute_recurring_payment` performs
+  **no token transfer**, does **not** increment `payment_count`, advances
+  `next_payment_at` by one `interval`, and returns `Ok`. Repeated due cycles
+  during the trial are each skipped this way.
+- On the first `execute_recurring_payment` where `now >= trial_data.ends_at` and a
+  payment is due, the customer is charged normally (running through the usual
+  merchant-not-paused, not-expired, spend-limit and discount checks). If that
+  transfer succeeds, `trial_data.converted` is set to `true` and a
+  `TrialConverted { subscription_id, converted_at }` event is emitted. Later
+  charges behave like any recurring payment.
+- If the first post-trial charge fails, the subscription follows the standard
+  retry / dunning path and `converted` stays `false` until a charge succeeds.
+
+**Cancelling during a trial**
+
+- If `cancel_subscription` is called while `now < trial_data.ends_at`, the
+  subscription moves to `Cancelled`, a `TrialCancelled { subscription_id,
+  cancelled_at }` event is emitted (in addition to `SubscriptionCancelled`), and
+  the customer is never charged. A customer who does not want to convert must
+  cancel before the trial ends.
+
 ### Metered Billing
 
 | Function                                                                                                               | Description                                                                                |
