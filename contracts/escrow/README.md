@@ -223,5 +223,151 @@ set_sub_account_fee_override(merchant, escrow_id, sub_id, fee_bps_override)
 | `SubAccountFundingExceedsEscrow`    | 216  | Total sub-account allocations would exceed the parent escrow amount  |
 
 ---
+
+## Dispute Collateral
+
+Collateral is a security deposit required from the party initiating a dispute. It ensures that disputing parties have skin in the game and discourages frivolous disputes.
+
+**Configuration**
+
+- **`set_dispute_config(admin, config)`**: Sets the dispute collateral parameters. The `DisputeConfig` includes:
+  - `collateral_token`: The token contract address used for collateral deposits
+  - `collateral_amount`: The exact amount of collateral required to initiate a dispute
+  - `collateral_enabled`: Whether collateral is required (`true`) or disabled (`false`)
+
+**How Collateral Works**
+
+When a party calls `dispute_escrow`:
+- If `collateral_enabled` is `true`, the disputing party must have `collateral_amount` of `collateral_token` in their balance
+- The collateral amount is automatically transferred from the disputing party to the escrow contract
+- The collateral is held alongside the escrowed funds until the dispute is resolved
+- **`get_dispute_collateral(escrow_id)`**: Returns the collateral record for a disputed escrow, including `amount` and `disputing_party`
+
+**Collateral Return vs. Forfeiture**
+
+The fate of the collateral depends on the dispute resolution:
+
+- **Returned to disputing party**: If the dispute is resolved in favor of the disputing party, the collateral is returned to them along with their portion of the escrowed funds. For example, if a customer disputes and wins, they receive both the escrow amount and their collateral back.
+- **Forfeited to counterparty**: If the dispute is resolved against the disputing party, the collateral is forfeited to the other party. For example, if a merchant disputes and loses, their collateral is transferred to the customer.
+
+**Disabling Collateral**
+
+- If `collateral_enabled` is set to `false`, disputes can be initiated without any collateral deposit
+- When disabled, `get_dispute_collateral` returns an error for escrows with no collateral
+- This allows for optional collateral enforcement based on the use case
+
+**Interaction with Dispute Evidence Deadline**
+
+- Collateral is deposited at the time `dispute_escrow` is called, which is independent of the evidence submission deadline
+- The evidence deadline governs when evidence can be submitted, but does not affect the collateral requirement
+- Collateral is held until dispute resolution regardless of evidence submission timing
+
+---
+
+## Beneficiary Transfer
+
+Beneficiary transfer allows the merchant (beneficiary) of an escrow to be reassigned to a different address. This is useful for scenarios such as business acquisitions, merchant account changes, or internal routing adjustments.
+
+**Authorization**
+
+- **`transfer_escrow_beneficiary(caller, escrow_id, new_beneficiary)`**: Transfers the beneficiary (merchant) role to a new address.
+- Only the **current merchant** or the **admin** is authorized to initiate a transfer. Any other caller receives `Unauthorized`.
+- The original beneficiary does **not** need to consent to the transfer — authorization is determined solely by the caller being the current merchant or admin.
+
+**Transfer Restrictions**
+
+- **Same beneficiary rejected**: Transferring to the same address as the current beneficiary returns `SameBeneficiary`
+- **Disputed escrow blocked**: If the escrow is in `Disputed` status, beneficiary transfer is blocked with `TransferNotAllowed`
+- **Resolved escrow blocked**: If the escrow has already been resolved (after a dispute), beneficiary transfer is blocked with `TransferNotAllowed`
+- Transfers are only allowed on escrows in active states (e.g., `Locked`)
+
+**Transfer History**
+
+- Every successful beneficiary transfer is recorded in an append-only history log
+- **`get_transfer_history(escrow_id)`**: Returns the complete transfer history for an escrow, including:
+  - `from`: The previous beneficiary address
+  - `to`: The new beneficiary address
+  - Timestamp of the transfer
+- The history is empty before any transfers occur
+- Multiple transfers can be chained (e.g., A → B → C), with each step recorded separately
+
+**Interaction with Disputes**
+
+- Once an escrow enters `Disputed` status, no further beneficiary transfers are allowed
+- If a dispute is resolved, the escrow remains blocked for transfers even after resolution
+- This ensures that the beneficiary at the time of dispute initiation remains the party involved in dispute resolution
+- Transfers should be completed before any dispute is raised if a beneficiary change is needed
+
+---
+
+## Timelock vs. Hold Period
+
+The escrow contract includes two time-based mechanisms: **timelock** and **hold period**. These serve different purposes and operate independently.
+
+### Timelock
+
+Timelock is a governance mechanism that delays the execution of sensitive administrative actions. It applies to queued actions such as dispute resolution and force release.
+
+**Configuration**
+
+- **`set_timelock_config(admin, config)`**: Sets the timelock parameters. The `TimeLockConfig` includes:
+  - `delay`: Minimum delay in seconds before a queued action can be executed (must be between 1 hour and 7 days)
+  - `grace_period`: Additional grace period in seconds after the delay expires
+
+**How Timelock Works**
+
+- **`queue_action(admin, escrow_id, action_type, data)`**: Queues an action for delayed execution. Returns an `action_id`.
+- The action cannot be executed until the `delay` period has elapsed since queuing
+- Attempting to execute before the delay returns `NotReady`
+- **`cancel_queued_action(admin, action_id)`**: Cancels a queued action before it executes
+- **`get_queued_action(action_id)`**: Retrieves the status of a queued action
+
+Timelock is designed for admin-gated actions that require a cooling-off period, such as resolving disputes in favor of one party or force-releasing funds.
+
+### Hold Period
+
+Hold period is a customer protection mechanism that prevents premature refunds. It applies to the customer's ability to refund an escrow.
+
+**How Hold Period Works**
+
+- When creating an escrow with `create_escrow`, a `hold_period_seconds` parameter can be specified
+- The customer cannot call `refund_escrow` until the hold period has elapsed since escrow creation
+- Attempting to refund before the hold period expires fails
+- Once the hold period elapses, the customer can refund the escrow unconditionally (if not disputed)
+
+Hold period is designed to give merchants a reasonable window to fulfill obligations before customers can unilaterally reclaim funds.
+
+### Interaction Between Timelock and Hold Period
+
+**Independent Mechanisms**
+
+- Timelock and hold period are **independent time windows** that do not stack or interfere with each other
+- Timelock applies to **admin actions** (queued actions like dispute resolution)
+- Hold period applies to **customer actions** (refund requests)
+- They operate on different callers and different operations
+
+**No Precedence Conflict**
+
+- There is no scenario where both mechanisms apply to the same operation on the same escrow
+- A customer refund is governed only by hold period (and dispute status)
+- An admin action (e.g., dispute resolution) is governed only by timelock
+- The two do not compete or take precedence — they simply apply to different operations
+
+**Example Timeline**
+
+1. Escrow created at t=0 with hold_period=500s
+2. At t=100, customer cannot refund (hold period not elapsed)
+3. At t=200, admin queues a dispute resolution action with timelock delay=7200s
+4. At t=600, customer can now refund (hold period elapsed) — timelock does not block customer refunds
+5. At t=7400, admin can execute the queued action (timelock delay elapsed) — hold period does not block admin actions
+
+**Summary**
+
+- **Timelock**: Delays admin actions for governance purposes
+- **Hold period**: Delays customer refunds for protection purposes
+- **Independence**: They apply to different operations and do not interact
+- **No stacking**: They are separate windows, not cumulative constraints
+
+---
 [⬅ Back to Main README](../../README.md)
 
