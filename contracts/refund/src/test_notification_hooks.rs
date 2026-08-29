@@ -129,7 +129,10 @@ fn test_max_hooks_per_event() {
     events.push_back(RefundEventType::Requested);
 
     let result = client.try_register_notification_hook(&subscriber11, &events);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::MaxHooksPerEventReached))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::MaxHooksPerEventReached)))
+    );
 }
 
 #[test]
@@ -161,7 +164,10 @@ fn test_deregister_hook_not_owner() {
     // Try to deregister with different address
     let other_subscriber = register_mock_subscriber(&env);
     let result = client.try_deregister_hook(&other_subscriber, &hook_id);
-    assert_eq!(result, Err(Ok(Error::Ext(ExtError::HookNotOwnedBySubscriber))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Ext(ExtError::HookNotOwnedBySubscriber)))
+    );
 }
 
 #[test]

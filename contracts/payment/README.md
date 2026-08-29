@@ -562,10 +562,84 @@ completion — integrators do not need to do anything special when calling `comp
 | `get_merchant_rate_limit(merchant)`                 | Return the rate-limit configuration for a specific merchant.            |
 | `reset_merchant_rate_limit(admin, merchant)`        | Reset a merchant's rate-limit counters.                                 |
 | `check_rate_limit(merchant, amount)`                | Return `true` if a proposed payment would not exceed rate limits.       |
-| `set_customer_spend_limit(admin, customer, config)` | Set a daily/monthly spending cap for a customer.                        |
-| `get_spend_limit(customer)`                         | Return a customer's spend limit configuration.                          |
-| `remove_customer_spend_limit(admin, customer)`      | Remove a customer's spend limit.                                        |
-| `check_spend_allowance(customer, amount)`           | Return `true` if the customer has sufficient spend allowance remaining. |
+| `set_customer_spend_limit(admin, customer, limit, period_seconds)` | Set a rolling spending cap for a customer.                              |
+| `get_spend_limit(customer)`                                        | Return a customer's spend limit configuration.                          |
+| `remove_customer_spend_limit(admin, customer)`                     | Remove a customer's spend limit.                                        |
+| `check_spend_allowance(customer, amount)`                          | Return `true` if the customer has sufficient spend allowance remaining. |
+
+#### How Spend Limits Work
+
+Spend limits allow admins to set a spending cap on a customer over a rolling time window (`period_seconds`).
+
+**Scope**
+
+- Spend limits are scoped strictly **per-customer** (`Address`).
+- Spend limits track cumulative spending across all payments made by a customer address (`DataKey::Feature(FeatureKey::CustomerSpendLimit(customer))`).
+- Limits are **not** scoped per-merchant or per-payment-method.
+
+**Configuration & Management**
+
+- **`set_customer_spend_limit(admin, customer, limit, period_seconds)`**: Requires multi-sig admin authorization (`admin.require_auth()`). Sets or updates the spending limit for a customer. Stores a `CustomerSpendLimit` struct containing `customer`, `limit_amount`, `period_seconds`, `used` (initialized to `0`), and `period_start` (set to `env.ledger().timestamp()`).
+- **`get_spend_limit(customer)`**: Returns `Option<CustomerSpendLimit>` containing the configured limit and current usage.
+- **`remove_customer_spend_limit(admin, customer)`**: Admin function to remove a customer's spend limit from contract storage. Once removed, any payment amount is allowed.
+- **`check_spend_allowance(customer, amount)`**: Read-only check returning `true` if the customer can spend `amount` without exceeding their remaining allowance (or if no limit is configured).
+
+**Rolling Window & Reset Boundary**
+
+- The contract checks whether the current ledger timestamp (`now`) has exceeded the rolling window: `now > period_start + period_seconds`.
+- **Exact Boundary Condition**: Window expiration uses strict inequality (`>`). At the exact boundary `now == period_start + period_seconds`, the window has **not** reset yet; `used` retains its accumulated value.
+- Once `now > period_start + period_seconds`, the accumulated `used` total automatically resets to `0` and `period_start` updates to `now`.
+
+**Enforcement & Error Handling**
+
+- Spend limits are checked automatically during payment creation (`create_payment`), scheduled payment execution, and recurring subscription charges.
+- **Exact Error Variant**: On breach, the contract returns `Error::Feature(FeatureError::SpendLimitExceeded)`. `FeatureError::SpendLimitExceeded` has explicit discriminant **`527`** in the `#[contracterror]` enum.
+- **`create_payment` vs `try_create_payment` Entry Points**:
+  - `create_payment(...)`: The contract function returns `Result<u64, Error>`. When invoked on-chain or via Stellar CLI, a limit breach causes the transaction to revert with contract error code `527`. In SDK/Rust client test code, calling `client.create_payment(...)` directly unrolls the `Result` and **panics/traps** on error.
+  - `try_create_payment(...)`: In SDK/Rust client code, `client.try_create_payment(...)` catches the error safely and returns `Err(Ok(Error::Feature(FeatureError::SpendLimitExceeded)))`, allowing callers to inspect and handle breaches programmatically.
+
+**Code Example**
+
+```rust
+// 1. Admin sets a spend limit of 1,000 units over a 1-hour period (3,600 seconds)
+client.set_customer_spend_limit(&admin, &customer, &1000, &3600);
+
+// 2. Query spend allowance prior to payment
+let is_allowed = client.check_spend_allowance(&customer, &500);
+assert!(is_allowed);
+
+// 3. Payment within limit succeeds
+let payment_id = client.create_payment(
+    &customer,
+    &merchant,
+    &500,
+    &token_addr,
+    &Currency::USDC,
+    &86400,
+    &soroban_sdk::String::from_str(&env, ""),
+);
+
+// 4. Attempting a payment exceeding remaining limit (e.g. 600 units when limit is 1000 and 500 used):
+// Using try_create_payment for programmatic error handling:
+let result = client.try_create_payment(
+    &customer,
+    &merchant,
+    &600,
+    &token_addr,
+    &Currency::USDC,
+    &86400,
+    &soroban_sdk::String::from_str(&env, ""),
+);
+
+assert_eq!(
+    result,
+    Err(Ok(Error::Feature(FeatureError::SpendLimitExceeded)))
+);
+// Note: Calling client.create_payment(...) directly when limit is exceeded will panic/trap
+// with contract error code 527.
+```
+
+
 
 ### Token Allowlist
 

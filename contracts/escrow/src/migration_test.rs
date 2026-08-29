@@ -35,7 +35,9 @@ fn test_schema_version_increments_after_migration() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.begin_migration(&admin);
     client.migrate_escrow(&admin, &1);
     client.complete_migration(&admin);
@@ -49,7 +51,9 @@ fn test_begin_migration_rejects_when_schema_already_at_target() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.begin_migration(&admin);
     client.migrate_escrow(&admin, &1);
     client.complete_migration(&admin);
@@ -116,20 +120,24 @@ fn test_sub_account_fee_bps_override() {
     );
 
     assert_eq!(
-        client.get_sub_account(&escrow_id, &fee_free_id).unwrap().fee_bps_override,
+        client
+            .get_sub_account(&escrow_id, &fee_free_id)
+            .unwrap()
+            .fee_bps_override,
         Some(0)
     );
     assert_eq!(
-        client.get_sub_account(&escrow_id, &premium_id).unwrap().fee_bps_override,
+        client
+            .get_sub_account(&escrow_id, &premium_id)
+            .unwrap()
+            .fee_bps_override,
         Some(1000)
     );
-    assert!(
-        client
-            .get_sub_account(&escrow_id, &inherited_id)
-            .unwrap()
-            .fee_bps_override
-            .is_none()
-    );
+    assert!(client
+        .get_sub_account(&escrow_id, &inherited_id)
+        .unwrap()
+        .fee_bps_override
+        .is_none());
 
     client.set_sub_account_fee_override(&merchant, &escrow_id, &inherited_id, &Some(250));
     assert_eq!(
@@ -150,8 +158,12 @@ fn test_begin_migration_sets_status() {
     let (client, admin, customer, merchant, token) = setup(&env);
 
     // Create a couple of escrows first
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     env.ledger().set_timestamp(100);
     client.begin_migration(&admin);
@@ -170,7 +182,9 @@ fn test_migrate_escrow_single() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.begin_migration(&admin);
     client.migrate_escrow(&admin, &id);
 
@@ -184,8 +198,12 @@ fn test_complete_migration_success() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id1 = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    let id2 = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id1 = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let id2 = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     env.ledger().set_timestamp(200);
     client.begin_migration(&admin);
@@ -206,9 +224,15 @@ fn test_migrate_escrow_batch() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id1 = client.create_escrow(&customer, &merchant, &100_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    let id2 = client.create_escrow(&customer, &merchant, &200_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    let id3 = client.create_escrow(&customer, &merchant, &300_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id1 = client.create_escrow(
+        &customer, &merchant, &100_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let id2 = client.create_escrow(
+        &customer, &merchant, &200_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let id3 = client.create_escrow(
+        &customer, &merchant, &300_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     client.begin_migration(&admin);
 
@@ -247,7 +271,9 @@ fn test_create_escrow_allowed_after_migration_complete() {
     client.complete_migration(&admin);
 
     // Should succeed now
-    let id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     assert_eq!(id, 1);
 }
 
@@ -259,7 +285,9 @@ fn test_double_migrate_returns_already_migrated() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
     client.begin_migration(&admin);
     client.migrate_escrow(&admin, &id);
 
@@ -273,8 +301,12 @@ fn test_batch_skips_already_migrated() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id1 = client.create_escrow(&customer, &merchant, &100_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    let id2 = client.create_escrow(&customer, &merchant, &200_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id1 = client.create_escrow(
+        &customer, &merchant, &100_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    let id2 = client.create_escrow(
+        &customer, &merchant, &200_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     client.begin_migration(&admin);
     client.migrate_escrow(&admin, &id1); // migrate id1 first
@@ -296,8 +328,12 @@ fn test_complete_migration_fails_if_not_all_migrated() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
-    client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
+    client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     client.begin_migration(&admin);
     // Only migrate one of two
@@ -315,10 +351,15 @@ fn test_migrate_without_begin_fails() {
     env.mock_all_auths();
     let (client, admin, customer, merchant, token) = setup(&env);
 
-    let id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
+    let id = client.create_escrow(
+        &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
+    );
 
     let result = client.try_migrate_escrow(&admin, &id);
-    assert_eq!(result, Err(Ok(Error::Basic(BasicError::MigrationNotStarted))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Basic(BasicError::MigrationNotStarted)))
+    );
 }
 
 // ── UNAUTHORIZED ADMIN ────────────────────────────────────────────────────────

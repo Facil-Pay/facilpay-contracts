@@ -51,7 +51,8 @@ fn test_redeem_voucher_before_expiry_succeeds() {
 
     // Issue a voucher expiring 1000s from now
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
+    let (_, voucher_id) =
+        create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
 
     // Redeem before expiry (at t=1500, expires at t=2000)
     env.ledger().set_timestamp(1500);
@@ -117,7 +118,8 @@ fn test_already_redeemed_voucher_cannot_be_redeemed_again() {
     let (client, admin, contract_id) = setup(&env);
 
     env.ledger().set_timestamp(1000);
-    let (_, voucher_id) = create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
+    let (_, voucher_id) =
+        create_refund_and_issue_voucher(&env, &client, &admin, &contract_id, 1000);
 
     let customer = client.get_voucher(&voucher_id).unwrap().customer;
 

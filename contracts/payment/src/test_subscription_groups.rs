@@ -4,7 +4,9 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
-use crate::{Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError, SubscriptionStatus};
+use crate::{
+    Currency, Error, PaymentContract, PaymentContractClient, SubscriptionError, SubscriptionStatus,
+};
 
 fn setup() -> (Env, PaymentContractClient<'static>, Address) {
     let env = Env::default();

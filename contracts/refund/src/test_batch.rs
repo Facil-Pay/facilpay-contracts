@@ -63,7 +63,10 @@ fn batch_with_all_valid_items_completes_successfully() {
         let result = approve_results.get(i).unwrap();
         assert!(result.success);
         assert_eq!(result.error_code, 0);
-        assert_eq!(refund_status(&client, result.refund_id), RefundStatus::Approved);
+        assert_eq!(
+            refund_status(&client, result.refund_id),
+            RefundStatus::Approved
+        );
     }
 
     let mut process_ids = Vec::new(&env);
@@ -78,7 +81,10 @@ fn batch_with_all_valid_items_completes_successfully() {
         assert!(result.success);
         assert_eq!(result.error_code, 0);
         assert_eq!(result.amount_refunded, 500i128);
-        assert_eq!(refund_status(&client, result.refund_id), RefundStatus::Processed);
+        assert_eq!(
+            refund_status(&client, result.refund_id),
+            RefundStatus::Processed
+        );
     }
 }
 

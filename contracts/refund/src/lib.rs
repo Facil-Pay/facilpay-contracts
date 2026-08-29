@@ -1359,10 +1359,9 @@ impl RefundContract {
             panic!("Already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(
-            &SystemKey::SchemaVersion,
-            &Self::INITIAL_SCHEMA_VERSION,
-        );
+        env.storage()
+            .instance()
+            .set(&SystemKey::SchemaVersion, &Self::INITIAL_SCHEMA_VERSION);
 
         // Set default refund policy (30 days, 100% refund)
         let mut default_tiers = Vec::new(&env);
@@ -1790,9 +1789,7 @@ impl RefundContract {
         if refund.customer != customer {
             return Err(Error::Core(CoreError::Unauthorized));
         }
-        if refund.status != RefundStatus::Rejected
-            && refund.status != RefundStatus::PendingAppeal
-        {
+        if refund.status != RefundStatus::Rejected && refund.status != RefundStatus::PendingAppeal {
             return Err(Error::Core(CoreError::RefundNotRejected));
         }
         if env
@@ -2639,8 +2636,7 @@ impl RefundContract {
         // `PendingAppeal` during the appeal window before finalizing to
         // `Rejected`, and arbitration must remain reachable during that
         // window, not only after it closes.
-        if refund.status != RefundStatus::Rejected && refund.status != RefundStatus::PendingAppeal
-        {
+        if refund.status != RefundStatus::Rejected && refund.status != RefundStatus::PendingAppeal {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
         if fee_amount <= 0 {
@@ -6704,8 +6700,11 @@ impl RefundContract {
         let func = Symbol::new(env, "get_payment_count_by_customer");
         let args = (address.clone(),).into_val(env);
 
-        match env.try_invoke_contract::<u64, soroban_sdk::InvokeError>(&payment_contract, &func, args)
-        {
+        match env.try_invoke_contract::<u64, soroban_sdk::InvokeError>(
+            &payment_contract,
+            &func,
+            args,
+        ) {
             Ok(Ok(count)) => count,
             _ => 0,
         }
@@ -7912,7 +7911,9 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
 
-        let expires_at = refund.expires_at.ok_or(Error::Core(CoreError::PolicyNotFound))?;
+        let expires_at = refund
+            .expires_at
+            .ok_or(Error::Core(CoreError::PolicyNotFound))?;
 
         if env.ledger().timestamp() < expires_at {
             return Err(Error::Core(CoreError::RefundWindowExpired));
@@ -8797,7 +8798,11 @@ impl RefundContract {
     ///
     /// # Returns
     /// The `RefundCap` for the tier if configured, `None` otherwise.
-    pub fn get_customer_tier_policy(env: Env, merchant: Address, tier_id: u32) -> Option<RefundCap> {
+    pub fn get_customer_tier_policy(
+        env: Env,
+        merchant: Address,
+        tier_id: u32,
+    ) -> Option<RefundCap> {
         env.storage()
             .instance()
             .get(&DataKey::CustomerTierPolicy(merchant, tier_id))
@@ -8811,11 +8816,7 @@ impl RefundContract {
     /// # Arguments
     /// * `merchant` - The merchant to configure (must authenticate).
     /// * `strict` - `true` to enable strict mode, `false` to disable it.
-    pub fn set_strict_tier_policy(
-        env: Env,
-        merchant: Address,
-        strict: bool,
-    ) -> Result<(), Error> {
+    pub fn set_strict_tier_policy(env: Env, merchant: Address, strict: bool) -> Result<(), Error> {
         merchant.require_auth();
         env.storage()
             .instance()

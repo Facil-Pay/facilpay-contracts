@@ -230,10 +230,7 @@ fn observer_cannot_release_escrow() {
     client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
 
     let result = client.try_release_escrow(&observer, &escrow_id, &false);
-    assert_eq!(
-        result,
-        Err(Ok(Error::Basic(BasicError::Unauthorized)))
-    );
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 
     let escrow = client.get_escrow_details(&observer, &escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Locked);
@@ -249,10 +246,7 @@ fn observer_cannot_open_dispute() {
     client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
 
     let result = client.try_dispute_escrow(&observer, &escrow_id);
-    assert_eq!(
-        result,
-        Err(Ok(Error::Basic(BasicError::Unauthorized)))
-    );
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 
     let escrow = client.get_escrow_details(&observer, &escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Locked);

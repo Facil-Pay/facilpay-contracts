@@ -304,7 +304,13 @@ mod test {
         let escrow_contract = setup_escrow(&env, &pauser);
         let refund_contract = setup_refund(&env, &pauser);
 
-        client.initialize(&admin, &pauser, &payment_contract, &escrow_contract, &refund_contract);
+        client.initialize(
+            &admin,
+            &pauser,
+            &payment_contract,
+            &escrow_contract,
+            &refund_contract,
+        );
 
         let reason = String::from_str(&env, "security incident");
         client.emergency_pause_all(&pauser, &reason);

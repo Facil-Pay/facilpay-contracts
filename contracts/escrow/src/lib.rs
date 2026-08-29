@@ -3,7 +3,8 @@
 #![no_std]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    xdr::ToXdr, Address, Bytes, BytesN, Env, FromVal, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, FromVal, IntoVal, String, Symbol, TryFromVal, Val,
+    Vec,
 };
 
 #[derive(Clone)]
@@ -3584,11 +3585,7 @@ impl EscrowContract {
 
         for entry in escrow.tokens.iter() {
             let token_client = token::Client::new(&env, &entry.token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &customer,
-                &entry.amount,
-            );
+            token_client.transfer(&env.current_contract_address(), &customer, &entry.amount);
         }
 
         Ok(())
@@ -4013,7 +4010,9 @@ impl EscrowContract {
         if config.collateral_enabled && config.collateral_amount > 0 {
             // Validate collateral-to-loan ratio
             // Formula: collateral_amount * 10000 >= escrow_amount * min_collateral_ratio_bps
-            if config.collateral_amount * 10000 < escrow.amount * config.min_collateral_ratio_bps as i128 {
+            if config.collateral_amount * 10000
+                < escrow.amount * config.min_collateral_ratio_bps as i128
+            {
                 return Err(Error::Action(ActionError::InsufficientCollateral));
             }
 
@@ -5434,12 +5433,12 @@ impl EscrowContract {
         );
 
         // Reflect the timeout in the persisted audit record.
-        if let Some(mut record) = env
-            .storage()
-            .instance()
-            .get::<DataKey, AppealRecord>(&DataKey::Dispute(DisputeKey::AppealRecord(
-                escrow_id, appeal_id,
-            )))
+        if let Some(mut record) =
+            env.storage()
+                .instance()
+                .get::<DataKey, AppealRecord>(&DataKey::Dispute(DisputeKey::AppealRecord(
+                    escrow_id, appeal_id,
+                )))
         {
             record.status = AppealStatus::Rejected;
             env.storage().instance().set(
@@ -11482,9 +11481,7 @@ impl EscrowContract {
         if let Some(ids) = env
             .storage()
             .instance()
-            .get::<DataKey, Vec<u64>>(&DataKey::Dispute(DisputeKey::EscalationQueue(
-                deadline,
-            )))
+            .get::<DataKey, Vec<u64>>(&DataKey::Dispute(DisputeKey::EscalationQueue(deadline)))
         {
             let mut remaining = Vec::new(env);
             for id in ids.iter() {

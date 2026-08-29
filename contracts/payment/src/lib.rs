@@ -1900,10 +1900,9 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
         }
 
-        env.storage().instance().set(
-            &DataKey::Config(ConfigKey::SchemaVersion),
-            &target_version,
-        );
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::SchemaVersion), &target_version);
         Ok(())
     }
 
@@ -3902,9 +3901,9 @@ impl PaymentContract {
         let payout_deferred = env
             .storage()
             .instance()
-            .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(
-                MerchantDataKey::PayoutSchedule(payment.merchant.clone()),
-            ))
+            .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
+                payment.merchant.clone(),
+            )))
             .map(|schedule: PayoutSchedule| {
                 schedule.token == payment.token && schedule.frequency != PayoutFrequency::Immediate
             })
@@ -5198,10 +5197,9 @@ impl PaymentContract {
         let mut page: Vec<u64> = env
             .storage()
             .instance()
-            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
-                merchant.clone(),
-                page_num,
-            )))
+            .get(&DataKey::Merchant(
+                MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
+            ))
             .unwrap_or_else(|| Vec::new(env));
 
         let page_offset_u32 = page_offset as u32;
@@ -5221,13 +5219,9 @@ impl PaymentContract {
     fn active_subscription_at(env: &Env, merchant: &Address, flat_index: u64) -> Option<u64> {
         let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
-        let page: Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
-                merchant.clone(),
-                page_num,
-            )))?;
+        let page: Vec<u64> = env.storage().instance().get(&DataKey::Merchant(
+            MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
+        ))?;
         let page_offset_u32 = page_offset as u32;
         if page_offset_u32 < page.len() {
             Some(page.get(page_offset_u32).unwrap())
@@ -5243,10 +5237,9 @@ impl PaymentContract {
         let mut page: Vec<u64> = env
             .storage()
             .instance()
-            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
-                merchant.clone(),
-                page_num,
-            )))
+            .get(&DataKey::Merchant(
+                MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
+            ))
             .unwrap_or_else(|| Vec::new(env));
 
         if page_offset_u32 < page.len() {
@@ -5331,9 +5324,9 @@ impl PaymentContract {
     pub fn get_merchant_subscriptions(env: Env, merchant: Address, page: u64) -> Vec<u64> {
         env.storage()
             .instance()
-            .get(&DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
-                merchant, page,
-            )))
+            .get(&DataKey::Merchant(
+                MerchantDataKey::MerchantActiveSubscriptions(merchant, page),
+            ))
             .unwrap_or_else(|| Vec::new(&env))
     }
 
@@ -5756,8 +5749,11 @@ impl PaymentContract {
             }
 
             // Check customer spend limit (#282)
-            let charge_amount =
-                PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
+            let charge_amount = PaymentContract::get_discounted_subscription_amount(
+                &env,
+                subscription_id,
+                sub.amount,
+            );
             if let Err(_) =
                 PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
             {
@@ -6395,8 +6391,7 @@ impl PaymentContract {
         if sub.pause_data.proration_enabled {
             // Proration formula: (Full Amount * Remaining Time in Cycle) / Cycle Duration
             let remaining_time = sub.next_payment_at - now;
-            let prorated_amount =
-                (sub.amount * remaining_time as i128) / sub.interval as i128;
+            let prorated_amount = (sub.amount * remaining_time as i128) / sub.interval as i128;
 
             if prorated_amount > 0 {
                 let merchant_paused: bool = env
@@ -6856,12 +6851,20 @@ impl PaymentContract {
 
     /// Apply an active subscription group's discount_bps to a billing amount.
     fn get_discounted_subscription_amount(env: &Env, subscription_id: u64, amount: i128) -> i128 {
-        if let Some(group_id) = env.storage().instance().get::<DataKey, u64>(
-            &DataKey::Subscription(SubscriptionKey::GroupMembership(subscription_id)),
-        ) {
-            if let Some(group) = env.storage().instance().get::<DataKey, SubscriptionGroup>(
-                &DataKey::Subscription(SubscriptionKey::Group(group_id)),
-            ) {
+        if let Some(group_id) =
+            env.storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::Subscription(SubscriptionKey::GroupMembership(
+                    subscription_id,
+                )))
+        {
+            if let Some(group) =
+                env.storage()
+                    .instance()
+                    .get::<DataKey, SubscriptionGroup>(&DataKey::Subscription(
+                        SubscriptionKey::Group(group_id),
+                    ))
+            {
                 if group.active && group.discount_bps > 0 {
                     let bps = group.discount_bps.min(10_000) as i128;
                     return amount * (10_000 - bps) / 10_000;
@@ -7643,11 +7646,11 @@ impl PaymentContract {
     }
 
     /// Admin sets the maximum forward chain depth.
-    /// 
+    ///
     /// # Arguments
     /// * `admin` - The admin address (must be in multisig config)
     /// * `max_depth` - Maximum allowed hops in a forward chain (default: 5)
-    /// 
+    ///
     /// # Returns
     /// `Ok(())` on success, or an error if unauthorized or contract is paused.
     pub fn set_max_forward_depth(env: Env, admin: Address, max_depth: u32) -> Result<(), Error> {
@@ -7876,8 +7879,7 @@ impl PaymentContract {
             amount,
             currency,
         );
-        let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64)
-            .min(1000u64) as u32;
+        let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64).min(1000u64) as u32;
         let fee = PaymentContract::compute_fee_amount(
             amount,
             effective_bps,
