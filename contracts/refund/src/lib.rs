@@ -185,6 +185,7 @@ pub enum VoucherKey {
     VoucherCounter,
     CustomerVoucher(Address, u64),
     CustomerVoucherCount(Address),
+    RefundVoucherIssued(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4781,6 +4782,8 @@ impl RefundContract {
     /// # Arguments
     /// * `admin` - The contract admin performing the override.
     /// * `refund_id` - The ID of the refund to override.
+    /// * `new_status` - The new status to apply to the refund.
+    /// * `new_amount` - The new amount to apply to the refund.
     /// * `reason` - A human-readable reason for the override.
     ///
     /// # Errors
@@ -4790,6 +4793,8 @@ impl RefundContract {
         env: Env,
         admin: Address,
         refund_id: u64,
+        new_status: RefundStatus,
+        new_amount: i128,
         reason: String,
     ) -> Result<(), Error> {
         // Require admin authentication
@@ -4805,12 +4810,19 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        // Verify refund exists
-        let refund: Refund = env
+        // Verify refund exists and update it
+        let mut refund: Refund = env
             .storage()
             .instance()
             .get(&DataKey::Refund(refund_id))
             .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        // Apply override
+        refund.status = new_status.clone();
+        refund.amount = new_amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Refund(refund_id), &refund);
 
         // Generate immutable audit log entry
         let override_id: u64 = env
@@ -4824,7 +4836,7 @@ impl RefundContract {
         // Create hash of override details for immutability verification
         let mut hash_data = Bytes::new(&env);
         hash_data.append(&Bytes::from_slice(&env, &refund_id.to_be_bytes()));
-        hash_data.append(&Bytes::from_slice(&env, &refund.amount.to_be_bytes()));
+        hash_data.append(&Bytes::from_slice(&env, &new_amount.to_be_bytes()));
         hash_data.append(&Bytes::from_slice(&env, &executed_at.to_be_bytes()));
         let transaction_hash = env.crypto().sha256(&hash_data);
 
@@ -4833,8 +4845,8 @@ impl RefundContract {
             refund_id,
             admin: admin.clone(),
             reason: reason.clone(),
-            override_amount: refund.amount,
-            override_status: refund.status.clone(),
+            override_amount: new_amount,
+            override_status: new_status.clone(),
             executed_at,
             transaction_hash: transaction_hash.into(),
         };
@@ -4855,8 +4867,8 @@ impl RefundContract {
             refund_id,
             admin: admin.clone(),
             reason: reason.clone(),
-            override_amount: refund.amount,
-            override_status: refund.status,
+            override_amount: new_amount,
+            override_status: new_status,
             executed_at,
         }
         .publish(&env);
@@ -7167,6 +7179,34 @@ impl RefundContract {
             .instance()
             .set(&SystemKey::NotificationHook(hook_id), &updated_hook);
 
+        // Decrement per-event hook counters
+        for event_type in hook.events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&SystemKey::HooksByEventCount(event_type.clone()))
+                .unwrap_or(0);
+            if count > 0 {
+                env.storage().instance().set(
+                    &SystemKey::HooksByEventCount(event_type.clone()),
+                    &(count - 1),
+                );
+            }
+        }
+
+        // Decrement per-subscriber hook counter
+        let subscriber_count: u32 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::SubscriberHookCount(subscriber.clone()))
+            .unwrap_or(0);
+        if subscriber_count > 0 {
+            env.storage().instance().set(
+                &SystemKey::SubscriberHookCount(subscriber.clone()),
+                &(subscriber_count - 1),
+            );
+        }
+
         // Emit event
         (HookDeregistered {
             hook_id,
@@ -7229,7 +7269,9 @@ impl RefundContract {
                     .instance()
                     .get::<_, NotificationHook>(&SystemKey::NotificationHook(hook_id))
                 {
-                    hooks.push_back(hook);
+                    if hook.active {
+                        hooks.push_back(hook);
+                    }
                 }
             }
         }
@@ -8292,6 +8334,21 @@ impl RefundContract {
             .get(&DataKey::Refund(refund_id))
             .ok_or(Error::Core(CoreError::RefundNotFound))?;
 
+        // Validate refund status is Approved
+        if refund.status != RefundStatus::Approved {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        // Prevent duplicate vouchers for the same refund
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&VoucherKey::RefundVoucherIssued(refund_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
         let counter: u64 = env
             .storage()
             .instance()
@@ -8318,6 +8375,11 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&VoucherKey::VoucherCounter, &voucher_id);
+
+        // Mark voucher as issued for this refund
+        env.storage()
+            .instance()
+            .set(&VoucherKey::RefundVoucherIssued(refund_id), &true);
 
         let customer_count: u64 = env
             .storage()
