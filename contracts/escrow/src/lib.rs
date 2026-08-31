@@ -4606,7 +4606,7 @@ impl EscrowContract {
         } else {
             escrow.last_activity_at
         };
-        let timeout: u64 = 500;
+        let timeout = escrow.escalation_timeout;
         if now.saturating_sub(last) < timeout {
             return Err(Error::Escrow(EscrowError::TimeoutNotReached));
         }
@@ -5931,6 +5931,10 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::require_not_paused(&env, "set_reputation_config")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::ReputationConfig), &config);
@@ -6054,6 +6058,10 @@ impl EscrowContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::require_not_paused(&env, "set_tenure_reputation_config")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
         env.storage()
             .instance()
             .set(&DataKey::Config(ConfigKey::TenureConfig), &config);
@@ -6708,6 +6716,8 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::NotFound));
         }
 
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
         let mut vesting_schedule = env
             .storage()
             .instance()
@@ -6766,6 +6776,14 @@ impl EscrowContract {
             &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
             &vesting_schedule,
         );
+
+        // Transfer the releasable tokens to the merchant
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &escrow.merchant,
+            releasable_amount,
+        )?;
 
         VestedAmountReleased {
             escrow_id,

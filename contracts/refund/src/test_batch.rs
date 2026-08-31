@@ -322,3 +322,177 @@ fn test_oversized_batch_rejected() {
         Error::Core(CoreError::BatchRefundTooLarge).to_u32()
     );
 }
+
+// ── 5 additional batch tests ─────────────────────────────────────────────────
+
+/// Empty batch returns an empty results vector without panicking.
+#[test]
+fn batch_with_empty_ids_returns_empty_results() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+
+    let approve_results = client.approve_refund_batch(&admin, &Vec::new(&env));
+    assert_eq!(approve_results.len(), 0);
+
+    let process_results = client.process_refund_batch(&admin, &Vec::new(&env));
+    assert_eq!(process_results.len(), 0);
+}
+
+/// Duplicate IDs in the same batch: the first occurrence succeeds, the
+/// second fails with InvalidStatus because the refund is already Approved.
+#[test]
+fn batch_approve_duplicate_id_second_occurrence_fails() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    let r1 = make_refund(&client, &env, &merchant, 1);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(r1);
+    ids.push_back(r1); // duplicate
+
+    let results = client.approve_refund_batch(&admin, &ids);
+    assert_eq!(results.len(), 2);
+
+    // First attempt succeeds.
+    assert!(results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().refund_id, r1);
+
+    // Second attempt on the same ID fails because it's already Approved.
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Error::Core(CoreError::InvalidStatus).to_u32()
+    );
+
+    assert_eq!(refund_status(&client, r1), RefundStatus::Approved);
+}
+
+/// Batch results preserve the exact input order, including the positions
+/// of failures, so callers can correlate results by index.
+#[test]
+fn batch_results_preserve_input_order() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    let r1 = make_refund(&client, &env, &merchant, 1);
+    let r2 = make_refund(&client, &env, &merchant, 2);
+    let r3 = make_refund(&client, &env, &merchant, 3);
+    let bad = 8888u64;
+
+    // Insert bad ID in the middle.
+    let mut ids = Vec::new(&env);
+    ids.push_back(r3); // index 0
+    ids.push_back(bad); // index 1  (not found)
+    ids.push_back(r1); // index 2
+    ids.push_back(r2); // index 3
+
+    let results = client.approve_refund_batch(&admin, &ids);
+    assert_eq!(results.len(), 4);
+
+    assert_eq!(results.get(0).unwrap().refund_id, r3);
+    assert!(results.get(0).unwrap().success);
+
+    assert_eq!(results.get(1).unwrap().refund_id, bad);
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Error::Core(CoreError::RefundNotFound).to_u32()
+    );
+
+    assert_eq!(results.get(2).unwrap().refund_id, r1);
+    assert!(results.get(2).unwrap().success);
+
+    assert_eq!(results.get(3).unwrap().refund_id, r2);
+    assert!(results.get(3).unwrap().success);
+}
+
+/// Batch process returns the correct amount_refunded for each item and
+/// the amount is zero for failed items.
+#[test]
+fn batch_process_amount_refunded_correctness() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    let r1 = make_refund(&client, &env, &merchant, 1); // amount = 500
+    let r2 = make_refund(&client, &env, &merchant, 2); // amount = 500
+    let bad = 7777u64;
+
+    // Approve both valid refunds first.
+    let mut approve_ids = Vec::new(&env);
+    approve_ids.push_back(r1);
+    approve_ids.push_back(r2);
+    client.approve_refund_batch(&admin, &approve_ids);
+
+    let mut process_ids = Vec::new(&env);
+    process_ids.push_back(r1);
+    process_ids.push_back(bad); // fails
+    process_ids.push_back(r2);
+
+    let results = client.process_refund_batch(&admin, &process_ids);
+    assert_eq!(results.len(), 3);
+
+    // Successful items carry the actual refund amount.
+    assert!(results.get(0).unwrap().success);
+    assert_eq!(results.get(0).unwrap().amount_refunded, 500i128);
+
+    // Failed item carries a zero amount.
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(results.get(1).unwrap().amount_refunded, 0i128);
+
+    assert!(results.get(2).unwrap().success);
+    assert_eq!(results.get(2).unwrap().amount_refunded, 500i128);
+}
+
+/// Raising the batch limit after it was lowered allows a previously
+/// rejected oversized batch to succeed.
+#[test]
+fn batch_limit_increase_allows_previously_oversized_batch() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let merchant = Address::generate(&env);
+
+    // Start with a tight limit.
+    client.set_batch_refund_limit(&admin, &2u32);
+
+    let r1 = make_refund(&client, &env, &merchant, 1);
+    let r2 = make_refund(&client, &env, &merchant, 2);
+    let r3 = make_refund(&client, &env, &merchant, 3);
+
+    let mut ids = Vec::new(&env);
+    ids.push_back(r1);
+    ids.push_back(r2);
+    ids.push_back(r3);
+
+    // Three items against a limit of 2 — must be rejected.
+    let results = client.approve_refund_batch(&admin, &ids);
+    assert_eq!(results.len(), 1);
+    assert!(!results.get(0).unwrap().success);
+    assert_eq!(
+        results.get(0).unwrap().error_code,
+        Error::Core(CoreError::BatchRefundTooLarge).to_u32()
+    );
+    assert_eq!(client.get_batch_refund_limit(), 2u32);
+
+    // All refunds remain untouched.
+    assert_eq!(refund_status(&client, r1), RefundStatus::Requested);
+    assert_eq!(refund_status(&client, r2), RefundStatus::Requested);
+    assert_eq!(refund_status(&client, r3), RefundStatus::Requested);
+
+    // Raise the limit to accommodate the batch.
+    client.set_batch_refund_limit(&admin, &5u32);
+    assert_eq!(client.get_batch_refund_limit(), 5u32);
+
+    // Same batch now succeeds.
+    let results2 = client.approve_refund_batch(&admin, &ids);
+    assert_eq!(results2.len(), 3);
+    for i in 0..3 {
+        assert!(results2.get(i).unwrap().success);
+    }
+    assert_eq!(refund_status(&client, r1), RefundStatus::Approved);
+    assert_eq!(refund_status(&client, r2), RefundStatus::Approved);
+    assert_eq!(refund_status(&client, r3), RefundStatus::Approved);
+}
