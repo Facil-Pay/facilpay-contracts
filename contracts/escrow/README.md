@@ -7,7 +7,7 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
-- clawback: Reverts the funds back to the original sender if the escrow conditions expire or fundamentally fail.
+- clawback: Admin-only emergency fund recovery. Initiates, executes, or cancels a time-delayed transfer of escrow funds to the admin address.
 - approve_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
 - add_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
 - is_escrow_released: Verifies whether an escrow exists and has been released.
@@ -37,9 +37,10 @@ To ensure transaction sizes remain within Soroban gas and resource limits, there
 
 ### Partial-Failure Semantics
 
-Batch releases are designed with partial-failure semantics: **one bad escrow does not revert the entire call**. If an escrow in the batch fails to release (e.g., due to it not being releasable yet, invalid status, or not found), the failure is recorded and the loop continues to the next escrow. 
+Batch releases are designed with partial-failure semantics: **one bad escrow does not revert the entire call**. If an escrow in the batch fails to release (e.g., due to it not being releasable yet, invalid status, or not found), the failure is recorded and the loop continues to the next escrow.
 
 The function returns a structure containing:
+
 - `succeeded`: A list of escrow IDs that were successfully released.
 - `failed`: A list of escrow IDs that failed to release.
 - `errors`: A list of error codes corresponding to each failure, allowing callers to programmatically handle or retry specific failures.
@@ -67,17 +68,17 @@ The escrow contract provides a dedicated State Verification Interface and access
 
 ### Verification Functions and Inputs
 
-| Function | Inputs | Return Type | Description |
-| :--- | :--- | :--- | :--- |
-| `is_escrow_released` | `escrow_id: u64` | `bool` | Returns `true` if the escrow exists and its status is `Released`. Returns `false` for non-existent IDs or unreleased escrows. |
-| `is_escrow_disputed` | `escrow_id: u64` | `bool` | Returns `true` if the escrow exists and its status is `Disputed`. Returns `false` for non-existent IDs or non-disputed escrows. |
-| `get_escrow_status` | `escrow_id: u64` | `Result<EscrowStatus, Error>` | Returns the exact `EscrowStatus` (`Locked`, `Released`, `Disputed`, `Resolved`, etc.) or `EscrowNotFound` if not found. |
-| `get_escrow_parties` | `escrow_id: u64` | `Result<(Address, Address), Error>` | Returns the `(customer, merchant)` tuple or `EscrowNotFound`. |
-| `get_escrow_amount` | `escrow_id: u64` | `Result<i128, Error>` | Returns the locked token amount or `EscrowNotFound`. |
-| `verify_escrow_participant` | `escrow_id: u64`, `address: Address` | `bool` | Returns `true` if `address` matches either `escrow.customer` or `escrow.merchant`. Returns `false` for non-existent IDs or non-matching addresses. |
-| `verify_observer_access` | `escrow_id: u64`, `observer: Address` | `bool` | Returns `true` if `observer` has an active grant where `now < expires_at`. Returns `false` if unassigned or expired. |
-| `get_escrow_details` | `caller: Address`, `escrow_id: u64` | `Result<Escrow, Error>` | Requires `caller.require_auth()`. Returns full `Escrow` struct if caller passes participant or observer verification; returns `Unauthorized` otherwise. |
-| `submit_evidence_with_proof` | `caller: Address`, `escrow_id: u64`, `evidence: Bytes`, `proof: Vec<BytesN<32>>`, `leaf_index: u32` | `Result<(), Error>` | Verifies `keccak256(evidence)` against committed Merkle root using proof and leaf index. Returns `InvalidMerkleProof` if verification fails. |
+| Function                     | Inputs                                                                                              | Return Type                         | Description                                                                                                                                             |
+| :--------------------------- | :-------------------------------------------------------------------------------------------------- | :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `is_escrow_released`         | `escrow_id: u64`                                                                                    | `bool`                              | Returns `true` if the escrow exists and its status is `Released`. Returns `false` for non-existent IDs or unreleased escrows.                           |
+| `is_escrow_disputed`         | `escrow_id: u64`                                                                                    | `bool`                              | Returns `true` if the escrow exists and its status is `Disputed`. Returns `false` for non-existent IDs or non-disputed escrows.                         |
+| `get_escrow_status`          | `escrow_id: u64`                                                                                    | `Result<EscrowStatus, Error>`       | Returns the exact `EscrowStatus` (`Locked`, `Released`, `Disputed`, `Resolved`, etc.) or `EscrowNotFound` if not found.                                 |
+| `get_escrow_parties`         | `escrow_id: u64`                                                                                    | `Result<(Address, Address), Error>` | Returns the `(customer, merchant)` tuple or `EscrowNotFound`.                                                                                           |
+| `get_escrow_amount`          | `escrow_id: u64`                                                                                    | `Result<i128, Error>`               | Returns the locked token amount or `EscrowNotFound`.                                                                                                    |
+| `verify_escrow_participant`  | `escrow_id: u64`, `address: Address`                                                                | `bool`                              | Returns `true` if `address` matches either `escrow.customer` or `escrow.merchant`. Returns `false` for non-existent IDs or non-matching addresses.      |
+| `verify_observer_access`     | `escrow_id: u64`, `observer: Address`                                                               | `bool`                              | Returns `true` if `observer` has an active grant where `now < expires_at`. Returns `false` if unassigned or expired.                                    |
+| `get_escrow_details`         | `caller: Address`, `escrow_id: u64`                                                                 | `Result<Escrow, Error>`             | Requires `caller.require_auth()`. Returns full `Escrow` struct if caller passes participant or observer verification; returns `Unauthorized` otherwise. |
+| `submit_evidence_with_proof` | `caller: Address`, `escrow_id: u64`, `evidence: Bytes`, `proof: Vec<BytesN<32>>`, `leaf_index: u32` | `Result<(), Error>`                 | Verifies `keccak256(evidence)` against committed Merkle root using proof and leaf index. Returns `InvalidMerkleProof` if verification fails.            |
 
 ### State Effects: Passed vs. Failed Verification
 
@@ -147,9 +148,9 @@ Succession only adds a new address to the multisig admin set — it does not rea
 
 ### Queries
 
-| Function                  | Returns                              |
-| -------------------------- | ------------------------------------ |
-| `get_succession_plan()`   | `Option<SuccessionPlan>` — the current pending or last-activated plan, if any |
+| Function                | Returns                                                                       |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| `get_succession_plan()` | `Option<SuccessionPlan>` — the current pending or last-activated plan, if any |
 
 ---
 
@@ -231,18 +232,155 @@ set_sub_account_fee_override(merchant, escrow_id, sub_id, fee_bps_override)
 
 ### Queries
 
-| Function                                          | Returns                                        |
-| ------------------------------------------------- | ---------------------------------------------- |
-| `get_sub_account(escrow_id, sub_id)`              | `Option<EscrowSubAccount>` — a single record   |
-| `list_sub_accounts(escrow_id)`                    | `Vec<EscrowSubAccount>` — all sub-accounts     |
+| Function                             | Returns                                      |
+| ------------------------------------ | -------------------------------------------- |
+| `get_sub_account(escrow_id, sub_id)` | `Option<EscrowSubAccount>` — a single record |
+| `list_sub_accounts(escrow_id)`       | `Vec<EscrowSubAccount>` — all sub-accounts   |
 
 ### Error Codes
 
-| Error                                | Code | Meaning                                                              |
-| ------------------------------------ | ---- | -------------------------------------------------------------------- |
-| `SubAccountNotFound`                | 214  | No sub-account exists for the given escrow/sub ID pair               |
-| `SubAccountAlreadyReleased`         | 215  | Attempted to release or modify a sub-account that was already released |
-| `SubAccountFundingExceedsEscrow`    | 216  | Total sub-account allocations would exceed the parent escrow amount  |
+| Error                            | Code | Meaning                                                                |
+| -------------------------------- | ---- | ---------------------------------------------------------------------- |
+| `SubAccountNotFound`             | 214  | No sub-account exists for the given escrow/sub ID pair                 |
+| `SubAccountAlreadyReleased`      | 215  | Attempted to release or modify a sub-account that was already released |
+| `SubAccountFundingExceedsEscrow` | 216  | Total sub-account allocations would exceed the parent escrow amount    |
+
+---
+
+## Clawback
+
+Clawback is an admin-only emergency fund-recovery mechanism. When normal resolution paths — release, dispute arbitration, or expiry refund — are unavailable due to fraud, compliance requirements, or an irrecoverable deadlock, a multisig admin can forcibly recover the full escrow balance.
+
+### Three-phase lifecycle
+
+**1. Initiate**
+
+```
+initiate_clawback(admin, escrow_id, reason_hash, delay_seconds) -> request_id
+```
+
+- `admin` must be a registered multisig admin.
+- `reason_hash` is a 32-byte hash of an off-chain justification document. The contract stores only the hash; the document itself lives off-chain, providing an audit trail without bloating on-chain state.
+- `delay_seconds` must be at least **86,400 seconds (24 hours)**. This mandatory window gives all parties time to contest the action or seek remediation before funds move.
+- Only one active clawback request may exist per escrow at a time. A second initiation while an active request exists returns `AlreadyProcessed`.
+- On success, a `ClawbackRequest` is stored and the `request_id` is returned.
+
+**2. Execute**
+
+```
+execute_clawback(admin, request_id) -> ()
+```
+
+- Can only be called after `execute_after` timestamp has elapsed. Calling before this returns `ActionError::NotReady`.
+- Transfers the **full escrow amount** from the contract to the **admin's address** (not to the customer or merchant). Clawback is an administrative recovery, not a standard refund.
+- Sets the escrow status to `Resolved` and marks the request as executed.
+
+**3. Cancel**
+
+```
+cancel_clawback(admin, request_id) -> ()
+```
+
+- Any admin can cancel an active request at any time before execution.
+- Cancellation is permanent — a cancelled request cannot be re-activated. A fresh initiation is required to restart the process.
+- No funds move; the escrow remains in its prior state.
+
+### Querying a request
+
+```
+get_clawback_request(request_id) -> Option<ClawbackRequest>
+```
+
+Returns the full `ClawbackRequest` record including `escrow_id`, `initiated_by`, `reason_hash`, `execute_after`, and the `executed` / `cancelled` flags.
+
+### Error reference
+
+| Error                                | Cause                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `BasicError::NotAnAdmin`             | Caller is not in the multisig admin set                                                          |
+| `EscrowError::ClawbackDelayTooShort` | `delay_seconds < 86,400`                                                                         |
+| `EscrowError::NotFound`              | Target escrow does not exist                                                                     |
+| `EscrowError::AlreadyProcessed`      | A live request already exists for this escrow (on initiate), or the request was already executed |
+| `EscrowError::InvalidStatus`         | Request was already cancelled (on execute)                                                       |
+| `ActionError::NotReady`              | Execution attempted before `execute_after` timestamp                                             |
+| `BasicError::Unauthorized`           | `request_id` not found in storage                                                                |
+
+---
+
+## Escrow Hierarchy
+
+The hierarchy feature lets a single parent escrow own a tree of child escrows. This models complex multi-party or multi-milestone structures — for example, a master contract that has separate sub-agreements for each deliverable — where the top-level payment must not settle until every downstream obligation is resolved.
+
+### How the tree is structured
+
+Each escrow can optionally be a node in a hierarchy. Nodes are represented by `EscrowHierarchyNode`:
+
+| Field       | Type          | Description                                       |
+| ----------- | ------------- | ------------------------------------------------- |
+| `escrow_id` | `u64`         | The escrow this node describes                    |
+| `parent_id` | `Option<u64>` | `None` for root nodes; `Some(id)` for child nodes |
+| `children`  | `Vec<u64>`    | Direct child escrow IDs                           |
+| `depth`     | `u32`         | Distance from the root; root = `0`, max = `3`     |
+
+The maximum supported depth is **3**, meaning the tree can have four tiers: root (depth 0), children (depth 1), grandchildren (depth 2), and great-grandchildren (depth 3). Attempting to add a node at depth 4 returns `MaxHierarchyDepth`.
+
+### Creating child escrows
+
+Child escrows are created by an admin, not by the customer or merchant:
+
+```
+create_child_escrow(admin, parent_id, amount, token, customer, merchant) -> child_id
+```
+
+- `admin` must be a registered multisig admin.
+- `parent_id` must refer to an existing escrow. A missing parent returns `ParentEscrowNotFound`.
+- The child **inherits** `release_timestamp`, `min_hold_period`, `expiry_timestamp`, and `auto_refund_on_expiry` from the parent. These cannot be overridden at creation time.
+- `customer` and `merchant` on the child are set independently and may differ from the parent's parties, enabling sub-contracts with different counterparties under the same root.
+- At creation, the child's `amount` is transferred from the customer's wallet into the contract, the same as a top-level `create_escrow`.
+- The parent's children list is updated to include the new child ID, and a `EscrowHierarchyNode` record is created for both the parent and child.
+
+### Release guard
+
+A parent escrow **cannot be released while any of its descendants remain unresolved**. The `release_escrow` function checks the full subtree using a breadth-first traversal:
+
+- Every node in the tree is visited.
+- If any child (or grandchild, or deeper) has a status other than `Resolved`, the release is blocked with `EscrowError::ChildrenNotResolved`.
+- This check is recursive — grandchildren must be resolved before grandparents can release.
+
+The `can_parent_release(parent_id)` function exposes this check directly, returning `true` if the full subtree is resolved and `false` otherwise. Off-chain services can poll this before attempting a release to avoid failed transactions.
+
+### Inspecting the full tree
+
+```
+get_escrow_hierarchy(root_id) -> Vec<EscrowHierarchyNode>
+```
+
+Returns all nodes in the subtree rooted at `root_id`, in breadth-first order: root first, then its direct children, then grandchildren, and so on. Returns an empty vector if `root_id` does not exist.
+
+Example — a root with two children, one of which has a grandchild:
+
+```
+index 0  →  root          (depth 0, parent: None,       children: [child_1, child_2])
+index 1  →  child_1       (depth 1, parent: root,       children: [grandchild_1])
+index 2  →  child_2       (depth 1, parent: root,       children: [])
+index 3  →  grandchild_1  (depth 2, parent: child_1,    children: [])
+```
+
+### Typical workflow
+
+1. Create the root escrow via `create_escrow`.
+2. For each sub-deliverable or sub-party, call `create_child_escrow` under the appropriate parent.
+3. As sub-deliverables are completed, release each child escrow independently via `release_escrow`.
+4. Once all descendants are resolved, the root escrow becomes releasable.
+
+### Error reference
+
+| Error                               | Cause                                                           |
+| ----------------------------------- | --------------------------------------------------------------- |
+| `BasicError::NotAnAdmin`            | Caller is not a multisig admin                                  |
+| `EscrowError::ParentEscrowNotFound` | `parent_id` does not refer to an existing escrow                |
+| `EscrowError::MaxHierarchyDepth`    | Adding a child would push a node beyond depth 3                 |
+| `EscrowError::ChildrenNotResolved`  | `release_escrow` called on a parent with unresolved descendants |
 
 ---
 
@@ -322,5 +460,5 @@ The contract is intentionally read-only here; health checks do not mutate escrow
 If no threshold has been configured, `get_escrow_health` and `get_stale_escrows` panic with `StaleThresholdNotConfigured`.
 
 ---
-[⬅ Back to Main README](../../README.md)
 
+[⬅ Back to Main README](../../README.md)
