@@ -5220,3 +5220,220 @@ fn test_conditional_escrow_re_evaluation_rejected() {
     let result = client.try_evaluate_and_release(&escrow_id);
     assert_eq!(result, Err(Ok(Error::Action(ActionError::ConditionAlreadyEvaluated))));
 }
+
+// ── ADDITIONAL TESTS ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_dispute_recommendation_equal_scores_after_mutual_wins() {
+    // Each party wins one dispute against the other so their scores end up
+    // equal — the recommendation must come back Inconclusive.
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 1000,
+            loss_penalty: 1000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Round 1: merchant wins → merchant=6000, customer=4000.
+    let e1 = client.create_escrow(&customer, &merchant, &100_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &e1);
+    client.resolve_dispute(&admin, &e1, &true);
+
+    // Round 2: customer wins → customer back to 5000, merchant back to 5000.
+    let e2 = client.create_escrow(&customer, &merchant, &100_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&merchant, &e2);
+    client.resolve_dispute(&admin, &e2, &false);
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &200_i128, &token, &10000_u64, &0_u64);
+    let rec = client.get_dispute_recommendation(&escrow_id);
+
+    assert_eq!(rec.customer_score, rec.merchant_score);
+    assert_eq!(rec.recommendation, DisputeOutcome::Inconclusive);
+    assert_eq!(rec.confidence_bps, 0);
+}
+
+#[test]
+fn test_watchdog_config_persists_across_escrows() {
+    // Verifies that a single watchdog config applies to all subsequently
+    // created escrows, not just the one active when the config was set.
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 300,
+            enabled: true,
+            favor_customer_on_release: false,
+        },
+    );
+
+    env.ledger().set_timestamp(1000);
+    let e1 = client.create_escrow(&customer, &merchant, &500_i128, &token, &1200_u64, &0_u64);
+    let e2 = client.create_escrow(&customer, &merchant, &500_i128, &token, &1300_u64, &0_u64);
+
+    // Neither escrow should be eligible before inactivity window expires.
+    env.ledger().set_timestamp(1400); // past release_timestamp of e1 but not e1+300
+    assert!(!client.is_watchdog_eligible(&e1));
+
+    // Past release_timestamp + inactivity for e1.
+    env.ledger().set_timestamp(1501);
+    assert!(client.is_watchdog_eligible(&e1));
+
+    // e2 release_timestamp=1300, so eligible at 1300+300=1600.
+    assert!(!client.is_watchdog_eligible(&e2));
+    env.ledger().set_timestamp(1601);
+    assert!(client.is_watchdog_eligible(&e2));
+}
+
+#[test]
+fn test_analytics_total_value_locked_decreases_on_release() {
+    // total_value_locked should drop by the escrow amount once it is released.
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(1000);
+    client.initialize(&admin);
+
+    let e1 = client.create_escrow(&customer, &merchant, &400_i128, &token, &1001_u64, &0_u64);
+    let _e2 = client.create_escrow(&customer, &merchant, &600_i128, &token, &1001_u64, &0_u64);
+
+    let before = client.get_escrow_analytics();
+    assert_eq!(before.total_value_locked, 1000);
+
+    env.ledger().set_timestamp(1002);
+    client.release_escrow(&admin, &e1, &false);
+
+    let after = client.get_escrow_analytics();
+    assert_eq!(after.total_value_locked, 600);
+    assert_eq!(after.total_escrows_released, 1);
+    assert_eq!(after.total_value_released, 400);
+}
+
+#[test]
+fn test_multisig_two_of_three_approve_and_execute() {
+    // With 3 admins and threshold=2, the second admin's approval should
+    // be enough to allow execution without the third signing.
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.initialize(&admin1);
+    client.add_admin(&admin1, &admin2);
+    client.add_admin(&admin1, &admin3);
+    client.update_required_signatures(&admin1, &2_u32);
+
+    env.ledger().set_timestamp(2000);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+
+    let mut data_bytes = [0u8; 9];
+    let id_bytes = escrow_id.to_be_bytes();
+    data_bytes[..8].copy_from_slice(&id_bytes);
+    data_bytes[8] = 1u8; // early_release = true
+    let data = soroban_sdk::Bytes::from_slice(&env, &data_bytes);
+
+    // admin1 proposes (counts as 1 approval).
+    let proposal_id =
+        client.propose_action(&admin1, &ActionType::ReleaseEscrow, &merchant, &data);
+
+    // admin2 provides the second approval — threshold met.
+    client.approve_action(&admin2, &proposal_id);
+
+    // Should execute without admin3 signing.
+    client.execute_action(&proposal_id);
+
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
+    assert_eq!(escrow.status, EscrowStatus::Released);
+
+    let config = client.get_multisig_config();
+    assert_eq!(config.total_admins, 3);
+    assert_eq!(config.required_signatures, 2);
+}
+
+#[test]
+fn test_vesting_acceleration_cap_not_exceeded_on_second_complete() {
+    // After the first mark_milestone_complete the cumulative accelerated bps
+    // equals the per-call cap; a second call must be rejected, and the vested
+    // amount must not exceed total_amount.
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &6000_u64,
+        &Vec::new(&env),
+    );
+
+    // per_milestone_bps=2000, cumulative_cap_bps=2000 — one call fills the cap.
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &2000_u32, &2000_u32)
+        .unwrap();
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    // Second call must fail: cap already reached.
+    let result = client.try_mark_milestone_complete(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::AccelerationLimitExceeded))));
+
+    // Verify total vested never exceeds total_amount at any timestamp.
+    env.ledger().set_timestamp(7000); // past end timestamp
+    let vested = client.get_vested_amount(&escrow_id);
+    assert!(vested <= 10000);
+}

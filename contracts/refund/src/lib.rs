@@ -110,6 +110,9 @@ pub enum ArbitrationKey {
     SeniorArbitratorList,
     ArbitrationTierConfig,
     CaseEscalated(u64),
+    // Uniqueness guard: maps refund_id -> case_id so the same refund
+    // cannot be escalated into multiple parallel arbitration cases.
+    CaseByRefund(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -141,6 +144,10 @@ pub enum SystemKey {
     FraudSignal(Address),
     FraudConfig,
     FlaggedAddressesIndex,
+    // Ordered list of flagged addresses: FlaggedAddress(n) -> Address, paired
+    // with the FlaggedAddressesIndex counter so get_flagged_addresses can
+    // enumerate every entry without iterating over all storage keys.
+    FlaggedAddress(u64),
     RefundRejectedAt(u64),
     Appeal(u64),
     AppealCounter,
@@ -2640,6 +2647,17 @@ impl RefundContract {
         if refund.status != RefundStatus::Rejected && refund.status != RefundStatus::PendingAppeal {
             return Err(Error::Core(CoreError::InvalidStatus));
         }
+
+        // Uniqueness guard: prevent the same refund from being escalated into
+        // multiple parallel arbitration cases.  If a case already exists for
+        // this refund_id, reject the duplicate attempt.
+        if env
+            .storage()
+            .instance()
+            .has(&ArbitrationKey::CaseByRefund(refund_id))
+        {
+            return Err(Error::Core(CoreError::AlreadyProcessed));
+        }
         if fee_amount <= 0 {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
@@ -2743,6 +2761,10 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&ArbitrationKey::ArbitrationCounter, &case_id);
+        // Record the reverse mapping so subsequent calls can detect the duplicate.
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::CaseByRefund(refund_id), &case_id);
 
         RefundEscalatedToArbitration {
             refund_id,
@@ -5119,6 +5141,7 @@ impl RefundContract {
         amount: i128,
         original_amount: i128,
         payment_created_at: u64,
+        payment_id: u64,
     ) -> Result<(), Error> {
         let policy: RefundPolicy = Self::get_effective_refund_policy(env.clone(), merchant.clone())
             .ok_or(Error::Core(CoreError::PolicyNotFound))?;
@@ -5130,6 +5153,18 @@ impl RefundContract {
         let current_time = env.ledger().timestamp();
         let elapsed_seconds = current_time.saturating_sub(payment_created_at);
         let days_since_purchase = elapsed_seconds / (24 * 60 * 60);
+        let elapsed_seconds_total = elapsed_seconds;
+
+        // Enforce the category-specific (or policy-default) refund window first.
+        // get_effective_window returns seconds; if elapsed time exceeds it the
+        // refund is outside the allowed window regardless of tier settings.
+        if payment_id > 0 {
+            let effective_window_seconds =
+                Self::get_effective_window(env.clone(), merchant.clone(), payment_id);
+            if elapsed_seconds_total > effective_window_seconds {
+                return Err(Error::Core(CoreError::RefundWindowExpired));
+            }
+        }
 
         let mut allowed_bps = 0;
         let mut found_tier = false;
@@ -5551,6 +5586,7 @@ impl RefundContract {
                 amount,
                 original_payment_amount,
                 payment_created_at,
+                payment_id,
             )?;
         }
 
@@ -6618,12 +6654,17 @@ impl RefundContract {
                         .instance()
                         .set(&SystemKey::FraudSignal(address.clone()), &signal);
 
-                    // Add to flagged addresses index
+                    // Add to flagged addresses index: store both the ordered
+                    // address entry and the updated counter so the list can
+                    // be fully reconstructed by get_flagged_addresses.
                     let flagged_count: u64 = env
                         .storage()
                         .instance()
                         .get(&SystemKey::FlaggedAddressesIndex)
                         .unwrap_or(0);
+                    env.storage()
+                        .instance()
+                        .set(&SystemKey::FlaggedAddress(flagged_count), &address.clone());
                     env.storage()
                         .instance()
                         .set(&SystemKey::FlaggedAddressesIndex, &(flagged_count + 1));
@@ -6648,13 +6689,31 @@ impl RefundContract {
     ///
     /// # Returns
     /// A vector of `FraudSignal` entries for all flagged addresses.
-    /// Currently returns a placeholder empty vector pending full index implementation.
     pub fn get_flagged_addresses(env: Env) -> Vec<FraudSignal> {
         let mut flagged = Vec::new(&env);
 
-        // In a real implementation, we'd iterate through all addresses
-        // For now, we'll return an empty vector as this is a placeholder
-        // In production, this would use an index to efficiently retrieve flagged addresses
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&SystemKey::FlaggedAddressesIndex)
+            .unwrap_or(0);
+
+        for i in 0..total {
+            if let Some(address) = env
+                .storage()
+                .instance()
+                .get::<SystemKey, Address>(&SystemKey::FlaggedAddress(i))
+            {
+                if let Some(signal) = env
+                    .storage()
+                    .instance()
+                    .get::<SystemKey, FraudSignal>(&SystemKey::FraudSignal(address))
+                {
+                    flagged.push_back(signal);
+                }
+            }
+        }
+
         flagged
     }
 
