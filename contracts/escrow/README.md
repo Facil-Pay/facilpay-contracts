@@ -100,6 +100,128 @@ The escrow contract provides a dedicated State Verification Interface and access
 
 ---
 
+## Conditional Escrows
+
+Conditional escrows allow funds to be locked and released based on the evaluation of an on-chain condition.
+
+### Creating a Conditional Escrow
+
+```
+create_conditional_escrow(customer, merchant, token, amount, condition) -> escrow_id
+```
+
+- Any address can create a conditional escrow (the caller must be the `customer`).
+- `condition` is an `OnChainCondition` struct that specifies:
+  - `contract_address`: The external contract to query.
+  - `state_key`: The 32-byte key passed to the external contract.
+  - `expected_value`: The expected byte array to match.
+
+### Evaluation and Release
+
+Any party can trigger the evaluation of a conditional escrow once it is in a `Locked` state:
+
+```
+evaluate_and_release(escrow_id) -> bool
+```
+
+- The contract invokes `get_state(state_key)` on the configured `contract_address`.
+- If the returned state matches `expected_value`, the condition is met (`true`), funds are transferred to the merchant (minus any fees), and the escrow status transitions to `Released`.
+- If it does not match, the condition is not met (`false`), and the funds remain locked.
+- **Important**: Evaluation happens exactly once. If called again after evaluation, the function reverts with `ActionError::ConditionAlreadyEvaluated`.
+- The evaluation result is stored permanently in the `ConditionalEscrow` record, which can be retrieved using:
+
+```
+get_conditional_escrow(escrow_id) -> ConditionalEscrow
+```
+
+---
+
+## Oracle Conditions
+
+Oracle conditions allow an existing `Locked` escrow to be resolved automatically based on external price feeds when a dispute arises.
+
+### Expected Oracle Interface
+
+The escrow contract expects the configured oracle at `oracle_address` to expose a `get_price` function:
+
+```rust
+// Expected function signature
+fn get_price(env: Env, price_feed_id: BytesN<32>) -> OraclePriceData;
+
+// Expected return type
+pub struct OraclePriceData {
+    pub price: i128,
+    pub timestamp: u64,
+}
+```
+
+### Attaching an Oracle Condition
+
+Only a multisig admin can attach an oracle condition to a locked escrow:
+
+```
+attach_oracle_condition(admin, escrow_id, condition) -> ()
+```
+
+- `condition` is an `OracleCondition` containing:
+  - `oracle`: Configuration containing `oracle_address`, `price_feed_id`, and `staleness_threshold`.
+  - `target_price`: The threshold price for comparison.
+  - `comparison`: How to compare the oracle price to the target (`GreaterThan`, `LessThan`, `GreaterThanOrEqual`, `LessThanOrEqual`).
+  - `release_to_merchant_if_met`: Boolean flag determining who wins the dispute if the condition is met.
+
+The attached condition can be retrieved via:
+
+```
+get_oracle_condition(escrow_id) -> OracleCondition
+```
+
+### Auto-Resolving Disputes
+
+When an escrow with an attached oracle condition enters the `Disputed` status, any party can trigger auto-resolution:
+
+```
+auto_resolve_with_oracle(escrow_id) -> ()
+```
+
+- **Failure Modes:**
+  - **Not Disputed:** Reverts with `ActionError::NotDisputed` if the escrow is not in the `Disputed` state.
+  - **Oracle Unavailable:** If the `oracle_address` is unavailable or fails, the transaction reverts via standard Soroban host errors.
+  - **Stale Data:** Reverts with `EscrowError::InvalidStatus` if `now - timestamp > staleness_threshold`.
+- If the data is fresh, the price is evaluated against `target_price` using the `comparison` operator.
+- The dispute is resolved in favor of the merchant if the condition evaluation matches `release_to_merchant_if_met`, otherwise it resolves in favor of the customer.
+
+### Auto-Resolution Flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant EscrowContract
+    participant OracleContract
+    
+    User->>EscrowContract: auto_resolve_with_oracle(escrow_id)
+    activate EscrowContract
+    
+    EscrowContract->>EscrowContract: Check escrow status is Disputed
+    EscrowContract->>OracleContract: get_price(price_feed_id)
+    activate OracleContract
+    OracleContract-->>EscrowContract: OraclePriceData { price, timestamp }
+    deactivate OracleContract
+    
+    EscrowContract->>EscrowContract: Verify now - timestamp <= staleness_threshold
+    
+    alt is stale
+        EscrowContract-->>User: Revert (InvalidStatus)
+    else is fresh
+        EscrowContract->>EscrowContract: Evaluate price vs target_price
+        EscrowContract->>EscrowContract: Determine winner based on release_to_merchant_if_met
+        EscrowContract->>EscrowContract: internal_resolve_dispute(winner)
+        EscrowContract-->>User: Ok(())
+    end
+    
+    deactivate EscrowContract
+```
+
+---
 ## Admin Succession
 
 Succession lets the current multisig admin set hand control of the contract to a new admin address after a time delay, without requiring the successor to already be part of the multisig.
