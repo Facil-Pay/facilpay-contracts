@@ -115,6 +115,8 @@ curl "https://friendbot.stellar.org/?addr=$(stellar keys address deployer)"
 curl "https://friendbot.stellar.org/?addr=$(stellar keys address pauser)"
 ```
 
+*Note: Friendbot is a testnet faucet. If requests fail due to rate limiting or network congestion, wait briefly before retrying.*
+
 ---
 
 ## 4. Deploy
@@ -126,7 +128,7 @@ Deploy the compiled WASM binaries to Stellar Testnet and export their assigned c
 ```bash
 export PAYMENT_ID=$(stellar contract deploy \
   --wasm target/wasm32v1-none/release/payments.wasm \
-  --source deployer \
+  --source-account deployer \
   --network testnet)
 
 echo "Payment Contract ID: $PAYMENT_ID"
@@ -137,7 +139,7 @@ echo "Payment Contract ID: $PAYMENT_ID"
 ```bash
 export ESCROW_ID=$(stellar contract deploy \
   --wasm target/wasm32v1-none/release/escrow.wasm \
-  --source deployer \
+  --source-account deployer \
   --network testnet)
 
 echo "Escrow Contract ID: $ESCROW_ID"
@@ -148,7 +150,7 @@ echo "Escrow Contract ID: $ESCROW_ID"
 ```bash
 export REFUND_ID=$(stellar contract deploy \
   --wasm target/wasm32v1-none/release/refund.wasm \
-  --source deployer \
+  --source-account deployer \
   --network testnet)
 
 echo "Refund Contract ID: $REFUND_ID"
@@ -159,7 +161,7 @@ echo "Refund Contract ID: $REFUND_ID"
 ```bash
 export ADMIN_ID=$(stellar contract deploy \
   --wasm target/wasm32v1-none/release/admin.wasm \
-  --source deployer \
+  --source-account deployer \
   --network testnet)
 
 echo "Admin Contract ID: $ADMIN_ID"
@@ -187,7 +189,7 @@ Contracts must be initialized in a strict order due to cross-contract linkage re
 ```bash
 stellar contract invoke \
   --id $PAYMENT_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   initialize \
@@ -204,7 +206,7 @@ stellar contract invoke \
 ```bash
 stellar contract invoke \
   --id $ESCROW_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   initialize \
@@ -221,7 +223,7 @@ stellar contract invoke \
 ```bash
 stellar contract invoke \
   --id $REFUND_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   initialize \
@@ -240,7 +242,7 @@ stellar contract invoke \
 ```bash
 stellar contract invoke \
   --id $REFUND_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   set_payment_contract_address \
@@ -263,7 +265,7 @@ stellar contract invoke \
 ```bash
 stellar contract invoke \
   --id $ADMIN_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   initialize \
@@ -330,19 +332,20 @@ stellar contract invoke \
   get_payment_contract_address
 ```
 
-**Expected Output for schema version**: `1`
-**Expected Output for payment contract address**: `"$PAYMENT_ID"`
+**Expected output**:
+- For schema version: `1`
+- For payment contract address: the Payment Contract address, which should match the value stored in `$PAYMENT_ID`.
 
 ---
 
 ### 6.4 Verify Admin Contract
 
-Verify initialization status by attempting to invoke `initialize` a second time (confirming `Error::AlreadyInitialized` protection):
+Verify initialization status by attempting to invoke `initialize` a second time:
 
 ```bash
 stellar contract invoke \
   --id $ADMIN_ID \
-  --source deployer \
+  --source-account deployer \
   --network testnet \
   -- \
   initialize \
@@ -353,7 +356,13 @@ stellar contract invoke \
   --refund_contract $REFUND_ID
 ```
 
-**Expected Output**: Reverts with `Error(Contract, #1)` (`AlreadyInitialized`).
+This invocation is intentionally expected to revert. A successful `AlreadyInitialized` error confirms that the Admin contract rejects a second initialization attempt.
+
+**Expected output**:
+```text
+Error(Contract, #1)
+AlreadyInitialized
+```
 
 ---
 
@@ -363,7 +372,7 @@ stellar contract invoke \
 | --- | --- | --- |
 | `Error(Contract, #1)` / `AlreadyInitialized` | `initialize` was called on an already initialized contract. | The contract is already set up. Do not invoke `initialize` again. |
 | `Error(Contract, #2)` / `NotInitialized` | A privileged admin function was invoked before `initialize`. | Execute `initialize` on the contract first. |
-| `Error(Contract, #3)` / `Unauthorized` | The `--source` keypair does not match the configured admin address or missing authorization. | Confirm `--source` matches the `--admin` address passed during initialization. |
+| `Error(Contract, #3)` / `Unauthorized` | The `--source-account` keypair does not match the configured admin address or missing authorization. | The transaction source account must be authorized to perform the requested operation and, where applicable, correspond to the configured admin address. |
 | `can't find crate for core` / `wasm32v1-none` target missing | Rust toolchain missing the `wasm32v1-none` compilation target. | Run `rustup target add wasm32v1-none`. |
 | `HostError: Error(Budget, ExceededLimit)` | Contract uncompressed WASM exceeds size limits or execution budget exceeded. | Run `make check-size` and verify release profile optimizations (`opt-level = "z"`). |
 | `AccountNotFound` / `TxFailed` | Deployer account is unfunded on Testnet. | Run `stellar keys fund deployer --network testnet`. |
