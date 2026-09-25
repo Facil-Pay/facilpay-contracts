@@ -80,3 +80,25 @@ fn test_migrate_schema_rejects_already_at_target() {
     assert_eq!(result, Err(Ok(Error::Ext(ExtError::SchemaAlreadyAtTarget))));
 }
 ```
+
+---
+
+## 🛟 Multi-Step Migrations: the Escrow Contract
+
+The single-call `migrate_schema(admin, target_version)` pattern above is the convention for
+`contracts/payment` and `contracts/refund`, which migrate their version marker only.
+
+`contracts/escrow` goes further: because it holds one record per escrow, it upgrades those records
+with a batched, resumable flow instead of a single call. The three steps are:
+
+1. `begin_migration(admin)` — snapshot `total_count` and open the migration window.
+2. `migrate_escrow(admin, escrow_id)` / `migrate_escrow_batch(admin, escrow_ids)` — re-write records in
+   the new shape and mark them migrated.
+3. `complete_migration(admin)` — close the window once every record is migrated and write
+   `ConfigKey::SchemaVersion = 2`.
+
+`get_migration_status()` reports `in_progress`, `migrated_count`, `total_count`, `started_at` and
+`completed_at`, and is how you verify completion. While the window is open, `create_escrow` is
+rejected with `ContractPaused` (**103**); all other escrow operations continue normally.
+
+👉 **Full operator runbook: [Escrow Storage Migration](./ESCROW_MIGRATION.md)**
