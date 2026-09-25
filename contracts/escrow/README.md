@@ -100,6 +100,117 @@ The escrow contract provides a dedicated State Verification Interface and access
 
 ---
 
+## Vesting Escrows
+
+A vesting escrow locks funds that unlock gradually over time instead of being released all at once. It is created with `create_vesting_escrow` and stores a `VestingSchedule`:
+
+| Field             | Type                  | Description                                                       |
+| ----------------- | --------------------- | ----------------------------------------------------------------- |
+| `escrow_id`       | `u64`                 | The escrow this schedule belongs to                               |
+| `total_amount`    | `i128`                | Total amount that will vest over the schedule                     |
+| `released_amount` | `i128`                | Amount already released via `release_vested_amount`               |
+| `start_timestamp` | `u64`                 | When the schedule begins                                          |
+| `cliff_timestamp` | `u64`                 | Earliest time anything can be released                            |
+| `end_timestamp`   | `u64`                 | When the schedule is fully vested                                 |
+| `milestones`      | `Vec<VestingMilestone>` | Optional milestone unlocks (empty for pure time-linear vesting) |
+
+### Schedule model
+
+A vesting schedule has three key timestamps:
+
+- **start** — the moment the schedule is created. Nothing vests before the cliff regardless of the start time.
+- **cliff** — the earliest timestamp at which any amount becomes releasable. Before `cliff_timestamp`, `get_vested_amount` returns `0` and `release_vested_amount` fails with `CliffPeriodNotPassed`.
+- **end** — once `now >= end_timestamp`, the full `total_amount` is vested.
+
+Between the cliff and the end, vesting is **time-linear** when the schedule has no milestones:
+
+```
+vested = (now - cliff_timestamp) * total_amount / (end_timestamp - cliff_timestamp)
+```
+
+If the schedule has milestones, the base vested amount is instead the sum of every milestone whose `unlock_timestamp` has been reached.
+
+### Worked example (time-linear)
+
+Create a vesting escrow with `total_amount = 10,000`, `cliff_timestamp = 1,500`, `end_timestamp = 6,000` (so the vesting window after the cliff is `6,000 - 1,500 = 4,500` seconds):
+
+| Ledger time (`now`) | Base vested amount                          | Releasable (`get_releasable_amount`) |
+| ------------------- | ------------------------------------------- | ------------------------------------ |
+| `1,000` (pre-cliff) | `0`                                         | `0`                                  |
+| `1,500` (at cliff)  | `0 * 10,000 / 4,500 = 0`                    | `0`                                  |
+| `3,750` (midpoint)  | `2,250 * 10,000 / 4,500 = 5,000`            | `5,000`                              |
+| `6,000` (at end)    | `4,500 * 10,000 / 4,500 = 10,000`           | `10,000`                             |
+| `7,000` (past end)  | `10,000` (capped at `total_amount`)         | `10,000`                             |
+
+Calling `release_vested_amount` at `now = 3,750` transfers `5,000` to the merchant and sets `released_amount = 5,000`. A later call at `now = 6,000` releases the remaining `10,000 - 5,000 = 5,000`.
+
+### Milestone acceleration
+
+Milestone acceleration lets an admin pull forward part of the **not-yet-vested** remainder when an off-chain milestone is completed, without changing the schedule's timestamps.
+
+1. `set_vesting_acceleration_config` stores a `VestingAccelerationConfig` for the schedule:
+
+   | Field                   | Type  | Description                                                       |
+   | ----------------------- | ----- | ----------------------------------------------------------------- |
+   | `schedule_id`           | `u64` | The vesting schedule this config applies to                       |
+   | `milestone_bps`         | `u32` | Basis points added to the accelerated total per completed milestone |
+   | `max_acceleration_bps`  | `u32` | Cumulative cap on acceleration, in basis points                   |
+   | `total_accelerated_bps` | `u32` | Running total of acceleration applied so far                      |
+
+2. Each `mark_milestone_complete` call adds `milestone_bps` to `total_accelerated_bps`, up to `max_acceleration_bps`.
+
+3. The accelerated amount is computed against the **remaining unvested** balance:
+
+   ```
+   accelerated = (total_amount - base_vested) * total_accelerated_bps / 10,000
+   ```
+
+   and `get_vested_amount` returns `min(base_vested + accelerated, total_amount)`.
+
+#### Worked example (acceleration)
+
+Using the schedule above (`total_amount = 10,000`, cliff `1,500`, end `6,000`), configure `milestone_bps = 2,000` (20%) and `max_acceleration_bps = 4,000` (40%), then complete one milestone at `now = 3,750`:
+
+| Step                                   | Value                                        |
+| -------------------------------------- | -------------------------------------------- |
+| Base vested at `now = 3,750`           | `5,000`                                      |
+| Remaining unvested                     | `10,000 - 5,000 = 5,000`                     |
+| `total_accelerated_bps` after 1 call   | `2,000`                                      |
+| Accelerated amount                     | `5,000 * 2,000 / 10,000 = 1,000`             |
+| `get_vested_amount`                    | `5,000 + 1,000 = 6,000`                      |
+| `get_releasable_amount`                | `6,000` (nothing released yet)               |
+
+A second `mark_milestone_complete` raises `total_accelerated_bps` to `4,000`, adding another `5,000 * 2,000 / 10,000 = 1,000` for a vested total of `7,000`. A third call fails with `AccelerationLimitExceeded` because `4,000 + 2,000 > max_acceleration_bps`.
+
+### Functions
+
+| Function                                                                                          | Parameters                                                                                          | Returns                            | Auth & errors                                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_vesting_escrow(customer, merchant, amount, token, cliff_timestamp, end_timestamp, milestones)` | `customer: Address`, `merchant: Address`, `amount: i128`, `token: Address`, `cliff_timestamp: u64`, `end_timestamp: u64`, `milestones: Vec<VestingMilestone>` | `u64` (escrow ID)                  | Requires `customer.require_auth()`. Fails with `InvalidVestingSchedule` if the schedule is malformed.                                                                                                          |
+| `get_vesting_schedule(escrow_id)`                                                                 | `escrow_id: u64`                                                                                    | `Result<VestingSchedule, Error>`   | Read-only. Returns `EscrowError::NotFound` if no schedule exists for the escrow.                                                                                                                              |
+| `get_vested_amount(escrow_id)`                                                                    | `escrow_id: u64`                                                                                    | `i128`                             | Read-only. Returns `0` if no schedule exists. Result is capped at `total_amount`.                                                                                                                             |
+| `get_cliff_status(escrow_id)`                                                                     | `escrow_id: u64`                                                                                    | `Result<CliffStatus, Error>`       | Read-only. Returns `EscrowError::NotFound` if no schedule exists. `CliffStatus` has `cliff_timestamp`, `cliff_passed`, `seconds_remaining`.                                                                    |
+| `get_releasable_amount(escrow_id)`                                                                | `escrow_id: u64`                                                                                    | `i128`                             | Read-only. Returns `get_vested_amount(escrow_id) - released_amount`; `0` if no schedule exists.                                                                                                               |
+| `release_vested_amount(admin, escrow_id)`                                                         | `admin: Address`, `escrow_id: u64`                                                                  | `Result<i128, Error>`              | Requires `admin.require_auth()`. Fails with `EscrowError::NotFound` (missing escrow/schedule), `EscrowError::CliffPeriodNotPassed` (before cliff), or `EscrowError::InvalidStatus` (nothing releasable). Emits `VestedAmountReleased`. |
+| `set_vesting_acceleration_config(admin, schedule_id, milestone_bps, max_acceleration_bps)`        | `admin: Address`, `schedule_id: u64`, `milestone_bps: u32`, `max_acceleration_bps: u32`             | `Result<(), Error>`                | Requires `admin.require_auth()` and admin membership (`BasicError::NotAnAdmin`). Fails with `EscrowError::InvalidVestingSchedule` if `milestone_bps` is not a valid bps value or exceeds `max_acceleration_bps`, and `EscrowError::NotFound` if the schedule does not exist. |
+| `mark_milestone_complete(admin, schedule_id)`                                                     | `admin: Address`, `schedule_id: u64`                                                                | `Result<(), Error>`                | Requires `admin.require_auth()` and admin membership (`BasicError::NotAnAdmin`). Fails with `EscrowError::NotFound` (no config), `EscrowError::MilestoneAlreadyReleased` (cap already reached), or `ActionError::AccelerationLimitExceeded` (this call would exceed the cap). |
+| `calculate_accelerated_amount(schedule_id)`                                                       | `schedule_id: u64`                                                                                  | `i128`                             | Read-only. Returns `0` if the schedule or acceleration config is missing.                                                                                                                                     |
+| `get_acceleration_config(schedule_id)`                                                            | `schedule_id: u64`                                                                                  | `Option<VestingAccelerationConfig>` | Read-only. Returns `None` when no config has been set.                                                                                                                                                        |
+
+### Error reference
+
+| Error                                       | Cause                                                                     |
+| ------------------------------------------- | ------------------------------------------------------------------------- |
+| `EscrowError::NotFound`                     | No escrow or vesting schedule exists for the given ID                     |
+| `EscrowError::InvalidVestingSchedule`       | Malformed schedule, or invalid `milestone_bps` / `max_acceleration_bps`   |
+| `EscrowError::CliffPeriodNotPassed`         | `release_vested_amount` called before `cliff_timestamp`                   |
+| `EscrowError::InvalidStatus`                | `release_vested_amount` called when nothing is releasable                 |
+| `EscrowError::MilestoneAlreadyReleased`     | `mark_milestone_complete` called after the acceleration cap was reached   |
+| `ActionError::AccelerationLimitExceeded`    | A milestone completion would push acceleration past `max_acceleration_bps` |
+| `BasicError::NotAnAdmin`                    | Caller is not in the multisig admin set                                   |
+
+---
+
 ## Admin Succession
 
 Succession lets the current multisig admin set hand control of the contract to a new admin address after a time delay, without requiring the successor to already be part of the multisig.
