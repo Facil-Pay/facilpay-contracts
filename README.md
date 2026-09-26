@@ -108,6 +108,7 @@ Recommended migration path:
 ## 🔗 Links
 
 - [Storage Versioning Guide](docs/STORAGE_VERSIONING.md)
+- [Audit Summary](docs/AUDIT_SUMMARY.md)
 - Telegram: https://t.me/+afM9uh7GGtVkYmZk
 - [API Repository](https://github.com/facilpay/facilpay-api)
 - [SDK Repository](https://github.com/facilpay/facilpay-sdk)

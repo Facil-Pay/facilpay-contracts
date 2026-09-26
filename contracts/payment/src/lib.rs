@@ -12978,3 +12978,6 @@ mod test_scheduled_payment;
 
 #[cfg(test)]
 mod schema_version_test;
+
+#[cfg(test)]
+mod test_glossary;

@@ -8,3 +8,7 @@ target
 .codex
 
 **/test_snapshots/**
+
+# Jupyter notebooks
+*.ipynb
+contracts/**/*.ipynb
