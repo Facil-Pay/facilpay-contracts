@@ -27,6 +27,121 @@ These are distinct timers rather than one combined timeout. Escalation timeout i
 
 ---
 
+## Insurance
+
+Insurance is an opt-in protection layer for `Locked` escrows. It introduces a per-token pool, a configurable premium rate, and a claim flow that can reimburse the customer after a resolved or cancelled escrow.
+
+### `InsuranceConfig`
+
+`InsuranceConfig` is stored under `ConfigKey::InsuranceConfig` and controls the pool-wide premium and coverage policy.
+
+| Field | Type | Unit | Meaning |
+| :----- | :--- | :--- | :------- |
+| `premium_bps` | `i128` | basis points (`bps`) | Portion of the escrow amount deducted when an escrow opts into insurance. `10000` equals `100%`. |
+| `max_coverage_bps` | `i128` | basis points (`bps`) | Maximum claim amount allowed as a percentage of the escrow amount. `10000` equals `100%`. |
+| `enabled` | `bool` | n/a | Enables or disables the insurance feature globally. |
+
+`InsurancePool` stores the token bucket backing the feature.
+
+| Field | Type | Unit | Meaning |
+| :----- | :--- | :--- | :------- |
+| `token` | `Address` | token address | Token address associated with the pool. |
+| `balance` | `i128` | token units | Current pool balance available to pay claims. |
+| `total_premiums_collected` | `i128` | token units | Cumulative premium value collected from opt-in escrows. |
+| `total_claims_paid` | `i128` | token units | Cumulative amount paid out to claimants. |
+
+### Premium and claim calculation
+
+When `opt_into_insurance` is called, the premium is calculated as:
+
+```rust
+let premium = (escrow.amount * config.premium_bps) / 10000;
+```
+
+If the premium is non-zero, the escrow amount is reduced by that premium before the balance is added to the token-specific pool:
+
+```rust
+escrow.amount -= premium;
+pool.balance += premium;
+pool.total_premiums_collected += premium;
+```
+
+`file_insurance_claim` computes the maximum coverage for the escrow as:
+
+```rust
+let max_coverage = (escrow.amount * config.max_coverage_bps) / 10000;
+```
+
+The submitted `amount` must be less than or equal to `max_coverage`; otherwise the function reverts with `Error::Basic(BasicError::Unauthorized)`.
+
+### Function reference
+
+| Function | Signature | Auth | Requirements | Errors |
+| :-------- | :-------- | :--- | :----------- | :----- |
+| `set_insurance_config` | `set_insurance_config(env: Env, admin: Address, config: InsuranceConfig) -> Result<(), Error>` | `admin.require_auth()` | Caller must be in the multisig admin set; contract must not be paused | `Error::Basic(BasicError::Unauthorized)` when the signer is not an admin; `Error::Basic(BasicError::ContractPaused)` when paused |
+| `get_insurance_pool` | `get_insurance_pool(env: Env, token: Address) -> InsurancePool` | None | Reads the pool for a token; returns a zeroed default if no pool exists | None (`panic` only if storage is structurally invalid) |
+| `opt_into_insurance` | `opt_into_insurance(env: Env, escrow_id: u64) -> Result<(), Error>` | None | `InsuranceConfig` must exist and `enabled` must be `true`; the escrow must be in `EscrowStatus::Locked` | `Error::Basic(BasicError::Unauthorized)` when insurance is disabled or config is missing; `Error::Escrow(EscrowError::InvalidStatus)` when the escrow is not `Locked` |
+| `file_insurance_claim` | `file_insurance_claim(env: Env, admin: Address, escrow_id: u64, amount: i128) -> Result<u64, Error>` | `admin.require_auth()` | Caller must be in the multisig admin set; escrow status must be `Resolved` or `Cancelled`; `amount <= max_coverage` | `Error::Basic(BasicError::Unauthorized)` for non-admins, missing config, or over-coverage claims; `Error::Escrow(EscrowError::InvalidStatus)` when the escrow is neither `Resolved` nor `Cancelled` |
+| `approve_claim` | `approve_claim(env: Env, admin: Address, claim_id: u64) -> Result<(), Error>` | `admin.require_auth()` | Claim must exist and not already be approved; pool must hold enough balance | `Error::Escrow(EscrowError::NotFound)` if the claim does not exist; `Error::Escrow(EscrowError::AlreadyProcessed)` if already approved; `Error::Escrow(EscrowError::InvalidStatus)` if the pool balance is insufficient |
+
+### Insurance lifecycle
+
+1. An admin sets the policy with `set_insurance_config`.
+2. Any caller can invoke `opt_into_insurance` on a `Locked` escrow. The escrow amount is reduced by the computed premium, and the premium is added to the token pool.
+3. After the escrow is resolved or cancelled, an admin can file a claim with `file_insurance_claim` and a claim amount up to the configured `max_coverage_bps` share.
+4. An admin can then approve the claim with `approve_claim`, which transfers funds from the insurance pool to the original customer (`claim.claimant`) and marks the claim as paid.
+5. Pool balances change in two directions: premium collection increases `balance` and `total_premiums_collected`, while approved payouts reduce `balance` and increase `total_claims_paid`.
+
+---
+
+## Watchdog
+
+Watchdog is a release safeguard for inactive escrows. It detects a stale, unresponsive escrow and allows a release to proceed if the escrow has been inactive long enough and the watchdog policy is enabled.
+
+### `WatchdogConfig`
+
+`WatchdogConfig` is stored under `ConfigKey::WatchdogConfig`.
+
+| Field | Type | Unit | Meaning |
+| :----- | :--- | :--- | :------- |
+| `inactivity_release_seconds` | `u64` | seconds | Inactivity threshold before the watchdog can trigger a release. |
+| `enabled` | `bool` | n/a | Enables the watchdog feature. |
+| `favor_customer_on_release` | `bool` | n/a | If `true`, the escrow resolves in favor of the customer; otherwise the funds are released to the merchant. |
+
+`is_watchdog_eligible` checks inactivity using:
+
+```rust
+let now = env.ledger().timestamp();
+if now < escrow.release_timestamp + config.inactivity_release_seconds {
+    return false;
+}
+```
+
+An escrow is eligible only if the watchdog is enabled, the escrow still exists, the escrow is `EscrowStatus::Locked`, and the ledger time is at least `release_timestamp + inactivity_release_seconds`.
+
+### Function reference
+
+| Function | Signature | Auth | Requirements | Errors |
+| :-------- | :-------- | :--- | :----------- | :----- |
+| `set_watchdog_config` | `set_watchdog_config(env: Env, admin: Address, config: WatchdogConfig) -> Result<(), Error>` | `admin.require_auth()` | Caller must be in the multisig admin set; contract must not be paused | `Error::Basic(BasicError::Unauthorized)` when the signer is not an admin; `Error::Basic(BasicError::ContractPaused)` when paused |
+| `get_watchdog_config` | `get_watchdog_config(env: Env) -> WatchdogConfig` | None | Reads the current watchdog policy; returns the default if no config has been saved | None (`panic` only if storage is structurally invalid) |
+| `is_watchdog_eligible` | `is_watchdog_eligible(env: Env, escrow_id: u64) -> bool` | None | The watchdog must be enabled and the escrow must exist, be `Locked`, and exceed the inactivity threshold | No error return; it returns `false` when the escrow is missing, not locked, disabled, or still within the inactivity window |
+| `trigger_watchdog_release` | `trigger_watchdog_release(env: Env, escrow_id: u64) -> Result<(), Error>` | None | `is_watchdog_eligible` must be `true`; escrow is updated and funds are transferred to either the customer or merchant | `Error::Action(ActionError::NotReady)` when the escrow is not yet eligible; `Error::Basic(BasicError::ContractPaused)` when paused |
+
+### Watchdog release behavior
+
+- `inactivity_release_seconds` is the inactivity window measured in seconds.
+- Eligibility is evaluated against `escrow.release_timestamp`, not the original creation time.
+- The call is not restricted to admin addresses; any caller can trigger the release once the escrow meets the inactivity requirement.
+- If `favor_customer_on_release` is `true`, the escrow status is set to `EscrowStatus::Resolved` and the escrow is released to the customer.
+- Otherwise, the escrow status is set to `EscrowStatus::Released` and the funds are transferred to the merchant.
+- The contract emits a `WatchdogReleaseTriggered` event with:
+  - `escrow_id`
+  - `released_to`
+  - `triggered_by: env.current_contract_address()`
+
+---
+
 ## Batch Release
 
 The contract supports releasing multiple escrows in a single call via `batch_release_escrows`. This is useful for merchants or admins managing high volumes of transactions.
