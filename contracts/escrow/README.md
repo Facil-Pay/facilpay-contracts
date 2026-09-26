@@ -583,4 +583,18 @@ If no threshold has been configured, `get_escrow_health` and `get_stale_escrows`
 
 ---
 
+## Migrations
+
+The escrow contract stores its records under an explicit storage schema version and ships a
+three-step, admin-driven migration for upgrading them from version `1` to version `2`:
+`begin_migration` → `migrate_escrow` / `migrate_escrow_batch` → `complete_migration`.
+Progress and completion are observed with `get_migration_status`.
+
+While a migration is in progress, `create_escrow` returns `ContractPaused`; existing escrows keep
+operating normally. See **[docs/ESCROW_MIGRATION.md](../../docs/ESCROW_MIGRATION.md)** for the full
+operator runbook — caller permissions, each step's exact semantics, batch-size guidance, and the
+`get_migration_status` verification checklist.
+
+---
+
 [⬅ Back to Main README](../../README.md)
