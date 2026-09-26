@@ -82,6 +82,10 @@ At this time, we do not operate a formal bug bounty program. However, we deeply 
 - **Acknowledged** in release notes
 - **Considered for future bug bounty programs**
 
+## Security Audits
+
+For details on security assessments, pause control enforcement, and contract invariants across `contracts/refund`, `contracts/escrow`, and `contracts/payment`, see the [Contracts Audit Summary](docs/AUDIT_SUMMARY.md).
+
 ## Security Best Practices for Integrators
 
 If you are integrating these contracts into your application:
