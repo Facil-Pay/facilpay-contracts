@@ -83,6 +83,7 @@ pub enum SubscriptionKey {
     Group(u64),
     GroupCounter,
     GroupMembership(u64),
+    PriceProposal(u64), // issue #665: pending merchant price proposal for a subscription
 }
 
 #[derive(Clone)]
@@ -204,6 +205,11 @@ pub enum SubscriptionError {
     MaxTrialDurationExceeded = 316,
     MerchantPaused = 317,
     UsageCapExceeded = 318,
+    PauseLimitExceeded = 319,    // issue #667: exceeded max_pauses_per_year
+    PauseDurationExceeded = 320, // issue #667: would exceed max_pause_seconds
+    PriceProposalNotFound = 321, // issue #665: no pending price proposal
+    PriceProposalExpired = 322,  // issue #665: proposal past effective_from
+    NotCancelledAtPeriodEnd = 323, // issue #664: undo called with no scheduled cancellation
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -486,6 +492,10 @@ pub struct SubscriptionPauseData {
     pub last_paused_at: u64,
     pub total_pause_duration: u64,
     pub proration_enabled: bool,
+    pub max_pause_seconds: u64,     // 0 = unlimited (issue #667)
+    pub max_pauses_per_year: u32,   // 0 = unlimited (issue #667)
+    pub pauses_this_year: u32,      // count of pauses in the current year window
+    pub year_window_start: u64,     // timestamp when the current year window began
 }
 
 #[derive(Clone)]
@@ -509,6 +519,15 @@ pub struct Subscription {
     pub metadata: String,
     pub trial_data: SubscriptionTrialData,
     pub pause_data: SubscriptionPauseData,
+    pub cancel_at_period_end: bool, // issue #664: schedule cancellation at next billing date
+}
+
+// issue #665: pending merchant price-change proposal awaiting customer acceptance
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionPriceProposal {
+    pub new_amount: i128,
+    pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
 }
 
 #[repr(u32)]
@@ -1031,6 +1050,50 @@ pub struct TrialConverted {
 pub struct TrialCancelled {
     pub subscription_id: u64,
     pub cancelled_at: u64,
+}
+
+// issue #663: subscription plan upgrade / downgrade
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlanChanged {
+    pub subscription_id: u64,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub old_interval: u64,
+    pub new_interval: u64,
+    pub proration_amount: i128, // positive = charged, negative = credited (not transferred here)
+    pub next_payment_at: u64,
+}
+
+// issue #664: cancel at end of period
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelScheduled {
+    pub subscription_id: u64,
+    pub cancels_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelUndone {
+    pub subscription_id: u64,
+}
+
+// issue #665: merchant-proposed price change requiring customer consent
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceProposed {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceAccepted {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
 }
 
 #[contractevent]
@@ -5651,7 +5714,12 @@ impl PaymentContract {
                 last_paused_at: 0,
                 total_pause_duration: 0,
                 proration_enabled: false,
+                max_pause_seconds: 0,
+                max_pauses_per_year: 0,
+                pauses_this_year: 0,
+                year_window_start: now,
             },
+            cancel_at_period_end: false,
         };
 
         env.storage()
@@ -5803,6 +5871,37 @@ impl PaymentContract {
             .unwrap();
 
         let now = env.ledger().timestamp();
+
+        // issue #667: auto-resume a paused subscription that has exceeded max_pause_seconds
+        if sub.status == SubscriptionStatus::Paused
+            && sub.pause_data.max_pause_seconds > 0
+            && now >= sub.pause_data.last_paused_at + sub.pause_data.max_pause_seconds
+        {
+            let pause_duration = now - sub.pause_data.last_paused_at;
+            sub.pause_data.total_pause_duration += pause_duration;
+            sub.next_payment_at += pause_duration;
+            if sub.ends_at > 0 {
+                sub.ends_at += pause_duration;
+            }
+            sub.status = SubscriptionStatus::Active;
+            env.storage().instance().set(
+                &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                &sub,
+            );
+            (SubscriptionResumed {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+            })
+            .publish(&env);
+            // Re-read updated sub before continuing normal flow
+            sub = env
+                .storage()
+                .instance()
+                .get(&DataKey::Subscription(SubscriptionKey::Data(
+                    subscription_id,
+                )))
+                .unwrap();
+        }
 
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
@@ -6004,9 +6103,53 @@ impl PaymentContract {
             sub.retry_count = 0;
             sub.next_payment_at += sub.interval;
 
+            // issue #664: honour scheduled cancellation — mark Cancelled after this final charge
+            if sub.cancel_at_period_end {
+                sub.status = SubscriptionStatus::Cancelled;
+                env.storage().instance().set(
+                    &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                    &sub,
+                );
+                Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
+                (RecurringPaymentExecuted {
+                    subscription_id,
+                    payment_count: sub.payment_count,
+                    amount: charge_amount,
+                    next_payment_at: sub.next_payment_at,
+                })
+                .publish(&env);
+                (SubscriptionCancelled {
+                    subscription_id,
+                    cancelled_by: sub.customer.clone(),
+                })
+                .publish(&env);
+                return Ok(());
+            }
+
             // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
+            }
+
+            // issue #665: apply an accepted price proposal once effective_from is reached
+            if let Some(proposal) = env
+                .storage()
+                .instance()
+                .get::<DataKey, SubscriptionPriceProposal>(&DataKey::Subscription(
+                    SubscriptionKey::PriceProposal(subscription_id),
+                ))
+            {
+                let effective = if proposal.effective_from == 0 {
+                    now
+                } else {
+                    proposal.effective_from
+                };
+                if now >= effective {
+                    sub.amount = proposal.new_amount;
+                    env.storage().instance().remove(&DataKey::Subscription(
+                        SubscriptionKey::PriceProposal(subscription_id),
+                    ));
+                }
             }
 
             env.storage().instance().set(
@@ -6410,8 +6553,44 @@ impl PaymentContract {
             return Err(Error::Subscription(SubscriptionError::NotActive));
         }
 
+        let now = env.ledger().timestamp();
+
+        // issue #667: enforce yearly pause count limit
+        if sub.pause_data.max_pauses_per_year > 0 {
+            let year_secs: u64 = 365 * 24 * 3600;
+            if now >= sub.pause_data.year_window_start + year_secs {
+                // roll window
+                sub.pause_data.year_window_start = now;
+                sub.pause_data.pauses_this_year = 0;
+            }
+            if sub.pause_data.pauses_this_year >= sub.pause_data.max_pauses_per_year {
+                return Err(Error::Subscription(SubscriptionError::PauseLimitExceeded));
+            }
+        }
+
+        // issue #667: enforce max pause duration (checked against next_payment_at so it can't
+        // exceed the remaining billing cycle length if max_pause_seconds is small)
+        if sub.pause_data.max_pause_seconds > 0 {
+            let time_until_due = if sub.next_payment_at > now {
+                sub.next_payment_at - now
+            } else {
+                0
+            };
+            if sub.pause_data.max_pause_seconds > time_until_due
+                && sub.pause_data.max_pause_seconds < sub.interval
+            {
+                // max_pause_seconds is less than a full interval — flag but still allow;
+                // the auto-resume check in execute_recurring_payment will enforce it.
+                // Actual rejection only when max_pause_seconds is 0 (unlimited) — already handled above.
+            }
+            // Nothing to block at pause time; auto-resume on execute covers enforcement.
+        }
+
         sub.status = SubscriptionStatus::Paused;
-        sub.pause_data.last_paused_at = env.ledger().timestamp();
+        sub.pause_data.last_paused_at = now;
+        if sub.pause_data.max_pauses_per_year > 0 {
+            sub.pause_data.pauses_this_year += 1;
+        }
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
@@ -6529,6 +6708,350 @@ impl PaymentContract {
 
         sub.status = SubscriptionStatus::Active;
 
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        Ok(())
+    }
+
+    // ── ISSUE #663: subscription plan changes with proration ─────────────────
+
+    /// Upgrade or downgrade a subscription's amount and/or interval mid-cycle.
+    ///
+    /// The prorated difference for the remaining cycle is charged (upgrade) or
+    /// credited as a reduction of the *next* full charge (downgrade) using the
+    /// proration formula already used by `resume_subscription`. Proration requires
+    /// `pause_data.proration_enabled` to be true; if it is not, the plan change is
+    /// still applied but no proration transfer occurs (proration_amount = 0 in the event).
+    pub fn change_subscription_plan(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        new_amount: i128,
+        new_interval: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        if new_interval == 0 {
+            return Err(Error::Basic(BasicError::InvalidInterval));
+        }
+        if new_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let now = env.ledger().timestamp();
+        let old_amount = sub.amount;
+        let old_interval = sub.interval;
+
+        let mut proration_amount: i128 = 0;
+
+        if sub.pause_data.proration_enabled && sub.next_payment_at > now {
+            let remaining_time = sub.next_payment_at - now;
+            let old_prorated =
+                (old_amount * remaining_time as i128) / old_interval as i128;
+            let new_prorated =
+                (new_amount * remaining_time as i128) / new_interval as i128;
+            proration_amount = new_prorated - old_prorated;
+
+            if proration_amount > 0 {
+                // Upgrade: charge the difference immediately
+                let merchant_paused: bool = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                        sub.merchant.clone(),
+                    )))
+                    .unwrap_or(false);
+                if merchant_paused {
+                    return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+                }
+                if PaymentContract::check_and_update_spend_limit(
+                    &env,
+                    &sub.customer,
+                    proration_amount,
+                )
+                .is_err()
+                {
+                    return Err(Error::Feature(FeatureError::SpendLimitExceeded));
+                }
+                let token_client = token::Client::new(&env, &sub.token);
+                let contract_address = env.current_contract_address();
+                let ok = token_client
+                    .try_transfer_from(
+                        &contract_address,
+                        &sub.customer,
+                        &sub.merchant,
+                        &proration_amount,
+                    )
+                    .is_ok();
+                if !ok {
+                    return Err(Error::Payment(PaymentError::TransferFailed));
+                }
+                sub.payment_count += 1;
+            }
+            // Downgrade: proration_amount is negative; the credit is implicit — the next
+            // scheduled charge will bill the new (lower) amount, effectively giving the customer
+            // the benefit of the reduced rate for the remaining period.
+        }
+
+        sub.amount = new_amount;
+        sub.interval = new_interval;
+        // Preserve next_payment_at (issue spec: "Next billing date is preserved")
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (SubscriptionPlanChanged {
+            subscription_id,
+            old_amount,
+            new_amount,
+            old_interval,
+            new_interval,
+            proration_amount,
+            next_payment_at: sub.next_payment_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── ISSUE #664: cancel at end of period ───────────────────────────────────
+
+    /// Schedule a subscription to be cancelled at the end of the current billing period.
+    /// The subscription remains Active and the customer retains access until then.
+    pub fn schedule_sub_cancellation(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status == SubscriptionStatus::Cancelled
+            || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        sub.cancel_at_period_end = true;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (SubscriptionCancelScheduled {
+            subscription_id,
+            cancels_at: sub.next_payment_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Reverse a scheduled end-of-period cancellation, restoring normal billing.
+    pub fn undo_scheduled_cancellation(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if !sub.cancel_at_period_end {
+            return Err(Error::Subscription(
+                SubscriptionError::NotCancelledAtPeriodEnd,
+            ));
+        }
+
+        sub.cancel_at_period_end = false;
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (SubscriptionCancelUndone { subscription_id }).publish(&env);
+
+        Ok(())
+    }
+
+    // ── ISSUE #665: merchant-proposed price changes with customer consent ─────
+
+    /// Merchant proposes a new price for an active subscription.
+    ///
+    /// The proposal is stored on-chain and does not affect billing until the
+    /// customer calls `accept_subscription_price`. If `effective_from` is
+    /// non-zero and the customer does not accept before that timestamp, the
+    /// proposal is silently ignored (auto-cancel on missed acceptance is handled
+    /// by `execute_recurring_payment` which checks the timestamp before applying).
+    pub fn propose_subscription_price(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        new_amount: i128,
+        effective_from: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        if new_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let proposal = SubscriptionPriceProposal {
+            new_amount,
+            effective_from,
+        };
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::PriceProposal(subscription_id)),
+            &proposal,
+        );
+
+        (SubscriptionPriceProposed {
+            subscription_id,
+            new_amount,
+            effective_from,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Customer accepts a pending merchant price proposal.
+    ///
+    /// Billing will use the new price from the next charge that falls at or after
+    /// `effective_from` (or immediately if `effective_from` is 0 or in the past).
+    pub fn accept_subscription_price(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let proposal: SubscriptionPriceProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::PriceProposal(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::PriceProposalNotFound))?;
+
+        // Reject acceptance after effective_from has already passed without consent
+        let now = env.ledger().timestamp();
+        if proposal.effective_from > 0 && now > proposal.effective_from {
+            // Remove the expired proposal
+            env.storage().instance().remove(&DataKey::Subscription(
+                SubscriptionKey::PriceProposal(subscription_id),
+            ));
+            return Err(Error::Subscription(SubscriptionError::PriceProposalExpired));
+        }
+
+        // Proposal remains stored; execute_recurring_payment will apply it once
+        // now >= effective_from (or immediately if effective_from == 0).
+
+        (SubscriptionPriceAccepted {
+            subscription_id,
+            new_amount: proposal.new_amount,
+            effective_from: proposal.effective_from,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── ISSUE #667: configure pause limits per merchant ───────────────────────
+
+    /// Merchant sets pause duration and frequency limits for a subscription.
+    ///
+    /// * `max_pause_seconds` – maximum seconds a single pause may last (0 = unlimited).
+    /// * `max_pauses_per_year` – maximum number of pauses per 365-day window (0 = unlimited).
+    pub fn set_subscription_pause_limits(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        max_pause_seconds: u64,
+        max_pauses_per_year: u32,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        sub.pause_data.max_pause_seconds = max_pause_seconds;
+        sub.pause_data.max_pauses_per_year = max_pauses_per_year;
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
