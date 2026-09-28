@@ -83,6 +83,7 @@ pub enum SubscriptionKey {
     Group(u64),
     GroupCounter,
     GroupMembership(u64),
+    NextToken(u64),
 }
 
 #[derive(Clone)]
@@ -103,6 +104,8 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    PendingChannelSettlement(u64),
+    SubscriptionLastAnnouncedCycle(u64),
 }
 
 #[derive(Clone)]
@@ -266,6 +269,12 @@ pub enum FeatureError {
     BelowMinSplitAmount = 539,
     // Issue #385: claimed settlement amounts must sum exactly to the channel deposit.
     BalanceSumMismatch = 541,
+    // Issue #678: challenge window settlement
+    ChallengeWindowOpen = 542,
+    ChallengeWindowClosed = 543,
+    NoPendingSettlement = 544,
+    // Issue #680: subscription token change
+    TokenNotAllowedForMerchant = 545,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -311,7 +320,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=540).contains(&code) {
+            if (500..=545).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -401,6 +410,8 @@ pub enum MerchantDataKey {
     MerchantActiveSubscriptions(Address, u64),
     MerchantActiveSubscriptionCount(Address),
     ActiveSubscriptionIndex(u64),
+    MerchantAllowedTokens(Address),
+    RefundUnusedOnCancel(Address),
 }
 
 // State and proposal data keys
@@ -894,6 +905,7 @@ pub struct PaymentChannel {
     pub open: bool,
     pub expires_at: u64,
     pub customer_pk: BytesN<32>,
+    pub challenge_window_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -1080,6 +1092,58 @@ pub struct SubscriptionSuspended {
 pub struct DunningResolved {
     pub subscription_id: u64,
     pub resolved_at: u64,
+}
+
+// Issue #678: pending channel settlement for challenge window
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PendingChannelSettlement {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub nonce: u64,
+    pub window_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementInitiated {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub nonce: u64,
+    pub window_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementChallenged {
+    pub channel_id: u64,
+    pub new_nonce: u64,
+    pub new_merchant_amount: i128,
+}
+
+// Issue #679: upcoming renewal event
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRenewalUpcoming {
+    pub subscription_id: u64,
+    pub next_payment_at: u64,
+    pub cycle: u64,
+}
+
+// Issue #680: subscription token changed event
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionTokenChanged {
+    pub subscription_id: u64,
+    pub new_token: Address,
+}
+
+// Issue #681: prorated refund on cancel event
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionProratedRefund {
+    pub subscription_id: u64,
+    pub refund_amount: i128,
 }
 
 #[derive(Clone)]
@@ -5976,6 +6040,22 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
 
+        // Issue #680: apply pending token change at the start of each new cycle
+        if let Some(pending_token) =
+            env.storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )))
+        {
+            sub.token = pending_token;
+            env.storage()
+                .instance()
+                .remove(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )));
+        }
+
         // Attempt token transfer
         let token_client = token::Client::new(&env, &sub.token);
         let contract_address = env.current_contract_address();
@@ -6365,6 +6445,54 @@ impl PaymentContract {
                 cancelled_at: now,
             })
             .publish(&env);
+        }
+
+        // Issue #681: prorated refund on mid-cycle cancellation
+        let refund_flag: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or(false);
+
+        if refund_flag && sub.interval > 0 && sub.amount > 0 {
+            // Compute the unused portion of the current cycle.
+            // `next_payment_at` is when the *next* charge is due; the current
+            // cycle started at `next_payment_at - interval`.
+            let cycle_start = sub.next_payment_at.saturating_sub(sub.interval);
+            if now > cycle_start && now < sub.next_payment_at {
+                let elapsed = now - cycle_start;
+                // unused_fraction = (interval - elapsed) / interval
+                // refund = amount * unused_fraction, rounded down (never more than charged)
+                let unused_seconds = sub.interval - elapsed;
+                // Use u128 arithmetic to avoid overflow
+                let refund_amount = ((sub.amount as u128).saturating_mul(unused_seconds as u128)
+                    / (sub.interval as u128)) as i128;
+
+                if refund_amount > 0 && refund_amount <= sub.amount {
+                    let token_client = token::Client::new(&env, &sub.token);
+                    let contract_address = env.current_contract_address();
+                    // Transfer from merchant back to customer (merchant must have allowance
+                    // for the contract, or the contract pulls from merchant's balance).
+                    // Best-effort: only emit and transfer if the transfer succeeds.
+                    if token_client
+                        .try_transfer_from(
+                            &contract_address,
+                            &sub.merchant,
+                            &sub.customer,
+                            &refund_amount,
+                        )
+                        .is_ok()
+                    {
+                        (SubscriptionProratedRefund {
+                            subscription_id,
+                            refund_amount,
+                        })
+                        .publish(&env);
+                    }
+                }
+            }
         }
 
         (SubscriptionCancelled {
@@ -11146,6 +11274,7 @@ impl PaymentContract {
         amount: i128,
         expires_at: u64,
         customer_pk: BytesN<32>,
+        challenge_window_seconds: u64,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
@@ -11181,6 +11310,7 @@ impl PaymentContract {
             open: true,
             expires_at,
             customer_pk,
+            challenge_window_seconds,
         };
 
         env.storage().instance().set(
@@ -11272,11 +11402,11 @@ impl PaymentContract {
         Ok(())
     }
 
-    /// Settles a payment channel with a signed off-chain state update.
+    /// Initiates settlement of a payment channel with a signed off-chain state update.
     ///
-    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
-    /// transfers funds to the merchant and refunds the remainder to the customer,
-    /// then closes the channel.
+    /// Issue #678: Starts a challenge window during which either party may submit a
+    /// higher-nonce signed state. Call `finalize_settlement` after the window closes
+    /// to actually move funds.
     ///
     /// # Arguments
     /// * `channel_id` - The ID of the channel to settle.
@@ -11286,10 +11416,251 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Ok(())` on success.
+    pub fn initiate_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "initiate_settlement")?;
+
+        let channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::Feature(FeatureError::ChannelExpired));
+        }
+
+        if nonce <= channel.settled_nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        let now = env.ledger().timestamp();
+        let window_ends_at = now + channel.challenge_window_seconds;
+
+        // Check if there is already a pending settlement with a higher nonce
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PendingChannelSettlement>(&DataKey::Feature(
+                FeatureKey::PendingChannelSettlement(channel_id),
+            ))
+        {
+            if nonce <= existing.nonce {
+                return Err(Error::Feature(FeatureError::InvalidNonce));
+            }
+        }
+
+        let pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &pending,
+        );
+
+        (SettlementInitiated {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Challenges a pending settlement with a higher-nonce signed state.
     ///
-    /// # Errors
-    /// Returns an error if the channel is not found, closed, expired, nonce is stale,
-    /// amount exceeds deposit, or signature verification fails.
+    /// Issue #678: During the challenge window either party may submit a higher-nonce
+    /// signed state to replace the pending one.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel being challenged.
+    /// * `merchant_amount` - The new (higher-nonce) amount for the merchant.
+    /// * `nonce` - Must be strictly greater than the pending settlement's nonce.
+    /// * `signature` - Ed25519 signature from the customer.
+    pub fn challenge_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "challenge_settlement")?;
+
+        let channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        let pending: PendingChannelSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now >= pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowClosed));
+        }
+
+        if nonce <= pending.nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        // Extend the window from now (reset the challenge clock)
+        let new_window_ends_at = now + channel.challenge_window_seconds;
+
+        let new_pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at: new_window_ends_at,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &new_pending,
+        );
+
+        (SettlementChallenged {
+            channel_id,
+            new_nonce: nonce,
+            new_merchant_amount: merchant_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Finalizes a pending channel settlement after the challenge window has elapsed.
+    ///
+    /// Issue #678: Funds are only transferred when the challenge window has closed
+    /// without a successful challenge.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel to finalize.
+    pub fn finalize_settlement(env: Env, channel_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "finalize_settlement")?;
+
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        let pending: PendingChannelSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowOpen));
+        }
+
+        let merchant_amount = pending.merchant_amount;
+        let customer_refund = channel.deposited - merchant_amount;
+
+        // Conservation check
+        if merchant_amount
+            .checked_add(customer_refund)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != channel.deposited
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if merchant_amount > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &merchant_amount);
+        }
+        if customer_refund > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &customer_refund);
+        }
+
+        channel.settled = merchant_amount;
+        channel.settled_nonce = pending.nonce;
+        channel.open = false;
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+        env.storage()
+            .instance()
+            .remove(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )));
+
+        (ChannelSettled {
+            channel_id,
+            merchant_amount,
+            customer_refund,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Legacy direct settlement (no challenge window) — kept for backward compatibility.
+    ///
+    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
+    /// transfers funds to the merchant and refunds the remainder to the customer,
+    /// then closes the channel immediately.
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -11449,6 +11820,200 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
+    }
+
+    /// Retrieves the pending settlement for a channel (if any).
+    pub fn get_pending_settlement(env: Env, channel_id: u64) -> Option<PendingChannelSettlement> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+    }
+
+    // ── SUBSCRIPTION: UPCOMING RENEWAL ANNOUNCEMENTS (Issue #679) ────────────
+
+    /// Emits `SubscriptionRenewalUpcoming` for each subscription due within `window_seconds`.
+    ///
+    /// Stores the last announced billing cycle per subscription to avoid duplicates.
+    /// Subscriptions not due within the window, or already announced for the current
+    /// cycle, emit nothing.
+    ///
+    /// # Arguments
+    /// * `ids` - Subscription IDs to check.
+    /// * `window_seconds` - How far ahead (in seconds from now) to look.
+    pub fn announce_upcoming_renewals(
+        env: Env,
+        ids: Vec<u64>,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        let window_end = now + window_seconds;
+
+        for subscription_id in ids.iter() {
+            let sub: Subscription =
+                match env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Subscription(SubscriptionKey::Data(
+                        subscription_id,
+                    ))) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+            if sub.status != SubscriptionStatus::Active {
+                continue;
+            }
+
+            if sub.next_payment_at > window_end {
+                continue;
+            }
+
+            // Use the payment_count as the cycle identifier — it increments on each
+            // successful execution, so it uniquely identifies the upcoming cycle.
+            let upcoming_cycle = sub.payment_count + 1;
+
+            let last_announced: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Feature(
+                    FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id),
+                ))
+                .unwrap_or(0);
+
+            if last_announced >= upcoming_cycle {
+                // Already announced for this cycle
+                continue;
+            }
+
+            env.storage().instance().set(
+                &DataKey::Feature(FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id)),
+                &upcoming_cycle,
+            );
+
+            (SubscriptionRenewalUpcoming {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+                cycle: upcoming_cycle,
+            })
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    // ── SUBSCRIPTION: CHANGE PAYMENT TOKEN (Issue #680) ─────────────────────
+
+    /// Allows a customer to change the payment token for a subscription.
+    ///
+    /// The new token must be in the merchant's per-merchant allowed-token list
+    /// (or the global allowed list if no per-merchant list is configured).
+    /// The change takes effect at the next billing cycle.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscriber (must authorize).
+    /// * `subscription_id` - The subscription to update.
+    /// * `new_token` - The new token address.
+    pub fn change_subscription_token(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        new_token: Address,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Check merchant's per-merchant allowed tokens; fall back to global list
+        let merchant_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let token_ok = if merchant_tokens.is_empty() {
+            // No per-merchant list: fall back to global allowed-token list
+            Self::is_token_allowed(&env, &new_token)
+        } else {
+            merchant_tokens.contains(&new_token)
+        };
+
+        if !token_ok {
+            return Err(Error::Feature(FeatureError::TokenNotAllowedForMerchant));
+        }
+
+        // Store the pending token change — applied at next billing cycle
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::NextToken(subscription_id)),
+            &new_token,
+        );
+
+        (SubscriptionTokenChanged {
+            subscription_id,
+            new_token,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Sets the per-merchant allowed token list.
+    ///
+    /// Only the merchant themselves may call this.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `tokens` - The list of accepted token addresses.
+    pub fn set_merchant_allowed_tokens(
+        env: Env,
+        merchant: Address,
+        tokens: Vec<Address>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(merchant)),
+            &tokens,
+        );
+        Ok(())
+    }
+
+    /// Sets the `refund_unused_on_cancel` flag for a merchant.
+    ///
+    /// Issue #681: When `true`, customers receive a prorated refund on mid-cycle
+    /// cancellation. Only the merchant may set this flag.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `enabled` - `true` to enable prorated refunds, `false` to disable.
+    pub fn set_refund_unused_on_cancel(
+        env: Env,
+        merchant: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(merchant)),
+            &enabled,
+        );
+        Ok(())
     }
 
     fn is_zero_address(env: &Env, address: &Address) -> bool {
@@ -12934,6 +13499,9 @@ mod test;
 
 #[cfg(test)]
 mod test_analytics;
+
+#[cfg(test)]
+mod test_issues_678_679_680_681;
 
 #[cfg(test)]
 mod test_trial;

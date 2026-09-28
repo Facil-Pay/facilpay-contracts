@@ -186,6 +186,10 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `get_subscriptions_by_customer(customer, page)`                                                                                     | Paginated list of subscription IDs for a customer.                                                              |
 | `get_subscriptions_by_merchant(merchant, page)`                                                                                     | Paginated list of subscription IDs for a merchant.                                                              |
 | `get_merchant_subscriptions(merchant, page)`                                                                                        | Alternative paginated index of subscription IDs for a merchant.                                                 |
+| `announce_upcoming_renewals(ids, window_seconds)`                                                                                   | **(Issue #679)** Emit `SubscriptionRenewalUpcoming` for each active subscription whose `next_payment_at` falls within `window_seconds` from now. Each billing cycle is announced at most once. |
+| `change_subscription_token(customer, subscription_id, new_token)`                                                                   | **(Issue #680)** Change the payment token for a subscription from the next billing cycle. `new_token` must be in the merchant's per-merchant allowed-token list (or the global list if none is set). |
+| `set_merchant_allowed_tokens(merchant, tokens)`                                                                                     | **(Issue #680)** Set the list of tokens a merchant accepts for subscriptions. Only the merchant may call this. |
+| `set_refund_unused_on_cancel(merchant, enabled)`                                                                                    | **(Issue #681)** Toggle prorated refunds on mid-cycle cancellation for a merchant. When `true`, cancelling a subscription returns the unused fraction of the current cycle to the customer. |
 
 #### How Free Trials Work
 
@@ -253,6 +257,34 @@ record as `trial_data` (`period_seconds`, `ends_at`, `converted`).
   cancelled_at }` event is emitted (in addition to `SubscriptionCancelled`), and
   the customer is never charged. A customer who does not want to convert must
   cancel before the trial ends.
+
+#### Upcoming Renewal Announcements (Issue #679)
+
+`announce_upcoming_renewals(ids, window_seconds)` lets an off-chain keeper warn customers
+about upcoming charges. It emits `SubscriptionRenewalUpcoming { subscription_id, next_payment_at, cycle }` for each active subscription in `ids` whose `next_payment_at` falls within `[now, now + window_seconds]`.
+
+- The upcoming **cycle number** (= `payment_count + 1`) is stored per subscription. If `announce_upcoming_renewals` is called again before the cycle executes, no second event is emitted — each billing cycle is announced at most once.
+- Subscriptions that are not `Active`, or whose next charge is outside the window, are silently skipped.
+
+#### Changing a Subscription's Payment Token (Issue #680)
+
+`change_subscription_token(customer, subscription_id, new_token)` lets the subscribed customer switch the token used for billing. The change takes effect at the **start of the next billing cycle** (i.e. the next call to `execute_recurring_payment`).
+
+- The current cycle is charged with the old token; the very next call to `execute_recurring_payment` applies the new token.
+- `new_token` must be in the merchant's per-merchant allowed-token list (set via `set_merchant_allowed_tokens`). If no per-merchant list is configured, the global allowed-token list applies. Tokens outside either list are rejected with `FeatureError::TokenNotAllowedForMerchant` (error `545`).
+- Emits `SubscriptionTokenChanged { subscription_id, new_token }`.
+
+#### Prorated Refund on Cancellation (Issue #681)
+
+`set_refund_unused_on_cancel(merchant, enabled)` enables or disables mid-cycle prorated refunds for all subscriptions under a merchant.
+
+When `enabled = true` and `cancel_subscription` is called mid-cycle:
+
+1. The contract computes `elapsed = now - cycle_start` and `unused = interval - elapsed`.
+2. `refund_amount = subscription_amount * unused / interval` (rounded down, never more than the charged amount).
+3. The contract attempts to transfer `refund_amount` from the merchant back to the customer. If the transfer succeeds, `SubscriptionProratedRefund { subscription_id, refund_amount }` is emitted.
+
+When `enabled = false` (the default), cancellation behaviour is unchanged.
 
 ### Metered Billing
 
@@ -450,12 +482,30 @@ client.cancel_subscription(&customer, &sub_id_1);
 
 ### Payment Channels
 
-| Function                                                                   | Description                                                                                |
-| -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `open_channel(customer, merchant, token, amount, expires_at, customer_pk)` | Open an off-chain payment channel by depositing tokens on-chain. Returns the `channel_id`. |
-| `settle_channel(caller, channel_id, merchant_amount, nonce, signature)`    | Merchant submits the final signed balance proof to settle the channel on-chain.            |
-| `close_channel_expired(caller, channel_id)`                                | Anyone can close an expired channel, refunding the deposited balance to the customer.      |
-| `get_channel(channel_id)`                                                  | Retrieve the `PaymentChannel` record.                                                      |
+| Function                                                                                            | Description                                                                                                                                                                    |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `open_channel(customer, merchant, token, amount, expires_at, customer_pk, challenge_window_seconds)` | Open an off-chain payment channel. `challenge_window_seconds` sets how long (in seconds) the dispute window lasts for the new three-phase settlement flow. Returns `channel_id`. |
+| `initiate_settlement(channel_id, merchant_amount, nonce, signature)`                                | **Phase 1 (Issue #678)** — Begin settlement. Records a `PendingChannelSettlement` and opens the challenge window. Either party may submit a higher-nonce state during the window. |
+| `challenge_settlement(channel_id, merchant_amount, nonce, signature)`                              | **Phase 2 (Issue #678)** — Replace the pending settlement with a higher-nonce signed state during the challenge window. Resets the window timer.                               |
+| `finalize_settlement(channel_id)`                                                                   | **Phase 3 (Issue #678)** — Transfer funds and close the channel after the challenge window has elapsed. Reverts with `ChallengeWindowOpen` if called too early.                |
+| `settle_channel(channel_id, merchant_amount, nonce, signature)`                                     | Legacy direct settlement (no challenge window). Kept for backward compatibility.                                                                                               |
+| `close_channel_expired(caller, channel_id)`                                                         | Anyone can close an expired channel, refunding the deposited balance to the customer.                                                                                          |
+| `get_channel(channel_id)`                                                                           | Retrieve the `PaymentChannel` record.                                                                                                                                          |
+| `get_pending_settlement(channel_id)`                                                                | Retrieve the `PendingChannelSettlement` record if a settlement has been initiated but not yet finalized.                                                                        |
+
+#### Challenge-Window Settlement (Issue #678)
+
+The three-phase settlement flow allows either party to submit a newer (higher-nonce) state
+before funds are released, preventing the merchant from finalising a stale off-chain state
+that under-pays the customer.
+
+1. **`initiate_settlement`** — the initiating party submits a signed state `(channel_id, merchant_amount, nonce)`. The contract records a `PendingChannelSettlement` with `window_ends_at = now + channel.challenge_window_seconds`.
+2. **`challenge_settlement`** — during the window, anyone with a valid higher-nonce signature may call this to replace the pending state. The window clock resets from the moment of the challenge.
+3. **`finalize_settlement`** — once `now >= window_ends_at`, anyone calls this to transfer funds and close the channel. Calling it before the window ends reverts with `FeatureError::ChallengeWindowOpen` (error `542`).
+
+New error codes: `ChallengeWindowOpen = 542`, `ChallengeWindowClosed = 543`, `NoPendingSettlement = 544`.
+
+New events: `SettlementInitiated { channel_id, merchant_amount, nonce, window_ends_at }`, `SettlementChallenged { channel_id, new_nonce, new_merchant_amount }`.
 
 ### Split Payments
 

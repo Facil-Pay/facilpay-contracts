@@ -41,6 +41,7 @@ fn test_close_expired_channel() {
         &1000i128,
         &expires_at,
         &dummy_pk,
+        &0u64,
     );
 
     // Fast forward
@@ -93,6 +94,7 @@ fn test_payment_channel_full_lifecycle() {
         &1000i128,
         &0u64, // no expiry
         &customer_pk,
+        &0u64,
     );
 
     let channel = client.get_channel(&channel_id);
@@ -163,6 +165,7 @@ fn test_settle_channel_invalid_nonce() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     // Build a signature with nonce = 0 (invalid — must be > channel.settled_nonce which starts at 0)
@@ -221,6 +224,7 @@ fn test_settle_channel_rejects_negative_merchant_amount() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     let merchant_amount: i128 = -500;
@@ -285,6 +289,7 @@ fn test_stale_nonce_replay_rejected() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     // Customer signed two off-chain states:
@@ -352,6 +357,7 @@ fn test_equal_nonce_replay_rejected() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     // nonce=0 equals settled_nonce initial value of 0 — must be rejected (not strictly greater)
@@ -406,6 +412,7 @@ fn setup_channel_env() -> (
         &1000i128,
         &expires_at,
         &dummy_pk,
+        &0u64,
     );
 
     (env, client, customer, merchant, token_id, channel_id)
@@ -482,6 +489,7 @@ fn counterparty_can_close_immediately_on_agreement() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     let merchant_amount: i128 = 400;
@@ -536,6 +544,7 @@ fn close_transfers_correct_balances_to_each_party() {
         &1000i128,
         &0u64,
         &customer_pk,
+        &0u64,
     );
 
     let merchant_amount: i128 = 300;
