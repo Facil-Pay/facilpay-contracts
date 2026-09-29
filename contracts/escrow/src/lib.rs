@@ -123,6 +123,18 @@ pub enum DisputeKey {
     DisputeOpener(u64),
 }
 
+// Issue #686: storage keys for escrow lifecycle notification hooks
+#[derive(Clone)]
+#[contracttype]
+pub enum HookKey {
+    Hook(u64),
+    Counter,
+    ByEvent(EscrowEventType, u64),
+    ByEventCount(EscrowEventType),
+    BySubscriber(Address, u64),
+    BySubscriberCount(Address),
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -132,6 +144,7 @@ pub enum DataKey {
     Dispute(DisputeKey),
     VoteWeight(u64, Address),
     ReleaseThresholdBps(u64),
+    Hook(HookKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1688,6 +1701,84 @@ fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant
     total
 }
 
+// ── Issue #686: Escrow lifecycle notification hooks ──────────────────────────
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum EscrowEventType {
+    Created,
+    Released,
+    Disputed,
+    Resolved,
+    Refunded,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowNotificationHook {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub events: Vec<EscrowEventType>,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowHookRegistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowHookDeregistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowHookInvocationFailed {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_type: EscrowEventType,
+    pub escrow_id: u64,
+}
+
+// ── Issue #684: Mutual cancellation events ───────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutualCancelRequested {
+    pub escrow_id: u64,
+    pub requester: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutualCancelWithdrawn {
+    pub escrow_id: u64,
+    pub requester: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutualCancelCompleted {
+    pub escrow_id: u64,
+    pub amount: i128,
+}
+
+// ── Issue #683: Split dispute resolution events ──────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowDisputeSplit {
+    pub escrow_id: u64,
+    pub merchant_amount: i128,
+    pub customer_amount: i128,
+}
+
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
@@ -3238,6 +3329,21 @@ impl EscrowContract {
             .publish(&env);
         }
 
+        // Issue #685: seed the Locked status index
+        let locked_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(EscrowStatus::Locked)))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::StatusList(EscrowStatus::Locked, locked_count)),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::StatusCount(EscrowStatus::Locked)),
+            &(locked_count + 1),
+        );
+
         EscrowCreated {
             escrow_id,
             customer,
@@ -3247,6 +3353,9 @@ impl EscrowContract {
             release_timestamp,
         }
         .publish(&env);
+
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Created, escrow_id);
 
         Ok(escrow_id)
     }
@@ -4194,12 +4303,17 @@ impl EscrowContract {
 
         let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
         if escrow.status == EscrowStatus::Locked {
+            let old_status = escrow.status.clone();
             escrow.status = EscrowStatus::Released;
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+            Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Released);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
         let merchant_amount = escrow.amount - fee_amount;
@@ -4329,6 +4443,9 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Released, escrow_id);
+
         Ok(())
     }
 
@@ -4457,6 +4574,7 @@ impl EscrowContract {
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
+        let old_status = escrow.status.clone();
         match escrow.status {
             EscrowStatus::Locked => {
                 let current_time = env.ledger().timestamp();
@@ -4491,6 +4609,9 @@ impl EscrowContract {
             amount: refund_amount,
         }
         .publish(&env);
+
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Refunded, escrow_id);
 
         Ok(())
     }
@@ -4565,6 +4686,7 @@ impl EscrowContract {
             .publish(&env);
         }
 
+        let old_status_for_dispute = escrow.status.clone();
         match escrow.status {
             EscrowStatus::Locked => {
                 escrow.status = EscrowStatus::Disputed;
@@ -4596,6 +4718,9 @@ impl EscrowContract {
             &DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)),
             &caller,
         );
+
+        // Issue #685: update status index
+        Self::update_status_index(&env, escrow_id, &old_status_for_dispute, &EscrowStatus::Disputed);
 
         // Update global analytics
         let mut analytics: EscrowAnalytics = env
@@ -4781,6 +4906,9 @@ impl EscrowContract {
             details_hash,
         }
         .publish(&env);
+
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Disputed, escrow_id);
 
         Ok(())
     }
@@ -5707,13 +5835,15 @@ impl EscrowContract {
         let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
 
         // Only resolve if status is Disputed
+        let new_resolve_status;
         match escrow.status {
             EscrowStatus::Disputed => {
-                escrow.status = if release_to_merchant {
+                new_resolve_status = if release_to_merchant {
                     EscrowStatus::Released
                 } else {
                     EscrowStatus::Resolved
                 };
+                escrow.status = new_resolve_status.clone();
             }
             _ => return Err(Error::Action(ActionError::NotDisputed)),
         }
@@ -5721,6 +5851,9 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        // Issue #685: update status index
+        Self::update_status_index(&env, escrow_id, &EscrowStatus::Disputed, &new_resolve_status);
 
         Self::dequeue_escalation(&env, escrow_id);
 
@@ -5804,6 +5937,9 @@ impl EscrowContract {
             amount: escrow.amount,
         }
         .publish(&env);
+
+        // Issue #686: notify hooks
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Resolved, escrow_id);
 
         Ok(())
     }
@@ -12471,6 +12607,609 @@ impl EscrowContract {
         };
 
         Ok(())
+    }
+
+    // ── Issue #685: status index helper ──────────────────────────────────────
+
+    fn update_status_index(
+        env: &Env,
+        escrow_id: u64,
+        old_status: &EscrowStatus,
+        new_status: &EscrowStatus,
+    ) {
+        // Decrement old status count
+        let old_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(old_status.clone())))
+            .unwrap_or(0);
+        if old_count > 0 {
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusCount(old_status.clone())),
+                &(old_count - 1),
+            );
+        }
+
+        // Increment new status count and append to the list
+        let new_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(new_status.clone())))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::StatusList(new_status.clone(), new_count)),
+            &escrow_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::StatusCount(new_status.clone())),
+            &(new_count + 1),
+        );
+    }
+
+    // ── Issue #685: query by status ──────────────────────────────────────────
+
+    /// Returns escrows whose current status matches `status`, with pagination.
+    pub fn get_escrows_by_status(
+        env: Env,
+        status: EscrowStatus,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Escrow> {
+        let total_appended: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(status.clone())))
+            .unwrap_or(0);
+
+        let mut escrows = Vec::new(&env);
+        let mut collected: u64 = 0;
+        let mut skipped: u64 = 0;
+
+        for i in 0..total_appended {
+            if collected >= limit {
+                break;
+            }
+            if let Some(escrow_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::Escrow(EscrowKey::StatusList(
+                    status.clone(),
+                    i,
+                )))
+            {
+                if let Some(escrow) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+                {
+                    if escrow.status == status {
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
+                            escrows.push_back(escrow);
+                            collected += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        escrows
+    }
+
+    /// Returns the number of escrows currently in the given status.
+    pub fn get_escrow_count_by_status(env: Env, status: EscrowStatus) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(status)))
+            .unwrap_or(0)
+    }
+
+    // ── Issue #683: split dispute resolution ─────────────────────────────────
+
+    /// Resolves a disputed escrow by splitting funds: `merchant_bps` basis
+    /// points (0–10 000) go to the merchant and the remainder to the customer.
+    /// The two transfers always sum to exactly the escrow amount.
+    pub fn resolve_dispute_split(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        merchant_bps: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "resolve_dispute_split")?;
+
+        if merchant_bps > 10000 {
+            return Err(Error::Basic(BasicError::InvalidBps));
+        }
+
+        if let Some(config) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MultiSigConfig>(&DataKey::Config(ConfigKey::AdminMultiSig))
+        {
+            if !config.admins.contains(&admin) {
+                return Err(Error::Basic(BasicError::NotAnAdmin));
+            }
+        }
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        match escrow.status {
+            EscrowStatus::Disputed => {}
+            _ => return Err(Error::Action(ActionError::NotDisputed)),
+        }
+
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Resolved;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        Self::dequeue_escalation(&env, escrow_id);
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
+        // Compute amounts: merchant gets merchant_bps/10000 of amount; customer
+        // gets the remainder so the two values sum to exactly escrow.amount.
+        let merchant_amount = (escrow.amount * merchant_bps as i128) / 10000_i128;
+        let customer_amount = escrow.amount - merchant_amount;
+
+        if merchant_amount > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &escrow.merchant, merchant_amount)?;
+        }
+        if customer_amount > 0 {
+            Self::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, customer_amount)?;
+        }
+
+        // Handle collateral: give it to whichever side received more
+        if let Some(collateral) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeCollateral>(
+                &DataKey::Dispute(DisputeKey::Collateral(escrow_id)),
+            )
+        {
+            let collateral_recipient = if merchant_bps >= 5000 {
+                escrow.merchant.clone()
+            } else {
+                escrow.customer.clone()
+            };
+            let token_client = token::Client::new(&env, &collateral.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &collateral_recipient,
+                &collateral.amount,
+            );
+            env.storage()
+                .instance()
+                .remove(&DataKey::Dispute(DisputeKey::Collateral(escrow_id)));
+        }
+
+        // Update analytics
+        let mut analytics: EscrowAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscrowAnalytics))
+            .unwrap_or(EscrowAnalytics::default_value());
+        analytics.total_resolutions += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute(DisputeKey::EscrowAnalytics), &analytics);
+
+        EscrowDisputeSplit {
+            escrow_id,
+            merchant_amount,
+            customer_amount,
+        }
+        .publish(&env);
+
+        Self::invoke_escrow_hooks(&env, EscrowEventType::Resolved, escrow_id);
+
+        Ok(())
+    }
+
+    // ── Issue #684: mutual cancellation ──────────────────────────────────────
+
+    /// Called by the customer or merchant to request a mutual cancel. Once
+    /// both parties have requested, the escrow is cancelled and the customer
+    /// is refunded immediately.
+    pub fn request_mutual_cancel(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "request_mutual_cancel")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        match escrow.status {
+            EscrowStatus::Locked => {}
+            _ => return Err(Error::Escrow(EscrowError::InvalidStatus)),
+        }
+
+        let is_customer = caller == escrow.customer;
+        let is_merchant = caller == escrow.merchant;
+
+        if !is_customer && !is_merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let customer_key = DataKey::Escrow(EscrowKey::MutualCancelCustomer(escrow_id));
+        let merchant_key = DataKey::Escrow(EscrowKey::MutualCancelMerchant(escrow_id));
+
+        if is_customer {
+            if env.storage().instance().get::<DataKey, bool>(&customer_key).unwrap_or(false) {
+                return Err(Error::Action(ActionError::MutualCancelAlreadyRequested));
+            }
+            env.storage().instance().set(&customer_key, &true);
+        } else {
+            if env.storage().instance().get::<DataKey, bool>(&merchant_key).unwrap_or(false) {
+                return Err(Error::Action(ActionError::MutualCancelAlreadyRequested));
+            }
+            env.storage().instance().set(&merchant_key, &true);
+        }
+
+        MutualCancelRequested {
+            escrow_id,
+            requester: caller.clone(),
+        }
+        .publish(&env);
+
+        // If both parties have now requested, complete the mutual cancel
+        let customer_requested = env.storage().instance().get::<DataKey, bool>(&customer_key).unwrap_or(false);
+        let merchant_requested = env.storage().instance().get::<DataKey, bool>(&merchant_key).unwrap_or(false);
+
+        if customer_requested && merchant_requested {
+            let mut updated = escrow.clone();
+            let old_status = updated.status.clone();
+            updated.status = EscrowStatus::Cancelled;
+            env.storage()
+                .instance()
+                .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &updated);
+
+            env.storage().instance().remove(&customer_key);
+            env.storage().instance().remove(&merchant_key);
+
+            Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
+
+            Self::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, escrow.amount)?;
+
+            MutualCancelCompleted {
+                escrow_id,
+                amount: escrow.amount,
+            }
+            .publish(&env);
+
+            Self::invoke_escrow_hooks(&env, EscrowEventType::Refunded, escrow_id);
+        }
+
+        Ok(())
+    }
+
+    /// Withdraws a previously submitted mutual cancel request. Only allowed
+    /// before both parties have confirmed (i.e. before the escrow is cancelled).
+    pub fn withdraw_mutual_cancel(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "withdraw_mutual_cancel")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        match escrow.status {
+            EscrowStatus::Locked => {}
+            _ => return Err(Error::Escrow(EscrowError::InvalidStatus)),
+        }
+
+        let is_customer = caller == escrow.customer;
+        let is_merchant = caller == escrow.merchant;
+
+        if !is_customer && !is_merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let key = if is_customer {
+            DataKey::Escrow(EscrowKey::MutualCancelCustomer(escrow_id))
+        } else {
+            DataKey::Escrow(EscrowKey::MutualCancelMerchant(escrow_id))
+        };
+
+        if !env.storage().instance().get::<DataKey, bool>(&key).unwrap_or(false) {
+            return Err(Error::Action(ActionError::MutualCancelNotRequested));
+        }
+
+        env.storage().instance().remove(&key);
+
+        MutualCancelWithdrawn {
+            escrow_id,
+            requester: caller,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── Issue #686: notification hooks ───────────────────────────────────────
+
+    const MAX_ESCROW_HOOKS_PER_EVENT: u32 = 10;
+
+    fn validate_escrow_hook_subscriber(env: &Env, subscriber: &Address) -> Result<(), Error> {
+        match env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+            subscriber,
+            &Symbol::new(env, "ping"),
+            ().into_val(env),
+        ) {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::Action(ActionError::InvalidHookAddress)),
+        }
+    }
+
+    /// Registers a notification hook to be called for the specified escrow
+    /// lifecycle events. The subscriber must be a contract that implements
+    /// `ping()` and `on_escrow_event(event_type, escrow_id)`.
+    pub fn register_escrow_hook(
+        env: Env,
+        subscriber: Address,
+        events: Vec<EscrowEventType>,
+    ) -> Result<u64, Error> {
+        subscriber.require_auth();
+        Self::require_not_paused(&env, "register_escrow_hook")?;
+
+        if events.is_empty() {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        Self::validate_escrow_hook_subscriber(&env, &subscriber)?;
+
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Hook(HookKey::ByEventCount(event_type.clone())))
+                .unwrap_or(0);
+            if count >= Self::MAX_ESCROW_HOOKS_PER_EVENT {
+                return Err(Error::Action(ActionError::MaxHooksPerEventReached));
+            }
+        }
+
+        let hook_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::Counter))
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::Hook(HookKey::Counter), &hook_id);
+
+        let hook = EscrowNotificationHook {
+            hook_id,
+            subscriber: subscriber.clone(),
+            events: events.clone(),
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Hook(HookKey::Hook(hook_id)), &hook);
+
+        // Index by event type
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Hook(HookKey::ByEventCount(event_type.clone())))
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::Hook(HookKey::ByEvent(event_type.clone(), count as u64)),
+                &hook_id,
+            );
+            env.storage().instance().set(
+                &DataKey::Hook(HookKey::ByEventCount(event_type.clone())),
+                &(count + 1),
+            );
+        }
+
+        // Index by subscriber
+        let sub_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::BySubscriberCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Hook(HookKey::BySubscriber(
+                subscriber.clone(),
+                sub_count as u64,
+            )),
+            &hook_id,
+        );
+        env.storage().instance().set(
+            &DataKey::Hook(HookKey::BySubscriberCount(subscriber.clone())),
+            &(sub_count + 1),
+        );
+
+        (EscrowHookRegistered {
+            hook_id,
+            subscriber,
+            event_count: events.len(),
+        })
+        .publish(&env);
+
+        Ok(hook_id)
+    }
+
+    /// Deregisters a previously registered hook. Only the original subscriber
+    /// may deregister it.
+    pub fn deregister_escrow_hook(
+        env: Env,
+        subscriber: Address,
+        hook_id: u64,
+    ) -> Result<(), Error> {
+        subscriber.require_auth();
+
+        let hook: EscrowNotificationHook = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::Hook(hook_id)))
+            .ok_or(Error::Action(ActionError::HookNotFound))?;
+
+        if hook.subscriber != subscriber {
+            return Err(Error::Action(ActionError::HookNotOwnedBySubscriber));
+        }
+
+        let mut updated = hook.clone();
+        updated.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::Hook(HookKey::Hook(hook_id)), &updated);
+
+        for event_type in hook.events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Hook(HookKey::ByEventCount(event_type.clone())))
+                .unwrap_or(0);
+            if count > 0 {
+                env.storage().instance().set(
+                    &DataKey::Hook(HookKey::ByEventCount(event_type.clone())),
+                    &(count - 1),
+                );
+            }
+        }
+
+        let sub_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::BySubscriberCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+        if sub_count > 0 {
+            env.storage().instance().set(
+                &DataKey::Hook(HookKey::BySubscriberCount(subscriber.clone())),
+                &(sub_count - 1),
+            );
+        }
+
+        (EscrowHookDeregistered {
+            hook_id,
+            subscriber,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns all active hooks registered for the given event type.
+    pub fn get_escrow_hooks(
+        env: Env,
+        event_type: EscrowEventType,
+    ) -> Vec<EscrowNotificationHook> {
+        let mut hooks = Vec::new(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::ByEventCount(event_type.clone())))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
+                    event_type.clone(),
+                    i as u64,
+                )))
+            {
+                if let Some(hook) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, EscrowNotificationHook>(
+                        &DataKey::Hook(HookKey::Hook(hook_id)),
+                    )
+                {
+                    if hook.active {
+                        hooks.push_back(hook);
+                    }
+                }
+            }
+        }
+
+        hooks
+    }
+
+    fn invoke_escrow_hooks(env: &Env, event_type: EscrowEventType, escrow_id: u64) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Hook(HookKey::ByEventCount(event_type.clone())))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
+                    event_type.clone(),
+                    i as u64,
+                )))
+            {
+                if let Some(hook) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, EscrowNotificationHook>(
+                        &DataKey::Hook(HookKey::Hook(hook_id)),
+                    )
+                {
+                    if hook.active && hook.events.contains(&event_type) {
+                        let result =
+                            env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                                &hook.subscriber,
+                                &Symbol::new(env, "on_escrow_event"),
+                                (event_type.clone(), escrow_id).into_val(env),
+                            );
+                        if result.is_err() {
+                            (EscrowHookInvocationFailed {
+                                hook_id: hook.hook_id,
+                                subscriber: hook.subscriber.clone(),
+                                event_type: event_type.clone(),
+                                escrow_id,
+                            })
+                            .publish(env);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
