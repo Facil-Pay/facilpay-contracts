@@ -1966,6 +1966,7 @@ impl RefundContract {
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
         Self::clear_counter_offer(env, refund_id);
+        Self::clear_sla_deadline(env, refund_id);
 
         let appeal_window: u64 = env
             .storage()
@@ -6489,6 +6490,7 @@ impl RefundContract {
 
         Self::remove_from_status_index(env, RefundStatus::Requested, refund_id)?;
         Self::clear_counter_offer(env, refund_id);
+        Self::clear_sla_deadline(env, refund_id);
         refund.status = RefundStatus::Approved;
         // Issue #147: Set approved_at timestamp
         refund.approved_at = Some(env.ledger().timestamp());
@@ -8867,6 +8869,7 @@ impl RefundContract {
 
         Self::remove_from_status_index(&env, RefundStatus::Requested, refund_id)?;
         Self::clear_counter_offer(&env, refund_id);
+        Self::clear_sla_deadline(&env, refund_id);
         refund.status = RefundStatus::Rejected;
         refund.rejected_at = Some(env.ledger().timestamp());
         env.storage()
@@ -9078,9 +9081,6 @@ impl RefundContract {
         }
 
         Self::approve_refund_internal(&env, env.current_contract_address(), refund_id)?;
-        env.storage()
-            .instance()
-            .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
 
         RefundSlaAutoApproved {
             refund_id,
@@ -9595,9 +9595,7 @@ impl RefundContract {
 
         Self::release_payment_refund_usage(&env, refund.payment_id, refund.amount);
         Self::clear_counter_offer(&env, refund_id);
-        env.storage()
-            .instance()
-            .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
+        Self::clear_sla_deadline(&env, refund_id);
 
         RefundWithdrawn {
             refund_id,
@@ -10171,11 +10169,18 @@ impl RefundContract {
             return Err(Error::Core(CoreError::CaseNotTimedOut));
         }
 
-        let senior_list: Vec<Address> = env
+        let all_seniors: Vec<Address> = env
             .storage()
             .instance()
             .get(&ArbitrationKey::SeniorArbitratorList)
             .unwrap_or(Vec::new(&env));
+        // Skip senior arbitrators who have opted out of new cases.
+        let mut senior_list: Vec<Address> = Vec::new(&env);
+        for a in all_seniors.iter() {
+            if Self::is_arbitrator_available_inner(&env, &a) {
+                senior_list.push_back(a);
+            }
+        }
 
         if senior_list.is_empty() {
             return Err(Error::Ext(ExtError::ArbitratorNotFound));
@@ -10351,6 +10356,13 @@ impl RefundContract {
         env.storage()
             .instance()
             .remove(&RefundExtKey::CounterOffer(refund_id));
+    }
+
+    /// Drop the merchant response SLA deadline once a refund leaves `Requested`.
+    fn clear_sla_deadline(env: &Env, refund_id: u64) {
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
     }
 
     fn add_customer_voucher(env: &Env, customer: &Address, voucher_id: u64) {
