@@ -38,7 +38,7 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 
 | Function                                                                                     | Description                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. |
+| `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. When `expiration_duration == 0` and the merchant has set a default expiry via `set_default_payment_expiry`, that default is used automatically. |
 | `complete_payment(admin, payment_id)`                                                        | Admin releases a `Pending` payment to the merchant. For amounts above the configured large-payment threshold a multi-sig proposal is auto-created instead.   |
 | `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment, marking it `Refunded` and returning any installments already collected via `pay_installment` to the customer.             |
 | `partial_refund(admin, payment_id, refund_amount)`                                           | Admin issues a partial refund on a `Completed` payment, returning only `refund_amount` to the customer.                                                      |
@@ -114,6 +114,17 @@ publishes its own lifecycle event.
 | `get_payment_count_by_merchant(merchant)`  | Total number of payments for a merchant.                   |
 | `get_merchant_payments(merchant, page)`    | Alternative paginated index of payment IDs for a merchant. |
 
+#### Status-Filtered Queries (Issue #671)
+
+Both customer and merchant lists can now be filtered by `PaymentStatus`:
+
+| Function | Parameters | Description |
+| --- | --- | --- |
+| `get_customer_payments_by_status(customer, status, limit, offset)` | `status: PaymentStatus`; `limit` (max 100); `offset` | Returns up to `limit` payments for `customer` whose status equals `status`, skipping the first `offset` matching results (creation order). |
+| `get_merchant_payments_by_status(merchant, status, limit, offset)` | `status: PaymentStatus`; `limit` (max 100); `offset` | Same as above but filters the merchant's received payments. |
+
+`limit` is capped at **100** regardless of the value passed. `offset` skips matching results, not raw list positions, so pagination across calls with the same `status` is stable as long as no new payments with that status are inserted before the scanned position.
+
 ### Analytics
 
 Payment analytics are exposed through read-only query functions. Aggregate records are maintained independently for the whole payment contract, for each merchant, and for each customer; querying one scope does not combine or leak records from another scope. Amount and volume fields use the token amount type `i128`, while counts and timestamps use unsigned integers.
@@ -157,6 +168,22 @@ installments recorded for that payment back to the customer before flipping the 
 `Refunded` / `Cancelled`. Only the amount actually deposited for **that** payment is
 returned — unrelated funds pooled in the contract are never touched — and a payment with no
 installment history transfers nothing. `expire_payment` already behaves this way.
+
+#### Installment Due Dates and Late Fees (Issue #673)
+
+Merchants can optionally attach a **schedule** to a `Pending` payment, specifying a due date and expected amount for each installment. The schedule's amounts must sum exactly to `payment.amount`.
+
+| Function | Parameters | Description |
+| --- | --- | --- |
+| `set_installment_schedule(merchant, payment_id, entries, late_fee_flat, late_fee_bps)` | `entries: Vec<InstallmentEntry>` — `(due_at: u64, amount: i128, paid: bool)`; `late_fee_flat: i128`; `late_fee_bps: u32` | Attach a schedule to a Pending payment. Only the payment's merchant may call this, and only once per payment. The sum of all entry amounts must equal `payment.amount`. |
+| `get_installment_schedule(payment_id)` | — | Returns the `InstallmentScheduleData` attached to a payment, or `None` if none is set. |
+| `check_installment_overdue(payment_id)` | — | Scans the schedule and emits an `InstallmentOverdue` event for every unpaid entry whose `due_at` is in the past. Returns the count of overdue installments. Does not mutate state. |
+
+**Late fees** are reported (not charged) by `check_installment_overdue`. The caller is responsible for passing the additional fee amount on the next `pay_installment` call. Either `late_fee_flat` (a fixed token amount) or `late_fee_bps` (basis-points of the installment amount) can be set; when `late_fee_bps > 0` it takes precedence.
+
+**Errors:**
+- `PaymentError::InstallmentScheduleAlreadySet` (227) — a schedule is already attached to this payment.
+- `PaymentError::InstallmentScheduleTotalMismatch` (229) — the entries do not sum to `payment.amount`.
 
 ### Escrowed Payments
 
@@ -665,6 +692,38 @@ completion — integrators do not need to do anything special when calling `comp
 | `trigger_scheduled_payout(merchant)`                     | Execute a pending scheduled payout for a merchant.                   |
 | `get_accumulated_balance(merchant)`                      | Return a merchant's accumulated but not-yet-paid-out balance.        |
 
+### Per-Merchant Default Payment Expiry (Issue #672)
+
+Merchants can set a default expiry duration that is automatically applied to payments created with `expiration_duration == 0`.
+
+| Function | Parameters | Description |
+| --- | --- | --- |
+| `set_default_payment_expiry(merchant, seconds)` | `merchant: Address` (must authorize); `seconds: u64` | Set the merchant's default expiry in seconds. Pass `0` to clear the default. Emits `MerchantDefaultExpirySet`. |
+| `get_default_payment_expiry(merchant)` | `merchant: Address` | Returns the configured default in seconds, or `0` if none is set. |
+
+**Errors:** `BasicError::ContractPaused` (116) if the contract is paused.
+
+### Payment Lifecycle Notification Hooks (Issue #674)
+
+Subscriber contracts can register to receive a callback whenever a payment reaches a specific lifecycle state. This mirrors the refund contract's notification hook design.
+
+| Function | Parameters | Description |
+| --- | --- | --- |
+| `register_payment_hook(subscriber, events)` | `subscriber: Address` (must authorize); `events: Vec<PaymentEventType>` | Register `subscriber` to be called for each of the listed `PaymentEventType` values (`Created`, `Completed`, `Refunded`, `Cancelled`). The subscriber must expose a `ping()` function. Returns the new `hook_id`. |
+| `deregister_payment_hook(subscriber, hook_id)` | `subscriber: Address`; `hook_id: u64` | Deactivate a previously registered hook. Only the original subscriber may call this. |
+| `get_payment_hooks(event_type)` | `event_type: PaymentEventType` | Return all active hooks registered for `event_type`. |
+
+**Subscriber interface:** the subscriber contract must implement `on_payment_event(event_type: PaymentEventType, payment_id: u64)`. A panic or error inside the subscriber does **not** revert the payment — the contract emits `PaymentHookInvocationFailed` and continues.
+
+**Limits:** at most **10** active hooks per event type.
+
+**Errors:**
+- `PaymentError::NoEventsSpecified` (234) — `events` is empty.
+- `PaymentError::InvalidHookAddress` (233) — subscriber does not respond to `ping()`.
+- `PaymentError::MaxHooksPerEventReached` (230) — 10 hooks already registered for one of the requested events.
+- `PaymentError::HookNotFound` (231) — `hook_id` does not exist.
+- `PaymentError::HookNotOwnedBySubscriber` (232) — caller is not the hook's subscriber.
+
 ### Finality Delay
 
 | Function                                         | Description                                                           |
@@ -976,13 +1035,17 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 
 ### Core Payment Events
 
-| Event              | Topic Name         | Payload Fields                                            | Fires When                                                |
-| ------------------ | ------------------ | --------------------------------------------------------- | --------------------------------------------------------- |
-| `PaymentCreated`   | `PaymentCreated`   | `payment_id`, `customer`, `merchant`, `amount`            | `create_payment()` succeeds, payment stored as `Pending`  |
-| `PaymentCompleted` | `PaymentCompleted` | `payment_id`, `merchant`, `amount`                        | `complete_payment()` succeeds, funds released to merchant |
-| `PaymentRefunded`  | `PaymentRefunded`  | `payment_id`, `customer`, `amount`                        | `refund_payment()` succeeds, funds returned to customer   |
-| `PaymentCancelled` | `PaymentCancelled` | `payment_id`, `cancelled_by`, `timestamp`                 | `cancel_payment()` succeeds                               |
-| `PaymentExpired`   | `PaymentExpired`   | `payment_id`, `customer`, `refunded_amount`, `expired_at` | `expire_payment()` called after expiration window passes  |
+| Event                         | Topic Name                    | Payload Fields                                            | Fires When                                                                            |
+| ----------------------------- | ----------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `PaymentCreated`              | `PaymentCreated`              | `payment_id`, `customer`, `merchant`, `amount`            | `create_payment()` succeeds, payment stored as `Pending`                              |
+| `PaymentCompleted`            | `PaymentCompleted`            | `payment_id`, `merchant`, `amount`                        | `complete_payment()` succeeds, funds released to merchant                             |
+| `PaymentRefunded`             | `PaymentRefunded`             | `payment_id`, `customer`, `amount`                        | `refund_payment()` succeeds, funds returned to customer                               |
+| `PaymentCancelled`            | `PaymentCancelled`            | `payment_id`, `cancelled_by`, `timestamp`                 | `cancel_payment()` succeeds                                                           |
+| `PaymentExpired`              | `PaymentExpired`              | `payment_id`, `customer`, `refunded_amount`, `expired_at` | `expire_payment()` called after expiration window passes                              |
+| `MerchantDefaultExpirySet`    | `MerchantDefaultExpirySet`    | `merchant`, `seconds`                                     | `set_default_payment_expiry()` updates or clears a merchant's default expiry duration |
+| `PaymentHookRegistered`       | `PaymentHookRegistered`       | `hook_id`, `subscriber`, `event_count`                    | `register_payment_hook()` succeeds                                                    |
+| `PaymentHookDeregistered`     | `PaymentHookDeregistered`     | `hook_id`, `subscriber`                                   | `deregister_payment_hook()` deactivates a hook                                        |
+| `PaymentHookInvocationFailed` | `PaymentHookInvocationFailed` | `hook_id`, `subscriber`, `event_type`, `payment_id`       | A subscriber contract panicked or returned an error during hook invocation            |
 
 ### Tip Events
 
@@ -994,10 +1057,12 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 
 ### Installment Payment Events
 
-| Event              | Topic Name         | Payload Fields                                                                | Fires When                                                                                 |
-| ------------------ | ------------------ | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `InstallmentPaid`  | `InstallmentPaid`  | `payment_id`, `installment_number`, `amount`, `remaining`, `payer`, `paid_at` | `pay_installment()` succeeds, records partial payment                                      |
-| `PaymentFullyPaid` | `PaymentFullyPaid` | `payment_id`, `total_installments`, `completed_at`                            | `finalize_installment_payment()` marks payment `Completed` after all installments received |
+| Event                       | Topic Name                  | Payload Fields                                                                         | Fires When                                                                                 |
+| --------------------------- | --------------------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `InstallmentPaid`           | `InstallmentPaid`           | `payment_id`, `installment_number`, `amount`, `remaining`, `payer`, `paid_at`          | `pay_installment()` succeeds, records partial payment                                      |
+| `PaymentFullyPaid`          | `PaymentFullyPaid`          | `payment_id`, `total_installments`, `completed_at`                                     | `finalize_installment_payment()` marks payment `Completed` after all installments received |
+| `InstallmentScheduleSet`    | `InstallmentScheduleSet`    | `payment_id`, `installment_count`                                                      | `set_installment_schedule()` attaches a due-date schedule to a payment                     |
+| `InstallmentOverdue`        | `InstallmentOverdue`        | `payment_id`, `installment_index`, `due_at`, `amount`, `late_fee`, `checked_at`        | `check_installment_overdue()` detects a schedule entry that is past its due date           |
 
 ### Escrowed Payment Events
 
