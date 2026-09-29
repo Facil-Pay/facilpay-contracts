@@ -1369,6 +1369,8 @@ fn test_create_vesting_escrow_with_milestones() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1378,6 +1380,8 @@ fn test_create_vesting_escrow_with_milestones() {
             description: String::from_str(&env, "Milestone 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 3,
@@ -1387,6 +1391,8 @@ fn test_create_vesting_escrow_with_milestones() {
             description: String::from_str(&env, "Milestone 3"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -1465,6 +1471,8 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1474,6 +1482,8 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
             description: String::from_str(&env, "Milestone 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -1512,6 +1522,8 @@ fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
             description: String::from_str(&env, "Too early"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1521,6 +1533,8 @@ fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
             description: String::from_str(&env, "Ok"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -1799,6 +1813,8 @@ fn test_get_vested_amount_milestone_based() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1808,6 +1824,8 @@ fn test_get_vested_amount_milestone_based() {
             description: String::from_str(&env, "Milestone 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 3,
@@ -1817,6 +1835,8 @@ fn test_get_vested_amount_milestone_based() {
             description: String::from_str(&env, "Milestone 3"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -1875,6 +1895,8 @@ fn test_get_releasable_amount() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1884,6 +1906,8 @@ fn test_get_releasable_amount() {
             description: String::from_str(&env, "Milestone 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -1939,6 +1963,8 @@ fn test_release_vested_amount_milestone() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -1948,6 +1974,8 @@ fn test_release_vested_amount_milestone() {
             description: String::from_str(&env, "Milestone 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -2186,6 +2214,8 @@ fn test_release_vested_amount_nothing_to_release() {
             description: String::from_str(&env, "Milestone 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -2228,6 +2258,8 @@ fn test_full_vesting_completion() {
             description: String::from_str(&env, "Phase 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -2237,6 +2269,8 @@ fn test_full_vesting_completion() {
             description: String::from_str(&env, "Phase 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 3,
@@ -2246,6 +2280,8 @@ fn test_full_vesting_completion() {
             description: String::from_str(&env, "Phase 3"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 4,
@@ -2255,6 +2291,8 @@ fn test_full_vesting_completion() {
             description: String::from_str(&env, "Phase 4"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -2315,6 +2353,8 @@ fn test_partial_milestone_release() {
             description: String::from_str(&env, "First half"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -2324,6 +2364,8 @@ fn test_partial_milestone_release() {
             description: String::from_str(&env, "Second half"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -3855,6 +3897,8 @@ fn setup_vesting_with_milestones(
             description: String::from_str(env, "Deliverable 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -3864,6 +3908,8 @@ fn setup_vesting_with_milestones(
             description: String::from_str(env, "Deliverable 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
     client.create_vesting_escrow(
@@ -4050,6 +4096,8 @@ fn test_release_milestone_transfers_exact_amount() {
             description: String::from_str(&env, "Deliverable 1"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
         VestingMilestone {
             milestone_id: 2,
@@ -4059,6 +4107,8 @@ fn test_release_milestone_transfers_exact_amount() {
             description: String::from_str(&env, "Deliverable 2"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
 
@@ -4246,6 +4296,8 @@ fn test_release_milestone_overflow_guard() {
             description: String::from_str(&env, "Full amount"),
             approved_by: None,
             approved_at: None,
+            deadline: None,
+            claimed_missed: false,
         },
     ];
     let escrow_id = client.create_vesting_escrow(
