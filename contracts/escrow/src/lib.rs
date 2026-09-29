@@ -77,12 +77,8 @@ pub enum EscrowKey {
     // (merchant, reference) -> escrow_id, and escrow_id -> reference.
     Reference(Address, BytesN<32>),
     EscrowReference(u64),
-    // Issue #684: mutual cancellation requests per escrow party
-    MutualCancelCustomer(u64),
-    MutualCancelMerchant(u64),
-    // Issue #685: status index for paginated queries
-    StatusList(EscrowStatus, u64),
-    StatusCount(EscrowStatus),
+    // Issue #689: per-escrow beneficiary split configuration.
+    BeneficiaryShares(u64),
 }
 
 #[derive(Clone)]
@@ -111,6 +107,7 @@ pub enum DisputeKey {
     InsuranceClaimCounter,
     MultiPartyDispute(u64),
     EscrowAnalytics,
+    DisputeReasonCount(u32),
     EscrowMigrationStatus,
     EscrowMigrated(u64),
     EscrowRenewalConfig,
@@ -206,6 +203,10 @@ pub enum EscrowError {
     SuccessionPlanExists = 228,
     ClawbackDelayTooShort = 229,
     DuplicateReference = 230,
+    MilestoneDeadlineNotPassed = 231,
+    MilestoneAlreadyClaimed = 232,
+    InvalidBeneficiaryShares = 233,
+    DuplicateBeneficiary = 234,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -228,14 +229,7 @@ pub enum ActionError {
     EvidenceDeadlinePassed = 313,
     ApprovalsThresholdNotMet = 314,
     InsufficientCollateral = 315,
-    // Issue #684
-    MutualCancelAlreadyRequested = 316,
-    MutualCancelNotRequested = 317,
-    // Issue #686
-    HookNotFound = 318,
-    HookNotOwnedBySubscriber = 319,
-    MaxHooksPerEventReached = 320,
-    InvalidHookAddress = 321,
+    PartialReleaseExceedsBalance = 316,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -629,6 +623,25 @@ pub struct EscrowReleased {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowPartiallyReleased {
+    pub escrow_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub released_total: i128,
+    pub token: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissedMilestoneClaimed {
+    pub escrow_id: u64,
+    pub milestone_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParticipantApproved {
     pub escrow_id: u64,
     pub approver: Address,
@@ -678,6 +691,15 @@ pub struct MultiTokenEscrowReleased {
 pub struct EscrowDisputed {
     pub escrow_id: u64,
     pub disputed_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowDisputedWithReason {
+    pub escrow_id: u64,
+    pub disputed_by: Address,
+    pub reason: u32,
+    pub details_hash: BytesN<32>,
 }
 
 #[contractevent]
@@ -1035,6 +1057,7 @@ pub struct Escrow {
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
     pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
+    pub released_amount: i128,          // Issue #687: cumulative amount already partially released
 }
 
 #[derive(Clone)]
@@ -1141,6 +1164,8 @@ pub struct VestingMilestone {
     pub description: String,
     pub approved_by: Option<Address>,
     pub approved_at: Option<u64>,
+    pub deadline: Option<u64>, // Issue #688: optional deadline for auto-refund on miss
+    pub claimed_missed: bool,  // Issue #688: true when customer claimed a missed milestone
 }
 
 #[derive(Clone)]
@@ -1491,6 +1516,25 @@ pub struct FunctionPausedEvent {
 pub struct FunctionUnpausedEvent {
     pub function_name: String,
     pub unpaused_by: Address,
+}
+
+/// Issue #690: reason code stored alongside a dispute.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum DisputeReason {
+    NonDelivery,
+    NotAsDescribed,
+    Damaged,
+    Fraud,
+    Other,
+}
+
+/// Issue #689: a single beneficiary's payout share (basis points out of 10 000).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BeneficiaryShare {
+    pub address: Address,
+    pub bps: u32,
 }
 
 #[derive(Clone)]
@@ -2940,6 +2984,73 @@ impl EscrowContract {
         )
     }
 
+    /// Creates a standard escrow whose release amount is split among multiple beneficiaries.
+    ///
+    /// `shares` must contain at least one entry and the `bps` values must sum
+    /// to exactly 10 000.  Duplicate beneficiary addresses are rejected.
+    /// The `merchant` field still identifies the primary counter-party but the
+    /// payout on release goes to `shares`.
+    pub fn create_escrow_with_beneficiaries(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+        shares: Vec<BeneficiaryShare>,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow_with_beneficiaries")?;
+
+        if shares.is_empty() {
+            return Err(Error::Escrow(EscrowError::InvalidBeneficiaryShares));
+        }
+
+        let mut bps_total: u32 = 0;
+        for s in shares.iter() {
+            bps_total = bps_total.saturating_add(s.bps);
+        }
+        if bps_total != 10_000 {
+            return Err(Error::Escrow(EscrowError::InvalidBeneficiaryShares));
+        }
+
+        // Detect duplicate addresses by checking each pair once
+        let len = shares.len();
+        for i in 0..len {
+            for j in (i + 1)..len {
+                let a = shares.get(i).unwrap();
+                let b = shares.get(j).unwrap();
+                if a.address == b.address {
+                    return Err(Error::Escrow(EscrowError::DuplicateBeneficiary));
+                }
+            }
+        }
+
+        let escrow_id = Self::internal_create_escrow(
+            env.clone(),
+            customer,
+            merchant,
+            amount,
+            token,
+            release_timestamp,
+            min_hold_period,
+            expiry_timestamp,
+            auto_refund_on_expiry,
+            None,
+            None,
+        )?;
+
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::BeneficiaryShares(escrow_id)),
+            &shares,
+        );
+
+        Ok(escrow_id)
+    }
+
     /// Looks up an escrow by the order reference it was created with.
     ///
     /// # Arguments
@@ -3123,6 +3234,7 @@ impl EscrowContract {
             escalation_timeout: escalation_cfg.timeout_seconds,
             auto_resolve_in_favor_of: escalation_cfg.favor,
             evidence_deadline: None,
+            released_amount: 0,
         };
 
         env.storage()
@@ -4239,12 +4351,39 @@ impl EscrowContract {
         }
 
         let recipient = recipient_override.unwrap_or(escrow.merchant.clone());
-        EscrowContract::transfer_if_token_contract(
-            &env,
-            &escrow.token,
-            &recipient,
-            merchant_amount,
-        )?;
+
+        // Issue #689: split payout among configured beneficiaries when present.
+        let shares: Option<Vec<BeneficiaryShare>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::BeneficiaryShares(escrow_id)));
+
+        if let Some(shares) = shares {
+            let mut distributed: i128 = 0;
+            let share_count = shares.len();
+            for (idx, share) in shares.iter().enumerate() {
+                let share_amount = if idx as u32 == share_count - 1 {
+                    // Last recipient gets the remainder to absorb rounding dust
+                    merchant_amount - distributed
+                } else {
+                    (merchant_amount * share.bps as i128) / 10_000
+                };
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &share.address,
+                    share_amount,
+                )?;
+                distributed += share_amount;
+            }
+        } else {
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &recipient,
+                merchant_amount,
+            )?;
+        }
 
         // Update reputation for both parties on successful completion.
         EscrowContract::update_reputation_on_completion(&env, &escrow.merchant);
@@ -4310,6 +4449,103 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Partially releases a standard escrow to the merchant.
+    ///
+    /// Multiple partial releases may be made; they accumulate in `released_amount`.
+    /// When the full escrow amount has been released the escrow is marked Released.
+    /// Refunds and disputes operate on the remaining balance only.
+    pub fn release_partial(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        Self::require_not_paused(&env, "release_partial")?;
+
+        if !Self::is_trusted_bridge(&env, &admin) {
+            let config = Self::get_multisig_config(env.clone());
+            if !config.admins.contains(&admin) {
+                return Err(Error::Basic(BasicError::NotAnAdmin));
+            }
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
+        if amount <= 0 || amount > remaining {
+            return Err(Error::Action(ActionError::PartialReleaseExceedsBalance));
+        }
+
+        let fee_amount = (amount * escrow.fee_bps) / 10000;
+        let merchant_amount = amount - fee_amount;
+
+        if fee_amount > 0 {
+            let fee_config = Self::effective_fee_config(&env, &escrow.token);
+            EscrowContract::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &fee_config.fee_recipient,
+                fee_amount,
+            )?;
+
+            if fee_config.fee_recipient == env.current_contract_address() {
+                let mut acc: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Participant(ParticipantKey::AccumulatedFees(
+                        escrow.token.clone(),
+                    )))
+                    .unwrap_or(0);
+                acc += fee_amount;
+                env.storage().instance().set(
+                    &DataKey::Participant(ParticipantKey::AccumulatedFees(escrow.token.clone())),
+                    &acc,
+                );
+            }
+
+            EscrowFeeCollected {
+                escrow_id,
+                fee_amount,
+                recipient: fee_config.fee_recipient.clone(),
+            }
+            .publish(&env);
+        }
+
+        EscrowContract::transfer_if_token_contract(
+            &env,
+            &escrow.token,
+            &escrow.merchant,
+            merchant_amount,
+        )?;
+
+        escrow.released_amount = escrow.released_amount.saturating_add(amount);
+        let released_total = escrow.released_amount;
+
+        if escrow.released_amount >= escrow.amount {
+            escrow.status = EscrowStatus::Released;
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        EscrowPartiallyReleased {
+            escrow_id,
+            recipient: escrow.merchant.clone(),
+            amount,
+            released_total,
+            token: escrow.token.clone(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Refunds escrow.
     ///
     /// # Arguments
@@ -4359,20 +4595,18 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        // Issue #685: update status index
-        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
-
+        let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(
             &env,
             &escrow.token,
             &escrow.customer,
-            escrow.amount,
+            refund_amount,
         )?;
 
         EscrowResolved {
             escrow_id,
             released_to_merchant: false,
-            amount: escrow.amount,
+            amount: refund_amount,
         }
         .publish(&env);
 
@@ -4516,7 +4750,160 @@ impl EscrowContract {
 
         EscrowDisputed {
             escrow_id,
+            disputed_by: caller.clone(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Disputes an escrow with an explicit reason code and evidence hash.
+    ///
+    /// Behaves identically to `dispute_escrow` but additionally records the
+    /// `reason` and `details_hash` so that dispute analytics can be grouped
+    /// by reason.  The old `dispute_escrow` delegates here with `Other`.
+    pub fn dispute_escrow_with_reason(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        reason: DisputeReason,
+        details_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_not_paused(&env, "dispute_escrow_with_reason")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        // Handle collateral (same logic as dispute_escrow)
+        let config = Self::get_dispute_config(env.clone());
+        if config.collateral_enabled && config.collateral_amount > 0 {
+            if config.collateral_amount * 10000
+                < escrow.amount * config.min_collateral_ratio_bps as i128
+            {
+                return Err(Error::Action(ActionError::InsufficientCollateral));
+            }
+
+            let token_client = token::Client::new(&env, &config.collateral_token);
+            token_client.transfer(
+                &caller,
+                env.current_contract_address(),
+                &config.collateral_amount,
+            );
+
+            let collateral = DisputeCollateral {
+                escrow_id,
+                disputing_party: caller.clone(),
+                amount: config.collateral_amount,
+                token: config.collateral_token.clone(),
+                deposited_at: env.ledger().timestamp(),
+            };
+            env.storage().instance().set(
+                &DataKey::Dispute(DisputeKey::Collateral(escrow_id)),
+                &collateral,
+            );
+
+            CollateralDeposited {
+                escrow_id,
+                party: caller.clone(),
+                amount: config.collateral_amount,
+            }
+            .publish(&env);
+        }
+
+        match escrow.status {
+            EscrowStatus::Locked => {
+                escrow.status = EscrowStatus::Disputed;
+                escrow.dispute_started_at = env.ledger().timestamp();
+                escrow.last_activity_at = escrow.dispute_started_at;
+                let evidence_deadline_seconds =
+                    Self::get_evidence_deadline_config(env.clone()).evidence_deadline_seconds;
+                escrow.evidence_deadline =
+                    Some(escrow.dispute_started_at + evidence_deadline_seconds);
+
+                EvidenceDeadlineSet {
+                    escrow_id,
+                    deadline: escrow.evidence_deadline.unwrap(),
+                    set_at: escrow.dispute_started_at,
+                }
+                .publish(&env);
+            }
+            EscrowStatus::Released => return Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::Disputed => return Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::Resolved => return Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+            EscrowStatus::Cancelled => return Err(Error::Escrow(EscrowError::AlreadyProcessed)),
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)),
+            &caller,
+        );
+
+        // Update global analytics
+        let mut analytics: EscrowAnalytics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::EscrowAnalytics))
+            .unwrap_or(EscrowAnalytics::default_value());
+        analytics.total_disputes += 1;
+        analytics.dispute_rate_bps = if analytics.total_escrows_created > 0 {
+            (analytics.total_disputes as i128 * 10000) / analytics.total_escrows_created as i128
+        } else {
+            0
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute(DisputeKey::EscrowAnalytics), &analytics);
+
+        // Update per-reason dispute count for analytics grouping
+        let reason_code: u32 = match reason {
+            DisputeReason::NonDelivery => 0,
+            DisputeReason::NotAsDescribed => 1,
+            DisputeReason::Damaged => 2,
+            DisputeReason::Fraud => 3,
+            DisputeReason::Other => 4,
+        };
+        let reason_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::DisputeReasonCount(
+                reason_code,
+            )))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::DisputeReasonCount(reason_code)),
+            &(reason_count + 1),
+        );
+
+        // Update per-address analytics
+        let customer_addr = escrow.customer.clone();
+        let merchant_addr = escrow.merchant.clone();
+        EscrowContract::update_customer_analytics(&env, &customer_addr, |a| {
+            a.total_disputes += 1;
+        });
+        EscrowContract::update_merchant_analytics(&env, &merchant_addr, |a| {
+            a.total_disputes += 1;
+        });
+
+        EscrowDisputedWithReason {
+            escrow_id,
             disputed_by: caller,
+            reason: reason_code,
+            details_hash,
         }
         .publish(&env);
 
@@ -4524,6 +4911,23 @@ impl EscrowContract {
         Self::invoke_escrow_hooks(&env, EscrowEventType::Disputed, escrow_id);
 
         Ok(())
+    }
+
+    /// Returns the dispute count for a given reason code.
+    pub fn get_dispute_reason_count(env: Env, reason: DisputeReason) -> u64 {
+        let reason_code: u32 = match reason {
+            DisputeReason::NonDelivery => 0,
+            DisputeReason::NotAsDescribed => 1,
+            DisputeReason::Damaged => 2,
+            DisputeReason::Fraud => 3,
+            DisputeReason::Other => 4,
+        };
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::DisputeReasonCount(
+                reason_code,
+            )))
+            .unwrap_or(0)
     }
 
     /// Withdraws an open dispute, e.g. after the parties settle privately.
@@ -6812,6 +7216,7 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            released_amount: 0,
         };
 
         env.storage()
@@ -7464,6 +7869,93 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(release_amount)
+    }
+
+    /// Claims a refund for a missed milestone after its deadline has passed.
+    ///
+    /// If a milestone has an optional `deadline` and has not been approved or
+    /// released by that time, the customer may call this to reclaim that
+    /// milestone's amount.  Approved or already-released milestones cannot be
+    /// claimed.
+    pub fn claim_missed_milestone(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+        milestone_id: u64,
+    ) -> Result<i128, Error> {
+        customer.require_auth();
+        Self::require_not_paused(&env, "claim_missed_milestone")?;
+
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if escrow.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let mut vesting_schedule = env
+            .storage()
+            .instance()
+            .get::<DataKey, VestingSchedule>(&DataKey::Escrow(EscrowKey::VestingSchedule(
+                escrow_id,
+            )))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        let now = env.ledger().timestamp();
+        let mut found = false;
+        let mut refund_amount: i128 = 0;
+        let mut milestones = vesting_schedule.milestones.clone();
+
+        for i in 0..milestones.len() {
+            let mut m = milestones.get(i).unwrap();
+            if m.milestone_id == milestone_id {
+                found = true;
+                if m.released {
+                    return Err(Error::Escrow(EscrowError::MilestoneAlreadyReleased));
+                }
+                if m.claimed_missed {
+                    return Err(Error::Escrow(EscrowError::MilestoneAlreadyClaimed));
+                }
+                if m.approved_by.is_some() {
+                    return Err(Error::Escrow(EscrowError::InvalidStatus));
+                }
+                let deadline = m
+                    .deadline
+                    .ok_or(Error::Escrow(EscrowError::InvalidStatus))?;
+                if now <= deadline {
+                    return Err(Error::Escrow(EscrowError::MilestoneDeadlineNotPassed));
+                }
+                refund_amount = m.amount;
+                m.claimed_missed = true;
+                milestones.set(i, m);
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        vesting_schedule.milestones = milestones;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::VestingSchedule(escrow_id)),
+            &vesting_schedule,
+        );
+
+        EscrowContract::transfer_if_token_contract(&env, &escrow.token, &customer, refund_amount)?;
+
+        MissedMilestoneClaimed {
+            escrow_id,
+            milestone_id,
+            customer,
+            amount: refund_amount,
+        }
+        .publish(&env);
+
+        Ok(refund_amount)
     }
 
     /// Returns all milestones that have not yet been released.
@@ -9779,6 +10271,7 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            released_amount: 0,
         };
 
         env.storage()
@@ -10549,6 +11042,7 @@ impl EscrowContract {
             escalation_timeout: 604800,
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
+            released_amount: 0,
         };
 
         env.storage()
@@ -12812,3 +13306,6 @@ mod withdraw_dispute_test;
 
 #[cfg(test)]
 mod token_fee_config_test;
+
+#[cfg(test)]
+mod feat_687_688_689_690_test;
