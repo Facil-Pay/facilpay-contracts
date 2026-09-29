@@ -330,6 +330,13 @@ pub enum ExtError {
     AmendmentLimitReached = 65,
     // Merchant refund date-range query
     InvalidDateRange = 66,
+    // Merchant counter-offer errors
+    InvalidCounterOffer = 67,
+    CounterOfferNotFound = 68,
+    CounterOfferExpired = 69,
+    // Voucher transfer errors
+    VoucherNotTransferable = 70,
+    InvalidVoucherRecipient = 71,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1307,6 +1314,8 @@ pub enum RefundExtKey {
     RefundSlaDeadline(u64),
     // Number of times a refund request has been amended before review.
     RefundAmendmentCount(u64),
+    // Merchant counter-offer data for a refund
+    CounterOffer(u64),
 }
 
 // Issue #195: Batch decision types
