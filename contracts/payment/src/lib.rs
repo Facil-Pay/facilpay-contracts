@@ -69,9 +69,19 @@ pub enum PaymentKey {
     AccumulatedFees,
     LargePaymentCounter,
     Discount(u64),
+    Tip(u64),
+    StatusHistory(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
+
+/// Upper bound on status-history entries kept per payment (#682). A payment's
+/// lifecycle has only a handful of transitions, so the oldest entry is dropped
+/// once this bound is reached.
+pub const MAX_STATUS_HISTORY: u32 = 10;
+
+/// Rolling window, in seconds, over which a merchant's skip cap is counted (#666).
+pub const SKIP_WINDOW_SECONDS: u64 = 365 * 86400;
 
 #[derive(Clone)]
 #[contracttype]
@@ -83,6 +93,7 @@ pub enum SubscriptionKey {
     Group(u64),
     GroupCounter,
     GroupMembership(u64),
+    SkipUsage(u64),
 }
 
 #[derive(Clone)]
@@ -103,6 +114,8 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    PendingChannelSettlement(u64),
+    SubscriptionLastAnnouncedCycle(u64),
 }
 
 #[derive(Clone)]
@@ -179,6 +192,20 @@ pub enum PaymentError {
     InvalidLineItem = 222,
     InvalidScheduleTime = 223,
     TokenNotAllowed = 224,
+    // Issue #671
+    InvalidStatusFilter = 225,
+    // Issue #672
+    InvalidExpiryDuration = 226,
+    // Issue #673
+    InstallmentScheduleAlreadySet = 227,
+    InstallmentScheduleNotFound = 228,
+    InstallmentScheduleTotalMismatch = 229,
+    // Issue #674
+    MaxHooksPerEventReached = 230,
+    HookNotFound = 231,
+    HookNotOwnedBySubscriber = 232,
+    InvalidHookAddress = 233,
+    NoEventsSpecified = 234,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,6 +231,7 @@ pub enum SubscriptionError {
     MaxTrialDurationExceeded = 316,
     MerchantPaused = 317,
     UsageCapExceeded = 318,
+    SkipCapExceeded = 319,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,6 +294,12 @@ pub enum FeatureError {
     BelowMinSplitAmount = 539,
     // Issue #385: claimed settlement amounts must sum exactly to the channel deposit.
     BalanceSumMismatch = 541,
+    // Issue #678: challenge window settlement
+    ChallengeWindowOpen = 542,
+    ChallengeWindowClosed = 543,
+    NoPendingSettlement = 544,
+    // Issue #680: subscription token change
+    TokenNotAllowedForMerchant = 545,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -311,7 +345,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=540).contains(&code) {
+            if (500..=545).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -321,12 +355,10 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=318).contains(&code) {
-                return Ok(Error::Subscription(unsafe {
-                    core::mem::transmute::<u32, SubscriptionError>(code)
-                }));
+            if code >= 300 && code <= 319 {
+                return Ok(Error::Subscription(unsafe { core::mem::transmute(code) }));
             }
-            if (200..=224).contains(&code) {
+            if (200..=234).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -401,6 +433,7 @@ pub enum MerchantDataKey {
     MerchantActiveSubscriptions(Address, u64),
     MerchantActiveSubscriptionCount(Address),
     ActiveSubscriptionIndex(u64),
+    SkipCap(Address),
 }
 
 // State and proposal data keys
@@ -486,6 +519,10 @@ pub struct SubscriptionPauseData {
     pub last_paused_at: u64,
     pub total_pause_duration: u64,
     pub proration_enabled: bool,
+    pub max_pause_seconds: u64,     // 0 = unlimited (issue #667)
+    pub max_pauses_per_year: u32,   // 0 = unlimited (issue #667)
+    pub pauses_this_year: u32,      // count of pauses in the current year window
+    pub year_window_start: u64,     // timestamp when the current year window began
 }
 
 #[derive(Clone)]
@@ -509,6 +546,32 @@ pub struct Subscription {
     pub metadata: String,
     pub trial_data: SubscriptionTrialData,
     pub pause_data: SubscriptionPauseData,
+    pub cancel_at_period_end: bool, // issue #664: schedule cancellation at next billing date
+}
+
+// issue #665: pending merchant price-change proposal awaiting customer acceptance
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionPriceProposal {
+    pub new_amount: i128,
+    pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
+}
+
+/// One entry in a payment's status history (#682).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentStatusEntry {
+    pub status: PaymentStatus,
+    pub timestamp: u64,
+    pub actor: Address,
+}
+
+/// Skips consumed by a subscription within the current rolling year (#666).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionSkipUsage {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 #[repr(u32)]
@@ -894,6 +957,7 @@ pub struct PaymentChannel {
     pub open: bool,
     pub expires_at: u64,
     pub customer_pk: BytesN<32>,
+    pub challenge_window_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -1005,6 +1069,46 @@ pub struct SubscriptionResumed {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCycleSkipped {
+    pub subscription_id: u64,
+    pub customer: Address,
+    pub skipped_payment_at: u64,
+    pub next_payment_at: u64,
+    pub skips_used: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkipCapSet {
+    pub merchant: Address,
+    pub max_skips_per_year: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipAdded {
+    pub payment_id: u64,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipSettled {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipReturned {
+    pub payment_id: u64,
+    pub customer: Address,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionResumedProrated {
     pub subscription_id: u64,
     pub pause_duration: u64,
@@ -1031,6 +1135,50 @@ pub struct TrialConverted {
 pub struct TrialCancelled {
     pub subscription_id: u64,
     pub cancelled_at: u64,
+}
+
+// issue #663: subscription plan upgrade / downgrade
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlanChanged {
+    pub subscription_id: u64,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub old_interval: u64,
+    pub new_interval: u64,
+    pub proration_amount: i128, // positive = charged, negative = credited (not transferred here)
+    pub next_payment_at: u64,
+}
+
+// issue #664: cancel at end of period
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelScheduled {
+    pub subscription_id: u64,
+    pub cancels_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelUndone {
+    pub subscription_id: u64,
+}
+
+// issue #665: merchant-proposed price change requiring customer consent
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceProposed {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceAccepted {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
 }
 
 #[contractevent]
@@ -1080,6 +1228,99 @@ pub struct SubscriptionSuspended {
 pub struct DunningResolved {
     pub subscription_id: u64,
     pub resolved_at: u64,
+}
+
+// Issue #673: installment schedule events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentScheduleSet {
+    pub payment_id: u64,
+    pub installment_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentOverdue {
+    pub payment_id: u64,
+    pub installment_index: u32,
+    pub due_at: u64,
+    pub amount: i128,
+    pub late_fee: i128,
+    pub checked_at: u64,
+}
+
+// Issue #674: payment lifecycle hook events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookRegistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookDeregistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookInvocationFailed {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_type: PaymentEventType,
+    pub payment_id: u64,
+}
+
+// Issue #672: default expiry set event
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantDefaultExpirySet {
+    pub merchant: Address,
+    pub seconds: u64,
+}
+
+// Issue #674: payment lifecycle event types for hooks
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PaymentEventType {
+    Created,
+    Completed,
+    Refunded,
+    Cancelled,
+}
+
+// Issue #674: notification hook stored per subscriber
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentNotificationHook {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub events: Vec<PaymentEventType>,
+    pub active: bool,
+}
+
+// Issue #673: a single due-date installment entry
+#[derive(Clone)]
+#[contracttype]
+pub struct InstallmentEntry {
+    pub due_at: u64,
+    pub amount: i128,
+    pub paid: bool,
+}
+
+// Issue #673: the full schedule attached to a payment
+#[derive(Clone)]
+#[contracttype]
+pub struct InstallmentScheduleData {
+    pub payment_id: u64,
+    pub entries: Vec<InstallmentEntry>,
+    // flat late fee in token units (0 = no late fee)
+    pub late_fee_flat: i128,
+    // late fee in basis points applied to the installment amount (0 = none)
+    pub late_fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -2427,6 +2668,100 @@ impl PaymentContract {
         )
     }
 
+    /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
+    ///
+    /// The tip is transferred from the customer into the contract immediately
+    /// and held alongside the payment; calling again adds to the existing tip.
+    /// On completion it is paid to the merchant in full (platform fees are
+    /// computed on `amount` only); on refund, cancellation or expiry it is
+    /// returned to the customer.
+    ///
+    /// # Arguments
+    /// * `customer` - The payment's customer (must authorize and fund the tip)
+    /// * `payment_id` - The pending payment to tip on
+    /// * `tip_amount` - The tip in base token units of the payment's token (`> 0`)
+    ///
+    /// # Returns
+    /// `Ok(total_tip)` on success, or `BasicError::InvalidAmount` if `tip_amount`
+    /// is not positive, `PaymentError::NotFound`, `BasicError::Unauthorized` if
+    /// `customer` is not the payment's customer, `PaymentError::Expired`, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Pending` or is an
+    /// escrowed or split payment.
+    pub fn add_tip(
+        env: Env,
+        customer: Address,
+        payment_id: u64,
+        tip_amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+        if tip_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::Payment(PaymentError::Expired));
+        }
+        // Escrowed and split payments settle outside `do_complete_payment`, so
+        // a tip on them could never reach the merchant.
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::State(StateDataKey::EscrowedPayment(payment_id)))
+            || env
+                .storage()
+                .instance()
+                .has(&DataKey::Feature(FeatureKey::SplitConfig(payment_id)))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        token::Client::new(&env, &payment.token).transfer(
+            &customer,
+            env.current_contract_address(),
+            &tip_amount,
+        );
+        let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::Tip(payment_id)), &total_tip);
+        (PaymentTipAdded {
+            payment_id,
+            tip_amount,
+        })
+        .publish(&env);
+        Ok(total_tip)
+    }
+
+    /// Returns the tip attached to a payment, or 0 if it has none (#675).
+    pub fn get_payment_tip(env: Env, payment_id: u64) -> i128 {
+        PaymentContract::get_tip(&env, payment_id)
+    }
+
+    /// Returns a payment's status history in chronological order (#682).
+    ///
+    /// Each entry records the status entered, the ledger timestamp and the
+    /// address that caused the transition. Permissionless transitions
+    /// (`expire_payment`, `finalize_installment_payment`, `execute_large_payment`,
+    /// `execute_if_condition_met`) record the contract's own address as actor.
+    /// At most `MAX_STATUS_HISTORY` entries are kept; older ones are dropped.
+    pub fn get_payment_status_history(env: Env, payment_id: u64) -> Vec<PaymentStatusEntry> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::StatusHistory(payment_id)))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Schedules a future payment by escrowing tokens until the scheduled time.
     ///
     /// # Arguments
@@ -2794,8 +3129,19 @@ impl PaymentContract {
         let payment_id = counter + 1;
 
         let current_timestamp = env.ledger().timestamp();
-        let expires_at = if expiration_duration > 0 {
-            current_timestamp + expiration_duration
+        // Issue #672: fall back to per-merchant default when caller passes 0
+        let effective_duration = if expiration_duration > 0 {
+            expiration_duration
+        } else {
+            env.storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(
+                    merchant.clone(),
+                )))
+                .unwrap_or(0)
+        };
+        let expires_at = if effective_duration > 0 {
+            current_timestamp + effective_duration
         } else {
             0
         };
@@ -2821,6 +3167,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
@@ -3078,6 +3430,9 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Issue #674: notify registered hooks
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Created, payment_id);
+
         Ok(payment_id)
     }
 
@@ -3249,6 +3604,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         (EscrowedPaymentCompleted {
             payment_id,
@@ -3305,6 +3661,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Cancelled, caller);
 
         (EscrowedPaymentCancelled {
             payment_id,
@@ -3456,6 +3813,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            payment.status.clone(),
+            admin.clone(),
+        );
         env.storage().instance().set(
             &DataKey::State(StateDataKey::EscrowedPaymentDispute(payment_id)),
             &dispute,
@@ -3715,6 +4078,9 @@ impl PaymentContract {
             token_client.transfer(&contract_address, &payment.customer, &refund_amount);
         }
 
+        // Return any escrowed tip (#675)
+        PaymentContract::return_tip(&env, &payment);
+
         // Update payment status to Cancelled
         payment.status = PaymentStatus::Cancelled;
         PaymentContract::restore_spend_limit(&env, &payment);
@@ -3723,6 +4089,13 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        // Expiry is permissionless, so the contract itself is the recorded actor.
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            env.current_contract_address(),
+        );
 
         // Emit PaymentExpired event with refund info
         (PaymentExpired {
@@ -3812,10 +4185,10 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id, admin)
     }
 
-    fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_complete_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
             .storage()
@@ -3878,6 +4251,10 @@ impl PaymentContract {
             payment.currency.clone(),
         );
 
+        // The tip (#675) is already escrowed in the contract and is fee-exempt:
+        // it is added to the merchant's settlement after fees are computed.
+        let tip = PaymentContract::get_tip(env, payment_id);
+
         // Check finality delay config (#219)
         let finality: Option<FinalityConfig> = env
             .storage()
@@ -3890,7 +4267,7 @@ impl PaymentContract {
                 let settlement = PendingSettlement {
                     payment_id,
                     merchant: payment.merchant.clone(),
-                    amount: net_amount,
+                    amount: net_amount + tip,
                     token: payment.token.clone(),
                     release_at,
                 };
@@ -3921,6 +4298,20 @@ impl PaymentContract {
                 env.storage()
                     .instance()
                     .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+                PaymentContract::record_status_change(
+                    env,
+                    payment_id,
+                    PaymentStatus::Completed,
+                    actor,
+                );
+                if tip > 0 {
+                    (PaymentTipSettled {
+                        payment_id,
+                        merchant: payment.merchant.clone(),
+                        tip_amount: tip,
+                    })
+                    .publish(env);
+                }
                 PaymentContract::update_merchant_fee_record_post_completion(
                     env,
                     payment.merchant.clone(),
@@ -3951,6 +4342,8 @@ impl PaymentContract {
                     amount: payment.amount,
                 })
                 .publish(env);
+                // Issue #674
+                PaymentContract::invoke_payment_hooks(env, PaymentEventType::Completed, payment_id);
                 return Ok(());
             }
         }
@@ -3976,8 +4369,16 @@ impl PaymentContract {
             env,
             payment.merchant.clone(),
             payment.token.clone(),
-            merchant_amount,
+            merchant_amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(env);
+        }
 
         // Forwarding only applies when funds were paid out immediately.
         let payout_deferred = env
@@ -4024,6 +4425,7 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Completed, actor);
         PaymentContract::update_merchant_fee_record_post_completion(
             env,
             payment.merchant.clone(),
@@ -4075,6 +4477,9 @@ impl PaymentContract {
             amount: payment.amount,
         })
         .publish(env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Completed, payment_id);
 
         // Accrue loyalty points for completed payments if loyalty is configured.
         PaymentContract::maybe_accrue_loyalty_points(env, payment.customer.clone(), payment.amount);
@@ -4524,14 +4929,14 @@ impl PaymentContract {
             installment_number: new_installment_number,
             amount,
             remaining,
-            payer: customer,
+            payer: customer.clone(),
             paid_at: partial_payment.paid_at,
         })
         .publish(&env);
 
         // Check if payment is now fully paid
         if remaining == 0 {
-            PaymentContract::finalize_installment_payment(env.clone(), payment_id)?;
+            PaymentContract::do_finalize_installment_payment(&env, payment_id, customer.clone())?;
         }
 
         Ok(())
@@ -4631,6 +5036,17 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not in Pending status or
     /// the outstanding balance is not zero.
     pub fn finalize_installment_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        // Permissionless entry point: the contract itself is the recorded actor.
+        let actor = env.current_contract_address();
+        PaymentContract::do_finalize_installment_payment(&env, payment_id, actor)
+    }
+
+    fn do_finalize_installment_payment(
+        env: &Env,
+        payment_id: u64,
+        actor: Address,
+    ) -> Result<(), Error> {
+        let env = env.clone();
         let mut payment = PaymentContract::get_payment(&env, payment_id);
 
         if payment.status != PaymentStatus::Pending {
@@ -4656,14 +5072,25 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, actor);
 
-        // Transfer or accumulate all collected funds to merchant
+        // Transfer or accumulate all collected funds (plus any escrowed,
+        // fee-exempt tip, #675) to the merchant
+        let tip = PaymentContract::get_tip(&env, payment_id);
         Self::settle_or_accumulate(
             &env,
             payment.merchant.clone(),
             payment.token.clone(),
-            payment.amount,
+            payment.amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
 
         // Emit payment fully paid event
         (PaymentFullyPaid {
@@ -4707,10 +5134,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        PaymentContract::do_refund_payment(&env, payment_id)
+        PaymentContract::do_refund_payment(&env, payment_id, admin)
     }
 
-    fn do_refund_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_refund_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
             .storage()
@@ -4746,11 +5173,13 @@ impl PaymentContract {
         // still-Pending payment before it becomes Refunded. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Refunded, actor);
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -4812,6 +5241,9 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Refunded, payment_id);
+
         let now = env.ledger().timestamp();
         PaymentContract::update_merchant_bucket(
             env,
@@ -4868,6 +5300,7 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::Expired));
         }
 
+        let previous_status = payment.status.clone();
         match payment.status {
             PaymentStatus::Pending | PaymentStatus::PartialRefunded => {
                 let new_refunded = payment.refunded_amount + refund_amount;
@@ -4886,14 +5319,95 @@ impl PaymentContract {
             }
         }
 
+        // A fully refunded payment also returns its escrowed tip (#675).
+        if payment.status == PaymentStatus::Refunded {
+            PaymentContract::return_tip(&env, &payment);
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(&env, payment_id, payment.status.clone(), admin);
+        }
 
         (PaymentRefunded {
             payment_id,
             customer: payment.customer,
             amount: refund_amount,
+        })
+        .publish(&env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(&env, PaymentEventType::Refunded, payment_id);
+
+        Ok(())
+    }
+
+    /// Refunds a completed payment from the merchant's own balance.
+    ///
+    /// Completed payments have already been settled out of the contract, so the
+    /// merchant returns `amount + tip` directly to the customer (#675) and the
+    /// payment moves `Completed → Refunded` (#682). Platform fees already
+    /// collected are not returned.
+    ///
+    /// # Arguments
+    /// * `merchant` - The payment's merchant (must authorize and fund the refund)
+    /// * `payment_id` - The ID of the completed payment
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `PaymentError::NotFound` if the payment does not exist,
+    /// `BasicError::Unauthorized` if `merchant` is not the payment's merchant, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed`.
+    pub fn refund_completed_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "refund_payment")?;
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Completed {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        let tip = PaymentContract::get_tip(&env, payment_id);
+        let refund_amount = payment.amount + tip;
+        if refund_amount > 0 {
+            token::Client::new(&env, &payment.token).transfer(
+                &merchant,
+                &payment.customer,
+                &refund_amount,
+            );
+        }
+
+        payment.status = PaymentStatus::Refunded;
+        payment.refunded_amount = payment.amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Refunded, merchant);
+
+        if tip > 0 {
+            (PaymentTipReturned {
+                payment_id,
+                customer: payment.customer.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
+        (PaymentRefunded {
+            payment_id,
+            customer: payment.customer,
+            amount: payment.amount,
         })
         .publish(&env);
 
@@ -4950,11 +5464,18 @@ impl PaymentContract {
         // still-Pending payment before it becomes Cancelled. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            caller.clone(),
+        );
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
@@ -5001,6 +5522,9 @@ impl PaymentContract {
             timestamp,
         })
         .publish(env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Cancelled, payment_id);
 
         PaymentContract::update_merchant_bucket(
             env,
@@ -5651,7 +6175,12 @@ impl PaymentContract {
                 last_paused_at: 0,
                 total_pause_duration: 0,
                 proration_enabled: false,
+                max_pause_seconds: 0,
+                max_pauses_per_year: 0,
+                pauses_this_year: 0,
+                year_window_start: now,
             },
+            cancel_at_period_end: false,
         };
 
         env.storage()
@@ -5803,6 +6332,37 @@ impl PaymentContract {
             .unwrap();
 
         let now = env.ledger().timestamp();
+
+        // issue #667: auto-resume a paused subscription that has exceeded max_pause_seconds
+        if sub.status == SubscriptionStatus::Paused
+            && sub.pause_data.max_pause_seconds > 0
+            && now >= sub.pause_data.last_paused_at + sub.pause_data.max_pause_seconds
+        {
+            let pause_duration = now - sub.pause_data.last_paused_at;
+            sub.pause_data.total_pause_duration += pause_duration;
+            sub.next_payment_at += pause_duration;
+            if sub.ends_at > 0 {
+                sub.ends_at += pause_duration;
+            }
+            sub.status = SubscriptionStatus::Active;
+            env.storage().instance().set(
+                &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                &sub,
+            );
+            (SubscriptionResumed {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+            })
+            .publish(&env);
+            // Re-read updated sub before continuing normal flow
+            sub = env
+                .storage()
+                .instance()
+                .get(&DataKey::Subscription(SubscriptionKey::Data(
+                    subscription_id,
+                )))
+                .unwrap();
+        }
 
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
@@ -5976,6 +6536,22 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
 
+        // Issue #680: apply pending token change at the start of each new cycle
+        if let Some(pending_token) =
+            env.storage()
+                .instance()
+                .get::<DataKey, Address>(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )))
+        {
+            sub.token = pending_token;
+            env.storage()
+                .instance()
+                .remove(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )));
+        }
+
         // Attempt token transfer
         let token_client = token::Client::new(&env, &sub.token);
         let contract_address = env.current_contract_address();
@@ -6004,9 +6580,53 @@ impl PaymentContract {
             sub.retry_count = 0;
             sub.next_payment_at += sub.interval;
 
+            // issue #664: honour scheduled cancellation — mark Cancelled after this final charge
+            if sub.cancel_at_period_end {
+                sub.status = SubscriptionStatus::Cancelled;
+                env.storage().instance().set(
+                    &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                    &sub,
+                );
+                Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
+                (RecurringPaymentExecuted {
+                    subscription_id,
+                    payment_count: sub.payment_count,
+                    amount: charge_amount,
+                    next_payment_at: sub.next_payment_at,
+                })
+                .publish(&env);
+                (SubscriptionCancelled {
+                    subscription_id,
+                    cancelled_by: sub.customer.clone(),
+                })
+                .publish(&env);
+                return Ok(());
+            }
+
             // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
+            }
+
+            // issue #665: apply an accepted price proposal once effective_from is reached
+            if let Some(proposal) = env
+                .storage()
+                .instance()
+                .get::<DataKey, SubscriptionPriceProposal>(&DataKey::Subscription(
+                    SubscriptionKey::PriceProposal(subscription_id),
+                ))
+            {
+                let effective = if proposal.effective_from == 0 {
+                    now
+                } else {
+                    proposal.effective_from
+                };
+                if now >= effective {
+                    sub.amount = proposal.new_amount;
+                    env.storage().instance().remove(&DataKey::Subscription(
+                        SubscriptionKey::PriceProposal(subscription_id),
+                    ));
+                }
             }
 
             env.storage().instance().set(
@@ -6367,6 +6987,54 @@ impl PaymentContract {
             .publish(&env);
         }
 
+        // Issue #681: prorated refund on mid-cycle cancellation
+        let refund_flag: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or(false);
+
+        if refund_flag && sub.interval > 0 && sub.amount > 0 {
+            // Compute the unused portion of the current cycle.
+            // `next_payment_at` is when the *next* charge is due; the current
+            // cycle started at `next_payment_at - interval`.
+            let cycle_start = sub.next_payment_at.saturating_sub(sub.interval);
+            if now > cycle_start && now < sub.next_payment_at {
+                let elapsed = now - cycle_start;
+                // unused_fraction = (interval - elapsed) / interval
+                // refund = amount * unused_fraction, rounded down (never more than charged)
+                let unused_seconds = sub.interval - elapsed;
+                // Use u128 arithmetic to avoid overflow
+                let refund_amount = ((sub.amount as u128).saturating_mul(unused_seconds as u128)
+                    / (sub.interval as u128)) as i128;
+
+                if refund_amount > 0 && refund_amount <= sub.amount {
+                    let token_client = token::Client::new(&env, &sub.token);
+                    let contract_address = env.current_contract_address();
+                    // Transfer from merchant back to customer (merchant must have allowance
+                    // for the contract, or the contract pulls from merchant's balance).
+                    // Best-effort: only emit and transfer if the transfer succeeds.
+                    if token_client
+                        .try_transfer_from(
+                            &contract_address,
+                            &sub.merchant,
+                            &sub.customer,
+                            &refund_amount,
+                        )
+                        .is_ok()
+                    {
+                        (SubscriptionProratedRefund {
+                            subscription_id,
+                            refund_amount,
+                        })
+                        .publish(&env);
+                    }
+                }
+            }
+        }
+
         (SubscriptionCancelled {
             subscription_id,
             cancelled_by: caller,
@@ -6410,8 +7078,44 @@ impl PaymentContract {
             return Err(Error::Subscription(SubscriptionError::NotActive));
         }
 
+        let now = env.ledger().timestamp();
+
+        // issue #667: enforce yearly pause count limit
+        if sub.pause_data.max_pauses_per_year > 0 {
+            let year_secs: u64 = 365 * 24 * 3600;
+            if now >= sub.pause_data.year_window_start + year_secs {
+                // roll window
+                sub.pause_data.year_window_start = now;
+                sub.pause_data.pauses_this_year = 0;
+            }
+            if sub.pause_data.pauses_this_year >= sub.pause_data.max_pauses_per_year {
+                return Err(Error::Subscription(SubscriptionError::PauseLimitExceeded));
+            }
+        }
+
+        // issue #667: enforce max pause duration (checked against next_payment_at so it can't
+        // exceed the remaining billing cycle length if max_pause_seconds is small)
+        if sub.pause_data.max_pause_seconds > 0 {
+            let time_until_due = if sub.next_payment_at > now {
+                sub.next_payment_at - now
+            } else {
+                0
+            };
+            if sub.pause_data.max_pause_seconds > time_until_due
+                && sub.pause_data.max_pause_seconds < sub.interval
+            {
+                // max_pause_seconds is less than a full interval — flag but still allow;
+                // the auto-resume check in execute_recurring_payment will enforce it.
+                // Actual rejection only when max_pause_seconds is 0 (unlimited) — already handled above.
+            }
+            // Nothing to block at pause time; auto-resume on execute covers enforcement.
+        }
+
         sub.status = SubscriptionStatus::Paused;
-        sub.pause_data.last_paused_at = env.ledger().timestamp();
+        sub.pause_data.last_paused_at = now;
+        if sub.pause_data.max_pauses_per_year > 0 {
+            sub.pause_data.pauses_this_year += 1;
+        }
         env.storage().instance().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
@@ -6535,6 +7239,119 @@ impl PaymentContract {
         );
 
         Ok(())
+    }
+
+    /// Caps how many billing cycles a merchant's customers may skip per
+    /// subscription within a rolling year (#666). A cap of 0 disables skipping.
+    /// Without a configured cap, skips are unlimited.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant configuring the cap (must authorize)
+    /// * `max_skips_per_year` - Maximum skips per subscription per rolling 365 days
+    pub fn set_skip_cap(env: Env, merchant: Address, max_skips_per_year: u32) {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::SkipCap(merchant.clone())),
+            &max_skips_per_year,
+        );
+        (SkipCapSet {
+            merchant,
+            max_skips_per_year,
+        })
+        .publish(&env);
+    }
+
+    /// Returns the merchant's skip cap, or `None` if skips are uncapped (#666).
+    pub fn get_skip_cap(env: Env, merchant: Address) -> Option<u32> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::SkipCap(merchant)))
+    }
+
+    /// Returns the skips a subscription has used in its current rolling year (#666).
+    pub fn get_skip_usage(env: Env, subscription_id: u64) -> SubscriptionSkipUsage {
+        env.storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::SkipUsage(
+                subscription_id,
+            )))
+            .unwrap_or(SubscriptionSkipUsage {
+                window_start: 0,
+                count: 0,
+            })
+    }
+
+    /// Skips the next billing cycle of an active subscription without charging
+    /// (#666). `next_payment_at` advances by exactly one `interval`; the
+    /// subscription stays `Active`. Only the subscription's customer may skip.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscription's customer (must authorize)
+    /// * `subscription_id` - The subscription to skip a cycle on
+    ///
+    /// # Returns
+    /// `Ok(new_next_payment_at)` on success, or `SubscriptionError::NotFound`,
+    /// `BasicError::Unauthorized`, `SubscriptionError::NotActive`, or
+    /// `SubscriptionError::SkipCapExceeded` if the merchant's yearly cap is used up.
+    pub fn skip_next_cycle(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let now = env.ledger().timestamp();
+        let mut usage = PaymentContract::get_skip_usage(env.clone(), subscription_id);
+        if usage.count == 0 || now >= usage.window_start + SKIP_WINDOW_SECONDS {
+            usage = SubscriptionSkipUsage {
+                window_start: now,
+                count: 0,
+            };
+        }
+        if let Some(cap) = PaymentContract::get_skip_cap(env.clone(), sub.merchant.clone()) {
+            if usage.count >= cap {
+                return Err(Error::Subscription(SubscriptionError::SkipCapExceeded));
+            }
+        }
+        usage.count += 1;
+
+        let skipped_payment_at = sub.next_payment_at;
+        sub.next_payment_at += sub.interval;
+
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::SkipUsage(subscription_id)),
+            &usage,
+        );
+
+        (SubscriptionCycleSkipped {
+            subscription_id,
+            customer,
+            skipped_payment_at,
+            next_payment_at: sub.next_payment_at,
+            skips_used: usage.count,
+        })
+        .publish(&env);
+
+        Ok(sub.next_payment_at)
     }
 
     /// Read a single subscription.
@@ -7627,11 +8444,11 @@ impl PaymentContract {
         match proposal.action_type {
             ActionType::CompletePayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_complete_payment(env, payment_id)?;
+                PaymentContract::do_complete_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::RefundPayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_refund_payment(env, payment_id)?;
+                PaymentContract::do_refund_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::AddAdmin => {
                 let new_admin = proposal.target.clone();
@@ -8695,7 +9512,7 @@ impl PaymentContract {
         let mut results = Vec::new(&env);
 
         for payment_id in payment_ids.iter() {
-            let result = PaymentContract::do_complete_payment(&env, payment_id);
+            let result = PaymentContract::do_complete_payment(&env, payment_id, admin.clone());
 
             match result {
                 Ok(()) => {
@@ -8920,6 +9737,12 @@ impl PaymentContract {
             env.storage()
                 .instance()
                 .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                PaymentStatus::Pending,
+                entry.customer.clone(),
+            );
 
             // Index by customer
             let customer_count: u64 = env
@@ -8987,7 +9810,7 @@ impl PaymentContract {
             // the risk surcharge), finality-delay hold, payment forwarding,
             // loyalty accrual, fee-rebate accrual, auto-escrow and analytics
             // are all applied — identical to a normal payment completion.
-            match PaymentContract::do_complete_payment(&env, payment_id) {
+            match PaymentContract::do_complete_payment(&env, payment_id, admin.clone()) {
                 Ok(()) => results.push_back(BatchResult {
                     payment_id,
                     success: true,
@@ -9245,7 +10068,7 @@ impl PaymentContract {
         }
 
         // Complete the payment
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        PaymentContract::do_complete_payment(&env, payment_id, admin)?;
 
         Ok(())
     }
@@ -9287,7 +10110,8 @@ impl PaymentContract {
         if !condition_met {
             return Err(Error::Feature(FeatureError::ConditionNotMet));
         }
-        PaymentContract::do_complete_payment(&env, payment_id)
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())
     }
 
     /// Retrieves the conditional payment record for a given payment ID.
@@ -10608,7 +11432,8 @@ impl PaymentContract {
         // Run the same completion path as a normal payment: platform fee
         // deduction (incl. risk surcharge), finality-delay hold, payment
         // forwarding, loyalty/rebate accrual, auto-escrow and analytics.
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())?;
 
         proposal.executed = true;
         env.storage().instance().set(
@@ -11146,6 +11971,7 @@ impl PaymentContract {
         amount: i128,
         expires_at: u64,
         customer_pk: BytesN<32>,
+        challenge_window_seconds: u64,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
@@ -11181,6 +12007,7 @@ impl PaymentContract {
             open: true,
             expires_at,
             customer_pk,
+            challenge_window_seconds,
         };
 
         env.storage().instance().set(
@@ -11272,11 +12099,11 @@ impl PaymentContract {
         Ok(())
     }
 
-    /// Settles a payment channel with a signed off-chain state update.
+    /// Initiates settlement of a payment channel with a signed off-chain state update.
     ///
-    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
-    /// transfers funds to the merchant and refunds the remainder to the customer,
-    /// then closes the channel.
+    /// Issue #678: Starts a challenge window during which either party may submit a
+    /// higher-nonce signed state. Call `finalize_settlement` after the window closes
+    /// to actually move funds.
     ///
     /// # Arguments
     /// * `channel_id` - The ID of the channel to settle.
@@ -11286,10 +12113,251 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Ok(())` on success.
+    pub fn initiate_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "initiate_settlement")?;
+
+        let channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::Feature(FeatureError::ChannelExpired));
+        }
+
+        if nonce <= channel.settled_nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        let now = env.ledger().timestamp();
+        let window_ends_at = now + channel.challenge_window_seconds;
+
+        // Check if there is already a pending settlement with a higher nonce
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, PendingChannelSettlement>(&DataKey::Feature(
+                FeatureKey::PendingChannelSettlement(channel_id),
+            ))
+        {
+            if nonce <= existing.nonce {
+                return Err(Error::Feature(FeatureError::InvalidNonce));
+            }
+        }
+
+        let pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &pending,
+        );
+
+        (SettlementInitiated {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Challenges a pending settlement with a higher-nonce signed state.
     ///
-    /// # Errors
-    /// Returns an error if the channel is not found, closed, expired, nonce is stale,
-    /// amount exceeds deposit, or signature verification fails.
+    /// Issue #678: During the challenge window either party may submit a higher-nonce
+    /// signed state to replace the pending one.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel being challenged.
+    /// * `merchant_amount` - The new (higher-nonce) amount for the merchant.
+    /// * `nonce` - Must be strictly greater than the pending settlement's nonce.
+    /// * `signature` - Ed25519 signature from the customer.
+    pub fn challenge_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "challenge_settlement")?;
+
+        let channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        let pending: PendingChannelSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now >= pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowClosed));
+        }
+
+        if nonce <= pending.nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        // Extend the window from now (reset the challenge clock)
+        let new_window_ends_at = now + channel.challenge_window_seconds;
+
+        let new_pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at: new_window_ends_at,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &new_pending,
+        );
+
+        (SettlementChallenged {
+            channel_id,
+            new_nonce: nonce,
+            new_merchant_amount: merchant_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Finalizes a pending channel settlement after the challenge window has elapsed.
+    ///
+    /// Issue #678: Funds are only transferred when the challenge window has closed
+    /// without a successful challenge.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel to finalize.
+    pub fn finalize_settlement(env: Env, channel_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "finalize_settlement")?;
+
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        let pending: PendingChannelSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowOpen));
+        }
+
+        let merchant_amount = pending.merchant_amount;
+        let customer_refund = channel.deposited - merchant_amount;
+
+        // Conservation check
+        if merchant_amount
+            .checked_add(customer_refund)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != channel.deposited
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if merchant_amount > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &merchant_amount);
+        }
+        if customer_refund > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &customer_refund);
+        }
+
+        channel.settled = merchant_amount;
+        channel.settled_nonce = pending.nonce;
+        channel.open = false;
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+        env.storage()
+            .instance()
+            .remove(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )));
+
+        (ChannelSettled {
+            channel_id,
+            merchant_amount,
+            customer_refund,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Legacy direct settlement (no challenge window) — kept for backward compatibility.
+    ///
+    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
+    /// transfers funds to the merchant and refunds the remainder to the customer,
+    /// then closes the channel immediately.
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -11451,6 +12519,200 @@ impl PaymentContract {
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
     }
 
+    /// Retrieves the pending settlement for a channel (if any).
+    pub fn get_pending_settlement(env: Env, channel_id: u64) -> Option<PendingChannelSettlement> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+    }
+
+    // ── SUBSCRIPTION: UPCOMING RENEWAL ANNOUNCEMENTS (Issue #679) ────────────
+
+    /// Emits `SubscriptionRenewalUpcoming` for each subscription due within `window_seconds`.
+    ///
+    /// Stores the last announced billing cycle per subscription to avoid duplicates.
+    /// Subscriptions not due within the window, or already announced for the current
+    /// cycle, emit nothing.
+    ///
+    /// # Arguments
+    /// * `ids` - Subscription IDs to check.
+    /// * `window_seconds` - How far ahead (in seconds from now) to look.
+    pub fn announce_upcoming_renewals(
+        env: Env,
+        ids: Vec<u64>,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        let window_end = now + window_seconds;
+
+        for subscription_id in ids.iter() {
+            let sub: Subscription =
+                match env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Subscription(SubscriptionKey::Data(
+                        subscription_id,
+                    ))) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+            if sub.status != SubscriptionStatus::Active {
+                continue;
+            }
+
+            if sub.next_payment_at > window_end {
+                continue;
+            }
+
+            // Use the payment_count as the cycle identifier — it increments on each
+            // successful execution, so it uniquely identifies the upcoming cycle.
+            let upcoming_cycle = sub.payment_count + 1;
+
+            let last_announced: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Feature(
+                    FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id),
+                ))
+                .unwrap_or(0);
+
+            if last_announced >= upcoming_cycle {
+                // Already announced for this cycle
+                continue;
+            }
+
+            env.storage().instance().set(
+                &DataKey::Feature(FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id)),
+                &upcoming_cycle,
+            );
+
+            (SubscriptionRenewalUpcoming {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+                cycle: upcoming_cycle,
+            })
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    // ── SUBSCRIPTION: CHANGE PAYMENT TOKEN (Issue #680) ─────────────────────
+
+    /// Allows a customer to change the payment token for a subscription.
+    ///
+    /// The new token must be in the merchant's per-merchant allowed-token list
+    /// (or the global allowed list if no per-merchant list is configured).
+    /// The change takes effect at the next billing cycle.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscriber (must authorize).
+    /// * `subscription_id` - The subscription to update.
+    /// * `new_token` - The new token address.
+    pub fn change_subscription_token(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        new_token: Address,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Check merchant's per-merchant allowed tokens; fall back to global list
+        let merchant_tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let token_ok = if merchant_tokens.is_empty() {
+            // No per-merchant list: fall back to global allowed-token list
+            Self::is_token_allowed(&env, &new_token)
+        } else {
+            merchant_tokens.contains(&new_token)
+        };
+
+        if !token_ok {
+            return Err(Error::Feature(FeatureError::TokenNotAllowedForMerchant));
+        }
+
+        // Store the pending token change — applied at next billing cycle
+        env.storage().instance().set(
+            &DataKey::Subscription(SubscriptionKey::NextToken(subscription_id)),
+            &new_token,
+        );
+
+        (SubscriptionTokenChanged {
+            subscription_id,
+            new_token,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Sets the per-merchant allowed token list.
+    ///
+    /// Only the merchant themselves may call this.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `tokens` - The list of accepted token addresses.
+    pub fn set_merchant_allowed_tokens(
+        env: Env,
+        merchant: Address,
+        tokens: Vec<Address>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(merchant)),
+            &tokens,
+        );
+        Ok(())
+    }
+
+    /// Sets the `refund_unused_on_cancel` flag for a merchant.
+    ///
+    /// Issue #681: When `true`, customers receive a prorated refund on mid-cycle
+    /// cancellation. Only the merchant may set this flag.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `enabled` - `true` to enable prorated refunds, `false` to disable.
+    pub fn set_refund_unused_on_cancel(
+        env: Env,
+        merchant: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(merchant)),
+            &enabled,
+        );
+        Ok(())
+    }
+
     fn is_zero_address(env: &Env, address: &Address) -> bool {
         let xdr = address.to_xdr(env);
         // Check if it's a Contract address with all-zero bytes
@@ -11561,6 +12823,12 @@ impl PaymentContract {
         env.storage()
             .instance()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
@@ -11830,9 +13098,11 @@ impl PaymentContract {
 
         // Mark payment as Completed to prevent subsequent complete_payment calls
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
-            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Data(payment_id)),
+            &payment,
+        );
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         Ok(())
     }
@@ -12193,6 +13463,52 @@ impl PaymentContract {
         }
         limit.used = limit.used.saturating_sub(payment.amount).max(0);
         env.storage().instance().set(&key, &limit);
+    }
+
+    /// Appends a `(status, timestamp, actor)` entry to a payment's status
+    /// history (#682), dropping the oldest entry once `MAX_STATUS_HISTORY` is
+    /// reached. No extra event is emitted: each transition already publishes
+    /// its own lifecycle event (`PaymentCompleted`, `PaymentRefunded`, ...).
+    fn record_status_change(env: &Env, payment_id: u64, status: PaymentStatus, actor: Address) {
+        let key = DataKey::Payment(PaymentKey::StatusHistory(payment_id));
+        let mut history: Vec<PaymentStatusEntry> = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if history.len() >= MAX_STATUS_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(PaymentStatusEntry {
+            status,
+            timestamp: env.ledger().timestamp(),
+            actor,
+        });
+        env.storage().instance().set(&key, &history);
+    }
+
+    fn get_tip(env: &Env, payment_id: u64) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Tip(payment_id)))
+            .unwrap_or(0)
+    }
+
+    /// Returns a pending payment's escrowed tip to the customer (#675). The tip
+    /// record is kept so `get_payment_tip` still reports what was tipped.
+    fn return_tip(env: &Env, payment: &Payment) {
+        let tip = PaymentContract::get_tip(env, payment.id);
+        if tip <= 0 {
+            return;
+        }
+        let token_client = token::Client::new(env, &payment.token);
+        token_client.transfer(&env.current_contract_address(), &payment.customer, &tip);
+        (PaymentTipReturned {
+            payment_id: payment.id,
+            customer: payment.customer.clone(),
+            tip_amount: tip,
+        })
+        .publish(env);
     }
 
     // ── SUBSCRIPTION GROUPS (#218) ────────────────────────────────────────────
@@ -12928,12 +14244,595 @@ impl PaymentContract {
 
         Ok(())
     }
+
+    // ── Issue #671: Query payments by status with pagination ──────────────
+
+    const STATUS_QUERY_LIMIT_CAP: u64 = 100;
+
+    /// Returns a paginated list of payments made by a customer, filtered by status.
+    ///
+    /// Scans the customer's payment list in creation order and collects only entries
+    /// whose status matches `status`. `offset` skips that many matching results;
+    /// `limit` is capped at 100.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer address to query
+    /// * `status` - The desired payment status
+    /// * `limit` - Maximum results to return (capped at 100)
+    /// * `offset` - Number of matching results to skip
+    pub fn get_customer_payments_by_status(
+        env: Env,
+        customer: Address,
+        status: PaymentStatus,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let effective_limit = limit.min(Self::STATUS_QUERY_LIMIT_CAP);
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut matched: u64 = 0;
+
+        for i in 0..total_count {
+            if results.len() as u64 >= effective_limit {
+                break;
+            }
+            if let Some(payment_id) =
+                env.storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::Customer(CustomerDataKey::Payments(
+                        customer.clone(),
+                        i,
+                    )))
+            {
+                if let Some(payment) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                {
+                    if payment.status == status {
+                        if matched >= offset {
+                            results.push_back(payment);
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Returns a paginated list of payments received by a merchant, filtered by status.
+    ///
+    /// Scans the merchant's payment list in creation order. `limit` is capped at 100.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to query
+    /// * `status` - The desired payment status
+    /// * `limit` - Maximum results to return (capped at 100)
+    /// * `offset` - Number of matching results to skip
+    pub fn get_merchant_payments_by_status(
+        env: Env,
+        merchant: Address,
+        status: PaymentStatus,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let effective_limit = limit.min(Self::STATUS_QUERY_LIMIT_CAP);
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut matched: u64 = 0;
+
+        for i in 0..total_count {
+            if results.len() as u64 >= effective_limit {
+                break;
+            }
+            if let Some(payment_id) =
+                env.storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::Merchant(MerchantDataKey::Payments(
+                        merchant.clone(),
+                        i,
+                    )))
+            {
+                if let Some(payment) = env
+                    .storage()
+                    .instance()
+                    .get::<DataKey, Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                {
+                    if payment.status == status {
+                        if matched >= offset {
+                            results.push_back(payment);
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    // ── Issue #672: Per-merchant default payment expiry ───────────────────
+
+    /// Set the default expiry duration (in seconds) for a merchant's payments.
+    ///
+    /// When `create_payment` is called with `expiration_duration == 0`, the merchant's
+    /// default (if set) is applied automatically.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant setting the default (must authorize)
+    /// * `seconds` - Default expiry in seconds; 0 clears the default
+    pub fn set_default_payment_expiry(
+        env: Env,
+        merchant: Address,
+        seconds: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_default_payment_expiry")?;
+        merchant.require_auth();
+
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(merchant.clone())),
+            &seconds,
+        );
+
+        (MerchantDefaultExpirySet { merchant, seconds }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the configured default expiry (in seconds) for a merchant, or 0 if none.
+    pub fn get_default_payment_expiry(env: Env, merchant: Address) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(
+                merchant,
+            )))
+            .unwrap_or(0)
+    }
+
+    // ── Issue #673: Installment due dates and late fees ───────────────────
+
+    /// Attach an installment schedule to an existing Pending payment.
+    ///
+    /// The sum of all `entry.amount` values must equal `payment.amount`. Each entry carries
+    /// a `due_at` Unix timestamp. Only the payment's merchant may call this, and only while
+    /// the payment is Pending and no schedule has been set yet.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the payment (must authorize)
+    /// * `payment_id` - ID of the target payment
+    /// * `entries` - Ordered list of `(due_at, amount)` installment entries
+    /// * `late_fee_flat` - Flat late fee in token base units (0 = none)
+    /// * `late_fee_bps` - Late fee as basis points of installment amount (0 = none)
+    pub fn set_installment_schedule(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        entries: Vec<InstallmentEntry>,
+        late_fee_flat: i128,
+        late_fee_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_installment_schedule")?;
+        merchant.require_auth();
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InstallmentScheduleAlreadySet));
+        }
+
+        // Validate total matches payment amount
+        let mut total: i128 = 0;
+        for entry in entries.iter() {
+            total = total.saturating_add(entry.amount);
+        }
+        if total != payment.amount {
+            return Err(Error::Payment(
+                PaymentError::InstallmentScheduleTotalMismatch,
+            ));
+        }
+
+        let installment_count = entries.len();
+        let schedule = InstallmentScheduleData {
+            payment_id,
+            entries,
+            late_fee_flat,
+            late_fee_bps,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::InstallmentSchedule(payment_id)),
+            &schedule,
+        );
+
+        (InstallmentScheduleSet {
+            payment_id,
+            installment_count,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the installment schedule attached to a payment, or None if none is set.
+    pub fn get_installment_schedule(env: Env, payment_id: u64) -> Option<InstallmentScheduleData> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                payment_id,
+            )))
+    }
+
+    /// Check whether any installment in the schedule is overdue and emit `InstallmentOverdue`
+    /// for each one that is past its due date and not yet paid.
+    ///
+    /// This is a pure-read function that does not mutate state; callers drive it to discover
+    /// which installments need attention. Late fees are calculated for reporting but not
+    /// deducted here — they are applied on the next `pay_installment` call (off-chain
+    /// integration should pass the extra amount).
+    ///
+    /// # Arguments
+    /// * `payment_id` - The payment to check
+    ///
+    /// # Returns
+    /// The number of overdue installments detected.
+    pub fn check_installment_overdue(env: Env, payment_id: u64) -> u32 {
+        let schedule: InstallmentScheduleData =
+            match env
+                .storage()
+                .instance()
+                .get(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                    payment_id,
+                ))) {
+                Some(s) => s,
+                None => return 0,
+            };
+
+        let now = env.ledger().timestamp();
+        let mut count: u32 = 0;
+
+        for (idx, entry) in schedule.entries.iter().enumerate() {
+            if !entry.paid && now > entry.due_at {
+                let late_fee = if schedule.late_fee_bps > 0 {
+                    (entry.amount * schedule.late_fee_bps as i128) / 10_000
+                } else {
+                    schedule.late_fee_flat
+                };
+
+                (InstallmentOverdue {
+                    payment_id,
+                    installment_index: idx as u32,
+                    due_at: entry.due_at,
+                    amount: entry.amount,
+                    late_fee,
+                    checked_at: now,
+                })
+                .publish(&env);
+
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    // ── Issue #674: Notification hooks for payment lifecycle events ───────
+
+    const MAX_PAYMENT_HOOKS_PER_EVENT: u32 = 10;
+
+    fn validate_payment_hook_subscriber(env: &Env, subscriber: &Address) -> Result<(), Error> {
+        match env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+            subscriber,
+            &Symbol::new(env, "ping"),
+            ().into_val(env),
+        ) {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::Payment(PaymentError::InvalidHookAddress)),
+        }
+    }
+
+    /// Register a notification hook for specific payment lifecycle events.
+    ///
+    /// The subscriber contract must expose a `ping()` function (reachability check) and
+    /// an `on_payment_event(event_type: PaymentEventType, payment_id: u64)` entry point.
+    /// A panicking subscriber never reverts the payment transaction.
+    ///
+    /// # Arguments
+    /// * `subscriber` - The contract to notify (must authorize)
+    /// * `events` - List of `PaymentEventType` values to subscribe to
+    ///
+    /// # Returns
+    /// The new hook ID.
+    pub fn register_payment_hook(
+        env: Env,
+        subscriber: Address,
+        events: Vec<PaymentEventType>,
+    ) -> Result<u64, Error> {
+        subscriber.require_auth();
+
+        if events.is_empty() {
+            return Err(Error::Payment(PaymentError::NoEventsSpecified));
+        }
+
+        Self::validate_payment_hook_subscriber(&env, &subscriber)?;
+
+        // Enforce per-event cap
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+
+            if count >= Self::MAX_PAYMENT_HOOKS_PER_EVENT {
+                return Err(Error::Payment(PaymentError::MaxHooksPerEventReached));
+            }
+        }
+
+        let hook_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::NotificationHookCounter))
+            .unwrap_or(0)
+            + 1;
+
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::NotificationHookCounter),
+            &hook_id,
+        );
+
+        let hook = PaymentNotificationHook {
+            hook_id,
+            subscriber: subscriber.clone(),
+            events: events.clone(),
+            active: true,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::NotificationHook(hook_id)),
+            &hook,
+        );
+
+        // Index by event type
+        for event_type in events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::HooksByEvent(
+                    event_type.clone(),
+                    count as u64,
+                )),
+                &hook_id,
+            );
+
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::HooksByEventCount(event_type.clone())),
+                &(count + 1),
+            );
+        }
+
+        // Index by subscriber
+        let sub_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::SubscriberHookCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::SubscriberHooks(
+                subscriber.clone(),
+                sub_count as u64,
+            )),
+            &hook_id,
+        );
+
+        env.storage().instance().set(
+            &DataKey::Merchant(MerchantDataKey::SubscriberHookCount(subscriber.clone())),
+            &(sub_count + 1),
+        );
+
+        (PaymentHookRegistered {
+            hook_id,
+            subscriber,
+            event_count: events.len(),
+        })
+        .publish(&env);
+
+        Ok(hook_id)
+    }
+
+    /// Deregister a previously registered payment hook.
+    ///
+    /// Only the original subscriber may deregister their hook.
+    pub fn deregister_payment_hook(
+        env: Env,
+        subscriber: Address,
+        hook_id: u64,
+    ) -> Result<(), Error> {
+        subscriber.require_auth();
+
+        let hook: PaymentNotificationHook = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::NotificationHook(hook_id)))
+            .ok_or(Error::Payment(PaymentError::HookNotFound))?;
+
+        if hook.subscriber != subscriber {
+            return Err(Error::Payment(PaymentError::HookNotOwnedBySubscriber));
+        }
+
+        let mut updated = hook.clone();
+        updated.active = false;
+
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::NotificationHook(hook_id)),
+            &updated,
+        );
+
+        // Decrement per-event counters
+        for event_type in hook.events.iter() {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+            if count > 0 {
+                env.storage().instance().set(
+                    &DataKey::Merchant(MerchantDataKey::HooksByEventCount(event_type.clone())),
+                    &(count - 1),
+                );
+            }
+        }
+
+        // Decrement subscriber counter
+        let sub_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::SubscriberHookCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+        if sub_count > 0 {
+            env.storage().instance().set(
+                &DataKey::Merchant(MerchantDataKey::SubscriberHookCount(subscriber.clone())),
+                &(sub_count - 1),
+            );
+        }
+
+        (PaymentHookDeregistered {
+            hook_id,
+            subscriber,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns all active hooks registered for a specific payment event type.
+    pub fn get_payment_hooks(
+        env: Env,
+        event_type: PaymentEventType,
+    ) -> Vec<PaymentNotificationHook> {
+        let mut hooks = Vec::new(&env);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                event_type.clone(),
+            )))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env.storage().instance().get::<_, u64>(&DataKey::Merchant(
+                MerchantDataKey::HooksByEvent(event_type.clone(), i as u64),
+            )) {
+                if let Some(hook) =
+                    env.storage()
+                        .instance()
+                        .get::<_, PaymentNotificationHook>(&DataKey::Payment(
+                            PaymentKey::NotificationHook(hook_id),
+                        ))
+                {
+                    if hook.active {
+                        hooks.push_back(hook);
+                    }
+                }
+            }
+        }
+
+        hooks
+    }
+
+    fn invoke_payment_hooks(env: &Env, event_type: PaymentEventType, payment_id: u64) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                event_type.clone(),
+            )))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) = env.storage().instance().get::<_, u64>(&DataKey::Merchant(
+                MerchantDataKey::HooksByEvent(event_type.clone(), i as u64),
+            )) {
+                if let Some(hook) =
+                    env.storage()
+                        .instance()
+                        .get::<_, PaymentNotificationHook>(&DataKey::Payment(
+                            PaymentKey::NotificationHook(hook_id),
+                        ))
+                {
+                    if hook.active && hook.events.contains(&event_type) {
+                        let result = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                            &hook.subscriber,
+                            &Symbol::new(env, "on_payment_event"),
+                            (event_type.clone(), payment_id).into_val(env),
+                        );
+
+                        if result.is_err() {
+                            (PaymentHookInvocationFailed {
+                                hook_id: hook.hook_id,
+                                subscriber: hook.subscriber.clone(),
+                                event_type: event_type.clone(),
+                                payment_id,
+                            })
+                            .publish(env);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 mod test;
 
 #[cfg(test)]
 mod test_analytics;
+
+#[cfg(test)]
+mod test_issues_678_679_680_681;
 
 #[cfg(test)]
 mod test_trial;
@@ -12984,3 +14883,6 @@ mod test_glossary;
 
 #[cfg(test)]
 mod test_routed_payment;
+
+#[cfg(test)]
+mod test_skip_tip_status_history;

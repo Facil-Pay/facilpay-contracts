@@ -43,6 +43,31 @@ Every privileged function performs two authorization checks:
 | `set_escrow_contract(admin, escrow_contract)` | Updates the stored escrow contract address. | Admin |
 | `set_refund_contract(admin, refund_contract)` | Updates the stored refund contract address. | Admin |
 
+### Read-Only Operations
+
+| Function | Description | Returns |
+|---|---|---|
+| `get_platform_status()` | Returns the current pause state of all three child contracts. If a child contract is unreachable, it is reported as `Unknown` rather than causing a panic. | `PlatformStatus` containing the address and pause status of each child. |
+
+### `PlatformStatus` Return Type
+
+The `get_platform_status()` function returns a `PlatformStatus` struct containing:
+
+```
+pub struct PlatformStatus {
+    pub payment: ChildContractStatus,
+    pub escrow: ChildContractStatus,
+    pub refund: ChildContractStatus,
+}
+```
+
+Each field is a `ChildContractStatus` enum that can be:
+
+- `Payment(Address, bool)` — payment contract address and globally_paused flag
+- `Escrow(Address, bool)` — escrow contract address and globally_paused flag
+- `Refund(Address, bool)` — refund contract address and globally_paused flag
+- `Unknown(Address)` — contract address is known but unreachable (no panic)
+
 ### Error Codes
 
 | Code | Constant | Description |

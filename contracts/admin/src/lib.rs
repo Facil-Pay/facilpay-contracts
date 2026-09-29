@@ -2,7 +2,7 @@
 use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Map, String};
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -10,6 +10,14 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractAddresses {
+    pub payment: Address,
+    pub escrow: Address,
+    pub refund: Address,
 }
 
 #[contracttype]
@@ -262,6 +270,65 @@ impl AdminContract {
 
         Ok(())
     }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// The `Address` of the current admin.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns the current pauser address.
+    ///
+    /// # Returns
+    /// The `Address` of the current pauser.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_pauser(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Pauser)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns all child contract addresses.
+    ///
+    /// # Returns
+    /// A `ContractAddresses` struct containing the payment, escrow, and refund contract addresses.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_contracts(env: Env) -> Result<ContractAddresses, Error> {
+        let payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContract)
+            .ok_or(Error::NotInitialized)?;
+        let escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .ok_or(Error::NotInitialized)?;
+        let refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundContract)
+            .ok_or(Error::NotInitialized)?;
+
+        Ok(ContractAddresses {
+            payment,
+            escrow,
+            refund,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -508,5 +575,91 @@ mod test {
                 .get_pause_state()
                 .globally_paused
         );
+    }
+
+    #[test]
+    fn test_get_admin_returns_stored_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, admin, _, _, _, _) = setup_initialized(&env);
+
+        assert_eq!(client.get_admin(), admin.clone());
+    }
+
+    #[test]
+    fn test_get_admin_returns_not_initialized_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+
+        assert_eq!(fresh.try_get_admin(), Err(Ok(Error::NotInitialized)));
+    }
+
+    #[test]
+    fn test_get_pauser_returns_stored_pauser() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
+
+        assert_eq!(client.get_pauser(), pauser.clone());
+    }
+
+    #[test]
+    fn test_get_pauser_returns_not_initialized_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+
+        assert_eq!(fresh.try_get_pauser(), Err(Ok(Error::NotInitialized)));
+    }
+
+    #[test]
+    fn test_get_contracts_returns_all_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, payment, escrow, refund) = setup_initialized(&env);
+
+        let contracts = client.get_contracts();
+        assert_eq!(contracts.payment, payment);
+        assert_eq!(contracts.escrow, escrow);
+        assert_eq!(contracts.refund, refund);
+    }
+
+    #[test]
+    fn test_get_contracts_returns_not_initialized_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+
+        assert_eq!(fresh.try_get_contracts(), Err(Ok(Error::NotInitialized)));
+    }
+
+    #[test]
+    fn test_get_contracts_reflects_updated_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let new_escrow = setup_escrow(&env, &pauser);
+        let new_refund = setup_refund(&env, &pauser);
+
+        client.set_payment_contract(&admin, &new_payment);
+        client.set_escrow_contract(&admin, &new_escrow);
+        client.set_refund_contract(&admin, &new_refund);
+
+        let contracts = client.get_contracts();
+        assert_eq!(contracts.payment, new_payment);
+        assert_eq!(contracts.escrow, new_escrow);
+        assert_eq!(contracts.refund, new_refund);
     }
 }
