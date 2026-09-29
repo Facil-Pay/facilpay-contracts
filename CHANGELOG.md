@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Refund contract in-place upgrades (#643)** — `upgrade(admin, new_wasm_hash)` replaces the refund contract's WASM without changing its address or storage, gated by the refund admin, and emits `ContractUpgraded`.
+
+- **Merchant-initiated payment requests (#662)** — `create_payment_request`, `pay_payment_request`, `cancel_payment_request` and `get_payment_request` let merchants issue invoice links that a customer (optionally a specific one) pays exactly once, before expiry.
+
+- **Refund admin rotation docs (#638)** — The refund README now documents `propose_admin`, `accept_admin` and `get_pending_admin`.
+
 - **Payment Contract Events Documentation** — Comprehensive event reference for all 50+ Soroban events emitted by the payment contract, including core payments, subscriptions, channels, fees, governance, and control events. Off-chain integrators can now use this table to subscribe to events via Horizon.
 
 - **Refund Contract Events Documentation** — Comprehensive event reference for all 20+ Soroban events emitted by the refund contract, including refund lifecycle, appeals, arbitration, and stake management events. Enables off-chain monitoring of refund status changes and arbitration outcomes.
@@ -18,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SECURITY.md** — Vulnerability disclosure policy and security contact information for responsible security research.
 
 ### Changed
+
+- **Payment storage tiers (Breaking, #648)** — Per-record and per-user payment contract data moved from instance to persistent storage, with TTL extended on read and write. Schema version is now `2`. v1 deployments holding data are not migrated in place; see [docs/STORAGE_VERSIONING.md](docs/STORAGE_VERSIONING.md).
 
 - **Refund Reason Code Migration (Breaking)** — The `request_refund()` function signature has changed to require a canonical `RefundReasonCode` enum variant in addition to free-text reason.
   - **Old signature:** `request_refund(..., reason: String, payment_created_at: u64)`
@@ -29,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     3. If upgrading a deployed instance with existing data, plan a storage/data migration for historical refunds before reading them as the new `Refund` shape.
 
 ### Fixed
+
+- Restored enum variants and types dropped by earlier merges so the escrow, refund and payment contracts compile again; renumbered the refund counter-offer/voucher errors to `72`–`76` and the payment `PauseLimitExceeded` error to `320` to remove code collisions.
 
 - Improved documentation coverage to reduce friction for off-chain integrators consuming Soroban events.
 

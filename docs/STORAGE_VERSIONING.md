@@ -83,6 +83,39 @@ fn test_migrate_schema_rejects_already_at_target() {
 
 ---
 
+## 🗄️ Payment Contract Schema v2: Storage Tiers (Issue #648)
+
+Payment contract schema **v2** moves every per-record and per-user key out of instance storage.
+Instance storage is one ledger entry that is read in full on every call and has a hard size limit,
+so it now only holds small, bounded, contract-global state (config, pause state, global counters).
+Everything else — payments, subscriptions, requests, channels, proposals, and all per-customer and
+per-merchant data — is stored in persistent storage, one entry per key.
+
+- `DataKey::is_instance()` in [`contracts/payment/src/lib.rs`](../contracts/payment/src/lib.rs) decides the tier for each key.
+  New keys must be classified there: anything keyed by a record id or an address belongs in persistent storage.
+- Contract code reads and writes through `env.store()`, which routes each key to its tier and extends the
+  TTL of persistent entries on every read and write (threshold ~30 days, extended to ~90 days).
+- `initialize()` now writes schema version `2`. Contracts that predate schema tracking still report `1`.
+
+**Migration path.** v2 ships before mainnet, so there is no deployed data to migrate and no automatic
+migration is provided. A v1 deployment that already holds records in instance storage must be
+redeployed: upgrading its code in place would leave those records in instance storage, where v2 no
+longer looks for them. See the [payment README](../contracts/payment/README.md#storage-layout-issue-648).
+
+---
+
+## ⬆️ Upgrading Code In Place: the Refund Contract
+
+`contracts/refund` exposes `upgrade(admin, new_wasm_hash)` (Issue #643), which swaps the contract's WASM
+while keeping its address and storage. When the new code changes stored data shapes, pair the two calls:
+
+1. Upload the new WASM and call `upgrade(admin, new_wasm_hash)`.
+2. Call `migrate_schema(admin, target_version)` — this now runs the new code, which performs the migration.
+
+See [Contract Upgrades](../contracts/refund/README.md#contract-upgrades) in the refund README.
+
+---
+
 ## 🛟 Multi-Step Migrations: the Escrow Contract
 
 The single-call `migrate_schema(admin, target_version)` pattern above is the convention for

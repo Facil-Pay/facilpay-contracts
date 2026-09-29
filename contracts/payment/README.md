@@ -34,6 +34,23 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `get_schema_version()`                  | Return the current storage schema version number.                                       |
 | `migrate_schema(admin, target_version)` | Migrate contract storage to a newer schema version.                                     |
 
+New deployments start at schema version `2` (see [Storage Layout](#storage-layout-issue-648)); deployments that predate schema tracking report `1`.
+
+### Storage Layout (Issue #648)
+
+Instance storage is a single ledger entry that is loaded in full on every call and has a hard size limit, so the payment contract keeps only small, bounded, contract-global state there. Everything that grows with usage lives in persistent storage, one ledger entry per key.
+
+| Tier | Keys |
+| --- | --- |
+| Instance | All `ConfigKey` values (admin, multi-sig config, fee config, pause state, allowed tokens, schema version, …); global counters (`PaymentKey::Counter`, `RequestCounter`, `NotificationHookCounter`, `LargePaymentCounter`, `AccumulatedFees`, `SubscriptionKey::Counter` / `MeteredCounter` / `GroupCounter`, `FeatureKey::PaymentChannelCounter` / `SweepCounter`, `StateDataKey::PauseHistoryCount` / `ScheduledPaymentCounter`); platform `PaymentAnalytics`; `SweepRecipient`; per-currency `ConversionRate` / `OracleRateConfig`; per-level `VerificationTierLimit`; per-event-type `HooksByEventCount` |
+| Persistent | Every other key: payment, subscription, request, channel, split, proposal and schedule records; all per-customer and per-merchant data and indexes; tags, invoices and `InvoiceCounter` |
+
+`DataKey::is_instance()` in [src/lib.rs](src/lib.rs) is the single source of truth. All contract code goes through the `env.store()` accessor, which routes each key to its tier, so call sites never name the storage type.
+
+**TTL.** Persistent entries are extended whenever they are read (if present) or written: once an entry's TTL falls below `PERSISTENT_TTL_THRESHOLD` (30 days of ledgers) it is extended to `PERSISTENT_TTL_EXTEND_TO` (90 days of ledgers). Records that are not touched for longer than that are archived by the network and must be restored before use.
+
+**Migration.** Schema v2 ships before mainnet, so there is no deployed v1 data to move. A v1 deployment that already holds records in instance storage is **not** migrated automatically: after upgrading its code, those records would no longer be found. Such a deployment must be redeployed rather than upgraded in place.
+
 ### Core Payments
 
 | Function                                                                                     | Description                                                                                                                                                  |
@@ -48,6 +65,43 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `expire_payment(payment_id)`                                                                 | Anyone can call this once a payment is past its expiration timestamp; tokens are returned to the customer.                                                   |
 | `is_payment_expired(payment_id)`                                                             | Returns `true` if the payment's expiration timestamp has passed.                                                                                             |
 | `update_payment_notes(admin, payment_id, notes)`                                             | Admin updates free-text notes on a payment.                                                                                                                  |
+
+### Payment Requests (Issue #662)
+
+Merchants can issue a payable request (an invoice link) that a customer accepts later. Paying a request creates a normal `Payment` on the request's terms, which then follows the usual lifecycle (`complete_payment`, `cancel_payment`, refunds, expiry, …).
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `create_payment_request` | `merchant: Address`, `amount: i128`, `token: Address`, `currency: Currency`, `expires_at: u64`, `metadata: String`, `customer: Option<Address>` | `Result<u64, Error>` — the new `request_id` | `merchant` |
+| `pay_payment_request` | `customer: Address`, `request_id: u64` | `Result<u64, Error>` — the created `payment_id` | `customer` |
+| `cancel_payment_request` | `merchant: Address`, `request_id: u64` | `Result<(), Error>` | `merchant` (must be the request's merchant) |
+| `get_payment_request` | `request_id: u64` | `Result<PaymentRequest, Error>` | — |
+
+- **Creating.** `amount` must be `> 0`; the token, currency and metadata are validated exactly as in `create_payment`. `expires_at` is an absolute ledger timestamp after which the request can no longer be paid; `0` means it never expires. Pass `customer: Some(address)` to restrict the request to one payer, or `None` to let anyone pay it. Request ids start at `1`.
+- **Paying.** The request must be `Open`, not expired (`now < expires_at`), and — if restricted — paid by the named customer. The contract then runs the same logic as `create_payment(customer, merchant, amount, token, currency, 0, metadata)`: all `create_payment` checks (token allowlist, flagged addresses, rate and spend limits, merchant pause) apply, and the merchant's default payment expiry is used. As with `create_payment`, no tokens move at this point; the customer's approved allowance is drawn when the payment is completed. The request becomes `Paid` and records the `payment_id`, so it can be paid exactly once.
+- **Cancelling.** Only the issuing merchant can cancel, and only while the request is `Open` (an expired but unpaid request can still be cancelled).
+- **Pausing.** `create_payment_request` honours the `create_payment_request` function pause; `pay_payment_request` honours both the `pay_payment_request` and `create_payment` function pauses.
+
+`PaymentRequest` fields: `id`, `merchant`, `customer: Option<Address>`, `amount`, `token`, `currency`, `expires_at`, `metadata`, `status` (`PaymentRequestStatus::Open | Paid | Cancelled`), `created_at`, `payment_id: Option<u64>`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `cancel_payment_request`: caller is not the request's merchant |
+| `BasicError::MetadataTooLarge` | `101` | `create_payment_request`: metadata exceeds 512 bytes |
+| `BasicError::InvalidCurrency` | `103` | `create_payment_request`: unsupported currency |
+| `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | The contract or the relevant function is paused |
+| `BasicError::InvalidAmount` | `121` | `create_payment_request`: `amount <= 0` |
+| `PaymentError::TokenNotAllowed` | `224` | The token is not on the allowlist |
+| `PaymentError::RequestNotFound` | `235` | No request with this id |
+| `PaymentError::RequestAlreadyPaid` | `236` | `pay_payment_request` / `cancel_payment_request`: the request was already paid |
+| `PaymentError::RequestCancelled` | `237` | `pay_payment_request` / `cancel_payment_request`: the request was cancelled |
+| `PaymentError::RequestExpired` | `238` | `create_payment_request`: `expires_at` is non-zero and not in the future. `pay_payment_request`: the request has expired |
+| `PaymentError::RequestCustomerMismatch` | `239` | `pay_payment_request`: the request is restricted to a different customer |
+| `SubscriptionError::MerchantPaused` | `317` | The merchant is paused |
+
+`pay_payment_request` can also return any error `create_payment` returns (for example `AddressFlagged`, `RateLimitExceeded`, `SpendLimitExceeded`).
+
+Emits `PaymentRequestCreated`, `PaymentRequestPaid` (after the payment's own `PaymentCreated`) and `PaymentRequestCancelled`.
 
 ### Tips
 
@@ -1074,6 +1128,7 @@ Key types referenced by the functions above:
 - **`MeteredSubscription`** — usage-based subscription record: `subscription_id`, `merchant`, `customer`, `token`, `price_per_unit`, `unit_name`, `accumulated_units`, `billing_cap`, `last_reset_at`, `max_units_per_period`.
 - **`PaymentChannel`** — off-chain channel state including deposited balance and settlement nonce.
 - **`MultiSigConfig`** — admin list, required signatures, and proposal TTL.
+- **`PaymentRequest`** / **`PaymentRequestStatus`** — merchant-issued payable request; `Open | Paid | Cancelled`.
 - **`PaymentStatusEntry`** — `status`, `timestamp`, `actor`; one entry per payment status change.
 - **`SubscriptionSkipUsage`** — `window_start`, `count`; skips used in the current rolling year.
 
@@ -1096,6 +1151,9 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `PaymentHookRegistered`       | `PaymentHookRegistered`       | `hook_id`, `subscriber`, `event_count`                    | `register_payment_hook()` succeeds                                                    |
 | `PaymentHookDeregistered`     | `PaymentHookDeregistered`     | `hook_id`, `subscriber`                                   | `deregister_payment_hook()` deactivates a hook                                        |
 | `PaymentHookInvocationFailed` | `PaymentHookInvocationFailed` | `hook_id`, `subscriber`, `event_type`, `payment_id`       | A subscriber contract panicked or returned an error during hook invocation            |
+| `PaymentRequestCreated`       | `payment_request_created`     | `request_id`, `merchant`, `customer`, `amount`, `token`, `expires_at` | `create_payment_request()` issues a request                               |
+| `PaymentRequestPaid`          | `payment_request_paid`        | `request_id`, `payment_id`, `customer`                    | `pay_payment_request()` creates the payment                                           |
+| `PaymentRequestCancelled`     | `payment_request_cancelled`   | `request_id`, `merchant`                                  | `cancel_payment_request()` cancels an open request                                    |
 
 ### Tip Events
 
@@ -1262,10 +1320,10 @@ Errors are grouped into five ranges:
 | Range   | Category                                                       |
 | ------- | -------------------------------------------------------------- |
 | 100–126 | `BasicError` — auth, metadata, rate limits, multi-sig setup    |
-| 200–224 | `PaymentError` — payment lifecycle violations                  |
-| 300–319 | `SubscriptionError` — subscription, dunning and skip-cap violations |
+| 200–239 | `PaymentError` — payment lifecycle and payment-request violations |
+| 300–320 | `SubscriptionError` — subscription, dunning, skip-cap and pause-limit violations |
 | 400–406 | `ProposalError` — multi-sig proposal violations                |
-| 500–540 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
+| 500–545 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
 
 See [`ERRORS.md`](./ERRORS.md) for the full list.
 

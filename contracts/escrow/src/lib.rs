@@ -79,6 +79,12 @@ pub enum EscrowKey {
     EscrowReference(u64),
     // Issue #689: per-escrow beneficiary split configuration.
     BeneficiaryShares(u64),
+    // Issue #684: mutual cancellation requests per escrow party
+    MutualCancelCustomer(u64),
+    MutualCancelMerchant(u64),
+    // Issue #685: status index for paginated queries
+    StatusList(EscrowStatus, u64),
+    StatusCount(EscrowStatus),
 }
 
 #[derive(Clone)]
@@ -230,6 +236,14 @@ pub enum ActionError {
     ApprovalsThresholdNotMet = 314,
     InsufficientCollateral = 315,
     PartialReleaseExceedsBalance = 316,
+    // Issue #684
+    MutualCancelAlreadyRequested = 317,
+    MutualCancelNotRequested = 318,
+    // Issue #686
+    HookNotFound = 319,
+    HookNotOwnedBySubscriber = 320,
+    MaxHooksPerEventReached = 321,
+    InvalidHookAddress = 322,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -276,12 +290,12 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (300..=315).contains(&code) {
+            if (300..=322).contains(&code) {
                 return Ok(Error::Action(unsafe {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=230).contains(&code) {
+            if (200..=234).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -3333,7 +3347,9 @@ impl EscrowContract {
         let locked_count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::Escrow(EscrowKey::StatusCount(EscrowStatus::Locked)))
+            .get(&DataKey::Escrow(EscrowKey::StatusCount(
+                EscrowStatus::Locked,
+            )))
             .unwrap_or(0);
         env.storage().instance().set(
             &DataKey::Escrow(EscrowKey::StatusList(EscrowStatus::Locked, locked_count)),
@@ -4595,6 +4611,8 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
         let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(
             &env,
@@ -4720,7 +4738,12 @@ impl EscrowContract {
         );
 
         // Issue #685: update status index
-        Self::update_status_index(&env, escrow_id, &old_status_for_dispute, &EscrowStatus::Disputed);
+        Self::update_status_index(
+            &env,
+            escrow_id,
+            &old_status_for_dispute,
+            &EscrowStatus::Disputed,
+        );
 
         // Update global analytics
         let mut analytics: EscrowAnalytics = env
@@ -5853,7 +5876,12 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         // Issue #685: update status index
-        Self::update_status_index(&env, escrow_id, &EscrowStatus::Disputed, &new_resolve_status);
+        Self::update_status_index(
+            &env,
+            escrow_id,
+            &EscrowStatus::Disputed,
+            &new_resolve_status,
+        );
 
         Self::dequeue_escalation(&env, escrow_id);
 
@@ -12672,10 +12700,7 @@ impl EscrowContract {
             if let Some(escrow_id) = env
                 .storage()
                 .instance()
-                .get::<DataKey, u64>(&DataKey::Escrow(EscrowKey::StatusList(
-                    status.clone(),
-                    i,
-                )))
+                .get::<DataKey, u64>(&DataKey::Escrow(EscrowKey::StatusList(status.clone(), i)))
             {
                 if let Some(escrow) = env
                     .storage()
@@ -12764,19 +12789,27 @@ impl EscrowContract {
         let customer_amount = escrow.amount - merchant_amount;
 
         if merchant_amount > 0 {
-            Self::transfer_if_token_contract(&env, &escrow.token, &escrow.merchant, merchant_amount)?;
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                merchant_amount,
+            )?;
         }
         if customer_amount > 0 {
-            Self::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, customer_amount)?;
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.customer,
+                customer_amount,
+            )?;
         }
 
         // Handle collateral: give it to whichever side received more
         if let Some(collateral) = env
             .storage()
             .instance()
-            .get::<DataKey, DisputeCollateral>(
-                &DataKey::Dispute(DisputeKey::Collateral(escrow_id)),
-            )
+            .get::<DataKey, DisputeCollateral>(&DataKey::Dispute(DisputeKey::Collateral(escrow_id)))
         {
             let collateral_recipient = if merchant_bps >= 5000 {
                 escrow.merchant.clone()
@@ -12822,11 +12855,7 @@ impl EscrowContract {
     /// Called by the customer or merchant to request a mutual cancel. Once
     /// both parties have requested, the escrow is cancelled and the customer
     /// is refunded immediately.
-    pub fn request_mutual_cancel(
-        env: Env,
-        caller: Address,
-        escrow_id: u64,
-    ) -> Result<(), Error> {
+    pub fn request_mutual_cancel(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env, "request_mutual_cancel")?;
 
@@ -12856,12 +12885,22 @@ impl EscrowContract {
         let merchant_key = DataKey::Escrow(EscrowKey::MutualCancelMerchant(escrow_id));
 
         if is_customer {
-            if env.storage().instance().get::<DataKey, bool>(&customer_key).unwrap_or(false) {
+            if env
+                .storage()
+                .instance()
+                .get::<DataKey, bool>(&customer_key)
+                .unwrap_or(false)
+            {
                 return Err(Error::Action(ActionError::MutualCancelAlreadyRequested));
             }
             env.storage().instance().set(&customer_key, &true);
         } else {
-            if env.storage().instance().get::<DataKey, bool>(&merchant_key).unwrap_or(false) {
+            if env
+                .storage()
+                .instance()
+                .get::<DataKey, bool>(&merchant_key)
+                .unwrap_or(false)
+            {
                 return Err(Error::Action(ActionError::MutualCancelAlreadyRequested));
             }
             env.storage().instance().set(&merchant_key, &true);
@@ -12874,8 +12913,16 @@ impl EscrowContract {
         .publish(&env);
 
         // If both parties have now requested, complete the mutual cancel
-        let customer_requested = env.storage().instance().get::<DataKey, bool>(&customer_key).unwrap_or(false);
-        let merchant_requested = env.storage().instance().get::<DataKey, bool>(&merchant_key).unwrap_or(false);
+        let customer_requested = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&customer_key)
+            .unwrap_or(false);
+        let merchant_requested = env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&merchant_key)
+            .unwrap_or(false);
 
         if customer_requested && merchant_requested {
             let mut updated = escrow.clone();
@@ -12906,11 +12953,7 @@ impl EscrowContract {
 
     /// Withdraws a previously submitted mutual cancel request. Only allowed
     /// before both parties have confirmed (i.e. before the escrow is cancelled).
-    pub fn withdraw_mutual_cancel(
-        env: Env,
-        caller: Address,
-        escrow_id: u64,
-    ) -> Result<(), Error> {
+    pub fn withdraw_mutual_cancel(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
         Self::require_not_paused(&env, "withdraw_mutual_cancel")?;
 
@@ -12942,7 +12985,12 @@ impl EscrowContract {
             DataKey::Escrow(EscrowKey::MutualCancelMerchant(escrow_id))
         };
 
-        if !env.storage().instance().get::<DataKey, bool>(&key).unwrap_or(false) {
+        if !env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&key)
+            .unwrap_or(false)
+        {
             return Err(Error::Action(ActionError::MutualCancelNotRequested));
         }
 
@@ -13046,10 +13094,7 @@ impl EscrowContract {
             )))
             .unwrap_or(0);
         env.storage().instance().set(
-            &DataKey::Hook(HookKey::BySubscriber(
-                subscriber.clone(),
-                sub_count as u64,
-            )),
+            &DataKey::Hook(HookKey::BySubscriber(subscriber.clone(), sub_count as u64)),
             &hook_id,
         );
         env.storage().instance().set(
@@ -13130,10 +13175,7 @@ impl EscrowContract {
     }
 
     /// Returns all active hooks registered for the given event type.
-    pub fn get_escrow_hooks(
-        env: Env,
-        event_type: EscrowEventType,
-    ) -> Vec<EscrowNotificationHook> {
+    pub fn get_escrow_hooks(env: Env, event_type: EscrowEventType) -> Vec<EscrowNotificationHook> {
         let mut hooks = Vec::new(&env);
         let count: u32 = env
             .storage()
@@ -13142,20 +13184,18 @@ impl EscrowContract {
             .unwrap_or(0);
 
         for i in 0..count {
-            if let Some(hook_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
-                    event_type.clone(),
-                    i as u64,
-                )))
+            if let Some(hook_id) =
+                env.storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
+                        event_type.clone(),
+                        i as u64,
+                    )))
             {
                 if let Some(hook) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, EscrowNotificationHook>(
-                        &DataKey::Hook(HookKey::Hook(hook_id)),
-                    )
+                    .get::<DataKey, EscrowNotificationHook>(&DataKey::Hook(HookKey::Hook(hook_id)))
                 {
                     if hook.active {
                         hooks.push_back(hook);
@@ -13175,28 +13215,25 @@ impl EscrowContract {
             .unwrap_or(0);
 
         for i in 0..count {
-            if let Some(hook_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
-                    event_type.clone(),
-                    i as u64,
-                )))
+            if let Some(hook_id) =
+                env.storage()
+                    .instance()
+                    .get::<DataKey, u64>(&DataKey::Hook(HookKey::ByEvent(
+                        event_type.clone(),
+                        i as u64,
+                    )))
             {
                 if let Some(hook) = env
                     .storage()
                     .instance()
-                    .get::<DataKey, EscrowNotificationHook>(
-                        &DataKey::Hook(HookKey::Hook(hook_id)),
-                    )
+                    .get::<DataKey, EscrowNotificationHook>(&DataKey::Hook(HookKey::Hook(hook_id)))
                 {
                     if hook.active && hook.events.contains(&event_type) {
-                        let result =
-                            env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
-                                &hook.subscriber,
-                                &Symbol::new(env, "on_escrow_event"),
-                                (event_type.clone(), escrow_id).into_val(env),
-                            );
+                        let result = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                            &hook.subscriber,
+                            &Symbol::new(env, "on_escrow_event"),
+                            (event_type.clone(), escrow_id).into_val(env),
+                        );
                         if result.is_err() {
                             (EscrowHookInvocationFailed {
                                 hook_id: hook.hook_id,

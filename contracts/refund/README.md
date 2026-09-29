@@ -40,6 +40,98 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `initialize()` — Initializes the contract with an admin address and default refund/appeal windows.
 - `get_schema_version()` — Returns the current schema version number. New deployments start at `2` (v2 added the `Withdrawn` refund status); deployments that predate schema tracking report `1`.
 - `migrate_schema()` — Admin-only migration of the contract schema to a new version.
+- `propose_admin()` / `accept_admin()` / `get_pending_admin()` — Two-step admin rotation. See [Admin Rotation](#admin-rotation).
+- `upgrade()` — Admin-only in-place WASM upgrade. See [Contract Upgrades](#contract-upgrades).
+
+### Admin Rotation
+
+The refund admin is rotated in two steps so that a mistyped or unreachable address can never take over (or lock up) admin control. The current admin proposes a successor, and the rotation only completes when that successor accepts.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `propose_admin` | `admin: Address`, `new_admin: Address` | `Result<(), Error>` | `admin` (must be the current admin) |
+| `accept_admin` | `new_admin: Address` | `Result<(), Error>` | `new_admin` (must be the pending admin) |
+| `get_pending_admin` | — | `Option<Address>` | — |
+
+**Flow**
+
+1. The current admin calls `propose_admin(admin, new_admin)`. `new_admin` is stored as the pending admin and `AdminRotationProposed` is emitted. The current admin keeps full control; nothing else changes yet.
+2. The proposed address calls `accept_admin(new_admin)`. It becomes the admin, the pending slot is cleared and `AdminRotationAccepted` is emitted. From this point the previous admin can no longer call admin-only functions.
+
+**Overriding a proposal.** There is only one pending slot. Calling `propose_admin` again replaces the pending admin: the earlier proposed address can no longer accept (it gets `NotPendingAdmin`), and only the latest proposal can. To withdraw a proposal, propose the current admin's own address instead; accepting it is then a no-op rotation.
+
+> ⚠️ **Verify the pending admin before accepting.** Before the new admin signs `accept_admin`, check `get_pending_admin()` returns exactly the address you expect. After acceptance the new admin has sole control of every admin-only function, including `upgrade()`, and the previous admin cannot undo the rotation.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | `propose_admin`: caller is not the current admin (or the contract is not initialized). `accept_admin`: no admin is stored |
+| `ExtError::NoPendingAdmin` | `59` | `accept_admin`: no rotation has been proposed |
+| `ExtError::NotPendingAdmin` | `60` | `accept_admin`: caller is not the pending admin |
+
+Emits `AdminRotationProposed` from `propose_admin` and `AdminRotationAccepted` from `accept_admin`.
+
+**Example (Stellar CLI)**
+
+```bash
+# 1. Current admin proposes the new admin
+stellar contract invoke \
+  --id <REFUND_CONTRACT_ID> \
+  --source current-admin \
+  --network testnet \
+  -- propose_admin \
+  --admin <CURRENT_ADMIN_ADDRESS> \
+  --new_admin <NEW_ADMIN_ADDRESS>
+
+# 2. Confirm the pending admin is the address you expect
+stellar contract invoke \
+  --id <REFUND_CONTRACT_ID> \
+  --source new-admin \
+  --network testnet \
+  -- get_pending_admin
+
+# 3. The new admin accepts
+stellar contract invoke \
+  --id <REFUND_CONTRACT_ID> \
+  --source new-admin \
+  --network testnet \
+  -- accept_admin \
+  --new_admin <NEW_ADMIN_ADDRESS>
+```
+
+### Contract Upgrades
+
+The refund contract can replace its own code in place, so bug fixes do not require a new contract address or a state migration to a new deployment. Merchants, customers and the admin coordinator keep using the same contract ID.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `upgrade` | `admin: Address`, `new_wasm_hash: BytesN<32>` | `Result<(), Error>` | `admin` (must be the current admin — the same check as `propose_admin`) |
+
+`upgrade` calls `update_current_contract_wasm(new_wasm_hash)`. The contract address and all stored data are kept; the new code runs from the next invocation. The WASM must already be uploaded to the network, otherwise the call fails with a host storage error. A proposed-but-not-accepted admin cannot upgrade.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | Caller is not the current admin (or the contract is not initialized) |
+
+Emits `ContractUpgraded` (`old_schema_version`, `new_wasm_hash`, `upgraded_by`), where `old_schema_version` is `get_schema_version()` at the time of the upgrade.
+
+**Upgrade + migration sequence**
+
+1. Build the new version and upload it: `stellar contract upload --wasm refund.wasm --source admin --network testnet` (prints the WASM hash).
+2. Call `upgrade(admin, <wasm hash>)`. Keep the storage layout compatible: add new keys or fields rather than re-interpreting existing ones.
+3. If the new code changes stored data shapes, call `migrate_schema(admin, <new version>)` — now running the **new** code — to perform the migration and bump the schema version (see [Storage Schema Versioning](../../docs/STORAGE_VERSIONING.md)).
+4. Check `get_schema_version()` returns the new version.
+
+The refund contract has no multi-step storage migration window, so there is no "migration in progress" state that would block an upgrade; `migrate_schema` completes in a single call.
+
+```bash
+stellar contract invoke \
+  --id <REFUND_CONTRACT_ID> \
+  --source admin \
+  --network testnet \
+  -- upgrade \
+  --admin <ADMIN_ADDRESS> \
+  --new_wasm_hash <WASM_HASH>
+```
 
 ### Core Refund Lifecycle
 
@@ -103,9 +195,9 @@ Merchants can counter a refund request with a partial amount instead of only app
 | `CoreError::Unauthorized` | `3` | `counter_offer`: caller is not the refund's merchant. `accept_counter_offer`: caller is not the refund's customer |
 | `CoreError::InvalidStatus` | `7` | Refund is not `Requested` |
 | `CoreError::RefundWindowExpired` | `11` | `accept_counter_offer`: the refund's TTL has expired |
-| `ExtError::InvalidCounterOffer` | `64` | `counter_offer`: `amount <= 0` or `amount >= requested amount` |
-| `ExtError::CounterOfferNotFound` | `65` | `accept_counter_offer`: no offer is pending |
-| `ExtError::CounterOfferExpired` | `66` | `accept_counter_offer`: the offer's `expires_at` has passed |
+| `ExtError::InvalidCounterOffer` | `72` | `counter_offer`: `amount <= 0` or `amount >= requested amount` |
+| `ExtError::CounterOfferNotFound` | `73` | `accept_counter_offer`: no offer is pending |
+| `ExtError::CounterOfferExpired` | `74` | `accept_counter_offer`: the offer's `expires_at` has passed |
 
 Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and `RefundApproved` from `accept_counter_offer`.
 
@@ -479,8 +571,8 @@ The merchant's `set_vouchers_transferable` setting is snapshotted onto each vouc
 | `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
 | `ExtError::VoucherExpired` | `53` | Ledger time is past the voucher's `expires_at` |
 | `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been redeemed |
-| `ExtError::VoucherNotTransferable` | `67` | The voucher was issued while its merchant had transfers disabled |
-| `ExtError::InvalidVoucherRecipient` | `68` | `new_owner` is the current owner |
+| `ExtError::VoucherNotTransferable` | `75` | The voucher was issued while its merchant had transfers disabled |
+| `ExtError::InvalidVoucherRecipient` | `76` | `new_owner` is the current owner |
 
 Emits `VoucherTransferred` from `transfer_voucher`, and `VoucherTransferabilitySet` from `set_vouchers_transferable`.
 
@@ -674,6 +766,9 @@ Customer tier changes (`set_customer_tier`, `set_customer_tier_policy`, `set_str
 | `ContractUnpausedEvent` | `ContractUnpausedEvent` | `unpaused_by`, `unpaused_at`           | `unpause_contract()` resumes operations                |
 | `FunctionPausedEvent`   | `FunctionPausedEvent`   | `function_name`, `paused_by`, `reason` | `pause_function()` pauses specific function            |
 | `FunctionUnpausedEvent` | `FunctionUnpausedEvent` | `function_name`, `unpaused_by`         | `unpause_function()` resumes function                  |
+| `AdminRotationProposed` | `admin_rotation_proposed` | `current_admin`, `pending_admin` | `propose_admin()` records a pending admin |
+| `AdminRotationAccepted` | `admin_rotation_accepted` | `previous_admin`, `new_admin` | `accept_admin()` completes the rotation |
+| `ContractUpgraded` | `contract_upgraded` | `old_schema_version`, `new_wasm_hash`, `upgraded_by` | `upgrade()` replaces the contract WASM |
 
 ### Circuit Breaker Events
 
