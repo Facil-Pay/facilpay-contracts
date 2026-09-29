@@ -330,6 +330,13 @@ pub enum ExtError {
     AmendmentLimitReached = 65,
     // Merchant refund date-range query
     InvalidDateRange = 66,
+    // Per-merchant refund reserve
+    InsufficientRefundReserve = 67,
+    ReserveBelowMinimum = 68,
+    // Scheduled refund policy changes
+    InvalidEffectiveTime = 69,
+    ScheduledPolicyNotFound = 70,
+    ScheduledPolicyNotDue = 71,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1307,6 +1314,11 @@ pub enum RefundExtKey {
     RefundSlaDeadline(u64),
     // Number of times a refund request has been amended before review.
     RefundAmendmentCount(u64),
+    // Per-merchant refund reserve: balance and admin-set floor per (merchant, token).
+    MerchantRefundReserve(Address, Address),
+    MinRefundReserve(Address, Address),
+    // Pending future-dated refund policy change for a merchant.
+    ScheduledRefundPolicy(Address),
 }
 
 // Issue #195: Batch decision types
@@ -1484,6 +1496,82 @@ pub struct AdminRotationProposed {
 pub struct AdminRotationAccepted {
     pub previous_admin: Address,
     pub new_admin: Address,
+}
+
+/// Event emitted when a merchant tops up its refund reserve.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveDeposited {
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when a merchant withdraws from its refund reserve.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveWithdrawn {
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when a processed refund is funded from a merchant's reserve.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveDebited {
+    pub merchant: Address,
+    pub token: Address,
+    pub refund_id: u64,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when the admin sets a merchant's minimum refund reserve.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinRefundReserveSet {
+    pub merchant: Address,
+    pub token: Address,
+    pub min_amount: i128,
+}
+
+/// A refund policy change a merchant has scheduled to take effect later.
+#[derive(Clone)]
+#[contracttype]
+pub struct ScheduledRefundPolicy {
+    pub merchant: Address,
+    pub tiers: Vec<RefundTier>,
+    pub effective_at: u64,
+    pub scheduled_at: u64,
+}
+
+/// Event emitted when a merchant schedules a future refund policy change.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyChangeScheduled {
+    pub merchant: Address,
+    pub tiers_count: u32,
+    pub effective_at: u64,
+}
+
+/// Event emitted when a merchant cancels a pending scheduled policy change.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyChangeCancelled {
+    pub merchant: Address,
+    pub effective_at: u64,
+}
+
+/// Event emitted when a scheduled policy change becomes the merchant's policy.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicyChangeActivated {
+    pub merchant: Address,
+    pub version: u32,
+    pub effective_at: u64,
 }
 
 #[contract]
@@ -2469,6 +2557,205 @@ impl RefundContract {
         env.storage()
             .instance()
             .set(&DataKey::MerchantRefundQuota(merchant), &quota);
+        Ok(())
+    }
+
+    // ── Per-merchant refund reserve ────────────────────────────────────────
+
+    /// Deposit tokens into the merchant's refund reserve.
+    ///
+    /// Once a merchant has a reserve for a token, every refund it processes in
+    /// that token is funded from the reserve, and processing fails with
+    /// `InsufficientRefundReserve` if the reserve can't cover the full amount.
+    /// Merchants without a reserve keep using the shared contract balance.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant funding the reserve (must authenticate).
+    /// * `token` - The token to deposit.
+    /// * `amount` - Amount to deposit; must be positive.
+    ///
+    /// # Returns
+    /// The reserve balance after the deposit.
+    pub fn deposit_refund_reserve(
+        env: Env,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "deposit_refund_reserve")?;
+        merchant.require_auth();
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &merchant,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        let new_balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone())
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+
+        (RefundReserveDeposited {
+            merchant,
+            token,
+            amount,
+            new_balance,
+        })
+        .publish(&env);
+
+        Ok(new_balance)
+    }
+
+    /// Withdraw tokens from the merchant's refund reserve. The balance left
+    /// behind may not drop below the admin-set minimum for that token.
+    ///
+    /// # Returns
+    /// The reserve balance after the withdrawal.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `amount` is not positive.
+    /// Returns `InsufficientRefundReserve` if `amount` exceeds the balance.
+    /// Returns `ReserveBelowMinimum` if the withdrawal breaches the minimum.
+    pub fn withdraw_refund_reserve(
+        env: Env,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "withdraw_refund_reserve")?;
+        merchant.require_auth();
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone());
+        if amount > balance {
+            return Err(Error::Ext(ExtError::InsufficientRefundReserve));
+        }
+        let new_balance = balance - amount;
+        let min_amount = Self::get_min_refund_reserve(env.clone(), merchant.clone(), token.clone());
+        if new_balance < min_amount {
+            return Err(Error::Ext(ExtError::ReserveBelowMinimum));
+        }
+
+        Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &merchant,
+            &amount,
+        );
+
+        (RefundReserveWithdrawn {
+            merchant,
+            token,
+            amount,
+            new_balance,
+        })
+        .publish(&env);
+
+        Ok(new_balance)
+    }
+
+    /// Set the minimum balance a merchant must keep in its refund reserve for
+    /// `token`. Admin-only. Only limits withdrawals; refunds may still draw the
+    /// reserve below the minimum.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    /// Returns `InvalidAmount` if `min_amount` is negative.
+    pub fn set_min_refund_reserve(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if min_amount < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        env.storage().persistent().set(
+            &RefundExtKey::MinRefundReserve(merchant.clone(), token.clone()),
+            &min_amount,
+        );
+
+        (MinRefundReserveSet {
+            merchant,
+            token,
+            min_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the merchant's refund reserve balance for `token` (0 if none).
+    pub fn get_refund_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::MerchantRefundReserve(merchant, token))
+            .unwrap_or(0)
+    }
+
+    /// Get the minimum refund reserve the merchant must keep for `token` (0 if unset).
+    pub fn get_min_refund_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::MinRefundReserve(merchant, token))
+            .unwrap_or(0)
+    }
+
+    /// Whether the merchant has opted into funding refunds in `token` from a reserve.
+    pub fn has_refund_reserve(env: Env, merchant: Address, token: Address) -> bool {
+        env.storage()
+            .persistent()
+            .has(&RefundExtKey::MerchantRefundReserve(merchant, token))
+    }
+
+    fn set_refund_reserve(env: &Env, merchant: &Address, token: &Address, balance: i128) {
+        env.storage().persistent().set(
+            &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
+            &balance,
+        );
+    }
+
+    /// Fund a processed refund from the merchant's reserve. A no-op for
+    /// merchants that have never deposited a reserve in this token.
+    fn debit_refund_reserve(
+        env: &Env,
+        merchant: &Address,
+        token: &Address,
+        refund_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let balance: i128 = match env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()))
+        {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        if amount > balance {
+            return Err(Error::Ext(ExtError::InsufficientRefundReserve));
+        }
+        let new_balance = balance - amount;
+        Self::set_refund_reserve(env, merchant, token, new_balance);
+
+        (RefundReserveDebited {
+            merchant: merchant.clone(),
+            token: token.clone(),
+            refund_id,
+            amount,
+            new_balance,
+        })
+        .publish(env);
+
         Ok(())
     }
 
@@ -4614,6 +4901,10 @@ impl RefundContract {
             }
         }
 
+        // A scheduled change that already came due must be recorded before this
+        // one, so the version history stays in chronological order.
+        Self::apply_due_scheduled_policy(&env, &merchant);
+
         // Sort tiers by days_from_purchase in ascending order
         let sorted_tiers = Self::sort_tiers(&env, tiers);
 
@@ -4627,31 +4918,7 @@ impl RefundContract {
             default_window_seconds: 30 * 24 * 60 * 60,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
-
-        // ── Issue #134: version the policy ──────────────────────────────────
-        let version_count: u32 = env
-            .storage()
-            .instance()
-            .get(&PolicyKey::RefundPolicyVersionCount(merchant.clone()))
-            .unwrap_or(0);
-        let new_version = version_count + 1;
-        let versioned = RefundPolicyVersion {
-            version: new_version,
-            policy: policy.clone(),
-            created_at: now,
-            created_by: merchant.clone(),
-        };
-        env.storage().instance().set(
-            &PolicyKey::RefundPolicyVersion(merchant.clone(), new_version),
-            &versioned,
-        );
-        env.storage().instance().set(
-            &PolicyKey::RefundPolicyVersionCount(merchant.clone()),
-            &new_version,
-        );
+        Self::write_versioned_policy(&env, &merchant, &policy, now, merchant.clone());
 
         // Emit RefundPolicySet event
         (RefundPolicySet {
@@ -4661,6 +4928,235 @@ impl RefundContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Store `policy` as the merchant's current policy and append it to the
+    /// version history (Issue #134). Returns the new version number.
+    fn write_versioned_policy(
+        env: &Env,
+        merchant: &Address,
+        policy: &RefundPolicy,
+        created_at: u64,
+        created_by: Address,
+    ) -> u32 {
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicy(merchant.clone()), policy);
+
+        let version_count: u32 = env
+            .storage()
+            .instance()
+            .get(&PolicyKey::RefundPolicyVersionCount(merchant.clone()))
+            .unwrap_or(0);
+        let new_version = version_count + 1;
+        let versioned = RefundPolicyVersion {
+            version: new_version,
+            policy: policy.clone(),
+            created_at,
+            created_by,
+        };
+        env.storage().instance().set(
+            &PolicyKey::RefundPolicyVersion(merchant.clone(), new_version),
+            &versioned,
+        );
+        env.storage().instance().set(
+            &PolicyKey::RefundPolicyVersionCount(merchant.clone()),
+            &new_version,
+        );
+        new_version
+    }
+
+    // ── Scheduled (future-dated) refund policy changes ─────────────────────
+
+    /// Schedule a refund policy change that takes effect at `effective_at`.
+    ///
+    /// Only one change can be pending per merchant; scheduling again replaces
+    /// the pending one. Once `effective_at` is reached the change is visible
+    /// through `get_refund_policy` immediately, and it is written to storage
+    /// (and the version history) the next time the merchant's policy is used
+    /// by `request_refund`, `set_refund_policy`, `deactivate_refund_policy`,
+    /// or anyone calls `activate_scheduled_refund_policy`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant scheduling the change (must authenticate).
+    /// * `tiers` - The tiers the new policy will use.
+    /// * `effective_at` - Ledger timestamp at which the change takes effect;
+    ///   must be strictly in the future.
+    ///
+    /// # Errors
+    /// Returns `InvalidEffectiveTime` if `effective_at` is not in the future.
+    /// Returns `RefundExceedsPolicy` if any tier has an invalid `max_refund_bps` value.
+    pub fn schedule_refund_policy_change(
+        env: Env,
+        merchant: Address,
+        tiers: Vec<RefundTier>,
+        effective_at: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let now = env.ledger().timestamp();
+        if effective_at <= now {
+            return Err(Error::Ext(ExtError::InvalidEffectiveTime));
+        }
+        for tier in tiers.iter() {
+            if Self::validate_bps(tier.max_refund_bps).is_err() {
+                return Err(Error::Core(CoreError::RefundExceedsPolicy));
+            }
+        }
+
+        // Don't let a replacement silently discard a change that already came due.
+        Self::apply_due_scheduled_policy(&env, &merchant);
+
+        let sorted_tiers = Self::sort_tiers(&env, tiers);
+        let scheduled = ScheduledRefundPolicy {
+            merchant: merchant.clone(),
+            tiers: sorted_tiers.clone(),
+            effective_at,
+            scheduled_at: now,
+        };
+        env.storage().persistent().set(
+            &RefundExtKey::ScheduledRefundPolicy(merchant.clone()),
+            &scheduled,
+        );
+
+        (RefundPolicyChangeScheduled {
+            merchant,
+            tiers_count: sorted_tiers.len(),
+            effective_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Cancel the merchant's pending scheduled refund policy change.
+    ///
+    /// # Errors
+    /// Returns `ScheduledPolicyNotFound` if nothing is pending, or if the
+    /// pending change has already taken effect (it can no longer be cancelled).
+    pub fn cancel_scheduled_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
+        merchant.require_auth();
+
+        if Self::apply_due_scheduled_policy(&env, &merchant) {
+            return Err(Error::Ext(ExtError::ScheduledPolicyNotFound));
+        }
+        let scheduled: ScheduledRefundPolicy = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ScheduledRefundPolicy(merchant.clone()))
+            .ok_or(Error::Ext(ExtError::ScheduledPolicyNotFound))?;
+        env.storage()
+            .persistent()
+            .remove(&RefundExtKey::ScheduledRefundPolicy(merchant.clone()));
+
+        (RefundPolicyChangeCancelled {
+            merchant,
+            effective_at: scheduled.effective_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the merchant's pending scheduled refund policy change, if any.
+    pub fn get_scheduled_refund_policy(
+        env: Env,
+        merchant: Address,
+    ) -> Option<ScheduledRefundPolicy> {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::ScheduledRefundPolicy(merchant))
+    }
+
+    /// Write a due scheduled policy change to storage. Permissionless, since
+    /// the merchant already authorized the change when scheduling it.
+    ///
+    /// # Returns
+    /// The new policy version number.
+    ///
+    /// # Errors
+    /// Returns `ScheduledPolicyNotFound` if nothing is pending.
+    /// Returns `ScheduledPolicyNotDue` if `effective_at` has not been reached.
+    pub fn activate_scheduled_refund_policy(env: Env, merchant: Address) -> Result<u32, Error> {
+        let scheduled: ScheduledRefundPolicy = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ScheduledRefundPolicy(merchant.clone()))
+            .ok_or(Error::Ext(ExtError::ScheduledPolicyNotFound))?;
+        if env.ledger().timestamp() < scheduled.effective_at {
+            return Err(Error::Ext(ExtError::ScheduledPolicyNotDue));
+        }
+        Ok(Self::activate_scheduled_policy(&env, scheduled))
+    }
+
+    /// Apply the merchant's scheduled policy change if it has come due.
+    /// Returns true if a change was applied.
+    fn apply_due_scheduled_policy(env: &Env, merchant: &Address) -> bool {
+        let scheduled: Option<ScheduledRefundPolicy> = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ScheduledRefundPolicy(merchant.clone()));
+        match scheduled {
+            Some(s) if env.ledger().timestamp() >= s.effective_at => {
+                Self::activate_scheduled_policy(env, s);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn activate_scheduled_policy(env: &Env, scheduled: ScheduledRefundPolicy) -> u32 {
+        let merchant = scheduled.merchant.clone();
+        let effective_at = scheduled.effective_at;
+        let existing: Option<RefundPolicy> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicy(merchant.clone()));
+        let policy = Self::policy_from_schedule(&scheduled, existing);
+        let tiers_count = policy.tiers.len();
+
+        // The version is dated at effective_at rather than now, so
+        // get_refund_policy_at_time reflects when the change really applied
+        // even if it was written lazily later.
+        let version =
+            Self::write_versioned_policy(env, &merchant, &policy, effective_at, merchant.clone());
+        env.storage()
+            .persistent()
+            .remove(&RefundExtKey::ScheduledRefundPolicy(merchant.clone()));
+
+        (RefundPolicySet {
+            merchant: merchant.clone(),
+            tiers_count,
+        })
+        .publish(env);
+        (RefundPolicyChangeActivated {
+            merchant,
+            version,
+            effective_at,
+        })
+        .publish(env);
+
+        version
+    }
+
+    /// Build the policy a scheduled change produces, keeping the existing
+    /// policy's creation time and default window where there is one.
+    fn policy_from_schedule(
+        scheduled: &ScheduledRefundPolicy,
+        existing: Option<RefundPolicy>,
+    ) -> RefundPolicy {
+        let (created_at, default_window_seconds) = match existing {
+            Some(p) => (p.created_at, p.default_window_seconds),
+            None => (scheduled.effective_at, 30 * 24 * 60 * 60),
+        };
+        RefundPolicy {
+            merchant: scheduled.merchant.clone(),
+            tiers: scheduled.tiers.clone(),
+            active: true,
+            created_at,
+            updated_at: scheduled.effective_at,
+            default_window_seconds,
+        }
     }
 
     // ── Issue #134: Policy versioning query functions ──────────────────────
@@ -4761,11 +5257,24 @@ impl RefundContract {
     /// * `merchant` - The merchant address to query.
     ///
     /// # Returns
-    /// The current `RefundPolicy` if one exists, `None` otherwise.
+    /// The current `RefundPolicy` if one exists, `None` otherwise. A scheduled
+    /// change whose `effective_at` has passed is returned even if it has not
+    /// been written to storage yet.
     pub fn get_refund_policy(env: &Env, merchant: Address) -> Option<RefundPolicy> {
-        env.storage()
+        let stored: Option<RefundPolicy> = env
+            .storage()
             .instance()
-            .get(&DataKey::RefundPolicy(merchant))
+            .get(&DataKey::RefundPolicy(merchant.clone()));
+        let scheduled: Option<ScheduledRefundPolicy> = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ScheduledRefundPolicy(merchant));
+        match scheduled {
+            Some(s) if env.ledger().timestamp() >= s.effective_at => {
+                Some(Self::policy_from_schedule(&s, stored))
+            }
+            _ => stored,
+        }
     }
 
     // ── Issue #93: Default refund policy management ────────────────────────
@@ -4988,6 +5497,9 @@ impl RefundContract {
     pub fn deactivate_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
         // Require merchant authentication
         merchant.require_auth();
+
+        // Deactivate the policy actually in effect, including a due scheduled change.
+        Self::apply_due_scheduled_policy(&env, &merchant);
 
         let mut policy: RefundPolicy = env
             .storage()
@@ -5792,6 +6304,9 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::CustomerBlockedFromRefund));
         }
 
+        // Write any scheduled policy change that has come due before validating.
+        Self::apply_due_scheduled_policy(&env, &merchant);
+
         if env.storage().instance().has(&DataKey::Admin) {
             Self::validate_against_policy(
                 &env,
@@ -6018,6 +6533,9 @@ impl RefundContract {
             refund.amount,
             refund.original_payment_amount,
         )?;
+
+        // Merchants with a refund reserve fund their own refunds from it.
+        Self::debit_refund_reserve(env, &refund.merchant, &refund.token, refund_id, refund.amount)?;
 
         // Deduct platform fee from refund amount
         let (net_refund_amount, _fee_amount) =
