@@ -2,7 +2,7 @@
 use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Map, String};
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -10,6 +10,23 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum ChildContractStatus {
+    Payment(Address, bool), // (contract_address, globally_paused)
+    Escrow(Address, bool),
+    Refund(Address, bool),
+    Unknown(Address), // contract unreachable or error occurred
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PlatformStatus {
+    pub payment: ChildContractStatus,
+    pub escrow: ChildContractStatus,
+    pub refund: ChildContractStatus,
 }
 
 #[contracttype]
@@ -262,6 +279,66 @@ impl AdminContract {
 
         Ok(())
     }
+
+    /// Queries the pause state of all child contracts and returns an aggregate platform status.
+    ///
+    /// # Parameters
+    /// - `env`: the Soroban environment.
+    ///
+    /// # Returns
+    /// Returns a `PlatformStatus` containing the address and pause state of each child contract.
+    /// If a child contract is unreachable or returns an error, it is reported as `Unknown`.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized.
+    pub fn get_platform_status(env: Env) -> Result<PlatformStatus, Error> {
+        let payment_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContract)
+            .ok_or(Error::NotInitialized)?;
+        let escrow_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .ok_or(Error::NotInitialized)?;
+        let refund_contract: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundContract)
+            .ok_or(Error::NotInitialized)?;
+
+        // Use try_call to gracefully handle unreachable contracts
+        let payment_status = PaymentContractClient::new(&env, &payment_contract)
+            .try_get_pause_state()
+            .ok()
+            .map(|state| {
+                ChildContractStatus::Payment(payment_contract.clone(), state.globally_paused)
+            })
+            .unwrap_or_else(|| ChildContractStatus::Unknown(payment_contract));
+
+        let escrow_status = EscrowContractClient::new(&env, &escrow_contract)
+            .try_get_pause_state()
+            .ok()
+            .map(|state| {
+                ChildContractStatus::Escrow(escrow_contract.clone(), state.globally_paused)
+            })
+            .unwrap_or_else(|| ChildContractStatus::Unknown(escrow_contract));
+
+        let refund_status = RefundContractClient::new(&env, &refund_contract)
+            .try_get_pause_state()
+            .ok()
+            .map(|state| {
+                ChildContractStatus::Refund(refund_contract.clone(), state.globally_paused)
+            })
+            .unwrap_or_else(|| ChildContractStatus::Unknown(refund_contract));
+
+        Ok(PlatformStatus {
+            payment: payment_status,
+            escrow: escrow_status,
+            refund: refund_status,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -507,6 +584,120 @@ mod test {
             !RefundContractClient::new(&env, &old_refund)
                 .get_pause_state()
                 .globally_paused
+        );
+    }
+
+    #[test]
+    fn test_get_platform_status_returns_all_child_states() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, payment_contract, escrow_contract, refund_contract) =
+            setup_initialized(&env);
+
+        // Initially, no contracts are paused
+        let status = client.get_platform_status();
+        match status {
+            Ok(platform_status) => {
+                match &platform_status.payment {
+                    ChildContractStatus::Payment(addr, paused) => {
+                        assert_eq!(addr, &payment_contract);
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Payment status"),
+                }
+                match &platform_status.escrow {
+                    ChildContractStatus::Escrow(addr, paused) => {
+                        assert_eq!(addr, &escrow_contract);
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Escrow status"),
+                }
+                match &platform_status.refund {
+                    ChildContractStatus::Refund(addr, paused) => {
+                        assert_eq!(addr, &refund_contract);
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Refund status"),
+                }
+            }
+            Err(_) => panic!("get_platform_status should succeed"),
+        }
+
+        // Pause all contracts
+        let reason = String::from_str(&env, "emergency");
+        client.emergency_pause_all(&pauser, &reason);
+
+        // All should now report as paused
+        let status = client.get_platform_status();
+        match status {
+            Ok(platform_status) => {
+                match &platform_status.payment {
+                    ChildContractStatus::Payment(addr, paused) => {
+                        assert_eq!(addr, &payment_contract);
+                        assert!(*paused);
+                    }
+                    _ => panic!("Expected Payment status"),
+                }
+                match &platform_status.escrow {
+                    ChildContractStatus::Escrow(addr, paused) => {
+                        assert_eq!(addr, &escrow_contract);
+                        assert!(*paused);
+                    }
+                    _ => panic!("Expected Escrow status"),
+                }
+                match &platform_status.refund {
+                    ChildContractStatus::Refund(addr, paused) => {
+                        assert_eq!(addr, &refund_contract);
+                        assert!(*paused);
+                    }
+                    _ => panic!("Expected Refund status"),
+                }
+            }
+            Err(_) => panic!("get_platform_status should succeed after pause"),
+        }
+
+        // Unpause all contracts
+        client.emergency_unpause_all(&pauser);
+
+        // All should now report as unpaused
+        let status = client.get_platform_status();
+        match status {
+            Ok(platform_status) => {
+                match &platform_status.payment {
+                    ChildContractStatus::Payment(_addr, paused) => {
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Payment status"),
+                }
+                match &platform_status.escrow {
+                    ChildContractStatus::Escrow(_addr, paused) => {
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Escrow status"),
+                }
+                match &platform_status.refund {
+                    ChildContractStatus::Refund(_addr, paused) => {
+                        assert!(!paused);
+                    }
+                    _ => panic!("Expected Refund status"),
+                }
+            }
+            Err(_) => panic!("get_platform_status should succeed after unpause"),
+        }
+    }
+
+    #[test]
+    fn test_get_platform_status_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+
+        assert_eq!(
+            fresh.try_get_platform_status(),
+            Err(Ok(Error::NotInitialized))
         );
     }
 }
