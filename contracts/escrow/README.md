@@ -749,3 +749,50 @@ operator runbook — caller permissions, each step's exact semantics, batch-size
 ---
 
 [⬅ Back to Main README](../../README.md)
+
+---
+
+## Partial release (issue #687)
+
+`release_partial(admin, escrow_id, amount)` releases part of a standard escrow's locked funds to the merchant.
+
+- Multiple calls accumulate in `escrow.released_amount`.
+- When `released_amount` reaches `amount` the escrow status becomes `Released`.
+- `refund_escrow` and dispute resolution operate on the **remaining balance** (`amount - released_amount`) only.
+- Emits `EscrowPartiallyReleased { escrow_id, recipient, amount, released_total, token }`.
+
+**Errors:** `NotAnAdmin`, `InvalidStatus` (escrow not Locked), `PartialReleaseExceedsBalance` (amount ≤ 0 or > remaining).
+
+---
+
+## Milestone deadlines with auto-refund (issue #688)
+
+`VestingMilestone` now carries an optional `deadline: Option<u64>` (ledger timestamp).
+
+`claim_missed_milestone(customer, escrow_id, milestone_id)` — callable by the customer after the deadline has passed if the milestone was never approved.
+
+- Approved or already-released milestones cannot be claimed.
+- Milestones without a deadline cannot be claimed via this path.
+- Emits `MissedMilestoneClaimed { escrow_id, milestone_id, customer, amount }`.
+
+**Errors:** `Unauthorized` (caller not the customer), `NotFound`, `MilestoneAlreadyReleased`, `MilestoneAlreadyClaimed`, `InvalidStatus` (approved or no deadline), `MilestoneDeadlineNotPassed`.
+
+---
+
+## Release to multiple beneficiaries (issue #689)
+
+`create_escrow_with_beneficiaries(customer, merchant, amount, token, release_timestamp, min_hold_period, expiry_timestamp, auto_refund_on_expiry, shares)` — like `create_escrow` but accepts a list of `BeneficiaryShare { address, bps }` whose `bps` values must sum to exactly **10 000** with no duplicate addresses.
+
+On release the payout is split across the configured beneficiaries proportionally; the last entry absorbs any rounding dust.
+
+**Errors (creation):** `InvalidBeneficiaryShares` (empty list or bps ≠ 10 000), `DuplicateBeneficiary`.
+
+---
+
+## Dispute reason code (issue #690)
+
+`dispute_escrow_with_reason(caller, escrow_id, reason, details_hash)` — like `dispute_escrow` but stores a `DisputeReason` (one of `NonDelivery`, `NotAsDescribed`, `Damaged`, `Fraud`, `Other`) and a 32-byte evidence hash.
+
+- The old `dispute_escrow` continues to work and now emits `EscrowDisputed` as before; it does **not** record a reason or hash.
+- Per-reason dispute counts are updated in storage and can be queried with `get_dispute_reason_count(reason) → u64`.
+- Emits `EscrowDisputedWithReason { escrow_id, disputed_by, reason: u32, details_hash }`.
