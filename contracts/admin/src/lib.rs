@@ -13,6 +13,7 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
+    InvalidFunctionName = 4,
 }
 
 #[contracttype]
@@ -213,6 +214,119 @@ impl AdminContract {
         PaymentContractClient::new(&env, &payment_contract).unpause_contract(&pauser);
         EscrowContractClient::new(&env, &escrow_contract).unpause_contract(&pauser);
         RefundContractClient::new(&env, &refund_contract).unpause_contract(&pauser);
+
+        Ok(())
+    }
+
+    /// Pauses a single function on one child contract, leaving every other
+    /// function and every other child contract untouched.
+    ///
+    /// # Parameters
+    /// - `pauser`: the pauser address that must be authorized.
+    /// - `target`: which child contract (payment, escrow or refund) to act on.
+    /// - `function_name`: the child function to pause (e.g. `"process_refund"`).
+    /// - `reason`: a human-readable explanation for the pause.
+    ///
+    /// # Returns
+    /// Returns `Ok(())` when the targeted child contract has paused the function.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// `Error::Unauthorized` if the provided pauser address does not match the stored
+    /// pauser, and `Error::InvalidFunctionName` if `function_name` is empty.
+    ///
+    /// # Events
+    /// Emits `EmergencyFunctionPausedEvent`.
+    pub fn emergency_pause_function(
+        env: Env,
+        pauser: Address,
+        target: ChildKind,
+        function_name: String,
+        reason: String,
+    ) -> Result<(), Error> {
+        require_pauser(&env, &pauser)?;
+        if function_name.is_empty() {
+            return Err(Error::InvalidFunctionName);
+        }
+
+        let child = child_contract(&env, target)?;
+        match target {
+            ChildKind::Payment => PaymentContractClient::new(&env, &child).pause_function(
+                &pauser,
+                &function_name,
+                &reason,
+            ),
+            ChildKind::Escrow => EscrowContractClient::new(&env, &child).pause_function(
+                &pauser,
+                &function_name,
+                &reason,
+            ),
+            ChildKind::Refund => RefundContractClient::new(&env, &child).pause_function(
+                &pauser,
+                &function_name,
+                &reason,
+            ),
+        }
+
+        EmergencyFunctionPausedEvent {
+            target,
+            function_name,
+            paused_by: pauser,
+            reason,
+            paused_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Unpauses a single function on one child contract.
+    ///
+    /// # Parameters
+    /// - `pauser`: the pauser address that must be authorized.
+    /// - `target`: which child contract (payment, escrow or refund) to act on.
+    /// - `function_name`: the child function to unpause.
+    ///
+    /// # Returns
+    /// Returns `Ok(())` when the targeted child contract has unpaused the function.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// `Error::Unauthorized` if the provided pauser address does not match the stored
+    /// pauser, and `Error::InvalidFunctionName` if `function_name` is empty.
+    ///
+    /// # Events
+    /// Emits `EmergencyFunctionUnpausedEvent`.
+    pub fn emergency_unpause_function(
+        env: Env,
+        pauser: Address,
+        target: ChildKind,
+        function_name: String,
+    ) -> Result<(), Error> {
+        require_pauser(&env, &pauser)?;
+        if function_name.is_empty() {
+            return Err(Error::InvalidFunctionName);
+        }
+
+        let child = child_contract(&env, target)?;
+        match target {
+            ChildKind::Payment => PaymentContractClient::new(&env, &child)
+                .unpause_function(&pauser, &function_name),
+            ChildKind::Escrow => {
+                EscrowContractClient::new(&env, &child).unpause_function(&pauser, &function_name)
+            }
+            ChildKind::Refund => {
+                RefundContractClient::new(&env, &child).unpause_function(&pauser, &function_name)
+            }
+        }
+
+        EmergencyFunctionUnpausedEvent {
+            target,
+            function_name,
+            unpaused_by: pauser,
+            unpaused_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
 
         Ok(())
     }
