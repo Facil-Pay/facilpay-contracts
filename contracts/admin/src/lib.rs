@@ -2,7 +2,7 @@
 use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Map, String};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]

@@ -337,6 +337,13 @@ pub enum ExtError {
     InvalidEffectiveTime = 69,
     ScheduledPolicyNotFound = 70,
     ScheduledPolicyNotDue = 71,
+    // Merchant counter-offers
+    InvalidCounterOffer = 72,
+    CounterOfferNotFound = 73,
+    CounterOfferExpired = 74,
+    // Voucher transfers
+    VoucherNotTransferable = 75,
+    InvalidVoucherRecipient = 76,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1319,6 +1326,8 @@ pub enum RefundExtKey {
     MinRefundReserve(Address, Address),
     // Pending future-dated refund policy change for a merchant.
     ScheduledRefundPolicy(Address),
+    // Pending merchant counter-offer for a refund.
+    CounterOffer(u64),
 }
 
 // Issue #195: Batch decision types
@@ -1496,6 +1505,15 @@ pub struct AdminRotationProposed {
 pub struct AdminRotationAccepted {
     pub previous_admin: Address,
     pub new_admin: Address,
+}
+
+/// Event emitted when the admin replaces the contract's WASM in place (#643).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_schema_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
 }
 
 /// Event emitted when a merchant tops up its refund reserve.
@@ -1750,6 +1768,35 @@ impl RefundContract {
     /// Get the address currently proposed as the next admin, if any.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+
+    /// Replace the contract's code with an already-uploaded WASM (Issue #643).
+    ///
+    /// The contract address and all stored data are kept; only the code changes,
+    /// and it takes effect from the next invocation. If the new code changes the
+    /// storage layout, follow up with [`Self::migrate_schema`] from the new code.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin (must be authorized and match stored admin).
+    /// * `new_wasm_hash` - Hash of the WASM previously uploaded to the network.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+
+        let old_schema_version = Self::get_schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+
+        (ContractUpgraded {
+            old_schema_version,
+            new_wasm_hash,
+            upgraded_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
     }
 
     /// Request a refund for a payment.
@@ -2591,7 +2638,7 @@ impl RefundContract {
 
         token::Client::new(&env, &token).transfer(
             &merchant,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &amount,
         );
 
@@ -2734,14 +2781,17 @@ impl RefundContract {
         refund_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
-        let balance: i128 = match env
-            .storage()
-            .persistent()
-            .get(&RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()))
-        {
-            Some(b) => b,
-            None => return Ok(()),
-        };
+        let balance: i128 =
+            match env
+                .storage()
+                .persistent()
+                .get(&RefundExtKey::MerchantRefundReserve(
+                    merchant.clone(),
+                    token.clone(),
+                )) {
+                Some(b) => b,
+                None => return Ok(()),
+            };
         if amount > balance {
             return Err(Error::Ext(ExtError::InsufficientRefundReserve));
         }
@@ -6537,7 +6587,13 @@ impl RefundContract {
         )?;
 
         // Merchants with a refund reserve fund their own refunds from it.
-        Self::debit_refund_reserve(env, &refund.merchant, &refund.token, refund_id, refund.amount)?;
+        Self::debit_refund_reserve(
+            env,
+            &refund.merchant,
+            &refund.token,
+            refund_id,
+            refund.amount,
+        )?;
 
         // Deduct platform fee from refund amount
         let (net_refund_amount, _fee_amount) =
@@ -10637,3 +10693,6 @@ mod test_counter_offer;
 
 #[cfg(test)]
 mod test_voucher_transfer;
+
+#[cfg(test)]
+mod test_upgrade;
