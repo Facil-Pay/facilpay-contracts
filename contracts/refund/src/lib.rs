@@ -10833,4 +10833,7 @@ mod test_counter_offer;
 mod test_voucher_transfer;
 
 #[cfg(test)]
+mod test_voucher_partial_redemption;
+
+#[cfg(test)]
 mod test_upgrade;
