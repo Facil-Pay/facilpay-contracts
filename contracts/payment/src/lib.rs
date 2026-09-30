@@ -2994,6 +2994,7 @@ impl PaymentContract {
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "create_payment_request")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
         merchant.require_auth();
 
         if amount <= 0 {
@@ -3282,6 +3283,7 @@ impl PaymentContract {
         scheduled_at: u64,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "schedule_payment")?;
+        Self::require_registered_merchant(&env, &merchant)?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Payment(PaymentError::InvalidStatus));
@@ -3581,6 +3583,7 @@ impl PaymentContract {
         metadata: String,
     ) -> Result<u64, Error> {
         Self::require_merchant_not_paused(env, &merchant)?;
+        Self::require_registered_merchant(env, &merchant)?;
         if !PaymentContract::is_token_allowed(env, &token) {
             return Err(Error::Payment(PaymentError::TokenNotAllowed));
         }
@@ -6474,6 +6477,7 @@ impl PaymentContract {
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "create_subscription")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
         customer.require_auth();
 
         if !PaymentContract::is_valid_currency(&currency) {
@@ -6735,6 +6739,7 @@ impl PaymentContract {
             if merchant_paused {
                 return Err(Error::Subscription(SubscriptionError::MerchantPaused));
             }
+            Self::require_registered_merchant(&env, &sub.merchant)?;
 
             // Check customer spend limit (#282)
             let charge_amount = PaymentContract::get_discounted_subscription_amount(
@@ -6857,6 +6862,7 @@ impl PaymentContract {
         if merchant_paused {
             return Err(Error::Subscription(SubscriptionError::MerchantPaused));
         }
+        Self::require_registered_merchant(&env, &sub.merchant)?;
 
         // Check payment is due
         if now < sub.next_payment_at {
@@ -7040,6 +7046,7 @@ impl PaymentContract {
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "create_metered_subscription")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
         merchant.require_auth();
 
         let counter: u64 = env
@@ -9887,6 +9894,16 @@ impl PaymentContract {
                 continue;
             }
 
+            // Issue #669: merchant registry enforcement
+            if let Err(e) = Self::require_registered_merchant(&env, &entry.merchant) {
+                results.push_back(BatchResult {
+                    payment_id: 0,
+                    success: false,
+                    error_code: Some(e.to_u32()),
+                });
+                continue;
+            }
+
             // Check merchant rate limits
             if let Err(e) =
                 PaymentContract::check_merchant_rate_limit(&env, &entry.merchant, entry.amount)
@@ -12304,6 +12321,7 @@ impl PaymentContract {
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
         customer.require_auth();
         if amount <= 0 {
             return Err(Error::Basic(BasicError::InvalidAmount));
@@ -13069,6 +13087,7 @@ impl PaymentContract {
         recipients: Vec<SplitRecipient>,
     ) -> Result<u64, Error> {
         Self::require_merchant_not_paused(&env, &merchant)?;
+        Self::require_registered_merchant(&env, &merchant)?;
         customer.require_auth();
 
         if recipients.len() > 10 {
