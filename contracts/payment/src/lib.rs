@@ -1737,6 +1737,8 @@ pub enum ActionType {
     AddAdmin,
     RemoveAdmin,
     UpdateRequiredSignatures,
+    /// Replace the contract WASM; `data` carries the 32-byte WASM hash (#641).
+    UpgradeContract,
 }
 
 #[derive(Clone)]
@@ -1868,6 +1870,15 @@ pub struct ActionApproved {
     pub proposal_id: String,
     pub approver: Address,
     pub approval_count: u32,
+}
+
+/// Event emitted when the contract's WASM is replaced in place (#641).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_schema_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
 }
 
 #[contractevent]
@@ -2380,6 +2391,41 @@ impl PaymentContract {
         env.store()
             .get(&DataKey::Config(ConfigKey::SchemaVersion))
             .unwrap_or(INITIAL_SCHEMA_VERSION)
+    }
+
+    /// Replace the contract's code with an already-uploaded WASM (Issue #641).
+    ///
+    /// Single-signature shortcut: allowed only when the multisig threshold is 1.
+    /// With a higher threshold, propose `ActionType::UpgradeContract` (with the
+    /// 32-byte hash as `data`) through `propose_action` / `approve_action` /
+    /// `execute_action` instead. The address and stored data are kept.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if `admin` is not a multisig admin or the threshold
+    /// requires more than one signature.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if !config.admins.contains(&admin) || config.required_signatures > 1 {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        Self::do_upgrade(&env, new_wasm_hash, admin);
+        Ok(())
+    }
+
+    fn do_upgrade(env: &Env, new_wasm_hash: BytesN<32>, upgraded_by: Address) {
+        let old_schema_version = Self::get_schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        (ContractUpgraded {
+            old_schema_version,
+            new_wasm_hash,
+            upgraded_by,
+        })
+        .publish(env);
     }
 
     /// Migrates the contract storage schema to a target version.
@@ -8696,6 +8742,11 @@ impl PaymentContract {
                 config.required_signatures = required;
                 env.store()
                     .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
+            }
+            ActionType::UpgradeContract => {
+                let hash = BytesN::<32>::try_from(proposal.data.clone())
+                    .map_err(|_| Error::Basic(BasicError::Unauthorized))?;
+                PaymentContract::do_upgrade(env, hash, proposal.proposer.clone());
             }
             _ => {}
         }

@@ -796,3 +796,32 @@ On release the payout is split across the configured beneficiaries proportionall
 - The old `dispute_escrow` continues to work and now emits `EscrowDisputed` as before; it does **not** record a reason or hash.
 - Per-reason dispute counts are updated in storage and can be queried with `get_dispute_reason_count(reason) → u64`.
 - Emits `EscrowDisputedWithReason { escrow_id, disputed_by, reason: u32, details_hash }`.
+
+## Contract Upgrades
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `upgrade` | `admin: Address`, `new_wasm_hash: BytesN<32>` | `Result<(), Error>` | `admin` (multisig admin; only when `required_signatures == 1`) |
+
+`upgrade` calls `update_current_contract_wasm(new_wasm_hash)`. The contract address and all stored data are kept; the new code runs from the next invocation. When the multisig threshold is above 1, the direct call returns `Unauthorized` — instead propose `ActionType::UpgradeContract` with the 32-byte WASM hash as `data` via `propose_action`, collect approvals with `approve_action`, then `execute_action`.
+
+**Errors:** `Unauthorized` (caller is not a multisig admin, multisig not initialized, threshold > 1, or proposal `data` is not 32 bytes), `MigrationInProgress` (115, a storage migration started with `begin_migration` is still running).
+
+**Event:** `ContractUpgraded { old_schema_version, new_wasm_hash, upgraded_by }`.
+
+**Upgrade sequence:**
+1. Upload the new WASM (`stellar contract upload`) and note its hash.
+2. Make sure no storage migration is in progress.
+3. Call `upgrade` (or execute an `UpgradeContract` proposal). Keep the storage layout compatible.
+4. If the new code changes the storage layout, run `begin_migration` and the batch migration functions from the new code.
+
+## Storage TTL
+
+Every state-changing entry point first extends the instance storage TTL, so the contract is not archived after quiet periods. Escrow keeps all its state in instance storage, so this one bump covers every entry.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `INSTANCE_BUMP_THRESHOLD` | `30 * 17_280` ledgers (~30 days) | Extend only when the remaining TTL is below this |
+| `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
+
+17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.

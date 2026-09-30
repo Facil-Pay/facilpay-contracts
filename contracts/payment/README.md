@@ -1378,3 +1378,20 @@ stellar contract invoke --id $CONTRACT_ID \
 - [Root README](../../README.md) — architecture overview and workspace setup
 - [Escrow Contract](../escrow/README.md)
 - [Refund Contract](../refund/README.md)
+
+## Contract Upgrades
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `upgrade` | `admin: Address`, `new_wasm_hash: BytesN<32>` | `Result<(), Error>` | `admin` (multisig admin; only when `required_signatures == 1`) |
+
+`upgrade` calls `update_current_contract_wasm(new_wasm_hash)`. The contract address and all stored data are kept; the new code runs from the next invocation. When the multisig threshold is above 1, the direct call returns `Unauthorized` — instead propose `ActionType::UpgradeContract` with the 32-byte WASM hash as `data` via `propose_action`, collect approvals with `approve_action`, then `execute_action`.
+
+**Errors:** `Unauthorized` (caller is not a multisig admin, multisig not initialized, threshold > 1, or proposal `data` is not 32 bytes). The payment contract has no multi-step migration window, so no "migration in progress" check applies.
+
+**Event:** `ContractUpgraded { old_schema_version, new_wasm_hash, upgraded_by }`.
+
+**Upgrade sequence:**
+1. Upload the new WASM (`stellar contract upload`) and note its hash.
+2. Call `upgrade` (or execute an `UpgradeContract` proposal). Keep the storage layout compatible.
+3. If the new code changes the storage layout, call `migrate_schema(admin, target_version)` from the new code.
