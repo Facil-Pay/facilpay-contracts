@@ -544,7 +544,9 @@ Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotB
 ### Refund Vouchers
 
 - `issue_refund_voucher()` — Admin issues a refund credit voucher for an approved refund.
-- `redeem_refund_voucher()` — Customer redeems a refund voucher against a future payment.
+- `redeem_refund_voucher()` — Customer redeems a refund voucher's remaining balance against a future payment.
+- `redeem_voucher_amount()` — Customer redeems part of a voucher, keeping the rest for later.
+- `get_voucher_balance()` — Gets a voucher's remaining redeemable balance.
 - `get_voucher()` — Gets a refund voucher by ID.
 - `get_customer_vouchers()` — Gets all refund vouchers currently owned by a customer.
 - `transfer_voucher()` — Owner transfers an unredeemed, unexpired voucher to another address.
@@ -575,6 +577,32 @@ The merchant's `set_vouchers_transferable` setting is snapshotted onto each vouc
 | `ExtError::InvalidVoucherRecipient` | `76` | `new_owner` is the current owner |
 
 Emits `VoucherTransferred` from `transfer_voucher`, and `VoucherTransferabilitySet` from `set_vouchers_transferable`.
+
+#### Partial voucher redemption
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `redeem_voucher_amount` | `customer: Address` (must authorize), `voucher_id: u64`, `amount: i128` | `Result<i128, Error>` (the remaining balance) |
+| `get_voucher_balance` | `voucher_id: u64` | `Result<i128, Error>` |
+
+`redeem_voucher_amount` transfers `amount` of the voucher's token to the customer and lowers the voucher's remaining balance. When the balance reaches `0`, the voucher is marked `redeemed`, and further redemptions fail with `VoucherAlreadyRedeemed`. The sum of all partial redemptions can never exceed the voucher's `amount`.
+
+`redeem_refund_voucher()` pays out the remaining balance only. A voucher of 1000 that already had 400 redeemed pays out 600.
+
+Expiry covers the remaining balance. After `expires_at`, neither function can redeem anything that is left. The remaining balance stays with the voucher when it is transferred.
+
+`get_voucher_balance` returns the full `amount` for a voucher with no redemptions and `0` for a fully redeemed voucher. It does not take expiry into account.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | Caller does not own the voucher |
+| `CoreError::InvalidAmount` | `1` | `amount` is zero or negative |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherExpired` | `53` | Ledger time is past the voucher's `expires_at` |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher's balance is already `0` |
+| `ExtError::VoucherInsufficientBalance` | `77` | `amount` is greater than the remaining balance |
+
+Emits `VoucherAmountRedeemed` from `redeem_voucher_amount`. `redeem_voucher_amount` can be paused on its own with `pause_function("redeem_voucher_amount")`.
 
 #### Voucher expiry and value handling
 
@@ -703,6 +731,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | --- | --- | --- | --- |
 | `VoucherTransferred` | `voucher_transferred` | `voucher_id`, `from`, `to` | `transfer_voucher()` moves a voucher to a new owner |
 | `VoucherTransferabilitySet` | `voucher_transferability_set` | `merchant`, `transferable` | `set_vouchers_transferable()` changes a merchant's voucher setting |
+| `VoucherAmountRedeemed` | `voucher_amount_redeemed` | `voucher_id`, `customer`, `amount`, `remaining_balance` | `redeem_voucher_amount()` redeems part (or the rest) of a voucher |
 
 ### Auto-Refund Trigger Events
 
