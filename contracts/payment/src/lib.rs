@@ -49,6 +49,8 @@ pub enum ConfigKey {
     SchemaVersion,
     AllowedTokens,
     MaxForwardDepth,
+    // Issue #669: reject payments to unregistered or deactivated merchants
+    RequireRegisteredMerchants,
 }
 
 #[derive(Clone)]
@@ -224,6 +226,11 @@ pub enum PaymentError {
     RequestCancelled = 237,
     RequestExpired = 238,
     RequestCustomerMismatch = 239,
+    // Issue #669: merchant registry
+    MerchantAlreadyRegistered = 240,
+    MerchantNotRegistered = 241,
+    MerchantInactive = 242,
+    InvalidMerchantName = 243,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -380,7 +387,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=239).contains(&code) {
+            if (200..=243).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -467,6 +474,8 @@ pub enum MerchantDataKey {
     HooksByEventCount(PaymentEventType),
     SubscriberHooks(Address, u64),
     SubscriberHookCount(Address),
+    // Issue #669: merchant registry profile
+    Profile(Address),
 }
 
 // State and proposal data keys
@@ -986,6 +995,44 @@ pub struct PaymentRequestPaid {
 pub struct PaymentRequestCancelled {
     pub request_id: u64,
     pub merchant: Address,
+}
+
+// Issue #669: merchant registry
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRegistered {
+    pub merchant: Address,
+    pub name: String,
+    pub metadata_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantProfileUpdated {
+    pub merchant: Address,
+    pub name: String,
+    pub metadata_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantDeactivated {
+    pub merchant: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantReactivated {
+    pub merchant: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequireRegisteredMerchantsSet {
+    pub required: bool,
+    pub admin: Address,
 }
 
 #[contractevent]
@@ -1621,6 +1668,25 @@ pub struct PaymentRequest {
     pub created_at: u64,
     /// Id of the payment created when the request was paid.
     pub payment_id: Option<u64>,
+}
+
+/// Maximum length, in bytes, of a registered merchant's display name (#669).
+pub const MAX_MERCHANT_NAME_LEN: u32 = 64;
+
+/// On-chain profile of an onboarded merchant (#669).
+///
+/// `metadata_hash` commits to an off-chain profile document (logo, website,
+/// contact details). `active` is cleared by `deactivate_merchant`; when
+/// `require_registered_merchants` is on, only active merchants can be paid.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MerchantProfile {
+    pub merchant: Address,
+    pub name: String,
+    pub metadata_hash: BytesN<32>,
+    pub active: bool,
+    pub registered_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone)]
