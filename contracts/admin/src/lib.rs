@@ -683,4 +683,155 @@ mod test {
                 .globally_paused
         );
     }
+
+    #[test]
+    fn test_pause_function_only_affects_targeted_child() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, payment_contract, escrow_contract, refund_contract) =
+            setup_initialized(&env);
+        let payment = PaymentContractClient::new(&env, &payment_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract);
+        let refund = RefundContractClient::new(&env, &refund_contract);
+
+        let function_name = String::from_str(&env, "process_refund");
+        let reason = String::from_str(&env, "refund processing incident");
+        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function_name, &reason);
+
+        assert!(refund.is_function_paused(&function_name));
+        assert!(!payment.is_function_paused(&function_name));
+        assert!(!escrow.is_function_paused(&function_name));
+
+        // Nothing is globally paused and other functions on the target stay live.
+        assert!(!refund.get_pause_state().globally_paused);
+        assert!(!payment.get_pause_state().globally_paused);
+        assert!(!escrow.get_pause_state().globally_paused);
+        assert!(!refund.is_function_paused(&String::from_str(&env, "request_refund")));
+
+        client.emergency_unpause_function(&pauser, &ChildKind::Refund, &function_name);
+        assert!(!refund.is_function_paused(&function_name));
+    }
+
+    #[test]
+    fn test_pause_function_targets_each_child() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, payment_contract, escrow_contract, _refund_contract) =
+            setup_initialized(&env);
+        let payment = PaymentContractClient::new(&env, &payment_contract);
+        let escrow = EscrowContractClient::new(&env, &escrow_contract);
+
+        let reason = String::from_str(&env, "incident");
+        let create_payment = String::from_str(&env, "create_payment");
+        let release_escrow = String::from_str(&env, "release_escrow");
+
+        client.emergency_pause_function(&pauser, &ChildKind::Payment, &create_payment, &reason);
+        client.emergency_pause_function(&pauser, &ChildKind::Escrow, &release_escrow, &reason);
+
+        assert!(payment.is_function_paused(&create_payment));
+        assert!(!payment.is_function_paused(&release_escrow));
+        assert!(escrow.is_function_paused(&release_escrow));
+        assert!(!escrow.is_function_paused(&create_payment));
+
+        client.emergency_unpause_function(&pauser, &ChildKind::Payment, &create_payment);
+        client.emergency_unpause_function(&pauser, &ChildKind::Escrow, &release_escrow);
+
+        assert!(!payment.is_function_paused(&create_payment));
+        assert!(!escrow.is_function_paused(&release_escrow));
+    }
+
+    #[test]
+    fn test_pause_function_rejects_non_pauser_and_uninitialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let function_name = String::from_str(&env, "process_refund");
+        let reason = String::from_str(&env, "incident");
+        let someone = Address::generate(&env);
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+        assert_eq!(
+            fresh.try_emergency_pause_function(
+                &someone,
+                &ChildKind::Refund,
+                &function_name,
+                &reason
+            ),
+            Err(Ok(Error::NotInitialized))
+        );
+        assert_eq!(
+            fresh.try_emergency_unpause_function(&someone, &ChildKind::Refund, &function_name),
+            Err(Ok(Error::NotInitialized))
+        );
+
+        // The admin is not the pauser and must be rejected too.
+        let (client, admin, pauser, _, _, refund_contract) = setup_initialized(&env);
+        assert_eq!(
+            client.try_emergency_pause_function(
+                &admin,
+                &ChildKind::Refund,
+                &function_name,
+                &reason
+            ),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(!RefundContractClient::new(&env, &refund_contract)
+            .is_function_paused(&function_name));
+
+        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function_name, &reason);
+        assert_eq!(
+            client.try_emergency_unpause_function(&someone, &ChildKind::Refund, &function_name),
+            Err(Ok(Error::Unauthorized))
+        );
+        assert!(RefundContractClient::new(&env, &refund_contract)
+            .is_function_paused(&function_name));
+    }
+
+    #[test]
+    fn test_pause_function_rejects_empty_function_name() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, _, _, _) = setup_initialized(&env);
+        let empty = String::from_str(&env, "");
+        let reason = String::from_str(&env, "incident");
+
+        assert_eq!(
+            client.try_emergency_pause_function(&pauser, &ChildKind::Payment, &empty, &reason),
+            Err(Ok(Error::InvalidFunctionName))
+        );
+        assert_eq!(
+            client.try_emergency_unpause_function(&pauser, &ChildKind::Payment, &empty),
+            Err(Ok(Error::InvalidFunctionName))
+        );
+    }
+
+    fn count_events_from(env: &Env, contract: &Address) -> usize {
+        use soroban_sdk::testutils::Events as _;
+
+        env.events()
+            .all()
+            .iter()
+            .filter(|(emitter, _, _)| emitter == contract)
+            .count()
+    }
+
+    #[test]
+    fn test_pause_function_emits_admin_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _admin, pauser, _, _, _) = setup_initialized(&env);
+        let function_name = String::from_str(&env, "complete_payment");
+        let reason = String::from_str(&env, "incident");
+
+        client.emergency_pause_function(&pauser, &ChildKind::Payment, &function_name, &reason);
+        assert_eq!(count_events_from(&env, &client.address), 1);
+
+        client.emergency_unpause_function(&pauser, &ChildKind::Payment, &function_name);
+        assert_eq!(count_events_from(&env, &client.address), 1);
+    }
 }
