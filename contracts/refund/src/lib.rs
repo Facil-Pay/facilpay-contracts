@@ -203,6 +203,10 @@ pub enum VoucherKey {
     NonTransferable(u64),
     // Issue #698: present (true) while a merchant issues non-transferable vouchers.
     MerchantTransferDisabled(Address),
+    // Issue #699: remaining redeemable balance after a partial redemption.
+    // Absent until the first partial redemption; the voucher's full `amount`
+    // is the balance until then.
+    RemainingBalance(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -344,6 +348,8 @@ pub enum ExtError {
     // Voucher transfers
     VoucherNotTransferable = 75,
     InvalidVoucherRecipient = 76,
+    // Issue #699: partial voucher redemption
+    VoucherInsufficientBalance = 77,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -706,6 +712,16 @@ pub struct VoucherTransferred {
 pub struct VoucherTransferabilitySet {
     pub merchant: Address,
     pub transferable: bool,
+}
+
+// Issue #699: partial voucher redemption
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherAmountRedeemed {
+    pub voucher_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+    pub remaining_balance: i128,
 }
 
 // Issue #194: Tiered arbitration escalation
