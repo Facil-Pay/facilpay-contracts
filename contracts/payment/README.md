@@ -787,6 +787,40 @@ completion — integrators do not need to do anything special when calling `comp
 | `set_verification_tier_limits(admin, tier, limits)`       | Configure per-tier payment limits.                  |
 | `get_tier_limits(tier)`                                   | Return the limits for a specific verification tier. |
 
+### Merchant Registry (Issue #669)
+
+Merchants can onboard with an on-chain profile, and admins can deactivate them. Enforcement is opt-in: while `require_registered_merchants` is off (the default), any address can still be paid exactly as before, whether registered, unregistered or deactivated.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `register_merchant` | `merchant: Address`, `name: String`, `metadata_hash: BytesN<32>` | `Result<(), Error>` | `merchant` |
+| `update_merchant_profile` | `merchant: Address`, `name: String`, `metadata_hash: BytesN<32>` | `Result<(), Error>` | `merchant` |
+| `deactivate_merchant` | `admin: Address`, `merchant: Address` | `Result<(), Error>` | `admin` (multi-sig admin) |
+| `reactivate_merchant` | `admin: Address`, `merchant: Address` | `Result<(), Error>` | `admin` (multi-sig admin) |
+| `get_merchant` | `merchant: Address` | `Option<MerchantProfile>` (`None` if unregistered) | — |
+| `set_require_registered_merchants` | `admin: Address`, `required: bool` | `Result<(), Error>` | `admin` (multi-sig admin) |
+| `get_require_registered_merchants` | — | `bool` (default `false`) | — |
+
+- **Registering.** `name` must be 1–64 bytes (`MAX_MERCHANT_NAME_LEN`); `metadata_hash` commits to an off-chain profile document (logo, website, contact details). New profiles are `active`. A merchant can register once; a deactivated merchant cannot re-register and must be reactivated by an admin.
+- **Updating.** Replaces `name` and `metadata_hash` and bumps `updated_at`. Allowed for deactivated merchants too; it never changes `active`.
+- **Deactivating / reactivating.** Admin-only toggles of `active`. Deactivation is independent of `pause_merchant`: a paused merchant is blocked regardless of the flag, a deactivated merchant only while the flag is on.
+- **Enforcement.** With `require_registered_merchants` on, the merchant must have a profile and be `active` in: `create_payment`, `create_escrowed_payment`, `create_conditional_payment`, `create_batch_payment`, `create_payment_batch_optimized` (per entry, reported in `BatchResult.error_code`), `create_payment_request`, `pay_payment_request`, `schedule_payment`, `create_subscription`, `create_metered_subscription`, `execute_recurring_payment` (including dunning retries), `open_channel` and `create_split_payment`. Already-created payments, escrowed scheduled payments and open channels can still be completed, executed, settled, cancelled or refunded.
+- **Pausing.** `register_merchant` and `update_merchant_profile` honour the contract pause and their own function pauses.
+
+`MerchantProfile` fields: `merchant`, `name`, `metadata_hash`, `active`, `registered_at`, `updated_at`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `deactivate_merchant` / `reactivate_merchant` / `set_require_registered_merchants`: caller is not an admin |
+| `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | `register_merchant` / `update_merchant_profile`: the contract or function is paused |
+| `PaymentError::InvalidStatus` | `201` | `reactivate_merchant`: the merchant is already active |
+| `PaymentError::MerchantAlreadyRegistered` | `240` | `register_merchant`: the merchant already has a profile |
+| `PaymentError::MerchantNotRegistered` | `241` | `update_merchant_profile` / `deactivate_merchant` / `reactivate_merchant`: no profile. Payment paths: the flag is on and the merchant is unregistered |
+| `PaymentError::MerchantInactive` | `242` | `deactivate_merchant`: already deactivated. Payment paths: the flag is on and the merchant is deactivated |
+| `PaymentError::InvalidMerchantName` | `243` | `register_merchant` / `update_merchant_profile`: `name` is empty or longer than 64 bytes |
+
+Emits `MerchantRegistered`, `MerchantProfileUpdated`, `MerchantDeactivated`, `MerchantReactivated` and `RequireRegisteredMerchantsSet` (see [Merchant Registry Events](#merchant-registry-events)).
+
 ### Payout Schedules
 
 | Function                                                 | Description                                                          |
@@ -1129,6 +1163,7 @@ Key types referenced by the functions above:
 - **`PaymentChannel`** — off-chain channel state including deposited balance and settlement nonce.
 - **`MultiSigConfig`** — admin list, required signatures, and proposal TTL.
 - **`PaymentRequest`** / **`PaymentRequestStatus`** — merchant-issued payable request; `Open | Paid | Cancelled`.
+- **`MerchantProfile`** — `merchant`, `name`, `metadata_hash`, `active`, `registered_at`, `updated_at`; a registered merchant's profile.
 - **`PaymentStatusEntry`** — `status`, `timestamp`, `actor`; one entry per payment status change.
 - **`SubscriptionSkipUsage`** — `window_start`, `count`; skips used in the current rolling year.
 
@@ -1289,6 +1324,16 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `AdminAdded`     | `AdminAdded`     | `admin`                                     | `add_admin()` adds new admin to multi-sig list |
 | `AdminRemoved`   | `AdminRemoved`   | `admin`                                     | `remove_admin()` removes admin from list       |
 
+### Merchant Registry Events
+
+| Event                           | Topic Name                      | Payload Fields                      | Fires When                                                      |
+| ------------------------------- | ------------------------------- | ----------------------------------- | --------------------------------------------------------------- |
+| `MerchantRegistered`            | `merchant_registered`           | `merchant`, `name`, `metadata_hash` | `register_merchant()` creates an active profile                 |
+| `MerchantProfileUpdated`        | `merchant_profile_updated`      | `merchant`, `name`, `metadata_hash` | `update_merchant_profile()` changes the name or metadata hash   |
+| `MerchantDeactivated`           | `merchant_deactivated`          | `merchant`, `admin`                 | `deactivate_merchant()` marks the merchant inactive             |
+| `MerchantReactivated`           | `merchant_reactivated`          | `merchant`, `admin`                 | `reactivate_merchant()` marks the merchant active again         |
+| `RequireRegisteredMerchantsSet` | `require_registered_merchants_set` | `required`, `admin`              | `set_require_registered_merchants()` toggles enforcement        |
+
 ### Contract Control Events
 
 | Event                   | Topic Name              | Payload Fields                         | Fires When                                             |
@@ -1320,7 +1365,7 @@ Errors are grouped into five ranges:
 | Range   | Category                                                       |
 | ------- | -------------------------------------------------------------- |
 | 100–126 | `BasicError` — auth, metadata, rate limits, multi-sig setup    |
-| 200–239 | `PaymentError` — payment lifecycle and payment-request violations |
+| 200–243 | `PaymentError` — payment lifecycle, payment-request and merchant-registry violations |
 | 300–320 | `SubscriptionError` — subscription, dunning, skip-cap and pause-limit violations |
 | 400–406 | `ProposalError` — multi-sig proposal violations                |
 | 500–545 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
