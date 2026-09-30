@@ -9916,6 +9916,9 @@ impl RefundContract {
 
     /// Redeem a refund credit voucher for a customer.
     ///
+    /// Pays out the voucher's remaining balance (the full amount unless part
+    /// of it was already redeemed with `redeem_voucher_amount`).
+    ///
     /// # Arguments
     /// * `customer` - The customer redeeming the voucher (must authenticate).
     /// * `voucher_id` - The ID of the voucher to redeem.
@@ -9950,18 +9953,127 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::VoucherExpired));
         }
 
+        // Issue #699: after partial redemptions only the remaining balance is paid.
+        let balance = Self::voucher_balance(&env, &voucher);
         token::Client::new(&env, &voucher.token).transfer(
             &env.current_contract_address(),
             &customer,
-            &voucher.amount,
+            &balance,
         );
 
         voucher.redeemed = true;
         env.storage()
             .instance()
             .set(&VoucherKey::Voucher(voucher_id), &voucher);
+        env.storage()
+            .instance()
+            .remove(&VoucherKey::RemainingBalance(voucher_id));
 
         Ok(())
+    }
+
+    // ── Issue #699: Partial voucher redemption ───────────────────────────
+
+    /// Redeem part of a refund credit voucher.
+    ///
+    /// Transfers `amount` of the voucher's token to the customer and reduces
+    /// the voucher's remaining balance. When the balance reaches zero the
+    /// voucher is marked redeemed. Expiry applies to the remaining balance:
+    /// nothing can be redeemed after `expires_at`. Emits `VoucherAmountRedeemed`.
+    ///
+    /// # Arguments
+    /// * `customer` - The voucher's current owner (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to redeem from.
+    /// * `amount` - The amount to redeem; must be positive and no more than
+    ///   the remaining balance.
+    ///
+    /// # Returns
+    /// The voucher's remaining balance after this redemption.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `amount` is zero or negative.
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if the caller is not the voucher's current owner.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `VoucherExpired` if the voucher has expired.
+    /// Returns `VoucherInsufficientBalance` if `amount` exceeds the remaining balance.
+    pub fn redeem_voucher_amount(
+        env: Env,
+        customer: Address,
+        voucher_id: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "redeem_voucher_amount")?;
+        customer.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if env.ledger().timestamp() > voucher.expires_at {
+            return Err(Error::Ext(ExtError::VoucherExpired));
+        }
+
+        let balance = Self::voucher_balance(&env, &voucher);
+        if amount > balance {
+            return Err(Error::Ext(ExtError::VoucherInsufficientBalance));
+        }
+        let remaining = balance - amount;
+
+        token::Client::new(&env, &voucher.token).transfer(
+            &env.current_contract_address(),
+            &customer,
+            &amount,
+        );
+
+        let balance_key = VoucherKey::RemainingBalance(voucher_id);
+        if remaining == 0 {
+            voucher.redeemed = true;
+            env.storage()
+                .instance()
+                .set(&VoucherKey::Voucher(voucher_id), &voucher);
+            env.storage().instance().remove(&balance_key);
+        } else {
+            env.storage().instance().set(&balance_key, &remaining);
+        }
+
+        VoucherAmountRedeemed {
+            voucher_id,
+            customer,
+            amount,
+            remaining_balance: remaining,
+        }
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
+    /// Get a voucher's remaining redeemable balance.
+    ///
+    /// Returns the full voucher amount if nothing has been redeemed yet, and
+    /// `0` for a fully redeemed voucher. Expiry is not taken into account.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    pub fn get_voucher_balance(env: Env, voucher_id: u64) -> Result<i128, Error> {
+        let voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+        Ok(Self::voucher_balance(&env, &voucher))
     }
 
     /// Get a refund voucher by its ID.
@@ -10435,6 +10547,16 @@ impl RefundContract {
         env.storage()
             .instance()
             .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
+    }
+
+    fn voucher_balance(env: &Env, voucher: &RefundVoucher) -> i128 {
+        if voucher.redeemed {
+            return 0;
+        }
+        env.storage()
+            .instance()
+            .get(&VoucherKey::RemainingBalance(voucher.voucher_id))
+            .unwrap_or(voucher.amount)
     }
 
     fn add_customer_voucher(env: &Env, customer: &Address, voucher_id: u64) {
