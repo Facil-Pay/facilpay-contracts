@@ -15132,3 +15132,6 @@ mod test_storage_tiers;
 
 #[cfg(test)]
 mod test_payment_request;
+
+#[cfg(test)]
+mod test_merchant_registry;
