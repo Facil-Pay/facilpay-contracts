@@ -69,9 +69,27 @@ pub enum PaymentKey {
     AccumulatedFees,
     LargePaymentCounter,
     Discount(u64),
+    Tip(u64),
+    StatusHistory(u64),
+    // Issue #673: installment schedule
+    InstallmentSchedule(u64),
+    // Issue #674: hook counter and storage
+    NotificationHookCounter,
+    NotificationHook(u64),
+    // Issue #662: merchant-initiated payment requests
+    RequestCounter,
+    Request(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
+
+/// Upper bound on status-history entries kept per payment (#682). A payment's
+/// lifecycle has only a handful of transitions, so the oldest entry is dropped
+/// once this bound is reached.
+pub const MAX_STATUS_HISTORY: u32 = 10;
+
+/// Rolling window, in seconds, over which a merchant's skip cap is counted (#666).
+pub const SKIP_WINDOW_SECONDS: u64 = 365 * 86400;
 
 #[derive(Clone)]
 #[contracttype]
@@ -83,6 +101,11 @@ pub enum SubscriptionKey {
     Group(u64),
     GroupCounter,
     GroupMembership(u64),
+    SkipUsage(u64),
+    // Issue #680: token to switch to at the next billing cycle
+    NextToken(u64),
+    // Issue #665: pending merchant price proposal for a subscription
+    PriceProposal(u64),
 }
 
 #[derive(Clone)]
@@ -103,6 +126,8 @@ pub enum FeatureKey {
     SweepCounter,
     SweepHistory(u64),
     RouteOptions(Address, Address),
+    PendingChannelSettlement(u64),
+    SubscriptionLastAnnouncedCycle(u64),
 }
 
 #[derive(Clone)]
@@ -179,6 +204,26 @@ pub enum PaymentError {
     InvalidLineItem = 222,
     InvalidScheduleTime = 223,
     TokenNotAllowed = 224,
+    // Issue #671
+    InvalidStatusFilter = 225,
+    // Issue #672
+    InvalidExpiryDuration = 226,
+    // Issue #673
+    InstallmentScheduleAlreadySet = 227,
+    InstallmentScheduleNotFound = 228,
+    InstallmentScheduleTotalMismatch = 229,
+    // Issue #674
+    MaxHooksPerEventReached = 230,
+    HookNotFound = 231,
+    HookNotOwnedBySubscriber = 232,
+    InvalidHookAddress = 233,
+    NoEventsSpecified = 234,
+    // Issue #662: merchant-initiated payment requests
+    RequestNotFound = 235,
+    RequestAlreadyPaid = 236,
+    RequestCancelled = 237,
+    RequestExpired = 238,
+    RequestCustomerMismatch = 239,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -204,6 +249,9 @@ pub enum SubscriptionError {
     MaxTrialDurationExceeded = 316,
     MerchantPaused = 317,
     UsageCapExceeded = 318,
+    SkipCapExceeded = 319,
+    // Issue #667: exceeded max_pauses_per_year
+    PauseLimitExceeded = 320,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,6 +314,12 @@ pub enum FeatureError {
     BelowMinSplitAmount = 539,
     // Issue #385: claimed settlement amounts must sum exactly to the channel deposit.
     BalanceSumMismatch = 541,
+    // Issue #678: challenge window settlement
+    ChallengeWindowOpen = 542,
+    ChallengeWindowClosed = 543,
+    NoPendingSettlement = 544,
+    // Issue #680: subscription token change
+    TokenNotAllowedForMerchant = 545,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -311,7 +365,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=540).contains(&code) {
+            if (500..=545).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -321,12 +375,12 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=318).contains(&code) {
+            if (300..=320).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=224).contains(&code) {
+            if (200..=239).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
@@ -401,6 +455,18 @@ pub enum MerchantDataKey {
     MerchantActiveSubscriptions(Address, u64),
     MerchantActiveSubscriptionCount(Address),
     ActiveSubscriptionIndex(u64),
+    SkipCap(Address),
+    // Issue #680: merchant-level token allowlist for subscriptions
+    MerchantAllowedTokens(Address),
+    // Issue #681: refund the unused portion when a subscription is cancelled
+    RefundUnusedOnCancel(Address),
+    // Issue #672: per-merchant default expiry seconds
+    DefaultPaymentExpiry(Address),
+    // Issue #674: notification hook indices
+    HooksByEvent(PaymentEventType, u64),
+    HooksByEventCount(PaymentEventType),
+    SubscriberHooks(Address, u64),
+    SubscriberHookCount(Address),
 }
 
 // State and proposal data keys
@@ -422,6 +488,120 @@ pub enum StateDataKey {
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
     SettlementFinalized(u64),
     ScheduledPaymentCounter,
+}
+
+// Issue #648: storage tier routing.
+//
+// Instance storage is a single ledger entry that is loaded in full on every
+// invocation and has a hard size limit, so it only holds small, bounded,
+// contract-global state (config, pause state, global counters). Every key that
+// grows with usage — anything keyed by a record id or a user address — lives in
+// persistent storage, where each entry is independent and carries its own TTL.
+
+/// Approximate number of ledgers closed per day (5-second ledgers).
+const LEDGERS_PER_DAY: u32 = 17_280;
+/// Persistent entries are extended once their TTL drops below this (~30 days).
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
+/// Persistent entries are extended to this TTL on read and write (~90 days).
+pub const PERSISTENT_TTL_EXTEND_TO: u32 = 90 * LEDGERS_PER_DAY;
+
+impl DataKey {
+    /// Returns `true` for keys kept in instance storage: small, bounded,
+    /// contract-global state. All other keys are per-record or per-user and are
+    /// kept in persistent storage.
+    pub fn is_instance(&self) -> bool {
+        match self {
+            DataKey::Config(_) => true,
+            DataKey::Payment(k) => matches!(
+                k,
+                PaymentKey::Counter
+                    | PaymentKey::AccumulatedFees
+                    | PaymentKey::LargePaymentCounter
+                    | PaymentKey::NotificationHookCounter
+                    | PaymentKey::RequestCounter
+            ),
+            DataKey::Subscription(k) => matches!(
+                k,
+                SubscriptionKey::Counter
+                    | SubscriptionKey::MeteredCounter
+                    | SubscriptionKey::GroupCounter
+            ),
+            DataKey::Feature(k) => matches!(
+                k,
+                FeatureKey::PaymentAnalytics
+                    | FeatureKey::PaymentChannelCounter
+                    | FeatureKey::SweepRecipient
+                    | FeatureKey::SweepCounter
+                    | FeatureKey::OracleRateConfig(_)
+                    | FeatureKey::ConversionRate(_)
+            ),
+            DataKey::Customer(_) => false,
+            DataKey::Merchant(k) => matches!(
+                k,
+                MerchantDataKey::VerificationTierLimit(_) | MerchantDataKey::HooksByEventCount(_)
+            ),
+            DataKey::State(k) => matches!(
+                k,
+                StateDataKey::PauseHistoryCount | StateDataKey::ScheduledPaymentCounter
+            ),
+        }
+    }
+}
+
+/// Storage accessor that routes each [`DataKey`] to its storage tier (see
+/// [`DataKey::is_instance`]) and extends the TTL of persistent entries on every
+/// read and write, so call sites never name the storage type themselves.
+pub(crate) struct Store<'a>(&'a Env);
+
+impl Store<'_> {
+    pub(crate) fn get<V: TryFromVal<Env, Val>>(&self, key: &DataKey) -> Option<V> {
+        if key.is_instance() {
+            return self.0.storage().instance().get(key);
+        }
+        let persistent = self.0.storage().persistent();
+        let value = persistent.get(key);
+        if value.is_some() {
+            persistent.extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        }
+        value
+    }
+
+    pub(crate) fn set<V: IntoVal<Env, Val>>(&self, key: &DataKey, val: &V) {
+        if key.is_instance() {
+            self.0.storage().instance().set(key, val);
+        } else {
+            let persistent = self.0.storage().persistent();
+            persistent.set(key, val);
+            persistent.extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND_TO);
+        }
+    }
+
+    pub(crate) fn has(&self, key: &DataKey) -> bool {
+        if key.is_instance() {
+            self.0.storage().instance().has(key)
+        } else {
+            self.0.storage().persistent().has(key)
+        }
+    }
+
+    pub(crate) fn remove(&self, key: &DataKey) {
+        if key.is_instance() {
+            self.0.storage().instance().remove(key);
+        } else {
+            self.0.storage().persistent().remove(key);
+        }
+    }
+}
+
+pub(crate) trait StoreExt {
+    /// Tier-routed access to the contract's [`DataKey`] storage.
+    fn store(&self) -> Store<'_>;
+}
+
+impl StoreExt for Env {
+    fn store(&self) -> Store<'_> {
+        Store(self)
+    }
 }
 
 #[derive(Clone)]
@@ -486,6 +666,10 @@ pub struct SubscriptionPauseData {
     pub last_paused_at: u64,
     pub total_pause_duration: u64,
     pub proration_enabled: bool,
+    pub max_pause_seconds: u64,   // 0 = unlimited (issue #667)
+    pub max_pauses_per_year: u32, // 0 = unlimited (issue #667)
+    pub pauses_this_year: u32,    // count of pauses in the current year window
+    pub year_window_start: u64,   // timestamp when the current year window began
 }
 
 #[derive(Clone)]
@@ -509,6 +693,32 @@ pub struct Subscription {
     pub metadata: String,
     pub trial_data: SubscriptionTrialData,
     pub pause_data: SubscriptionPauseData,
+    pub cancel_at_period_end: bool, // issue #664: schedule cancellation at next billing date
+}
+
+// issue #665: pending merchant price-change proposal awaiting customer acceptance
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionPriceProposal {
+    pub new_amount: i128,
+    pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
+}
+
+/// One entry in a payment's status history (#682).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentStatusEntry {
+    pub status: PaymentStatus,
+    pub timestamp: u64,
+    pub actor: Address,
+}
+
+/// Skips consumed by a subscription within the current rolling year (#666).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SubscriptionSkipUsage {
+    pub window_start: u64,
+    pub count: u32,
 }
 
 #[repr(u32)]
@@ -751,6 +961,33 @@ pub struct PaymentCreated {
     pub amount: i128,
 }
 
+// Issue #662: merchant-initiated payment requests
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestCreated {
+    pub request_id: u64,
+    pub merchant: Address,
+    pub customer: Option<Address>,
+    pub amount: i128,
+    pub token: Address,
+    pub expires_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPaid {
+    pub request_id: u64,
+    pub payment_id: u64,
+    pub customer: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestCancelled {
+    pub request_id: u64,
+    pub merchant: Address,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentCompleted {
@@ -894,6 +1131,7 @@ pub struct PaymentChannel {
     pub open: bool,
     pub expires_at: u64,
     pub customer_pk: BytesN<32>,
+    pub challenge_window_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -1005,6 +1243,46 @@ pub struct SubscriptionResumed {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCycleSkipped {
+    pub subscription_id: u64,
+    pub customer: Address,
+    pub skipped_payment_at: u64,
+    pub next_payment_at: u64,
+    pub skips_used: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkipCapSet {
+    pub merchant: Address,
+    pub max_skips_per_year: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipAdded {
+    pub payment_id: u64,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipSettled {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentTipReturned {
+    pub payment_id: u64,
+    pub customer: Address,
+    pub tip_amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionResumedProrated {
     pub subscription_id: u64,
     pub pause_duration: u64,
@@ -1031,6 +1309,50 @@ pub struct TrialConverted {
 pub struct TrialCancelled {
     pub subscription_id: u64,
     pub cancelled_at: u64,
+}
+
+// issue #663: subscription plan upgrade / downgrade
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPlanChanged {
+    pub subscription_id: u64,
+    pub old_amount: i128,
+    pub new_amount: i128,
+    pub old_interval: u64,
+    pub new_interval: u64,
+    pub proration_amount: i128, // positive = charged, negative = credited (not transferred here)
+    pub next_payment_at: u64,
+}
+
+// issue #664: cancel at end of period
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelScheduled {
+    pub subscription_id: u64,
+    pub cancels_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelUndone {
+    pub subscription_id: u64,
+}
+
+// issue #665: merchant-proposed price change requiring customer consent
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceProposed {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceAccepted {
+    pub subscription_id: u64,
+    pub new_amount: i128,
+    pub effective_from: u64,
 }
 
 #[contractevent]
@@ -1080,6 +1402,99 @@ pub struct SubscriptionSuspended {
 pub struct DunningResolved {
     pub subscription_id: u64,
     pub resolved_at: u64,
+}
+
+// Issue #673: installment schedule events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentScheduleSet {
+    pub payment_id: u64,
+    pub installment_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallmentOverdue {
+    pub payment_id: u64,
+    pub installment_index: u32,
+    pub due_at: u64,
+    pub amount: i128,
+    pub late_fee: i128,
+    pub checked_at: u64,
+}
+
+// Issue #674: payment lifecycle hook events
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookRegistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_count: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookDeregistered {
+    pub hook_id: u64,
+    pub subscriber: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentHookInvocationFailed {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub event_type: PaymentEventType,
+    pub payment_id: u64,
+}
+
+// Issue #672: default expiry set event
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantDefaultExpirySet {
+    pub merchant: Address,
+    pub seconds: u64,
+}
+
+// Issue #674: payment lifecycle event types for hooks
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PaymentEventType {
+    Created,
+    Completed,
+    Refunded,
+    Cancelled,
+}
+
+// Issue #674: notification hook stored per subscriber
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentNotificationHook {
+    pub hook_id: u64,
+    pub subscriber: Address,
+    pub events: Vec<PaymentEventType>,
+    pub active: bool,
+}
+
+// Issue #673: a single due-date installment entry
+#[derive(Clone)]
+#[contracttype]
+pub struct InstallmentEntry {
+    pub due_at: u64,
+    pub amount: i128,
+    pub paid: bool,
+}
+
+// Issue #673: the full schedule attached to a payment
+#[derive(Clone)]
+#[contracttype]
+pub struct InstallmentScheduleData {
+    pub payment_id: u64,
+    pub entries: Vec<InstallmentEntry>,
+    // flat late fee in token units (0 = no late fee)
+    pub late_fee_flat: i128,
+    // late fee in basis points applied to the installment amount (0 = none)
+    pub late_fee_bps: u32,
 }
 
 #[derive(Clone)]
@@ -1175,6 +1590,37 @@ pub struct Payment {
     pub metadata: String,
     pub notes: String,
     pub refunded_amount: i128,
+}
+
+/// Lifecycle of a merchant-initiated payment request (#662).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum PaymentRequestStatus {
+    Open,
+    Paid,
+    Cancelled,
+}
+
+/// A payable request (invoice link) issued by a merchant (#662).
+///
+/// Paying it creates a normal `Payment` on these terms, so `customer` may be
+/// left `None` to let any customer pay, or pinned to a single address.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentRequest {
+    pub id: u64,
+    pub merchant: Address,
+    pub customer: Option<Address>,
+    pub amount: i128,
+    pub token: Address,
+    pub currency: Currency,
+    /// Ledger timestamp after which the request can no longer be paid (0 = never).
+    pub expires_at: u64,
+    pub metadata: String,
+    pub status: PaymentRequestStatus,
+    pub created_at: u64,
+    /// Id of the payment created when the request was paid.
+    pub payment_id: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -1291,6 +1737,8 @@ pub enum ActionType {
     AddAdmin,
     RemoveAdmin,
     UpdateRequiredSignatures,
+    /// Replace the contract WASM; `data` carries the 32-byte WASM hash (#641).
+    UpgradeContract,
 }
 
 #[derive(Clone)]
@@ -1422,6 +1870,15 @@ pub struct ActionApproved {
     pub proposal_id: String,
     pub approver: Address,
     pub approval_count: u32,
+}
+
+/// Event emitted when the contract's WASM is replaced in place (#641).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgraded {
+    pub old_schema_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
 }
 
 #[contractevent]
@@ -1783,6 +2240,58 @@ pub struct PendingSettlement {
     pub release_at: u64,
 }
 
+// Issue #678: channel settlement awaiting the end of its challenge window.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct PendingChannelSettlement {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub nonce: u64,
+    pub window_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementInitiated {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub nonce: u64,
+    pub window_ends_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettlementChallenged {
+    pub channel_id: u64,
+    pub new_nonce: u64,
+    pub new_merchant_amount: i128,
+}
+
+// Issue #679: emitted once per billing cycle ahead of a renewal.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionRenewalUpcoming {
+    pub subscription_id: u64,
+    pub next_payment_at: u64,
+    pub cycle: u64,
+}
+
+// Issue #680: subscription token change applied.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionTokenChanged {
+    pub subscription_id: u64,
+    pub new_token: Address,
+}
+
+// Issue #681: unused portion refunded on cancellation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionProratedRefund {
+    pub subscription_id: u64,
+    pub refund_amount: i128,
+}
+
 // Issue #118: Payment routing optimization
 #[derive(Clone)]
 #[contracttype]
@@ -1838,7 +2347,11 @@ const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
 const ENTERPRISE_VOLUME_THRESHOLD: i128 = 100_000;
+// Schema version assumed for deployments that predate schema tracking.
 const INITIAL_SCHEMA_VERSION: u32 = 1;
+// v2 (Issue #648): per-record and per-user keys moved from instance to
+// persistent storage (see `DataKey::is_instance`).
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[contractimpl]
 impl PaymentContract {
@@ -1850,11 +2363,7 @@ impl PaymentContract {
     /// # Panics
     /// Panics if the contract has already been initialized.
     pub fn initialize(env: Env, admin: Address) {
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Config(ConfigKey::MultiSigConfig))
-        {
+        if env.store().has(&DataKey::Config(ConfigKey::MultiSigConfig)) {
             panic!("already initialized");
         }
         let config = MultiSigConfig {
@@ -1863,16 +2372,13 @@ impl PaymentContract {
             total_admins: 1,
             proposal_ttl: 604800,
         };
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
         // Keep Admin key for backward compat
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::Admin), &admin);
-        env.storage().instance().set(
+        env.store().set(&DataKey::Config(ConfigKey::Admin), &admin);
+        env.store().set(
             &DataKey::Config(ConfigKey::SchemaVersion),
-            &INITIAL_SCHEMA_VERSION,
+            &CURRENT_SCHEMA_VERSION,
         );
         (AdminAdded { admin }).publish(&env);
     }
@@ -1882,10 +2388,44 @@ impl PaymentContract {
     /// # Returns
     /// The current schema version as a `u32`.
     pub fn get_schema_version(env: Env) -> u32 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::SchemaVersion))
             .unwrap_or(INITIAL_SCHEMA_VERSION)
+    }
+
+    /// Replace the contract's code with an already-uploaded WASM (Issue #641).
+    ///
+    /// Single-signature shortcut: allowed only when the multisig threshold is 1.
+    /// With a higher threshold, propose `ActionType::UpgradeContract` (with the
+    /// 32-byte hash as `data`) through `propose_action` / `approve_action` /
+    /// `execute_action` instead. The address and stored data are kept.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if `admin` is not a multisig admin or the threshold
+    /// requires more than one signature.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if !config.admins.contains(&admin) || config.required_signatures > 1 {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        Self::do_upgrade(&env, new_wasm_hash, admin);
+        Ok(())
+    }
+
+    fn do_upgrade(env: &Env, new_wasm_hash: BytesN<32>, upgraded_by: Address) {
+        let old_schema_version = Self::get_schema_version(env.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        (ContractUpgraded {
+            old_schema_version,
+            new_wasm_hash,
+            upgraded_by,
+        })
+        .publish(env);
     }
 
     /// Migrates the contract storage schema to a target version.
@@ -1900,8 +2440,7 @@ impl PaymentContract {
     pub fn migrate_schema(env: Env, admin: Address, target_version: u32) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -1913,8 +2452,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::SchemaAlreadyAtTarget));
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::SchemaVersion), &target_version);
         Ok(())
     }
@@ -1936,15 +2474,14 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::VerificationLevel(merchant)),
             &level,
         );
@@ -1963,8 +2500,7 @@ impl PaymentContract {
         env: Env,
         merchant: Address,
     ) -> MerchantVerificationLevel {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::VerificationLevel(
                 merchant,
             )))
@@ -1986,15 +2522,14 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::VerificationTierLimit(limits.level.clone())),
             &limits,
         );
@@ -2013,8 +2548,7 @@ impl PaymentContract {
         env: Env,
         level: MerchantVerificationLevel,
     ) -> Option<VerificationTierLimits> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::VerificationTierLimit(
                 level,
             )))
@@ -2028,8 +2562,7 @@ impl PaymentContract {
     /// # Panics
     /// Panics if the multisig configuration has not been initialized.
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .expect("MultiSig not initialized")
     }
@@ -2055,8 +2588,7 @@ impl PaymentContract {
         proposer.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2065,13 +2597,11 @@ impl PaymentContract {
         }
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::LargePaymentCounter))
             .unwrap_or(0)
             + 1;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::LargePaymentCounter), &counter);
 
         let proposal_id = PaymentContract::u64_to_string(&env, counter);
@@ -2094,7 +2624,7 @@ impl PaymentContract {
             expires_at: now + config.proposal_ttl,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AdminProposal(proposal_id.clone())),
             &proposal,
         );
@@ -2123,8 +2653,7 @@ impl PaymentContract {
         approver.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2133,8 +2662,7 @@ impl PaymentContract {
         }
 
         let mut proposal: AdminProposal = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::AdminProposal(
                 proposal_id.clone(),
             )))
@@ -2155,7 +2683,7 @@ impl PaymentContract {
         proposal.approvals.push_back(approver.clone());
         proposal.approval_count += 1;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AdminProposal(proposal_id.clone())),
             &proposal,
         );
@@ -2180,14 +2708,12 @@ impl PaymentContract {
     /// executed/rejected, is expired, or has not reached the required signature threshold.
     pub fn execute_action(env: Env, proposal_id: String) -> Result<(), Error> {
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
         let mut proposal: AdminProposal = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::AdminProposal(
                 proposal_id.clone(),
             )))
@@ -2206,7 +2732,7 @@ impl PaymentContract {
         }
 
         proposal.executed = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AdminProposal(proposal_id.clone())),
             &proposal,
         );
@@ -2231,8 +2757,7 @@ impl PaymentContract {
         rejecter.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2241,8 +2766,7 @@ impl PaymentContract {
         }
 
         let mut proposal: AdminProposal = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::AdminProposal(
                 proposal_id.clone(),
             )))
@@ -2253,7 +2777,7 @@ impl PaymentContract {
         }
 
         proposal.rejected = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AdminProposal(proposal_id.clone())),
             &proposal,
         );
@@ -2280,8 +2804,7 @@ impl PaymentContract {
         caller.require_auth();
 
         let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2292,8 +2815,7 @@ impl PaymentContract {
         if !config.admins.contains(&new_admin) {
             config.admins.push_back(new_admin.clone());
             config.total_admins += 1;
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
             (AdminAdded { admin: new_admin }).publish(&env);
         }
@@ -2315,8 +2837,7 @@ impl PaymentContract {
         caller.require_auth();
 
         let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2341,8 +2862,7 @@ impl PaymentContract {
 
         config.admins = new_admins;
         config.total_admins -= 1;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
         (AdminRemoved { admin }).publish(&env);
 
@@ -2366,8 +2886,7 @@ impl PaymentContract {
         caller.require_auth();
 
         let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -2380,8 +2899,7 @@ impl PaymentContract {
         }
 
         config.required_signatures = required;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
 
         Ok(())
@@ -2427,6 +2945,302 @@ impl PaymentContract {
         )
     }
 
+    /// Issues a payment request (invoice link) that a customer can pay later (#662).
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant issuing the request (must authorize)
+    /// * `amount` - The amount to be paid in base token units (`> 0`)
+    /// * `token` - The token the payment must be made in
+    /// * `currency` - The fiat currency associated with the payment
+    /// * `expires_at` - Ledger timestamp after which the request can no longer be
+    ///   paid, or `0` for no expiry
+    /// * `metadata` - Arbitrary metadata copied onto the resulting payment
+    /// * `customer` - Restricts the request to a single payer, or `None` to let
+    ///   any customer pay it
+    ///
+    /// # Returns
+    /// `Ok(request_id)` on success, or an error if the amount is not positive, the
+    /// token is not allowed, the currency is invalid, the metadata is too large,
+    /// `expires_at` is not in the future, or the contract or merchant is paused.
+    pub fn create_payment_request(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expires_at: u64,
+        metadata: String,
+        customer: Option<Address>,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_payment_request")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        merchant.require_auth();
+
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if !PaymentContract::is_token_allowed(&env, &token) {
+            return Err(Error::Payment(PaymentError::TokenNotAllowed));
+        }
+        if !PaymentContract::is_valid_currency(&currency) {
+            return Err(Error::Basic(BasicError::InvalidCurrency));
+        }
+        if metadata.len() > MAX_METADATA_SIZE {
+            return Err(Error::Basic(BasicError::MetadataTooLarge));
+        }
+        let now = env.ledger().timestamp();
+        if expires_at != 0 && expires_at <= now {
+            return Err(Error::Payment(PaymentError::RequestExpired));
+        }
+
+        let request_id = env
+            .store()
+            .get::<u64>(&DataKey::Payment(PaymentKey::RequestCounter))
+            .unwrap_or(0)
+            + 1;
+        let request = PaymentRequest {
+            id: request_id,
+            merchant: merchant.clone(),
+            customer: customer.clone(),
+            amount,
+            token: token.clone(),
+            currency,
+            expires_at,
+            metadata,
+            status: PaymentRequestStatus::Open,
+            created_at: now,
+            payment_id: None,
+        };
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Request(request_id)), &request);
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::RequestCounter), &request_id);
+
+        (PaymentRequestCreated {
+            request_id,
+            merchant,
+            customer,
+            amount,
+            token,
+            expires_at,
+        })
+        .publish(&env);
+
+        Ok(request_id)
+    }
+
+    /// Pays an open payment request, creating a normal payment on its terms (#662).
+    ///
+    /// The resulting payment is identical to one made with `create_payment` for the
+    /// request's merchant, amount, token, currency and metadata, and follows the
+    /// normal payment lifecycle from there. A request can be paid exactly once.
+    ///
+    /// # Arguments
+    /// * `customer` - The paying customer (must authorize)
+    /// * `request_id` - The request to pay
+    ///
+    /// # Returns
+    /// `Ok(payment_id)` of the created payment, or an error if the request does not
+    /// exist, was already paid, was cancelled, has expired, is restricted to a
+    /// different customer, or any `create_payment` check fails.
+    pub fn pay_payment_request(env: Env, customer: Address, request_id: u64) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "pay_payment_request")?;
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+
+        let key = DataKey::Payment(PaymentKey::Request(request_id));
+        let mut request: PaymentRequest = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::RequestNotFound))?;
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+        if request.expires_at != 0 && env.ledger().timestamp() >= request.expires_at {
+            return Err(Error::Payment(PaymentError::RequestExpired));
+        }
+        if let Some(allowed) = &request.customer {
+            if *allowed != customer {
+                return Err(Error::Payment(PaymentError::RequestCustomerMismatch));
+            }
+        }
+
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer.clone(),
+            request.merchant.clone(),
+            request.amount,
+            request.token.clone(),
+            request.currency.clone(),
+            0,
+            request.metadata.clone(),
+        )?;
+
+        request.status = PaymentRequestStatus::Paid;
+        request.payment_id = Some(payment_id);
+        env.store().set(&key, &request);
+
+        (PaymentRequestPaid {
+            request_id,
+            payment_id,
+            customer,
+        })
+        .publish(&env);
+
+        Ok(payment_id)
+    }
+
+    /// Cancels an open payment request so it can no longer be paid (#662).
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that issued the request (must authorize)
+    /// * `request_id` - The request to cancel
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the request does not exist, the caller is
+    /// not its merchant, or the request was already paid or cancelled.
+    pub fn cancel_payment_request(
+        env: Env,
+        merchant: Address,
+        request_id: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let key = DataKey::Payment(PaymentKey::Request(request_id));
+        let mut request: PaymentRequest = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::RequestNotFound))?;
+        if request.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+
+        request.status = PaymentRequestStatus::Cancelled;
+        env.store().set(&key, &request);
+
+        (PaymentRequestCancelled {
+            request_id,
+            merchant,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a payment request by id (#662).
+    ///
+    /// # Returns
+    /// The `PaymentRequest`, or `RequestNotFound` if it does not exist.
+    pub fn get_payment_request(env: Env, request_id: u64) -> Result<PaymentRequest, Error> {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::Request(request_id)))
+            .ok_or(Error::Payment(PaymentError::RequestNotFound))
+    }
+
+    /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
+    ///
+    /// The tip is transferred from the customer into the contract immediately
+    /// and held alongside the payment; calling again adds to the existing tip.
+    /// On completion it is paid to the merchant in full (platform fees are
+    /// computed on `amount` only); on refund, cancellation or expiry it is
+    /// returned to the customer.
+    ///
+    /// # Arguments
+    /// * `customer` - The payment's customer (must authorize and fund the tip)
+    /// * `payment_id` - The pending payment to tip on
+    /// * `tip_amount` - The tip in base token units of the payment's token (`> 0`)
+    ///
+    /// # Returns
+    /// `Ok(total_tip)` on success, or `BasicError::InvalidAmount` if `tip_amount`
+    /// is not positive, `PaymentError::NotFound`, `BasicError::Unauthorized` if
+    /// `customer` is not the payment's customer, `PaymentError::Expired`, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Pending` or is an
+    /// escrowed or split payment.
+    pub fn add_tip(
+        env: Env,
+        customer: Address,
+        payment_id: u64,
+        tip_amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+        if tip_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let payment: Payment = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        if PaymentContract::is_payment_expired(&env, payment_id) {
+            return Err(Error::Payment(PaymentError::Expired));
+        }
+        // Escrowed and split payments settle outside `do_complete_payment`, so
+        // a tip on them could never reach the merchant.
+        if env
+            .store()
+            .has(&DataKey::State(StateDataKey::EscrowedPayment(payment_id)))
+            || env
+                .store()
+                .has(&DataKey::Feature(FeatureKey::SplitConfig(payment_id)))
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        token::Client::new(&env, &payment.token).transfer(
+            &customer,
+            env.current_contract_address(),
+            &tip_amount,
+        );
+        let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Tip(payment_id)), &total_tip);
+        (PaymentTipAdded {
+            payment_id,
+            tip_amount,
+        })
+        .publish(&env);
+        Ok(total_tip)
+    }
+
+    /// Returns the tip attached to a payment, or 0 if it has none (#675).
+    pub fn get_payment_tip(env: Env, payment_id: u64) -> i128 {
+        PaymentContract::get_tip(&env, payment_id)
+    }
+
+    /// Returns a payment's status history in chronological order (#682).
+    ///
+    /// Each entry records the status entered, the ledger timestamp and the
+    /// address that caused the transition. Permissionless transitions
+    /// (`expire_payment`, `finalize_installment_payment`, `execute_large_payment`,
+    /// `execute_if_condition_met`) record the contract's own address as actor.
+    /// At most `MAX_STATUS_HISTORY` entries are kept; older ones are dropped.
+    pub fn get_payment_status_history(env: Env, payment_id: u64) -> Vec<PaymentStatusEntry> {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::StatusHistory(payment_id)))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Schedules a future payment by escrowing tokens until the scheduled time.
     ///
     /// # Arguments
@@ -2462,8 +3276,7 @@ impl PaymentContract {
         token_client.transfer_from(&contract_address, &customer, &contract_address, &amount);
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::ScheduledPaymentCounter))
             .unwrap_or(0);
         let payment_id = counter + 1;
@@ -2477,11 +3290,11 @@ impl PaymentContract {
             executed: false,
             cancelled: false,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ScheduledPayment(payment_id)),
             &scheduled,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ScheduledPaymentCounter),
             &payment_id,
         );
@@ -2509,8 +3322,7 @@ impl PaymentContract {
     pub fn execute_scheduled_payment(env: Env, payment_id: u64) -> Result<(), Error> {
         Self::require_not_paused(&env, "execute_scheduled_payment")?;
         let mut scheduled: ScheduledPayment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::ScheduledPayment(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
         if scheduled.cancelled {
@@ -2533,7 +3345,7 @@ impl PaymentContract {
             scheduled.amount,
         )?;
         scheduled.executed = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ScheduledPayment(payment_id)),
             &scheduled,
         );
@@ -2557,8 +3369,7 @@ impl PaymentContract {
         Self::require_not_paused(&env, "cancel_scheduled_payment")?;
         caller.require_auth();
         let mut scheduled: ScheduledPayment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::ScheduledPayment(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
         if scheduled.executed {
@@ -2569,8 +3380,7 @@ impl PaymentContract {
         }
         if caller != scheduled.customer {
             let stored_admin: Address = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Config(ConfigKey::Admin))
                 .ok_or(Error::Basic(BasicError::Unauthorized))?;
             if caller != stored_admin {
@@ -2582,7 +3392,7 @@ impl PaymentContract {
         let contract_address = env.current_contract_address();
         token_client.transfer(&contract_address, &scheduled.customer, &scheduled.amount);
         scheduled.cancelled = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ScheduledPayment(payment_id)),
             &scheduled,
         );
@@ -2597,8 +3407,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(ScheduledPayment)` on success, or `Error::Payment(NotFound)` if not found.
     pub fn get_scheduled_payment(env: Env, payment_id: u64) -> Result<ScheduledPayment, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::ScheduledPayment(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))
     }
@@ -2611,15 +3420,14 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         // If merchant has a payout schedule for this token and it's not Immediate, accumulate
         if let Some(mut schedule) =
-            env.storage()
-                .instance()
-                .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(
-                    MerchantDataKey::PayoutSchedule(merchant.clone()),
-                ))
+            env.store()
+                .get::<PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
+                    merchant.clone(),
+                )))
         {
             if schedule.token == token && schedule.frequency != PayoutFrequency::Immediate {
                 schedule.accumulated += amount;
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant.clone())),
                     &schedule,
                 );
@@ -2664,7 +3472,7 @@ impl PaymentContract {
             next_payout_at: next,
             accumulated: 0,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant)),
             &schedule,
         );
@@ -2679,8 +3487,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(PayoutSchedule)` if configured, or `None` otherwise.
     pub fn get_payout_schedule(env: Env, merchant: Address) -> Option<PayoutSchedule> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
                 merchant,
             )))
@@ -2697,8 +3504,7 @@ impl PaymentContract {
     pub fn trigger_scheduled_payout(env: Env, merchant: Address) -> Result<(), Error> {
         merchant.require_auth();
         let mut schedule: PayoutSchedule = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
                 merchant.clone(),
             )))
@@ -2721,7 +3527,7 @@ impl PaymentContract {
             PayoutFrequency::Monthly => SECONDS_PER_DAY * 30,
         };
         schedule.next_payout_at += period;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant)),
             &schedule,
         );
@@ -2736,9 +3542,8 @@ impl PaymentContract {
     /// # Returns
     /// The accumulated balance in base token units, or 0 if no payout schedule exists.
     pub fn get_accumulated_balance(env: Env, merchant: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
+        env.store()
+            .get::<PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
                 merchant,
             )))
             .map(|s: PayoutSchedule| s.accumulated)
@@ -2787,15 +3592,24 @@ impl PaymentContract {
         PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Counter))
             .unwrap_or(0);
         let payment_id = counter + 1;
 
         let current_timestamp = env.ledger().timestamp();
-        let expires_at = if expiration_duration > 0 {
-            current_timestamp + expiration_duration
+        // Issue #672: fall back to per-merchant default when caller passes 0
+        let effective_duration = if expiration_duration > 0 {
+            expiration_duration
+        } else {
+            env.store()
+                .get(&DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(
+                    merchant.clone(),
+                )))
+                .unwrap_or(0)
+        };
+        let expires_at = if effective_duration > 0 {
+            current_timestamp + effective_duration
         } else {
             0
         };
@@ -2815,43 +3629,45 @@ impl PaymentContract {
             refunded_amount: 0,
         };
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
                 customer.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Payments(customer.clone(), customer_count)),
             &payment_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::PaymentCount(customer)),
             &(customer_count + 1),
         );
 
         // Index by merchant
         let merchant_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
                 merchant.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), merchant_count)),
             &payment_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
             &(merchant_count + 1),
         );
@@ -2861,15 +3677,14 @@ impl PaymentContract {
             const PAGE_SIZE: u64 = 100;
             let page_num = merchant_count / PAGE_SIZE;
             let mut page: Vec<u64> = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                     merchant.clone(),
                     page_num,
                 )))
                 .unwrap_or_else(|| Vec::new(env));
             page.push_back(payment_id);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(merchant, page_num)),
                 &page,
             );
@@ -2877,8 +3692,7 @@ impl PaymentContract {
 
         // Update global analytics
         let mut analytics: PaymentAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -2898,27 +3712,24 @@ impl PaymentContract {
         if merchant_count == 0 {
             analytics.unique_merchants += 1;
             let global_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Config(ConfigKey::GlobalMerchantCount))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::GlobalList(global_count)),
                 &payment.merchant.clone(),
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Config(ConfigKey::GlobalMerchantCount),
                 &(global_count + 1),
             );
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
 
         // Update merchant analytics
         let mut m_analytics: MerchantAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                 payment.merchant.clone(),
             )))
@@ -2932,15 +3743,14 @@ impl PaymentContract {
             });
         m_analytics.total_payments += 1;
         m_analytics.total_volume += amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
             &m_analytics,
         );
 
         // Update customer analytics
         let mut c_analytics: CustomerAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::Analytics(
                 payment.customer.clone(),
             )))
@@ -2967,21 +3777,19 @@ impl PaymentContract {
         // Track peak hour (UTC hour 0-23)
         let hour = ((current_timestamp / 3600) % 24) as u32;
         let hour_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::HourCount(
                 payment.customer.clone(),
                 hour,
             )))
             .unwrap_or(0)
             + 1;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::HourCount(payment.customer.clone(), hour)),
             &hour_count,
         );
         let peak_hour_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::HourCount(
                 payment.customer.clone(),
                 c_analytics.peak_hour,
@@ -2995,8 +3803,7 @@ impl PaymentContract {
 
         // Track per-merchant volume and update top merchant
         let prev_merchant_vol: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::MerchantVolume(
                 payment.customer.clone(),
                 payment.merchant.clone(),
@@ -3005,26 +3812,25 @@ impl PaymentContract {
         if prev_merchant_vol == 0 {
             // New merchant for this customer — add to list
             let m_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Customer(CustomerDataKey::MerchantCount(
                     payment.customer.clone(),
                 )))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::MerchantList(
                     payment.customer.clone(),
                     m_count,
                 )),
                 &payment.merchant,
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::MerchantCount(payment.customer.clone())),
                 &(m_count + 1),
             );
         }
         let new_merchant_vol = prev_merchant_vol + amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::MerchantVolume(
                 payment.customer.clone(),
                 payment.merchant.clone(),
@@ -3039,14 +3845,13 @@ impl PaymentContract {
         // Track monthly volume (30-day bucket)
         let month_bucket = (current_timestamp / 2_592_000) * 2_592_000;
         let prev_monthly: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::MonthlyVolume(
                 payment.customer.clone(),
                 month_bucket,
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::MonthlyVolume(
                 payment.customer.clone(),
                 month_bucket,
@@ -3054,7 +3859,7 @@ impl PaymentContract {
             &(prev_monthly + amount),
         );
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Analytics(payment.customer.clone())),
             &c_analytics,
         );
@@ -3078,6 +3883,9 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Issue #674: notify registered hooks
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Created, payment_id);
+
         Ok(payment_id)
     }
 
@@ -3092,8 +3900,7 @@ impl PaymentContract {
     /// # Panics
     /// Panics if the payment is not found.
     pub fn get_payment(env: &Env, payment_id: u64) -> Payment {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .expect("Payment not found")
     }
@@ -3102,8 +3909,7 @@ impl PaymentContract {
     /// Returns true if the payment exists, belongs to `customer`, and is Completed.
     pub fn check_payment_customer(env: Env, payment_id: u64, customer: Address) -> bool {
         let payment: Option<Payment> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)));
         match payment {
             Some(p) => p.customer == customer && p.status == PaymentStatus::Completed,
@@ -3171,7 +3977,7 @@ impl PaymentContract {
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::EscrowedPayment(payment_id)),
             &bridge,
         );
@@ -3206,16 +4012,14 @@ impl PaymentContract {
         Self::require_not_paused(&env, "complete_escrowed_payment")?;
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3246,9 +4050,9 @@ impl PaymentContract {
         }
 
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         (EscrowedPaymentCompleted {
             payment_id,
@@ -3276,8 +4080,7 @@ impl PaymentContract {
         Self::require_not_paused(&env, "cancel_escrowed_payment")?;
         caller.require_auth();
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3302,9 +4105,9 @@ impl PaymentContract {
         }
 
         payment.status = PaymentStatus::Cancelled;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Cancelled, caller);
 
         (EscrowedPaymentCancelled {
             payment_id,
@@ -3334,8 +4137,7 @@ impl PaymentContract {
         Self::require_not_paused(&env, "dispute_escrowed_payment")?;
         caller.require_auth();
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3374,7 +4176,7 @@ impl PaymentContract {
             resolved_at: None,
             favor_customer: None,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::EscrowedPaymentDispute(payment_id)),
             &dispute,
         );
@@ -3406,16 +4208,14 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3453,18 +4253,22 @@ impl PaymentContract {
         dispute.resolved_at = Some(env.ledger().timestamp());
         dispute.favor_customer = Some(favor_customer);
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-        env.storage().instance().set(
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            payment.status.clone(),
+            admin.clone(),
+        );
+        env.store().set(
             &DataKey::State(StateDataKey::EscrowedPaymentDispute(payment_id)),
             &dispute,
         );
 
         if favor_customer {
             let mut analytics: PaymentAnalytics = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
                 .unwrap_or(PaymentAnalytics {
                     total_payments_created: 0,
@@ -3478,13 +4282,11 @@ impl PaymentContract {
                 });
             analytics.total_payments_refunded += 1;
             analytics.total_refunded_volume += payment.amount;
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
 
             let mut m_analytics: MerchantAnalytics = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                     payment.merchant.clone(),
                 )))
@@ -3498,20 +4300,19 @@ impl PaymentContract {
                 });
             m_analytics.total_refunded += 1;
             m_analytics.total_refunded_volume += payment.amount;
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
                 &m_analytics,
             );
 
             let mut c_analytics: CustomerAnalytics = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Customer(CustomerDataKey::Analytics(
                     payment.customer.clone(),
                 )))
                 .unwrap_or(PaymentContract::default_customer_analytics());
             c_analytics.total_refunds += payment.amount;
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::Analytics(payment.customer.clone())),
                 &c_analytics,
             );
@@ -3545,8 +4346,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(EscrowedPayment)` on success, or an error if the escrow mapping is not found.
     pub fn get_escrowed_payment(env: Env, payment_id: u64) -> Result<EscrowedPayment, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::EscrowedPayment(payment_id)))
             .ok_or(Error::Feature(FeatureError::EscrowMappingNotFound))
     }
@@ -3562,8 +4362,7 @@ impl PaymentContract {
         env: Env,
         payment_id: u64,
     ) -> Option<EscrowedPaymentDispute> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::EscrowedPaymentDispute(
                 payment_id,
             )))
@@ -3573,13 +4372,9 @@ impl PaymentContract {
         env: &Env,
         payment_id: u64,
     ) -> Result<(), Error> {
-        if let Some(dispute) = env
-            .storage()
-            .instance()
-            .get::<DataKey, EscrowedPaymentDispute>(&DataKey::State(
-                StateDataKey::EscrowedPaymentDispute(payment_id),
-            ))
-        {
+        if let Some(dispute) = env.store().get::<EscrowedPaymentDispute>(&DataKey::State(
+            StateDataKey::EscrowedPaymentDispute(payment_id),
+        )) {
             if !dispute.resolved {
                 return Err(Error::Payment(PaymentError::InvalidStatus));
             }
@@ -3612,8 +4407,7 @@ impl PaymentContract {
 
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3630,8 +4424,7 @@ impl PaymentContract {
         payment.notes = notes;
 
         // Save updated payment
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
 
         Ok(())
@@ -3647,8 +4440,7 @@ impl PaymentContract {
     /// exceeds the expiration; `false` otherwise.
     pub fn is_payment_expired(env: &Env, payment_id: u64) -> bool {
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return false;
@@ -3668,8 +4460,7 @@ impl PaymentContract {
     pub fn expire_payment(env: Env, payment_id: u64) -> Result<(), Error> {
         // Retrieve payment from storage
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3715,14 +4506,23 @@ impl PaymentContract {
             token_client.transfer(&contract_address, &payment.customer, &refund_amount);
         }
 
+        // Return any escrowed tip (#675)
+        PaymentContract::return_tip(&env, &payment);
+
         // Update payment status to Cancelled
         payment.status = PaymentStatus::Cancelled;
         PaymentContract::restore_spend_limit(&env, &payment);
 
         // Store updated payment back to storage
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        // Expiry is permissionless, so the contract itself is the recorded actor.
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            env.current_contract_address(),
+        );
 
         // Emit PaymentExpired event with refund info
         (PaymentExpired {
@@ -3755,8 +4555,7 @@ impl PaymentContract {
 
         // Verify caller is in the multisig admin list
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -3770,11 +4569,10 @@ impl PaymentContract {
         if threshold > 0 && payment.amount > threshold {
             // Check if there's already a proposal for this payment
             if env
-                .storage()
-                .instance()
-                .get::<DataKey, LargePaymentProposal>(&DataKey::State(
-                    StateDataKey::LargePaymentProposal(payment_id),
-                ))
+                .store()
+                .get::<LargePaymentProposal>(&DataKey::State(StateDataKey::LargePaymentProposal(
+                    payment_id,
+                )))
                 .is_some()
             {
                 return Err(Error::Proposal(ProposalError::RequiresMultiSig));
@@ -3796,7 +4594,7 @@ impl PaymentContract {
                 executed: false,
             };
 
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::State(StateDataKey::LargePaymentProposal(payment_id)),
                 &proposal,
             );
@@ -3812,14 +4610,13 @@ impl PaymentContract {
             return Err(Error::Proposal(ProposalError::RequiresMultiSig));
         }
 
-        PaymentContract::do_complete_payment(&env, payment_id)
+        PaymentContract::do_complete_payment(&env, payment_id, admin)
     }
 
-    fn do_complete_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_complete_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -3849,13 +4646,11 @@ impl PaymentContract {
 
         // Subtract any loyalty-point discount redeemed against this payment (#490)
         let discount: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
             .unwrap_or(0);
         let charge_amount = if discount > 0 {
-            env.storage()
-                .instance()
+            env.store()
                 .remove(&DataKey::Payment(PaymentKey::Discount(payment_id)));
             let capped_discount = if discount > payment.amount {
                 payment.amount
@@ -3878,11 +4673,13 @@ impl PaymentContract {
             payment.currency.clone(),
         );
 
+        // The tip (#675) is already escrowed in the contract and is fee-exempt:
+        // it is added to the merchant's settlement after fees are computed.
+        let tip = PaymentContract::get_tip(env, payment_id);
+
         // Check finality delay config (#219)
-        let finality: Option<FinalityConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FinalityConfig));
+        let finality: Option<FinalityConfig> =
+            env.store().get(&DataKey::Config(ConfigKey::FinalityConfig));
         if let Some(ref fc) = finality {
             if fc.active && payment.amount >= fc.min_amount_threshold {
                 // Hold funds — create PendingSettlement instead of transferring
@@ -3890,37 +4687,49 @@ impl PaymentContract {
                 let settlement = PendingSettlement {
                     payment_id,
                     merchant: payment.merchant.clone(),
-                    amount: net_amount,
+                    amount: net_amount + tip,
                     token: payment.token.clone(),
                     release_at,
                 };
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Payment(PaymentKey::PendingSettlement(payment_id)),
                     &settlement,
                 );
                 let idx: u64 = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Merchant(MerchantDataKey::PendingSettlementCount(
                         payment.merchant.clone(),
                     )))
                     .unwrap_or(0);
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::PendingSettlementIndex(
                         payment.merchant.clone(),
                         idx,
                     )),
                     &payment_id,
                 );
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::PendingSettlementCount(
                         payment.merchant.clone(),
                     )),
                     &(idx + 1),
                 );
-                env.storage()
-                    .instance()
+                env.store()
                     .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+                PaymentContract::record_status_change(
+                    env,
+                    payment_id,
+                    PaymentStatus::Completed,
+                    actor,
+                );
+                if tip > 0 {
+                    (PaymentTipSettled {
+                        payment_id,
+                        merchant: payment.merchant.clone(),
+                        tip_amount: tip,
+                    })
+                    .publish(env);
+                }
                 PaymentContract::update_merchant_fee_record_post_completion(
                     env,
                     payment.merchant.clone(),
@@ -3928,8 +4737,7 @@ impl PaymentContract {
                     fee_amount,
                 );
                 let mut analytics: PaymentAnalytics = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
                     .unwrap_or(PaymentAnalytics {
                         total_payments_created: 0,
@@ -3942,8 +4750,7 @@ impl PaymentContract {
                         unique_merchants: 0,
                     });
                 analytics.total_payments_completed += 1;
-                env.storage()
-                    .instance()
+                env.store()
                     .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
                 (PaymentCompleted {
                     payment_id,
@@ -3951,6 +4758,8 @@ impl PaymentContract {
                     amount: payment.amount,
                 })
                 .publish(env);
+                // Issue #674
+                PaymentContract::invoke_payment_hooks(env, PaymentEventType::Completed, payment_id);
                 return Ok(());
             }
         }
@@ -3976,14 +4785,21 @@ impl PaymentContract {
             env,
             payment.merchant.clone(),
             payment.token.clone(),
-            merchant_amount,
+            merchant_amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(env);
+        }
 
         // Forwarding only applies when funds were paid out immediately.
         let payout_deferred = env
-            .storage()
-            .instance()
-            .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
+            .store()
+            .get::<PayoutSchedule>(&DataKey::Merchant(MerchantDataKey::PayoutSchedule(
                 payment.merchant.clone(),
             )))
             .map(|schedule: PayoutSchedule| {
@@ -4021,9 +4837,9 @@ impl PaymentContract {
             }
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Completed, actor);
         PaymentContract::update_merchant_fee_record_post_completion(
             env,
             payment.merchant.clone(),
@@ -4033,8 +4849,7 @@ impl PaymentContract {
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -4047,12 +4862,10 @@ impl PaymentContract {
                 unique_merchants: 0,
             });
         analytics.total_payments_completed += 1;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
         let mut m_analytics: MerchantAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                 payment.merchant.clone(),
             )))
@@ -4065,7 +4878,7 @@ impl PaymentContract {
                 total_refunded_volume: 0,
             });
         m_analytics.total_completed += 1;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
             &m_analytics,
         );
@@ -4075,6 +4888,9 @@ impl PaymentContract {
             amount: payment.amount,
         })
         .publish(env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Completed, payment_id);
 
         // Accrue loyalty points for completed payments if loyalty is configured.
         PaymentContract::maybe_accrue_loyalty_points(env, payment.customer.clone(), payment.amount);
@@ -4124,8 +4940,7 @@ impl PaymentContract {
 
         // Get configured max depth (default 5)
         let max_depth: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
             .unwrap_or(5);
 
@@ -4136,20 +4951,16 @@ impl PaymentContract {
                 if current == merchant {
                     return Err(Error::Feature(FeatureError::ForwardLoop));
                 }
-                match env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, PaymentForwardConfig>(&DataKey::Feature(
-                        FeatureKey::PaymentForwardConfig(current.clone()),
-                    )) {
+                match env.store().get::<PaymentForwardConfig>(&DataKey::Feature(
+                    FeatureKey::PaymentForwardConfig(current.clone()),
+                )) {
                     Some(next) => current = next.forward_to,
                     None => break,
                 }
             }
             // If we exhausted max_depth iterations, the chain is too long
             if env
-                .storage()
-                .instance()
+                .store()
                 .has(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
                     current.clone(),
                 )))
@@ -4166,7 +4977,7 @@ impl PaymentContract {
             active: true,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentForwardConfig(merchant.clone())),
             &config,
         );
@@ -4194,8 +5005,7 @@ impl PaymentContract {
 
         // Check if the forward config exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
                 merchant.clone(),
             )))
@@ -4204,8 +5014,7 @@ impl PaymentContract {
         }
 
         // Remove the forward config
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
                 merchant.clone(),
             )));
@@ -4226,8 +5035,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(PaymentForwardConfig)` if configured, or an error if no config is found.
     pub fn get_forward_config(env: Env, merchant: Address) -> Result<PaymentForwardConfig, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
                 merchant,
             )))
@@ -4249,8 +5057,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let multisig_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !multisig_config.admins.contains(&admin) {
@@ -4261,8 +5068,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::LoyaltyConfig), &config);
         Ok(())
     }
@@ -4275,8 +5081,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(CustomerLoyaltyBalance)` if the customer has a loyalty balance, or `None` otherwise.
     pub fn get_loyalty_balance(env: Env, customer: Address) -> Option<CustomerLoyaltyBalance> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(
                 customer,
             )))
@@ -4304,8 +5109,7 @@ impl PaymentContract {
         customer.require_auth();
 
         let config: LoyaltyConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::LoyaltyConfig))
             .ok_or(Error::Feature(FeatureError::LoyaltyNotConfigured))?;
         if !config.active {
@@ -4313,8 +5117,7 @@ impl PaymentContract {
         }
 
         let mut balance: CustomerLoyaltyBalance = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(
                 customer.clone(),
             )))
@@ -4330,8 +5133,7 @@ impl PaymentContract {
         }
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -4342,8 +5144,7 @@ impl PaymentContract {
         }
 
         let existing_discount: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
             .unwrap_or(0);
 
@@ -4363,12 +5164,12 @@ impl PaymentContract {
 
         balance.points -= points;
         balance.last_updated = now;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(customer.clone())),
             &balance,
         );
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::Discount(payment_id)),
             &(existing_discount + discount),
         );
@@ -4377,9 +5178,7 @@ impl PaymentContract {
     }
 
     fn get_loyalty_config(env: &Env) -> Option<LoyaltyConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::LoyaltyConfig))
+        env.store().get(&DataKey::Config(ConfigKey::LoyaltyConfig))
     }
 
     fn maybe_accrue_loyalty_points(env: &Env, customer: Address, amount: i128) {
@@ -4398,8 +5197,7 @@ impl PaymentContract {
 
         let now = env.ledger().timestamp();
         let mut balance: CustomerLoyaltyBalance = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(
                 customer.clone(),
             )))
@@ -4418,7 +5216,7 @@ impl PaymentContract {
         balance.last_updated = now;
         balance.expires_at = now + config.expiry_seconds;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(customer)),
             &balance,
         );
@@ -4473,8 +5271,7 @@ impl PaymentContract {
 
         // Get current installment counter
         let installment_counter: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
                 payment_id,
             )))
@@ -4498,7 +5295,7 @@ impl PaymentContract {
         };
 
         // Store partial payment record
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PartialPaymentRecord(
                 payment_id,
                 new_installment_number,
@@ -4507,13 +5304,13 @@ impl PaymentContract {
         );
 
         // Update installment counter
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::PartialPaymentCounter(payment_id)),
             &new_installment_number,
         );
 
         // Update outstanding balance
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::OutstandingBalance(payment_id)),
             &remaining,
         );
@@ -4524,14 +5321,14 @@ impl PaymentContract {
             installment_number: new_installment_number,
             amount,
             remaining,
-            payer: customer,
+            payer: customer.clone(),
             paid_at: partial_payment.paid_at,
         })
         .publish(&env);
 
         // Check if payment is now fully paid
         if remaining == 0 {
-            PaymentContract::finalize_installment_payment(env.clone(), payment_id)?;
+            PaymentContract::do_finalize_installment_payment(&env, payment_id, customer.clone())?;
         }
 
         Ok(())
@@ -4546,8 +5343,7 @@ impl PaymentContract {
     /// A `Vec<PartialPaymentRecord>` of all installments made toward the payment.
     pub fn get_installment_history(env: Env, payment_id: u64) -> Vec<PartialPaymentRecord> {
         let installment_counter: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
                 payment_id,
             )))
@@ -4556,8 +5352,7 @@ impl PaymentContract {
         let mut history = Vec::new(&env);
         for i in 1..=installment_counter {
             if let Some(record) =
-                env.storage()
-                    .instance()
+                env.store()
                     .get(&DataKey::State(StateDataKey::PartialPaymentRecord(
                         payment_id, i,
                     )))
@@ -4578,12 +5373,11 @@ impl PaymentContract {
     /// partial payments have been made.
     pub fn get_outstanding_balance(env: Env, payment_id: u64) -> i128 {
         // First check if we have an outstanding balance stored
-        if let Some(balance) =
-            env.storage()
-                .instance()
-                .get(&DataKey::Payment(PaymentKey::OutstandingBalance(
-                    payment_id,
-                )))
+        if let Some(balance) = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::OutstandingBalance(
+                payment_id,
+            )))
         {
             return balance;
         }
@@ -4591,8 +5385,7 @@ impl PaymentContract {
         // If not, calculate from payment amount and partial payments
         let payment = PaymentContract::get_payment(&env, payment_id);
         let installment_counter: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
                 payment_id,
             )))
@@ -4600,13 +5393,9 @@ impl PaymentContract {
 
         let mut total_paid = 0i128;
         for i in 1..=installment_counter {
-            if let Some(record) = env
-                .storage()
-                .instance()
-                .get::<DataKey, PartialPaymentRecord>(&DataKey::State(
-                    StateDataKey::PartialPaymentRecord(payment_id, i),
-                ))
-            {
+            if let Some(record) = env.store().get::<PartialPaymentRecord>(&DataKey::State(
+                StateDataKey::PartialPaymentRecord(payment_id, i),
+            )) {
                 total_paid += record.amount_paid;
             }
         }
@@ -4614,7 +5403,7 @@ impl PaymentContract {
         let outstanding = payment.amount - total_paid;
 
         // Cache the calculated balance
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::OutstandingBalance(payment_id)),
             &outstanding,
         );
@@ -4631,6 +5420,17 @@ impl PaymentContract {
     /// `Ok(())` on success, or an error if the payment is not in Pending status or
     /// the outstanding balance is not zero.
     pub fn finalize_installment_payment(env: Env, payment_id: u64) -> Result<(), Error> {
+        // Permissionless entry point: the contract itself is the recorded actor.
+        let actor = env.current_contract_address();
+        PaymentContract::do_finalize_installment_payment(&env, payment_id, actor)
+    }
+
+    fn do_finalize_installment_payment(
+        env: &Env,
+        payment_id: u64,
+        actor: Address,
+    ) -> Result<(), Error> {
+        let env = env.clone();
         let mut payment = PaymentContract::get_payment(&env, payment_id);
 
         if payment.status != PaymentStatus::Pending {
@@ -4644,8 +5444,7 @@ impl PaymentContract {
 
         // Get installment counter for event
         let installment_counter: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
                 payment_id,
             )))
@@ -4653,17 +5452,27 @@ impl PaymentContract {
 
         // Update payment status to Completed
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, actor);
 
-        // Transfer or accumulate all collected funds to merchant
+        // Transfer or accumulate all collected funds (plus any escrowed,
+        // fee-exempt tip, #675) to the merchant
+        let tip = PaymentContract::get_tip(&env, payment_id);
         Self::settle_or_accumulate(
             &env,
             payment.merchant.clone(),
             payment.token.clone(),
-            payment.amount,
+            payment.amount + tip,
         )?;
+        if tip > 0 {
+            (PaymentTipSettled {
+                payment_id,
+                merchant: payment.merchant.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
 
         // Emit payment fully paid event
         (PaymentFullyPaid {
@@ -4699,22 +5508,20 @@ impl PaymentContract {
 
         // Verify caller is in the multisig admin list
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        PaymentContract::do_refund_payment(&env, payment_id)
+        PaymentContract::do_refund_payment(&env, payment_id, admin)
     }
 
-    fn do_refund_payment(env: &Env, payment_id: u64) -> Result<(), Error> {
+    fn do_refund_payment(env: &Env, payment_id: u64, actor: Address) -> Result<(), Error> {
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -4746,16 +5553,16 @@ impl PaymentContract {
         // still-Pending payment before it becomes Refunded. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(env, payment_id, PaymentStatus::Refunded, actor);
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -4769,12 +5576,10 @@ impl PaymentContract {
             });
         analytics.total_payments_refunded += 1;
         analytics.total_refunded_volume += payment.amount;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
         let mut m_analytics: MerchantAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                 payment.merchant.clone(),
             )))
@@ -4788,19 +5593,18 @@ impl PaymentContract {
             });
         m_analytics.total_refunded += 1;
         m_analytics.total_refunded_volume += payment.amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
             &m_analytics,
         );
         let mut c_analytics: CustomerAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::Analytics(
                 payment.customer.clone(),
             )))
             .unwrap_or(PaymentContract::default_customer_analytics());
         c_analytics.total_refunds += payment.amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Analytics(payment.customer.clone())),
             &c_analytics,
         );
@@ -4811,6 +5615,9 @@ impl PaymentContract {
             amount: payment.amount,
         })
         .publish(env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Refunded, payment_id);
 
         let now = env.ledger().timestamp();
         PaymentContract::update_merchant_bucket(
@@ -4846,8 +5653,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -4855,8 +5661,7 @@ impl PaymentContract {
         }
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -4868,6 +5673,7 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::Expired));
         }
 
+        let previous_status = payment.status.clone();
         match payment.status {
             PaymentStatus::Pending | PaymentStatus::PartialRefunded => {
                 let new_refunded = payment.refunded_amount + refund_amount;
@@ -4886,14 +5692,92 @@ impl PaymentContract {
             }
         }
 
-        env.storage()
-            .instance()
+        // A fully refunded payment also returns its escrowed tip (#675).
+        if payment.status == PaymentStatus::Refunded {
+            PaymentContract::return_tip(&env, &payment);
+        }
+
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        if payment.status != previous_status {
+            PaymentContract::record_status_change(&env, payment_id, payment.status.clone(), admin);
+        }
 
         (PaymentRefunded {
             payment_id,
             customer: payment.customer,
             amount: refund_amount,
+        })
+        .publish(&env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(&env, PaymentEventType::Refunded, payment_id);
+
+        Ok(())
+    }
+
+    /// Refunds a completed payment from the merchant's own balance.
+    ///
+    /// Completed payments have already been settled out of the contract, so the
+    /// merchant returns `amount + tip` directly to the customer (#675) and the
+    /// payment moves `Completed → Refunded` (#682). Platform fees already
+    /// collected are not returned.
+    ///
+    /// # Arguments
+    /// * `merchant` - The payment's merchant (must authorize and fund the refund)
+    /// * `payment_id` - The ID of the completed payment
+    ///
+    /// # Returns
+    /// `Ok(())` on success, `PaymentError::NotFound` if the payment does not exist,
+    /// `BasicError::Unauthorized` if `merchant` is not the payment's merchant, or
+    /// `PaymentError::InvalidStatus` if the payment is not `Completed`.
+    pub fn refund_completed_payment(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "refund_payment")?;
+        merchant.require_auth();
+
+        let mut payment: Payment = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
+            .ok_or(Error::Payment(PaymentError::NotFound))?;
+        if payment.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Completed {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        let tip = PaymentContract::get_tip(&env, payment_id);
+        let refund_amount = payment.amount + tip;
+        if refund_amount > 0 {
+            token::Client::new(&env, &payment.token).transfer(
+                &merchant,
+                &payment.customer,
+                &refund_amount,
+            );
+        }
+
+        payment.status = PaymentStatus::Refunded;
+        payment.refunded_amount = payment.amount;
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Refunded, merchant);
+
+        if tip > 0 {
+            (PaymentTipReturned {
+                payment_id,
+                customer: payment.customer.clone(),
+                tip_amount: tip,
+            })
+            .publish(&env);
+        }
+        (PaymentRefunded {
+            payment_id,
+            customer: payment.customer,
+            amount: payment.amount,
         })
         .publish(&env);
 
@@ -4918,8 +5802,7 @@ impl PaymentContract {
     fn do_cancel_payment(env: &Env, caller: Address, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -4950,16 +5833,21 @@ impl PaymentContract {
         // still-Pending payment before it becomes Cancelled. A payment with no
         // installment history transfers nothing.
         PaymentContract::return_collected_installments(env, &payment, payment_id);
+        PaymentContract::return_tip(env, &payment);
         PaymentContract::restore_spend_limit(env, &payment);
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(
+            env,
+            payment_id,
+            PaymentStatus::Cancelled,
+            caller.clone(),
+        );
 
         // Update analytics
         let mut analytics: PaymentAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -4972,12 +5860,10 @@ impl PaymentContract {
                 unique_merchants: 0,
             });
         analytics.total_payments_cancelled += 1;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
         let mut m_analytics: MerchantAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                 payment.merchant.clone(),
             )))
@@ -4990,7 +5876,7 @@ impl PaymentContract {
                 total_refunded_volume: 0,
             });
         m_analytics.total_cancelled += 1;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Analytics(payment.merchant.clone())),
             &m_analytics,
         );
@@ -5001,6 +5887,9 @@ impl PaymentContract {
             timestamp,
         })
         .publish(env);
+
+        // Issue #674
+        PaymentContract::invoke_payment_hooks(env, PaymentEventType::Cancelled, payment_id);
 
         PaymentContract::update_merchant_bucket(
             env,
@@ -5032,8 +5921,7 @@ impl PaymentContract {
         offset: u64,
     ) -> Vec<Payment> {
         let total_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
                 customer.clone(),
             )))
@@ -5045,17 +5933,15 @@ impl PaymentContract {
 
         for i in start..end {
             if let Some(payment_id) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, u64>(&DataKey::Customer(CustomerDataKey::Payments(
+                env.store()
+                    .get::<u64>(&DataKey::Customer(CustomerDataKey::Payments(
                         customer.clone(),
                         i,
                     )))
             {
                 if let Some(payment) = env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                    .store()
+                    .get::<Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
                 {
                     payments.push_back(payment);
                 }
@@ -5073,8 +5959,7 @@ impl PaymentContract {
     /// # Returns
     /// The total payment count for the customer, or 0 if none.
     pub fn get_payment_count_by_customer(env: Env, customer: Address) -> u64 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(customer)))
             .unwrap_or(0)
     }
@@ -5095,8 +5980,7 @@ impl PaymentContract {
         offset: u64,
     ) -> Vec<Payment> {
         let total_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
                 merchant.clone(),
             )))
@@ -5108,17 +5992,15 @@ impl PaymentContract {
 
         for i in start..end {
             if let Some(payment_id) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, u64>(&DataKey::Merchant(MerchantDataKey::Payments(
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::Payments(
                         merchant.clone(),
                         i,
                     )))
             {
                 if let Some(payment) = env
-                    .storage()
-                    .instance()
-                    .get::<DataKey, Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                    .store()
+                    .get::<Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
                 {
                     payments.push_back(payment);
                 }
@@ -5136,16 +6018,14 @@ impl PaymentContract {
     /// # Returns
     /// The total payment count for the merchant, or 0 if none.
     pub fn get_payment_count_by_merchant(env: Env, merchant: Address) -> u64 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(merchant)))
             .unwrap_or(0)
     }
 
     /// Returns the payment IDs for the given merchant on the requested page (100 per page).
     pub fn get_merchant_payments(env: Env, merchant: Address, page: u64) -> Vec<u64> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                 merchant, page,
             )))
@@ -5164,8 +6044,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -5173,14 +6052,12 @@ impl PaymentContract {
         }
 
         let mut tokens: Vec<Address> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::AllowedTokens))
             .unwrap_or_else(|| Vec::new(&env));
         if !tokens.contains(&token) {
             tokens.push_back(token);
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Config(ConfigKey::AllowedTokens), &tokens);
         }
 
@@ -5199,8 +6076,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -5208,8 +6084,7 @@ impl PaymentContract {
         }
 
         let tokens: Vec<Address> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::AllowedTokens))
             .unwrap_or_else(|| Vec::new(&env));
         let mut updated = Vec::new(&env);
@@ -5218,8 +6093,7 @@ impl PaymentContract {
                 updated.push_back(entry);
             }
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::AllowedTokens), &updated);
 
         Ok(())
@@ -5236,8 +6110,7 @@ impl PaymentContract {
     /// # Returns
     /// A `Vec<Address>` of allowed token addresses. Returns an empty vector if none are configured.
     pub fn get_allowed_tokens(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::AllowedTokens))
             .unwrap_or_else(|| Vec::new(&env))
     }
@@ -5248,8 +6121,7 @@ impl PaymentContract {
     // `add_allowed_token`.
     fn is_token_allowed(env: &Env, token: &Address) -> bool {
         let tokens: Vec<Address> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::AllowedTokens))
             .unwrap_or_else(|| Vec::new(env));
         tokens.is_empty() || tokens.contains(token)
@@ -5258,8 +6130,7 @@ impl PaymentContract {
     const ACTIVE_SUBSCRIPTION_PAGE_SIZE: u64 = 100;
 
     fn merchant_active_subscription_count(env: &Env, merchant: &Address) -> u64 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(
                 MerchantDataKey::MerchantActiveSubscriptionCount(merchant.clone()),
             ))
@@ -5275,8 +6146,7 @@ impl PaymentContract {
         let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let mut page: Vec<u64> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(
                 MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
             ))
@@ -5287,7 +6157,7 @@ impl PaymentContract {
             page.push_back(0);
         }
         page.set(page_offset_u32, subscription_id);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
                 merchant.clone(),
                 page_num,
@@ -5299,7 +6169,7 @@ impl PaymentContract {
     fn active_subscription_at(env: &Env, merchant: &Address, flat_index: u64) -> Option<u64> {
         let page_num = flat_index / Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
-        let page: Vec<u64> = env.storage().instance().get(&DataKey::Merchant(
+        let page: Vec<u64> = env.store().get(&DataKey::Merchant(
             MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
         ))?;
         let page_offset_u32 = page_offset as u32;
@@ -5315,8 +6185,7 @@ impl PaymentContract {
         let page_offset = flat_index % Self::ACTIVE_SUBSCRIPTION_PAGE_SIZE;
         let page_offset_u32 = page_offset as u32;
         let page: Vec<u64> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(
                 MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
             ))
@@ -5330,11 +6199,11 @@ impl PaymentContract {
                 }
             }
             if rebuilt.is_empty() {
-                env.storage().instance().remove(&DataKey::Merchant(
+                env.store().remove(&DataKey::Merchant(
                     MerchantDataKey::MerchantActiveSubscriptions(merchant.clone(), page_num),
                 ));
             } else {
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptions(
                         merchant.clone(),
                         page_num,
@@ -5348,11 +6217,11 @@ impl PaymentContract {
     fn add_to_merchant_active_subscriptions(env: &Env, merchant: &Address, subscription_id: u64) {
         let count = Self::merchant_active_subscription_count(env, merchant);
         Self::set_active_subscription_at(env, merchant, count, subscription_id);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::ActiveSubscriptionIndex(subscription_id)),
             &count,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptionCount(
                 merchant.clone(),
             )),
@@ -5370,7 +6239,7 @@ impl PaymentContract {
             return;
         }
 
-        let index: u64 = match env.storage().instance().get(&DataKey::Merchant(
+        let index: u64 = match env.store().get(&DataKey::Merchant(
             MerchantDataKey::ActiveSubscriptionIndex(subscription_id),
         )) {
             Some(i) => i,
@@ -5381,7 +6250,7 @@ impl PaymentContract {
         if index != last_index {
             if let Some(last_id) = Self::active_subscription_at(env, merchant, last_index) {
                 Self::set_active_subscription_at(env, merchant, index, last_id);
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::ActiveSubscriptionIndex(last_id)),
                     &index,
                 );
@@ -5389,10 +6258,10 @@ impl PaymentContract {
         }
 
         Self::remove_active_subscription_page_entry(env, merchant, last_index);
-        env.storage().instance().remove(&DataKey::Merchant(
+        env.store().remove(&DataKey::Merchant(
             MerchantDataKey::ActiveSubscriptionIndex(subscription_id),
         ));
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::MerchantActiveSubscriptionCount(
                 merchant.clone(),
             )),
@@ -5402,8 +6271,7 @@ impl PaymentContract {
 
     /// Returns active subscription IDs for a merchant (100 per page).
     pub fn get_merchant_subscriptions(env: Env, merchant: Address, page: u64) -> Vec<u64> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(
                 MerchantDataKey::MerchantActiveSubscriptions(merchant, page),
             ))
@@ -5437,8 +6305,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -5449,7 +6316,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidCurrency));
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::ConversionRate(currency)),
             &rate,
         );
@@ -5467,8 +6334,7 @@ impl PaymentContract {
     /// # Returns
     /// The conversion rate in base units.
     pub fn get_conversion_rate(env: Env, currency: Currency) -> i128 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::ConversionRate(currency)))
             .unwrap_or(1_0000000)
     }
@@ -5492,14 +6358,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let multisig: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::OracleRateConfig(config.currency.clone())),
             &config,
         );
@@ -5514,8 +6379,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(OracleRateConfig)` if configured, `None` otherwise.
     pub fn get_oracle_rate_config(env: Env, currency: Currency) -> Option<OracleRateConfig> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::OracleRateConfig(currency)))
     }
 
@@ -5536,8 +6400,7 @@ impl PaymentContract {
     /// - `OracleFeedStale` if the fetched data exceeds the staleness threshold.
     pub fn refresh_conversion_rate(env: Env, currency: Currency) -> Result<i128, Error> {
         let cfg: OracleRateConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::OracleRateConfig(
                 currency.clone(),
             )))
@@ -5562,7 +6425,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::OracleFeedStale));
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::ConversionRate(currency)),
             &fetched.0,
         );
@@ -5605,8 +6468,7 @@ impl PaymentContract {
         }
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Counter))
             .unwrap_or(0);
         let sub_id = counter + 1;
@@ -5651,46 +6513,47 @@ impl PaymentContract {
                 last_paused_at: 0,
                 total_pause_duration: 0,
                 proration_enabled: false,
+                max_pause_seconds: 0,
+                max_pauses_per_year: 0,
+                pauses_this_year: 0,
+                year_window_start: now,
             },
+            cancel_at_period_end: false,
         };
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Subscription(SubscriptionKey::Data(sub_id)), &sub);
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Subscription(SubscriptionKey::Counter), &sub_id);
 
         // Index by customer
         let c_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
                 customer.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), c_count)),
             &sub_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer)),
             &(c_count + 1),
         );
 
         // Index by merchant
         let m_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::SubscriptionCount(
                 merchant.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Subscriptions(merchant.clone(), m_count)),
             &sub_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::SubscriptionCount(merchant.clone())),
             &(m_count + 1),
         );
@@ -5729,8 +6592,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -5772,7 +6634,7 @@ impl PaymentContract {
             ))?;
         sub.trial_data.period_seconds = new_total;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
@@ -5785,8 +6647,7 @@ impl PaymentContract {
     /// payment is due. It handles retry logic internally.
     pub fn execute_recurring_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -5795,8 +6656,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -5804,11 +6664,40 @@ impl PaymentContract {
 
         let now = env.ledger().timestamp();
 
+        // issue #667: auto-resume a paused subscription that has exceeded max_pause_seconds
+        if sub.status == SubscriptionStatus::Paused
+            && sub.pause_data.max_pause_seconds > 0
+            && now >= sub.pause_data.last_paused_at + sub.pause_data.max_pause_seconds
+        {
+            let pause_duration = now - sub.pause_data.last_paused_at;
+            sub.pause_data.total_pause_duration += pause_duration;
+            sub.next_payment_at += pause_duration;
+            if sub.ends_at > 0 {
+                sub.ends_at += pause_duration;
+            }
+            sub.status = SubscriptionStatus::Active;
+            env.store().set(
+                &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                &sub,
+            );
+            (SubscriptionResumed {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+            })
+            .publish(&env);
+            // Re-read updated sub before continuing normal flow
+            sub = env
+                .store()
+                .get(&DataKey::Subscription(SubscriptionKey::Data(
+                    subscription_id,
+                )))
+                .unwrap();
+        }
+
         // InDunning path: enforce on-chain backoff before retrying
         if sub.status == SubscriptionStatus::InDunning {
             let mut dunning: DunningState = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::State(StateDataKey::DunningState(subscription_id)))
                 .ok_or(Error::Subscription(SubscriptionError::DunningNotFound))?;
 
@@ -5818,8 +6707,7 @@ impl PaymentContract {
 
             // Check merchant account is not paused
             let merchant_paused: bool = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
                     sub.merchant.clone(),
                 )))
@@ -5861,12 +6749,11 @@ impl PaymentContract {
                     sub.status = SubscriptionStatus::Expired;
                 }
 
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                     &sub,
                 );
-                env.storage()
-                    .instance()
+                env.store()
                     .remove(&DataKey::State(StateDataKey::DunningState(subscription_id)));
 
                 (DunningResolved {
@@ -5888,11 +6775,11 @@ impl PaymentContract {
 
                 if dunning.retry_count >= dunning.max_retries {
                     sub.status = SubscriptionStatus::Suspended;
-                    env.storage().instance().set(
+                    env.store().set(
                         &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                         &sub,
                     );
-                    env.storage().instance().set(
+                    env.store().set(
                         &DataKey::State(StateDataKey::DunningState(subscription_id)),
                         &dunning,
                     );
@@ -5908,7 +6795,7 @@ impl PaymentContract {
 
                 // Exponential backoff: backoff_seconds * 2^retry_count
                 dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::State(StateDataKey::DunningState(subscription_id)),
                     &dunning,
                 );
@@ -5933,7 +6820,7 @@ impl PaymentContract {
         // Check subscription has not ended
         if sub.ends_at > 0 && now >= sub.ends_at {
             sub.status = SubscriptionStatus::Expired;
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
             );
@@ -5942,8 +6829,7 @@ impl PaymentContract {
 
         // Check merchant account is not paused
         let merchant_paused: bool = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
                 sub.merchant.clone(),
             )))
@@ -5960,7 +6846,7 @@ impl PaymentContract {
         // Skip charge if still within trial period
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
             sub.next_payment_at += sub.interval;
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
             );
@@ -5974,6 +6860,20 @@ impl PaymentContract {
             .is_err()
         {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
+        }
+
+        // Issue #680: apply pending token change at the start of each new cycle
+        if let Some(pending_token) =
+            env.store()
+                .get::<Address>(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )))
+        {
+            sub.token = pending_token;
+            env.store()
+                .remove(&DataKey::Subscription(SubscriptionKey::NextToken(
+                    subscription_id,
+                )));
         }
 
         // Attempt token transfer
@@ -6004,12 +6904,60 @@ impl PaymentContract {
             sub.retry_count = 0;
             sub.next_payment_at += sub.interval;
 
+            // issue #664: honour scheduled cancellation — mark Cancelled after this final charge
+            if sub.cancel_at_period_end {
+                sub.status = SubscriptionStatus::Cancelled;
+                env.store().set(
+                    &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+                    &sub,
+                );
+                Self::remove_from_merchant_active_subscriptions(
+                    &env,
+                    &sub.merchant,
+                    subscription_id,
+                );
+                (RecurringPaymentExecuted {
+                    subscription_id,
+                    payment_count: sub.payment_count,
+                    amount: charge_amount,
+                    next_payment_at: sub.next_payment_at,
+                })
+                .publish(&env);
+                (SubscriptionCancelled {
+                    subscription_id,
+                    cancelled_by: sub.customer.clone(),
+                })
+                .publish(&env);
+                return Ok(());
+            }
+
             // Auto-expire when duration is reached
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
             }
 
-            env.storage().instance().set(
+            // issue #665: apply an accepted price proposal once effective_from is reached
+            if let Some(proposal) =
+                env.store()
+                    .get::<SubscriptionPriceProposal>(&DataKey::Subscription(
+                        SubscriptionKey::PriceProposal(subscription_id),
+                    ))
+            {
+                let effective = if proposal.effective_from == 0 {
+                    now
+                } else {
+                    proposal.effective_from
+                };
+                if now >= effective {
+                    sub.amount = proposal.new_amount;
+                    env.store()
+                        .remove(&DataKey::Subscription(SubscriptionKey::PriceProposal(
+                            subscription_id,
+                        )));
+                }
+            }
+
+            env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
             );
@@ -6075,8 +7023,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::MeteredCounter))
             .unwrap_or(0);
         let sub_id = counter + 1;
@@ -6096,11 +7043,11 @@ impl PaymentContract {
             max_units_per_period,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Metered(sub_id)),
             &sub,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::MeteredCounter),
             &sub_id,
         );
@@ -6133,8 +7080,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         let mut sub: MeteredSubscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Metered(
                 subscription_id,
             )))
@@ -6152,7 +7098,7 @@ impl PaymentContract {
 
         sub.accumulated_units = sub.accumulated_units.saturating_add(units);
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Metered(subscription_id)),
             &sub,
         );
@@ -6178,8 +7124,7 @@ impl PaymentContract {
     /// # Panics
     /// Panics if the metered subscription is not found.
     pub fn get_current_usage(env: Env, subscription_id: u64) -> MeteredSubscription {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Subscription(SubscriptionKey::Metered(
                 subscription_id,
             )))
@@ -6210,8 +7155,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         let mut sub: MeteredSubscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Metered(
                 subscription_id,
             )))
@@ -6223,7 +7167,7 @@ impl PaymentContract {
 
         sub.billing_cap = Some(cap);
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Metered(subscription_id)),
             &sub,
         );
@@ -6247,8 +7191,7 @@ impl PaymentContract {
     /// - `BillingOverflow` if the multiplication of units × price overflows.
     pub fn execute_metered_billing(env: Env, subscription_id: u64) -> Result<i128, Error> {
         let mut sub: MeteredSubscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Metered(
                 subscription_id,
             )))
@@ -6282,7 +7225,7 @@ impl PaymentContract {
         sub.accumulated_units = 0;
         sub.last_reset_at = env.ledger().timestamp();
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Metered(subscription_id)),
             &sub,
         );
@@ -6314,8 +7257,7 @@ impl PaymentContract {
         caller.require_auth();
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6324,17 +7266,14 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
             .unwrap();
 
-        let config: Option<MultiSigConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::MultiSigConfig));
+        let config: Option<MultiSigConfig> =
+            env.store().get(&DataKey::Config(ConfigKey::MultiSigConfig));
 
         let is_authorized = sub.customer == caller
             || sub.merchant == caller
@@ -6350,7 +7289,7 @@ impl PaymentContract {
         }
 
         sub.status = SubscriptionStatus::Cancelled;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
@@ -6365,6 +7304,53 @@ impl PaymentContract {
                 cancelled_at: now,
             })
             .publish(&env);
+        }
+
+        // Issue #681: prorated refund on mid-cycle cancellation
+        let refund_flag: bool = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or(false);
+
+        if refund_flag && sub.interval > 0 && sub.amount > 0 {
+            // Compute the unused portion of the current cycle.
+            // `next_payment_at` is when the *next* charge is due; the current
+            // cycle started at `next_payment_at - interval`.
+            let cycle_start = sub.next_payment_at.saturating_sub(sub.interval);
+            if now > cycle_start && now < sub.next_payment_at {
+                let elapsed = now - cycle_start;
+                // unused_fraction = (interval - elapsed) / interval
+                // refund = amount * unused_fraction, rounded down (never more than charged)
+                let unused_seconds = sub.interval - elapsed;
+                // Use u128 arithmetic to avoid overflow
+                let refund_amount = ((sub.amount as u128).saturating_mul(unused_seconds as u128)
+                    / (sub.interval as u128)) as i128;
+
+                if refund_amount > 0 && refund_amount <= sub.amount {
+                    let token_client = token::Client::new(&env, &sub.token);
+                    let contract_address = env.current_contract_address();
+                    // Transfer from merchant back to customer (merchant must have allowance
+                    // for the contract, or the contract pulls from merchant's balance).
+                    // Best-effort: only emit and transfer if the transfer succeeds.
+                    if token_client
+                        .try_transfer_from(
+                            &contract_address,
+                            &sub.merchant,
+                            &sub.customer,
+                            &refund_amount,
+                        )
+                        .is_ok()
+                    {
+                        (SubscriptionProratedRefund {
+                            subscription_id,
+                            refund_amount,
+                        })
+                        .publish(&env);
+                    }
+                }
+            }
         }
 
         (SubscriptionCancelled {
@@ -6385,8 +7371,7 @@ impl PaymentContract {
         customer.require_auth();
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6395,8 +7380,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6410,9 +7394,41 @@ impl PaymentContract {
             return Err(Error::Subscription(SubscriptionError::NotActive));
         }
 
+        let now = env.ledger().timestamp();
+
+        // issue #667: enforce yearly pause count limit
+        if sub.pause_data.max_pauses_per_year > 0 {
+            let year_secs: u64 = 365 * 24 * 3600;
+            if now >= sub.pause_data.year_window_start + year_secs {
+                // roll window
+                sub.pause_data.year_window_start = now;
+                sub.pause_data.pauses_this_year = 0;
+            }
+            if sub.pause_data.pauses_this_year >= sub.pause_data.max_pauses_per_year {
+                return Err(Error::Subscription(SubscriptionError::PauseLimitExceeded));
+            }
+        }
+
+        // issue #667: enforce max pause duration (checked against next_payment_at so it can't
+        // exceed the remaining billing cycle length if max_pause_seconds is small)
+        if sub.pause_data.max_pause_seconds > 0 {
+            let time_until_due = sub.next_payment_at.saturating_sub(now);
+            if sub.pause_data.max_pause_seconds > time_until_due
+                && sub.pause_data.max_pause_seconds < sub.interval
+            {
+                // max_pause_seconds is less than a full interval — flag but still allow;
+                // the auto-resume check in execute_recurring_payment will enforce it.
+                // Actual rejection only when max_pause_seconds is 0 (unlimited) — already handled above.
+            }
+            // Nothing to block at pause time; auto-resume on execute covers enforcement.
+        }
+
         sub.status = SubscriptionStatus::Paused;
-        sub.pause_data.last_paused_at = env.ledger().timestamp();
-        env.storage().instance().set(
+        sub.pause_data.last_paused_at = now;
+        if sub.pause_data.max_pauses_per_year > 0 {
+            sub.pause_data.pauses_this_year += 1;
+        }
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
@@ -6431,8 +7447,7 @@ impl PaymentContract {
         customer.require_auth();
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6441,8 +7456,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6475,8 +7489,7 @@ impl PaymentContract {
 
             if prorated_amount > 0 {
                 let merchant_paused: bool = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
                         sub.merchant.clone(),
                     )))
@@ -6529,7 +7542,7 @@ impl PaymentContract {
 
         sub.status = SubscriptionStatus::Active;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
@@ -6537,10 +7550,119 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Caps how many billing cycles a merchant's customers may skip per
+    /// subscription within a rolling year (#666). A cap of 0 disables skipping.
+    /// Without a configured cap, skips are unlimited.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant configuring the cap (must authorize)
+    /// * `max_skips_per_year` - Maximum skips per subscription per rolling 365 days
+    pub fn set_skip_cap(env: Env, merchant: Address, max_skips_per_year: u32) {
+        merchant.require_auth();
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::SkipCap(merchant.clone())),
+            &max_skips_per_year,
+        );
+        (SkipCapSet {
+            merchant,
+            max_skips_per_year,
+        })
+        .publish(&env);
+    }
+
+    /// Returns the merchant's skip cap, or `None` if skips are uncapped (#666).
+    pub fn get_skip_cap(env: Env, merchant: Address) -> Option<u32> {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::SkipCap(merchant)))
+    }
+
+    /// Returns the skips a subscription has used in its current rolling year (#666).
+    pub fn get_skip_usage(env: Env, subscription_id: u64) -> SubscriptionSkipUsage {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::SkipUsage(
+                subscription_id,
+            )))
+            .unwrap_or(SubscriptionSkipUsage {
+                window_start: 0,
+                count: 0,
+            })
+    }
+
+    /// Skips the next billing cycle of an active subscription without charging
+    /// (#666). `next_payment_at` advances by exactly one `interval`; the
+    /// subscription stays `Active`. Only the subscription's customer may skip.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscription's customer (must authorize)
+    /// * `subscription_id` - The subscription to skip a cycle on
+    ///
+    /// # Returns
+    /// `Ok(new_next_payment_at)` on success, or `SubscriptionError::NotFound`,
+    /// `BasicError::Unauthorized`, `SubscriptionError::NotActive`, or
+    /// `SubscriptionError::SkipCapExceeded` if the merchant's yearly cap is used up.
+    pub fn skip_next_cycle(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let now = env.ledger().timestamp();
+        let mut usage = PaymentContract::get_skip_usage(env.clone(), subscription_id);
+        if usage.count == 0 || now >= usage.window_start + SKIP_WINDOW_SECONDS {
+            usage = SubscriptionSkipUsage {
+                window_start: now,
+                count: 0,
+            };
+        }
+        if let Some(cap) = PaymentContract::get_skip_cap(env.clone(), sub.merchant.clone()) {
+            if usage.count >= cap {
+                return Err(Error::Subscription(SubscriptionError::SkipCapExceeded));
+            }
+        }
+        usage.count += 1;
+
+        let skipped_payment_at = sub.next_payment_at;
+        sub.next_payment_at += sub.interval;
+
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::SkipUsage(subscription_id)),
+            &usage,
+        );
+
+        (SubscriptionCycleSkipped {
+            subscription_id,
+            customer,
+            skipped_payment_at,
+            next_payment_at: sub.next_payment_at,
+            skips_used: usage.count,
+        })
+        .publish(&env);
+
+        Ok(sub.next_payment_at)
+    }
+
     /// Read a single subscription.
     pub fn get_subscription(env: Env, subscription_id: u64) -> Subscription {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6555,8 +7677,7 @@ impl PaymentContract {
         offset: u64,
     ) -> Vec<Subscription> {
         let total: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::SubscriptionCount(
                 customer.clone(),
             )))
@@ -6566,20 +7687,16 @@ impl PaymentContract {
         let end = (offset + limit).min(total);
 
         for i in offset..end {
-            if let Some(sub_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::Customer(CustomerDataKey::Subscriptions(
-                    customer.clone(),
-                    i,
-                )))
+            if let Some(sub_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Customer(CustomerDataKey::Subscriptions(
+                        customer.clone(),
+                        i,
+                    )))
             {
-                if let Some(sub) =
-                    env.storage()
-                        .instance()
-                        .get::<DataKey, Subscription>(&DataKey::Subscription(
-                            SubscriptionKey::Data(sub_id),
-                        ))
+                if let Some(sub) = env
+                    .store()
+                    .get::<Subscription>(&DataKey::Subscription(SubscriptionKey::Data(sub_id)))
                 {
                     result.push_back(sub);
                 }
@@ -6597,8 +7714,7 @@ impl PaymentContract {
         offset: u64,
     ) -> Vec<Subscription> {
         let total: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::SubscriptionCount(
                 merchant.clone(),
             )))
@@ -6608,20 +7724,16 @@ impl PaymentContract {
         let end = (offset + limit).min(total);
 
         for i in offset..end {
-            if let Some(sub_id) = env
-                .storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::Merchant(MerchantDataKey::Subscriptions(
-                    merchant.clone(),
-                    i,
-                )))
+            if let Some(sub_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::Subscriptions(
+                        merchant.clone(),
+                        i,
+                    )))
             {
-                if let Some(sub) =
-                    env.storage()
-                        .instance()
-                        .get::<DataKey, Subscription>(&DataKey::Subscription(
-                            SubscriptionKey::Data(sub_id),
-                        ))
+                if let Some(sub) = env
+                    .store()
+                    .get::<Subscription>(&DataKey::Subscription(SubscriptionKey::Data(sub_id)))
                 {
                     result.push_back(sub);
                 }
@@ -6642,16 +7754,14 @@ impl PaymentContract {
         admin.require_auth();
 
         let ms_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !ms_config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::DunningConfig), &config);
 
         Ok(())
@@ -6660,8 +7770,7 @@ impl PaymentContract {
     /// Returns the current dunning configuration.
     /// Returns default config if not yet set.
     pub fn get_dunning_config(env: Env) -> DunningConfig {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::DunningConfig))
             .unwrap_or(DunningConfig {
                 initial_backoff_seconds: 3600, // 1 hour
@@ -6671,8 +7780,7 @@ impl PaymentContract {
 
     /// Returns the dunning state for a subscription, if any.
     pub fn get_dunning_state(env: Env, subscription_id: u64) -> Option<DunningState> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::DunningState(subscription_id)))
     }
 
@@ -6680,8 +7788,7 @@ impl PaymentContract {
     /// Validates that the retry is due before attempting.
     pub fn retry_failed_payment(env: Env, subscription_id: u64) -> Result<(), Error> {
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6690,8 +7797,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6702,8 +7808,7 @@ impl PaymentContract {
         }
 
         let mut dunning: DunningState = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::DunningState(subscription_id)))
             .ok_or(Error::Subscription(SubscriptionError::DunningNotFound))?;
 
@@ -6739,12 +7844,11 @@ impl PaymentContract {
                 sub.status = SubscriptionStatus::Expired;
             }
 
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
             );
-            env.storage()
-                .instance()
+            env.store()
                 .remove(&DataKey::State(StateDataKey::DunningState(subscription_id)));
 
             (DunningResolved {
@@ -6768,11 +7872,11 @@ impl PaymentContract {
 
             if dunning.retry_count >= dunning.max_retries {
                 sub.status = SubscriptionStatus::Suspended;
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                     &sub,
                 );
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::State(StateDataKey::DunningState(subscription_id)),
                     &dunning,
                 );
@@ -6788,7 +7892,7 @@ impl PaymentContract {
 
             // Exponential backoff: backoff_seconds * 2^retry_count
             dunning.next_retry_at = now + (dunning.backoff_seconds << dunning.retry_count);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::State(StateDataKey::DunningState(subscription_id)),
                 &dunning,
             );
@@ -6814,8 +7918,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -6823,8 +7926,7 @@ impl PaymentContract {
         }
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6833,8 +7935,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -6851,14 +7952,13 @@ impl PaymentContract {
         sub.retry_count = 0;
         sub.next_payment_at = env.ledger().timestamp() + sub.interval;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
 
         // Remove dunning state
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::State(StateDataKey::DunningState(subscription_id)));
 
         (DunningResolved {
@@ -6897,7 +7997,7 @@ impl PaymentContract {
 
             // Clear the cached outstanding balance so a later query recomputes
             // against the now-terminal payment instead of returning stale data.
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Payment(PaymentKey::OutstandingBalance(payment_id)),
                 &payment.amount,
             );
@@ -6909,8 +8009,7 @@ impl PaymentContract {
     /// Sum of installment deposits actually received for a pending payment.
     fn get_payment_deposited_amount(env: &Env, payment_id: u64) -> i128 {
         let installment_counter: u32 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PartialPaymentCounter(
                 payment_id,
             )))
@@ -6918,13 +8017,9 @@ impl PaymentContract {
 
         let mut total_deposited = 0i128;
         for i in 1..=installment_counter {
-            if let Some(record) = env
-                .storage()
-                .instance()
-                .get::<DataKey, PartialPaymentRecord>(&DataKey::State(
-                    StateDataKey::PartialPaymentRecord(payment_id, i),
-                ))
-            {
+            if let Some(record) = env.store().get::<PartialPaymentRecord>(&DataKey::State(
+                StateDataKey::PartialPaymentRecord(payment_id, i),
+            )) {
                 total_deposited += record.amount_paid;
             }
         }
@@ -6934,18 +8029,14 @@ impl PaymentContract {
     /// Apply an active subscription group's discount_bps to a billing amount.
     fn get_discounted_subscription_amount(env: &Env, subscription_id: u64, amount: i128) -> i128 {
         if let Some(group_id) =
-            env.storage()
-                .instance()
-                .get::<DataKey, u64>(&DataKey::Subscription(SubscriptionKey::GroupMembership(
+            env.store()
+                .get::<u64>(&DataKey::Subscription(SubscriptionKey::GroupMembership(
                     subscription_id,
                 )))
         {
-            if let Some(group) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, SubscriptionGroup>(&DataKey::Subscription(
-                        SubscriptionKey::Group(group_id),
-                    ))
+            if let Some(group) = env
+                .store()
+                .get::<SubscriptionGroup>(&DataKey::Subscription(SubscriptionKey::Group(group_id)))
             {
                 if group.active && group.discount_bps > 0 {
                     let bps = group.discount_bps.min(10_000) as i128;
@@ -6972,21 +8063,20 @@ impl PaymentContract {
             last_failed_at: now,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::DunningState(subscription_id)),
             &dunning_state,
         );
 
         // Update subscription status
         if let Some(mut sub) =
-            env.storage()
-                .instance()
-                .get::<DataKey, Subscription>(&DataKey::Subscription(SubscriptionKey::Data(
+            env.store()
+                .get::<Subscription>(&DataKey::Subscription(SubscriptionKey::Data(
                     subscription_id,
                 )))
         {
             sub.status = SubscriptionStatus::InDunning;
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
             );
@@ -7010,15 +8100,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let ms_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !ms_config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::RateLimitConfig), &config);
         Ok(())
     }
@@ -7026,8 +8114,7 @@ impl PaymentContract {
     /// Returns the current rate limit configuration.
     /// Defaults to unlimited if not yet configured.
     pub fn get_rate_limit_config(env: Env) -> RateLimitConfig {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::RateLimitConfig))
             .unwrap_or(RateLimitConfig {
                 max_payments_per_window: 0,
@@ -7039,8 +8126,7 @@ impl PaymentContract {
 
     /// Returns the per-address rate limit state (or a zeroed default).
     pub fn get_address_rate_limit(env: Env, address: Address) -> AddressRateLimit {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::RateLimit(
                 address.clone(),
             )))
@@ -7063,16 +8149,14 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         let mut rate_limit: AddressRateLimit = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::RateLimit(
                 address.clone(),
             )))
@@ -7088,11 +8172,11 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::AddressAlreadyFlagged));
         }
         rate_limit.flagged = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::RateLimit(address.clone())),
             &rate_limit,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::FlagReason(address.clone())),
             &reason,
         );
@@ -7104,16 +8188,14 @@ impl PaymentContract {
     pub fn unflag_address(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         let mut rate_limit: AddressRateLimit = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::RateLimit(
                 address.clone(),
             )))
@@ -7129,12 +8211,11 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
         rate_limit.flagged = false;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::RateLimit(address.clone())),
             &rate_limit,
         );
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Customer(CustomerDataKey::FlagReason(
                 address.clone(),
             )));
@@ -7153,8 +8234,7 @@ impl PaymentContract {
     /// `true` if the address is flagged, `false` otherwise.
     pub fn is_address_flagged(env: Env, address: Address) -> bool {
         let rate_limit: AddressRateLimit = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::RateLimit(
                 address.clone(),
             )))
@@ -7177,8 +8257,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(reason)` if the address is flagged and a reason was recorded, `None` otherwise.
     pub fn get_flag_reason(env: Env, address: Address) -> Option<String> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::FlagReason(address)))
     }
 
@@ -7195,14 +8274,13 @@ impl PaymentContract {
     pub fn add_to_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Allowlist(address)),
             &true,
         );
@@ -7222,15 +8300,13 @@ impl PaymentContract {
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Customer(CustomerDataKey::Allowlist(address)));
         Ok(())
     }
@@ -7240,8 +8316,7 @@ impl PaymentContract {
     fn check_rate_limit_internal(env: &Env, address: &Address, amount: i128) -> Result<(), Error> {
         // If no config is set, rate limiting is disabled.
         let config: Option<RateLimitConfig> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::RateLimitConfig));
         let config = match config {
             None => {
@@ -7251,8 +8326,7 @@ impl PaymentContract {
         };
 
         let mut rate_limit: AddressRateLimit = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::RateLimit(
                 address.clone(),
             )))
@@ -7321,7 +8395,7 @@ impl PaymentContract {
         rate_limit.payment_count += 1;
         rate_limit.last_payment_at = now;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::RateLimit(address.clone())),
             &rate_limit,
         );
@@ -7330,8 +8404,7 @@ impl PaymentContract {
     }
 
     fn is_allowlisted(env: &Env, address: &Address) -> bool {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::Allowlist(
                 address.clone(),
             )))
@@ -7358,14 +8431,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let ms_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !ms_config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::MerchantRateLimit(merchant)),
             &config,
         );
@@ -7380,8 +8452,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(MerchantRateLimit)` if a custom config exists, `None` if the merchant uses global defaults.
     pub fn get_merchant_rate_limit(env: Env, merchant: Address) -> Option<MerchantRateLimit> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::MerchantRateLimit(merchant)))
     }
 
@@ -7400,15 +8471,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let ms_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !ms_config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Feature(FeatureKey::MerchantRateLimit(merchant)));
         Ok(())
     }
@@ -7429,39 +8498,34 @@ impl PaymentContract {
         let level = Self::get_merchant_verification_level(env.clone(), merchant.clone());
         let tier_limits_opt = Self::get_tier_limits(env.clone(), level);
 
-        let (max_tx, max_amt) = if let Some(tier_limits) = tier_limits_opt {
-            (tier_limits.tx_per_period, tier_limits.volume_limit)
-        } else if let Some(custom_limit) =
-            env.storage()
-                .instance()
-                .get::<_, MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
+        let (max_tx, max_amt) =
+            if let Some(tier_limits) = tier_limits_opt {
+                (tier_limits.tx_per_period, tier_limits.volume_limit)
+            } else if let Some(custom_limit) = env.store().get::<MerchantRateLimit>(
+                &DataKey::Feature(FeatureKey::MerchantRateLimit(merchant.clone())),
+            ) {
+                (
+                    custom_limit.max_transactions_per_hour,
+                    custom_limit.max_amount_per_hour,
+                )
+            } else {
+                // Fallback to global config
+                let config: Option<RateLimitConfig> = env
+                    .store()
+                    .get(&DataKey::Config(ConfigKey::RateLimitConfig));
+                if let Some(config) = config {
+                    if config.max_payment_amount > 0 && amount > config.max_payment_amount {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+        if let Some(l) =
+            env.store()
+                .get::<MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
                     merchant.clone(),
                 )))
-        {
-            (
-                custom_limit.max_transactions_per_hour,
-                custom_limit.max_amount_per_hour,
-            )
-        } else {
-            // Fallback to global config
-            let config: Option<RateLimitConfig> = env
-                .storage()
-                .instance()
-                .get(&DataKey::Config(ConfigKey::RateLimitConfig));
-            if let Some(config) = config {
-                if config.max_payment_amount > 0 && amount > config.max_payment_amount {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        if let Some(l) = env
-            .storage()
-            .instance()
-            .get::<_, MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
-                merchant.clone(),
-            )))
         {
             let now = env.ledger().timestamp();
             let reset_needed = l.window_start > 0 && now >= l.window_start + 3600;
@@ -7491,36 +8555,31 @@ impl PaymentContract {
         let level = Self::get_merchant_verification_level(env.clone(), merchant.clone());
         let tier_limits_opt = Self::get_tier_limits(env.clone(), level);
 
-        let (max_tx, max_amt) = if let Some(tier_limits) = tier_limits_opt {
-            (tier_limits.tx_per_period, tier_limits.volume_limit)
-        } else if let Some(custom_limit) =
-            env.storage()
-                .instance()
-                .get::<_, MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
-                    merchant.clone(),
-                )))
-        {
-            (
-                custom_limit.max_transactions_per_hour,
-                custom_limit.max_amount_per_hour,
-            )
-        } else {
-            let config: Option<RateLimitConfig> = env
-                .storage()
-                .instance()
-                .get(&DataKey::Config(ConfigKey::RateLimitConfig));
-            if let Some(config) = config {
-                if config.max_payment_amount > 0 && amount > config.max_payment_amount {
-                    return Err(Error::Basic(BasicError::AmountExceedsLimit));
+        let (max_tx, max_amt) =
+            if let Some(tier_limits) = tier_limits_opt {
+                (tier_limits.tx_per_period, tier_limits.volume_limit)
+            } else if let Some(custom_limit) = env.store().get::<MerchantRateLimit>(
+                &DataKey::Feature(FeatureKey::MerchantRateLimit(merchant.clone())),
+            ) {
+                (
+                    custom_limit.max_transactions_per_hour,
+                    custom_limit.max_amount_per_hour,
+                )
+            } else {
+                let config: Option<RateLimitConfig> = env
+                    .store()
+                    .get(&DataKey::Config(ConfigKey::RateLimitConfig));
+                if let Some(config) = config {
+                    if config.max_payment_amount > 0 && amount > config.max_payment_amount {
+                        return Err(Error::Basic(BasicError::AmountExceedsLimit));
+                    }
                 }
-            }
-            return Ok(());
-        };
+                return Ok(());
+            };
 
         let mut limit = env
-            .storage()
-            .instance()
-            .get::<_, MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
+            .store()
+            .get::<MerchantRateLimit>(&DataKey::Feature(FeatureKey::MerchantRateLimit(
                 merchant.clone(),
             )))
             .unwrap_or(MerchantRateLimit {
@@ -7558,7 +8617,7 @@ impl PaymentContract {
 
         limit.current_transactions += 1;
         limit.current_amount += amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::MerchantRateLimit(merchant.clone())),
             &limit,
         );
@@ -7627,24 +8686,22 @@ impl PaymentContract {
         match proposal.action_type {
             ActionType::CompletePayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_complete_payment(env, payment_id)?;
+                PaymentContract::do_complete_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::RefundPayment => {
                 let payment_id = PaymentContract::read_u64_from_bytes(&proposal.data, 0);
-                PaymentContract::do_refund_payment(env, payment_id)?;
+                PaymentContract::do_refund_payment(env, payment_id, proposal.proposer.clone())?;
             }
             ActionType::AddAdmin => {
                 let new_admin = proposal.target.clone();
                 let mut config: MultiSigConfig = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Config(ConfigKey::MultiSigConfig))
                     .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
                 if !config.admins.contains(&new_admin) {
                     config.admins.push_back(new_admin.clone());
                     config.total_admins += 1;
-                    env.storage()
-                        .instance()
+                    env.store()
                         .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
                     (AdminAdded { admin: new_admin }).publish(env);
                 }
@@ -7652,8 +8709,7 @@ impl PaymentContract {
             ActionType::RemoveAdmin => {
                 let admin_to_remove = proposal.target.clone();
                 let mut config: MultiSigConfig = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Config(ConfigKey::MultiSigConfig))
                     .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
                 if config.total_admins <= config.required_signatures {
@@ -7667,8 +8723,7 @@ impl PaymentContract {
                 }
                 config.admins = new_admins;
                 config.total_admins -= 1;
-                env.storage()
-                    .instance()
+                env.store()
                     .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
                 (AdminRemoved {
                     admin: admin_to_remove,
@@ -7678,17 +8733,20 @@ impl PaymentContract {
             ActionType::UpdateRequiredSignatures => {
                 let required = PaymentContract::read_u64_from_bytes(&proposal.data, 0) as u32;
                 let mut config: MultiSigConfig = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Config(ConfigKey::MultiSigConfig))
                     .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
                 if required == 0 || required > config.total_admins {
                     return Err(Error::Basic(BasicError::InsufficientAdmins));
                 }
                 config.required_signatures = required;
-                env.storage()
-                    .instance()
+                env.store()
                     .set(&DataKey::Config(ConfigKey::MultiSigConfig), &config);
+            }
+            ActionType::UpgradeContract => {
+                let hash = BytesN::<32>::try_from(proposal.data.clone())
+                    .map_err(|_| Error::Basic(BasicError::Unauthorized))?;
+                PaymentContract::do_upgrade(env, hash, proposal.proposer.clone());
             }
             _ => {}
         }
@@ -7701,8 +8759,7 @@ impl PaymentContract {
     pub fn set_fee_config(env: Env, admin: Address, fee_config: FeeConfig) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -7713,16 +8770,14 @@ impl PaymentContract {
             treasury: fee_config.treasury.clone(),
         })
         .publish(&env);
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::FeeConfig), &fee_config);
         Ok(())
     }
 
     /// Returns the current fee configuration.
     pub fn get_fee_config(env: Env) -> Result<FeeConfig, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))
     }
@@ -7739,23 +8794,20 @@ impl PaymentContract {
         Self::require_not_paused(&env, "set_max_forward_depth")?;
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::MaxForwardDepth), &max_depth);
         Ok(())
     }
 
     /// Returns the maximum forward chain depth.
     pub fn get_max_forward_depth(env: Env) -> u32 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
             .unwrap_or(5)
     }
@@ -7768,10 +8820,7 @@ impl PaymentContract {
         customer: Address,
         currency: Currency,
     ) -> i128 {
-        let config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         let config = match config {
             None => {
                 return 0;
@@ -7819,8 +8868,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -7834,7 +8882,7 @@ impl PaymentContract {
         if PaymentContract::tier_rank(&tier) < PaymentContract::tier_rank(&old_tier) {
             record.tier_volume_baseline = record.total_volume;
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::FeeRecord(merchant)),
             &record,
         );
@@ -7854,8 +8902,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -7863,16 +8910,14 @@ impl PaymentContract {
         }
 
         PaymentContract::validate_thresholds(&thresholds)?;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::TierThresholds), &thresholds);
         Ok(())
     }
 
     /// Returns the total fees accumulated in the contract.
     pub fn get_accumulated_fees(env: Env) -> i128 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0)
     }
@@ -7881,21 +8926,18 @@ impl PaymentContract {
     pub fn withdraw_fees(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
         admin.require_auth();
         let multisig: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         let fee_config: FeeConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
         let accumulated: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0);
         if amount > accumulated {
@@ -7907,7 +8949,7 @@ impl PaymentContract {
             &fee_config.treasury,
             &amount,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated - amount),
         );
@@ -7930,10 +8972,7 @@ impl PaymentContract {
         customer: &Address,
         currency: Currency,
     ) -> (i128, i128) {
-        let config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         let config = match config {
             None => {
                 return (amount, 0);
@@ -7975,11 +9014,10 @@ impl PaymentContract {
 
         // Update accumulated fees
         let accumulated: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated + fee),
         );
@@ -8048,14 +9086,11 @@ impl PaymentContract {
     /// components: large amount, new customer (fewer than 3 prior payments),
     /// and high-risk currency (BTC/ETH).
     fn risk_surcharge_bps(env: &Env, customer: &Address, amount: i128, currency: &Currency) -> u32 {
-        let config: RiskFeeConfig = match env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
-        {
-            Some(c) => c,
-            None => return 0,
-        };
+        let config: RiskFeeConfig =
+            match env.store().get(&DataKey::Config(ConfigKey::RiskFeeConfig)) {
+                Some(c) => c,
+                None => return 0,
+            };
 
         let mut surcharge: u32 = 0;
 
@@ -8064,8 +9099,7 @@ impl PaymentContract {
         }
 
         let customer_payment_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
                 customer.clone(),
             )))
@@ -8093,8 +9127,7 @@ impl PaymentContract {
     }
 
     fn get_or_default_merchant_fee_record(env: &Env, merchant: Address) -> MerchantFeeRecord {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::FeeRecord(
                 merchant.clone(),
             )))
@@ -8115,8 +9148,7 @@ impl PaymentContract {
     }
 
     fn get_stored_or_default_thresholds(env: &Env) -> Vec<(FeeTier, i128)> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::TierThresholds))
             .unwrap_or_else(|| {
                 let defaults = PaymentContract::default_tier_thresholds_for_volume();
@@ -8221,7 +9253,7 @@ impl PaymentContract {
             .publish(env);
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::FeeRecord(merchant)),
             &record,
         );
@@ -8253,8 +9285,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -8275,7 +9306,7 @@ impl PaymentContract {
             granted_by: admin.clone(),
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::FeeWaiver(merchant.clone())),
             &waiver,
         );
@@ -8304,8 +9335,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -8315,16 +9345,14 @@ impl PaymentContract {
 
         // Check if waiver exists
         let _waiver: FeeWaiver = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::FeeWaiver(
                 merchant.clone(),
             )))
             .ok_or(Error::Payment(PaymentError::NotFound))?; // Reuse existing error
 
         // Remove the waiver
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Customer(CustomerDataKey::FeeWaiver(
                 merchant.clone(),
             )));
@@ -8349,8 +9377,7 @@ impl PaymentContract {
     /// `Some(FeeWaiver)` if a valid waiver exists, `None` otherwise.
     pub fn get_fee_waiver(env: Env, merchant: Address) -> Option<FeeWaiver> {
         let waiver: Option<FeeWaiver> =
-            env.storage()
-                .instance()
+            env.store()
                 .get(&DataKey::Customer(CustomerDataKey::FeeWaiver(
                     merchant.clone(),
                 )));
@@ -8359,8 +9386,7 @@ impl PaymentContract {
         if let Some(w) = waiver {
             if env.ledger().timestamp() > w.valid_until {
                 // Remove expired waiver and publish expiration event
-                env.storage()
-                    .instance()
+                env.store()
                     .remove(&DataKey::Customer(CustomerDataKey::FeeWaiver(
                         merchant.clone(),
                     )));
@@ -8386,10 +9412,7 @@ impl PaymentContract {
     /// The effective fee in basis points.
     pub fn get_effective_fee_bps(env: Env, merchant: Address) -> u32 {
         // Get base fee configuration
-        let config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         let config = match config {
             None => return 0,
             Some(c) if !c.active => return 0,
@@ -8430,15 +9453,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let multisig: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::FeeRebateConfig), &config);
         Ok(())
     }
@@ -8451,8 +9472,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(MerchantRebateAccrual)` if accrual data exists, `None` otherwise.
     pub fn get_rebate_accrual(env: Env, merchant: Address) -> Option<MerchantRebateAccrual> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::RebateAccrual(merchant)))
     }
 
@@ -8474,8 +9494,7 @@ impl PaymentContract {
         merchant.require_auth();
 
         let config: FeeRebateConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::FeeRebateConfig))
             .ok_or(Error::Feature(FeatureError::RebateConfigNotFound))?;
 
@@ -8484,8 +9503,7 @@ impl PaymentContract {
         }
 
         let accrual: MerchantRebateAccrual = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::RebateAccrual(
                 merchant.clone(),
             )))
@@ -8499,18 +9517,16 @@ impl PaymentContract {
 
         // Deduct from accumulated fees and transfer to merchant
         let accumulated: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated - rebate),
         );
 
         let fee_config: FeeConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
         let token_client = token::Client::new(&env, &fee_config.fee_token);
@@ -8523,7 +9539,7 @@ impl PaymentContract {
             period_start: accrual.period_start,
             period_volume: accrual.period_volume,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::RebateAccrual(merchant)),
             &reset,
         );
@@ -8538,8 +9554,7 @@ impl PaymentContract {
         fee_amount: i128,
     ) {
         let config: Option<FeeRebateConfig> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::FeeRebateConfig));
         let config = match config {
             Some(c) if c.active => c,
@@ -8549,8 +9564,7 @@ impl PaymentContract {
         let now = env.ledger().timestamp();
 
         let mut accrual: MerchantRebateAccrual = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::RebateAccrual(
                 merchant.clone(),
             )))
@@ -8576,7 +9590,7 @@ impl PaymentContract {
             accrual.accrued_rebate += rebate;
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::RebateAccrual(merchant)),
             &accrual,
         );
@@ -8682,8 +9696,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -8695,7 +9708,7 @@ impl PaymentContract {
         let mut results = Vec::new(&env);
 
         for payment_id in payment_ids.iter() {
-            let result = PaymentContract::do_complete_payment(&env, payment_id);
+            let result = PaymentContract::do_complete_payment(&env, payment_id, admin.clone());
 
             match result {
                 Ok(()) => {
@@ -8794,8 +9807,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -8886,8 +9898,7 @@ impl PaymentContract {
 
             // Create payment record
             let counter: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Payment(PaymentKey::Counter))
                 .unwrap_or(0);
             let payment_id = counter + 1;
@@ -8914,49 +9925,51 @@ impl PaymentContract {
                 refunded_amount: 0,
             };
 
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+            PaymentContract::record_status_change(
+                &env,
+                payment_id,
+                PaymentStatus::Pending,
+                entry.customer.clone(),
+            );
 
             // Index by customer
             let customer_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
                     entry.customer.clone(),
                 )))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::Payments(
                     entry.customer.clone(),
                     customer_count,
                 )),
                 &payment_id,
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::PaymentCount(entry.customer.clone())),
                 &(customer_count + 1),
             );
 
             // Index by merchant
             let merchant_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
                     entry.merchant.clone(),
                 )))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::Payments(
                     entry.merchant.clone(),
                     merchant_count,
                 )),
                 &payment_id,
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::PaymentCount(entry.merchant.clone())),
                 &(merchant_count + 1),
             );
@@ -8966,15 +9979,14 @@ impl PaymentContract {
                 const PAGE_SIZE: u64 = 100;
                 let page_num = merchant_count / PAGE_SIZE;
                 let mut page: Vec<u64> = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                         entry.merchant.clone(),
                         page_num,
                     )))
                     .unwrap_or_else(|| Vec::new(&env));
                 page.push_back(payment_id);
-                env.storage().instance().set(
+                env.store().set(
                     &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                         entry.merchant.clone(),
                         page_num,
@@ -8987,7 +9999,7 @@ impl PaymentContract {
             // the risk surcharge), finality-delay hold, payment forwarding,
             // loyalty accrual, fee-rebate accrual, auto-escrow and analytics
             // are all applied — identical to a normal payment completion.
-            match PaymentContract::do_complete_payment(&env, payment_id) {
+            match PaymentContract::do_complete_payment(&env, payment_id, admin.clone()) {
                 Ok(()) => results.push_back(BatchResult {
                     payment_id,
                     success: true,
@@ -9085,7 +10097,7 @@ impl PaymentContract {
             evaluated_at: None,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ConditionalPayment(payment_id)),
             &conditional_payment,
         );
@@ -9124,8 +10136,7 @@ impl PaymentContract {
     /// oracle/cross-contract evaluation fails.
     pub fn evaluate_condition(env: Env, payment_id: u64) -> Result<bool, Error> {
         let mut conditional_payment: ConditionalPayment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::ConditionalPayment(
                 payment_id,
             )))
@@ -9162,7 +10173,7 @@ impl PaymentContract {
         conditional_payment.condition_met = condition_met;
         conditional_payment.evaluated_at = Some(current_timestamp);
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::ConditionalPayment(payment_id)),
             &conditional_payment,
         );
@@ -9200,8 +10211,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -9210,8 +10220,7 @@ impl PaymentContract {
 
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -9219,8 +10228,7 @@ impl PaymentContract {
 
         // Check if conditional payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::ConditionalPayment(
                 payment_id,
             )))
@@ -9245,7 +10253,7 @@ impl PaymentContract {
         }
 
         // Complete the payment
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        PaymentContract::do_complete_payment(&env, payment_id, admin)?;
 
         Ok(())
     }
@@ -9267,8 +10275,7 @@ impl PaymentContract {
     /// or the condition is not met.
     pub fn execute_if_condition_met(env: Env, payment_id: u64) -> Result<(), Error> {
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::ConditionalPayment(
                 payment_id,
             )))
@@ -9287,7 +10294,8 @@ impl PaymentContract {
         if !condition_met {
             return Err(Error::Feature(FeatureError::ConditionNotMet));
         }
-        PaymentContract::do_complete_payment(&env, payment_id)
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())
     }
 
     /// Retrieves the conditional payment record for a given payment ID.
@@ -9301,8 +10309,7 @@ impl PaymentContract {
     /// # Errors
     /// Returns `PaymentError::NotFound` if no conditional payment exists.
     pub fn get_conditional_payment(env: Env, payment_id: u64) -> Result<ConditionalPayment, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::ConditionalPayment(
                 payment_id,
             )))
@@ -9317,8 +10324,7 @@ impl PaymentContract {
     /// A `PaymentAnalytics` struct with aggregate counts and volume totals.
     /// Returns zeroed defaults if no analytics data has been recorded.
     pub fn get_payment_analytics(env: Env) -> PaymentAnalytics {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -9341,8 +10347,7 @@ impl PaymentContract {
     /// A `MerchantAnalytics` struct with per-merchant payment counts and volume.
     /// Returns zeroed defaults if no analytics data exists for this merchant.
     pub fn get_merchant_analytics(env: Env, merchant: Address) -> MerchantAnalytics {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(merchant)))
             .unwrap_or(MerchantAnalytics {
                 total_payments: 0,
@@ -9373,8 +10378,7 @@ impl PaymentContract {
     /// # Returns
     /// A `CustomerAnalytics` struct with payment counts, volume, and behavioral metrics.
     pub fn get_customer_analytics(env: Env, customer: Address) -> CustomerAnalytics {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::Analytics(customer)))
             .unwrap_or(PaymentContract::default_customer_analytics())
     }
@@ -9394,8 +10398,7 @@ impl PaymentContract {
         limit: u32,
     ) -> Vec<(Address, i128)> {
         let count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::MerchantCount(
                 customer.clone(),
             )))
@@ -9404,16 +10407,14 @@ impl PaymentContract {
         let mut pairs: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..count {
             if let Some(merchant) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, Address>(&DataKey::Customer(CustomerDataKey::MerchantList(
+                env.store()
+                    .get::<Address>(&DataKey::Customer(CustomerDataKey::MerchantList(
                         customer.clone(),
                         i,
                     )))
             {
                 let vol: i128 = env
-                    .storage()
-                    .instance()
+                    .store()
                     .get(&DataKey::Customer(CustomerDataKey::MerchantVolume(
                         customer.clone(),
                         merchant.clone(),
@@ -9460,8 +10461,7 @@ impl PaymentContract {
     /// # Returns
     /// Volume as `i128` for the specified month. Returns 0 if no data exists.
     pub fn get_customer_monthly_volume(env: Env, customer: Address, month_timestamp: u64) -> i128 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Customer(CustomerDataKey::MonthlyVolume(
                 customer,
                 month_timestamp,
@@ -9493,13 +10493,9 @@ impl PaymentContract {
         let mut out = Vec::new(&env);
         let mut bucket_start = PaymentContract::hour_bucket_start(from);
         while bucket_start < to {
-            if let Some(bucket) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, AnalyticsBucket>(&DataKey::Merchant(
-                        MerchantDataKey::AnalyticsBucket(merchant.clone(), bucket_start),
-                    ))
-            {
+            if let Some(bucket) = env.store().get::<AnalyticsBucket>(&DataKey::Merchant(
+                MerchantDataKey::AnalyticsBucket(merchant.clone(), bucket_start),
+            )) {
                 out.push_back(bucket);
             }
             bucket_start += 3600;
@@ -9516,8 +10512,7 @@ impl PaymentContract {
     /// An `AnalyticsBucket` with aggregated daily metrics (payments, volume, refunds, failures).
     pub fn get_platform_analytics_daily(env: Env, day_timestamp: u64) -> AnalyticsBucket {
         let day_start = PaymentContract::day_bucket_start(day_timestamp);
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::PlatformAnalyticsDaily(
                 day_start,
             )))
@@ -9541,16 +10536,14 @@ impl PaymentContract {
     /// sorted by descending volume.
     pub fn get_top_merchants_by_volume(env: Env, limit: u32) -> Vec<(Address, i128)> {
         let count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::GlobalMerchantCount))
             .unwrap_or(0);
         let mut pairs: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..count {
             if let Some(merchant) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Address>(&DataKey::Merchant(MerchantDataKey::GlobalList(i)))
+                .store()
+                .get::<Address>(&DataKey::Merchant(MerchantDataKey::GlobalList(i)))
             {
                 let analytics =
                     PaymentContract::get_merchant_analytics(env.clone(), merchant.clone());
@@ -9603,8 +10596,7 @@ impl PaymentContract {
     ) {
         let bucket_start = PaymentContract::hour_bucket_start(ts);
         let mut bucket: AnalyticsBucket = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::AnalyticsBucket(
                 merchant.clone(),
                 bucket_start,
@@ -9621,7 +10613,7 @@ impl PaymentContract {
         bucket.total_volume += volume_delta;
         bucket.total_refunds += refund_delta;
         bucket.failed_count += failed_delta;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::AnalyticsBucket(merchant, bucket_start)),
             &bucket,
         );
@@ -9636,8 +10628,7 @@ impl PaymentContract {
     ) {
         let day_start = PaymentContract::day_bucket_start(ts);
         let mut bucket: AnalyticsBucket = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PlatformAnalyticsDaily(
                 day_start,
             )))
@@ -9655,7 +10646,7 @@ impl PaymentContract {
         bucket.total_volume += volume_delta;
         bucket.total_refunds += refund_delta;
         bucket.failed_count += failed_delta;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PlatformAnalyticsDaily(day_start)),
             &bucket,
         );
@@ -9694,8 +10685,7 @@ impl PaymentContract {
     pub fn pause_contract(env: Env, admin: Address, reason: String) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -9703,9 +10693,8 @@ impl PaymentContract {
         }
         let now = env.ledger().timestamp();
         let pause_state = if let Some(mut state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             state.globally_paused = true;
             state.paused_at = now;
@@ -9721,12 +10710,10 @@ impl PaymentContract {
                 pause_reason: reason.clone(),
             }
         };
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::PauseStateKey), &pause_state);
         let history_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::PauseHistoryCount))
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -9737,11 +10724,11 @@ impl PaymentContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryEntry(history_count)),
             &entry,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryCount),
             &(history_count + 1),
         );
@@ -9770,27 +10757,23 @@ impl PaymentContract {
     pub fn unpause_contract(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         if let Some(mut state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             state.globally_paused = false;
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Config(ConfigKey::PauseStateKey), &state);
         }
         let now = env.ledger().timestamp();
         let history_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::PauseHistoryCount))
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -9801,11 +10784,11 @@ impl PaymentContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryEntry(history_count)),
             &entry,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryCount),
             &(history_count + 1),
         );
@@ -9840,8 +10823,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -9849,9 +10831,8 @@ impl PaymentContract {
         }
         let now = env.ledger().timestamp();
         let mut pause_state = if let Some(state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             state
         } else {
@@ -9869,12 +10850,10 @@ impl PaymentContract {
                 .paused_functions
                 .push_back(function_name.clone());
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::PauseStateKey), &pause_state);
         let history_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::PauseHistoryCount))
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -9885,11 +10864,11 @@ impl PaymentContract {
             changed_at: now,
             reason: reason.clone(),
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryEntry(history_count)),
             &entry,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryCount),
             &(history_count + 1),
         );
@@ -9919,17 +10898,15 @@ impl PaymentContract {
     pub fn unpause_function(env: Env, admin: Address, function_name: String) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         if let Some(mut state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             let mut new_paused = Vec::new(&env);
             for fn_name in state.paused_functions.iter() {
@@ -9938,14 +10915,12 @@ impl PaymentContract {
                 }
             }
             state.paused_functions = new_paused;
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Config(ConfigKey::PauseStateKey), &state);
         }
         let now = env.ledger().timestamp();
         let history_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::PauseHistoryCount))
             .unwrap_or(0);
         let entry = PauseHistory {
@@ -9956,11 +10931,11 @@ impl PaymentContract {
             changed_at: now,
             reason: String::from_str(&env, ""),
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryEntry(history_count)),
             &entry,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::PauseHistoryCount),
             &(history_count + 1),
         );
@@ -9976,14 +10951,13 @@ impl PaymentContract {
     pub fn pause_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::MerchantPaused(merchant.clone())),
             &true,
         );
@@ -9994,15 +10968,13 @@ impl PaymentContract {
     pub fn unpause_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
                 merchant,
             )));
@@ -10015,8 +10987,7 @@ impl PaymentContract {
     /// A `PauseState` struct indicating whether the contract is globally paused,
     /// which individual functions are paused, and who/when it was paused.
     pub fn get_pause_state(env: Env) -> PauseState {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::PauseStateKey))
             .unwrap_or(PauseState {
                 globally_paused: false,
@@ -10039,9 +11010,8 @@ impl PaymentContract {
     /// `true` if the function is paused, `false` otherwise.
     pub fn is_function_paused(env: Env, function_name: String) -> bool {
         if let Some(state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             if state.globally_paused {
                 return true;
@@ -10087,8 +11057,7 @@ impl PaymentContract {
 
         // Verify caller is admin
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -10104,7 +11073,7 @@ impl PaymentContract {
             escrow_contract,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AutoEscrowRule(merchant)),
             &rule,
         );
@@ -10120,8 +11089,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(AutoEscrowRule)` if a rule exists, `None` otherwise.
     pub fn get_auto_escrow_rule(env: Env, merchant: Address) -> Option<AutoEscrowRule> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::AutoEscrowRule(merchant)))
     }
 
@@ -10147,8 +11115,7 @@ impl PaymentContract {
 
         // Verify caller is admin
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -10157,8 +11124,7 @@ impl PaymentContract {
 
         // Check if rule exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::AutoEscrowRule(
                 merchant.clone(),
             )))
@@ -10166,8 +11132,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::AutoEscrowRuleNotFound));
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::State(StateDataKey::AutoEscrowRule(merchant)));
 
         Ok(())
@@ -10192,8 +11157,7 @@ impl PaymentContract {
     /// rule would carve out of `payment` for escrow, or 0 if no rule applies.
     fn get_auto_escrow_carveout(env: &Env, payment: &Payment) -> i128 {
         if env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::AutoEscrowTriggered(
                 payment.id,
             )))
@@ -10201,15 +11165,15 @@ impl PaymentContract {
             return 0;
         }
 
-        let rule = match env
-            .storage()
-            .instance()
-            .get::<DataKey, AutoEscrowRule>(&DataKey::State(StateDataKey::AutoEscrowRule(
-                payment.merchant.clone(),
-            ))) {
-            Some(rule) => rule,
-            None => return 0,
-        };
+        let rule =
+            match env
+                .store()
+                .get::<AutoEscrowRule>(&DataKey::State(StateDataKey::AutoEscrowRule(
+                    payment.merchant.clone(),
+                ))) {
+                Some(rule) => rule,
+                None => return 0,
+            };
 
         if !rule.active || payment.amount < rule.min_amount || payment.token != rule.token {
             return 0;
@@ -10221,8 +11185,7 @@ impl PaymentContract {
     pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -10232,8 +11195,7 @@ impl PaymentContract {
 
         // Check if auto-escrow already triggered for this payment
         if env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::AutoEscrowTriggered(
                 payment_id,
             )))
@@ -10243,9 +11205,8 @@ impl PaymentContract {
 
         // Get auto-escrow rule for merchant
         let rule = env
-            .storage()
-            .instance()
-            .get::<DataKey, AutoEscrowRule>(&DataKey::State(StateDataKey::AutoEscrowRule(
+            .store()
+            .get::<AutoEscrowRule>(&DataKey::State(StateDataKey::AutoEscrowRule(
                 payment.merchant.clone(),
             )))
             .ok_or(Error::Feature(FeatureError::AutoEscrowRuleNotFound))?;
@@ -10289,7 +11250,7 @@ impl PaymentContract {
         );
 
         // Mark escrow as triggered for this payment
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::AutoEscrowTriggered(payment_id)),
             &escrow_id,
         );
@@ -10309,8 +11270,7 @@ impl PaymentContract {
 
     fn require_merchant_not_paused(env: &Env, merchant: &Address) -> Result<(), Error> {
         let merchant_paused: bool = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
                 merchant.clone(),
             )))
@@ -10323,9 +11283,8 @@ impl PaymentContract {
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
         if let Some(state) = env
-            .storage()
-            .instance()
-            .get::<DataKey, PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
+            .store()
+            .get::<PauseState>(&DataKey::Config(ConfigKey::PauseStateKey))
         {
             if state.globally_paused {
                 return Err(Error::Basic(BasicError::ContractPaused));
@@ -10361,8 +11320,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -10370,7 +11328,7 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::NotAnAdmin));
         }
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Config(ConfigKey::LargePaymentThreshold),
             &threshold,
         );
@@ -10389,8 +11347,7 @@ impl PaymentContract {
     /// # Returns
     /// The threshold amount as `i128`. A value of 0 means multi-sig is disabled.
     pub fn get_large_payment_threshold(env: Env) -> i128 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Config(ConfigKey::LargePaymentThreshold))
             .unwrap_or(0) // Default threshold of 0 disables multi-sig requirement
     }
@@ -10420,8 +11377,7 @@ impl PaymentContract {
 
         // Verify payment exists and belongs to merchant
         let payment: Payment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
 
@@ -10437,19 +11393,17 @@ impl PaymentContract {
 
         // Check if proposal already exists
         if env
-            .storage()
-            .instance()
-            .get::<DataKey, LargePaymentProposal>(&DataKey::State(
-                StateDataKey::LargePaymentProposal(payment_id),
-            ))
+            .store()
+            .get::<LargePaymentProposal>(&DataKey::State(StateDataKey::LargePaymentProposal(
+                payment_id,
+            )))
             .is_some()
         {
             return Err(Error::Payment(PaymentError::AlreadyProcessed));
         }
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -10468,7 +11422,7 @@ impl PaymentContract {
             executed: false,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::LargePaymentProposal(payment_id)),
             &proposal,
         );
@@ -10507,8 +11461,7 @@ impl PaymentContract {
         approver.require_auth();
 
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
@@ -10517,8 +11470,7 @@ impl PaymentContract {
         }
 
         let mut proposal: LargePaymentProposal = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::LargePaymentProposal(
                 payment_id,
             )))
@@ -10538,7 +11490,7 @@ impl PaymentContract {
 
         proposal.approvals.push_back(approver.clone());
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::LargePaymentProposal(payment_id)),
             &proposal,
         );
@@ -10570,14 +11522,12 @@ impl PaymentContract {
     /// approvals, or the payment is not in pending status.
     pub fn execute_large_payment(env: Env, payment_id: u64) -> Result<(), Error> {
         // Ensure multi-sig has been initialised.
-        env.storage()
-            .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::Config(ConfigKey::MultiSigConfig))
+        env.store()
+            .get::<MultiSigConfig>(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
 
         let mut proposal: LargePaymentProposal = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::State(StateDataKey::LargePaymentProposal(
                 payment_id,
             )))
@@ -10596,8 +11546,7 @@ impl PaymentContract {
         }
 
         let payment: Payment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
 
@@ -10608,10 +11557,11 @@ impl PaymentContract {
         // Run the same completion path as a normal payment: platform fee
         // deduction (incl. risk surcharge), finality-delay hold, payment
         // forwarding, loyalty/rebate accrual, auto-escrow and analytics.
-        PaymentContract::do_complete_payment(&env, payment_id)?;
+        // Permissionless execution: the contract itself is the recorded actor.
+        PaymentContract::do_complete_payment(&env, payment_id, env.current_contract_address())?;
 
         proposal.executed = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::LargePaymentProposal(payment_id)),
             &proposal,
         );
@@ -10632,8 +11582,7 @@ impl PaymentContract {
     /// # Panics
     /// Panics if no proposal exists for the given payment ID.
     pub fn get_large_payment_proposal(env: Env, payment_id: u64) -> LargePaymentProposal {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::State(StateDataKey::LargePaymentProposal(
                 payment_id,
             )))
@@ -10655,8 +11604,7 @@ impl PaymentContract {
 
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -10665,19 +11613,14 @@ impl PaymentContract {
         let payment = PaymentContract::get_payment(&env, payment_id);
 
         // Verify caller is customer, merchant, or admin
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::Admin))
-            .unwrap();
+        let admin: Address = env.store().get(&DataKey::Config(ConfigKey::Admin)).unwrap();
         if caller != payment.customer && caller != payment.merchant && caller != admin {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
         // Check if metadata already exists
         let existing_metadata: Option<PaymentMetadata> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Metadata(payment_id)));
 
         if let Some(existing) = existing_metadata {
@@ -10692,7 +11635,7 @@ impl PaymentContract {
                 version: new_version,
             };
 
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Payment(PaymentKey::Metadata(payment_id)),
                 &updated_metadata,
             );
@@ -10715,7 +11658,7 @@ impl PaymentContract {
                 version: 1,
             };
 
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Payment(PaymentKey::Metadata(payment_id)),
                 &metadata,
             );
@@ -10734,8 +11677,7 @@ impl PaymentContract {
 
     /// Get payment metadata
     pub fn get_payment_metadata(env: Env, payment_id: u64) -> Option<PaymentMetadata> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::Metadata(payment_id)))
     }
 
@@ -10747,8 +11689,7 @@ impl PaymentContract {
         plaintext_hash: BytesN<32>,
     ) -> bool {
         let metadata: Option<PaymentMetadata> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Metadata(payment_id)));
 
         match metadata {
@@ -10770,8 +11711,7 @@ impl PaymentContract {
 
         // Check if payment exists
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
         {
             return Err(Error::Payment(PaymentError::NotFound));
@@ -10780,19 +11720,14 @@ impl PaymentContract {
         let payment = PaymentContract::get_payment(&env, payment_id);
 
         // Verify caller is customer, merchant, or admin
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::Admin))
-            .unwrap();
+        let admin: Address = env.store().get(&DataKey::Config(ConfigKey::Admin)).unwrap();
         if caller != payment.customer && caller != payment.merchant && caller != admin {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
         // Check if memo already exists
         let existing_memo: Option<PaymentMemo> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Memo(payment_id)));
 
         let current_time = env.ledger().timestamp();
@@ -10800,8 +11735,7 @@ impl PaymentContract {
         if let Some(existing) = existing_memo {
             // Archive current version into sliding-window history (capped at MAX_MEMO_VERSIONS)
             let mut history: Vec<PaymentMemo> = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Payment(PaymentKey::MemoVersion(payment_id)))
                 .unwrap_or_else(|| Vec::new(&env));
             if history.len() >= MAX_MEMO_VERSIONS {
@@ -10813,7 +11747,7 @@ impl PaymentContract {
                 history = trimmed;
             }
             history.push_back(existing.clone());
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Payment(PaymentKey::MemoVersion(payment_id)),
                 &history,
             );
@@ -10839,7 +11773,7 @@ impl PaymentContract {
                 created_by: existing.created_by,
             };
 
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Payment(PaymentKey::Memo(payment_id)),
                 &updated_memo,
             );
@@ -10871,8 +11805,7 @@ impl PaymentContract {
                 created_by: caller.clone(),
             };
 
-            env.storage()
-                .instance()
+            env.store()
                 .set(&DataKey::Payment(PaymentKey::Memo(payment_id)), &memo);
 
             PaymentMemoSet {
@@ -10888,8 +11821,7 @@ impl PaymentContract {
 
     /// Get payment memo
     pub fn get_payment_memo(env: Env, payment_id: u64) -> Option<PaymentMemo> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::Memo(payment_id)))
     }
 
@@ -10897,8 +11829,7 @@ impl PaymentContract {
     /// Returns true if hashes match, false otherwise
     pub fn verify_memo_integrity(env: Env, payment_id: u64, plaintext_hash: BytesN<32>) -> bool {
         let memo: Option<PaymentMemo> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Memo(payment_id)));
 
         match memo {
@@ -10915,8 +11846,7 @@ impl PaymentContract {
         expected_reference_hash: BytesN<32>,
     ) -> bool {
         let memo: Option<PaymentMemo> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Memo(payment_id)));
 
         match memo {
@@ -10946,8 +11876,7 @@ impl PaymentContract {
         currency: Currency,
     ) -> u32 {
         let config: RiskFeeConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
             .unwrap_or(RiskFeeConfig {
                 base_fee_bps: 100,                 // 1%
@@ -10966,8 +11895,7 @@ impl PaymentContract {
 
         // New customer risk (simplified - in production would check payment history)
         let customer_payment_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(customer)))
             .unwrap_or(0);
         if customer_payment_count < 3 {
@@ -11006,8 +11934,7 @@ impl PaymentContract {
         currency: Currency,
     ) -> u32 {
         let risk_config: RiskFeeConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
             .unwrap_or(RiskFeeConfig {
                 base_fee_bps: 100, // 1%
@@ -11016,10 +11943,7 @@ impl PaymentContract {
                 new_customer_surcharge_bps: 100,
                 high_risk_currency_surcharge: 200,
             });
-        let fee_config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let fee_config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         let base_fee_bps = fee_config.map_or(risk_config.base_fee_bps, |cfg| cfg.fee_bps);
 
         let risk_surcharge = Self::calculate_risk_score(env, customer, merchant, amount, currency);
@@ -11054,8 +11978,7 @@ impl PaymentContract {
 
         // Verify admin is the contract admin
         let stored_admin = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::Admin))
             .expect("Admin not set");
         if admin != stored_admin {
@@ -11070,8 +11993,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::InvalidFeeConfig));
         }
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::RiskFeeConfig), &config);
         Ok(())
     }
@@ -11086,8 +12008,7 @@ impl PaymentContract {
         customer.require_auth();
 
         if !env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -11096,8 +12017,7 @@ impl PaymentContract {
         }
 
         let mut sub: Subscription = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Data(
                 subscription_id,
             )))
@@ -11108,7 +12028,7 @@ impl PaymentContract {
         }
 
         sub.pause_data.proration_enabled = enabled;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
@@ -11146,6 +12066,7 @@ impl PaymentContract {
         amount: i128,
         expires_at: u64,
         customer_pk: BytesN<32>,
+        challenge_window_seconds: u64,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "open_channel")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
@@ -11164,8 +12085,7 @@ impl PaymentContract {
         token_client.transfer(&customer, &contract_address, &amount);
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentChannelCounter))
             .unwrap_or(0);
         let channel_id = counter + 1;
@@ -11181,13 +12101,14 @@ impl PaymentContract {
             open: true,
             expires_at,
             customer_pk,
+            challenge_window_seconds,
         };
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
             &channel,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentChannelCounter),
             &channel_id,
         );
@@ -11234,8 +12155,7 @@ impl PaymentContract {
         }
 
         let mut channel: PaymentChannel = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
 
@@ -11257,7 +12177,7 @@ impl PaymentContract {
 
         channel.deposited += amount;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
             &channel,
         );
@@ -11272,11 +12192,11 @@ impl PaymentContract {
         Ok(())
     }
 
-    /// Settles a payment channel with a signed off-chain state update.
+    /// Initiates settlement of a payment channel with a signed off-chain state update.
     ///
-    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
-    /// transfers funds to the merchant and refunds the remainder to the customer,
-    /// then closes the channel.
+    /// Issue #678: Starts a challenge window during which either party may submit a
+    /// higher-nonce signed state. Call `finalize_settlement` after the window closes
+    /// to actually move funds.
     ///
     /// # Arguments
     /// * `channel_id` - The ID of the channel to settle.
@@ -11286,10 +12206,244 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Ok(())` on success.
+    pub fn initiate_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "initiate_settlement")?;
+
+        let channel: PaymentChannel = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::Feature(FeatureError::ChannelExpired));
+        }
+
+        if nonce <= channel.settled_nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        let now = env.ledger().timestamp();
+        let window_ends_at = now + channel.challenge_window_seconds;
+
+        // Check if there is already a pending settlement with a higher nonce
+        if let Some(existing) = env
+            .store()
+            .get::<PendingChannelSettlement>(&DataKey::Feature(
+                FeatureKey::PendingChannelSettlement(channel_id),
+            ))
+        {
+            if nonce <= existing.nonce {
+                return Err(Error::Feature(FeatureError::InvalidNonce));
+            }
+        }
+
+        let pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        };
+
+        env.store().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &pending,
+        );
+
+        (SettlementInitiated {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Challenges a pending settlement with a higher-nonce signed state.
     ///
-    /// # Errors
-    /// Returns an error if the channel is not found, closed, expired, nonce is stale,
-    /// amount exceeds deposit, or signature verification fails.
+    /// Issue #678: During the challenge window either party may submit a higher-nonce
+    /// signed state to replace the pending one.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel being challenged.
+    /// * `merchant_amount` - The new (higher-nonce) amount for the merchant.
+    /// * `nonce` - Must be strictly greater than the pending settlement's nonce.
+    /// * `signature` - Ed25519 signature from the customer.
+    pub fn challenge_settlement(
+        env: Env,
+        channel_id: u64,
+        merchant_amount: i128,
+        nonce: u64,
+        signature: BytesN<64>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "challenge_settlement")?;
+
+        let channel: PaymentChannel = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        let pending: PendingChannelSettlement = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now >= pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowClosed));
+        }
+
+        if nonce <= pending.nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // Verify signature over (channel_id, merchant_amount, nonce)
+        let mut msg = Bytes::new(&env);
+        msg.append(&channel_id.to_xdr(&env));
+        msg.append(&merchant_amount.to_xdr(&env));
+        msg.append(&nonce.to_xdr(&env));
+        env.crypto()
+            .ed25519_verify(&channel.customer_pk, &msg, &signature);
+
+        // Extend the window from now (reset the challenge clock)
+        let new_window_ends_at = now + channel.challenge_window_seconds;
+
+        let new_pending = PendingChannelSettlement {
+            channel_id,
+            merchant_amount,
+            nonce,
+            window_ends_at: new_window_ends_at,
+        };
+
+        env.store().set(
+            &DataKey::Feature(FeatureKey::PendingChannelSettlement(channel_id)),
+            &new_pending,
+        );
+
+        (SettlementChallenged {
+            channel_id,
+            new_nonce: nonce,
+            new_merchant_amount: merchant_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Finalizes a pending channel settlement after the challenge window has elapsed.
+    ///
+    /// Issue #678: Funds are only transferred when the challenge window has closed
+    /// without a successful challenge.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel to finalize.
+    pub fn finalize_settlement(env: Env, channel_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "finalize_settlement")?;
+
+        let mut channel: PaymentChannel = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        let pending: PendingChannelSettlement = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+            .ok_or(Error::Feature(FeatureError::NoPendingSettlement))?;
+
+        let now = env.ledger().timestamp();
+        if now < pending.window_ends_at {
+            return Err(Error::Feature(FeatureError::ChallengeWindowOpen));
+        }
+
+        let merchant_amount = pending.merchant_amount;
+        let customer_refund = channel.deposited - merchant_amount;
+
+        // Conservation check
+        if merchant_amount
+            .checked_add(customer_refund)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != channel.deposited
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if merchant_amount > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &merchant_amount);
+        }
+        if customer_refund > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &customer_refund);
+        }
+
+        channel.settled = merchant_amount;
+        channel.settled_nonce = pending.nonce;
+        channel.open = false;
+
+        env.store().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+        env.store()
+            .remove(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )));
+
+        (ChannelSettled {
+            channel_id,
+            merchant_amount,
+            customer_refund,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Legacy direct settlement (no challenge window) — kept for backward compatibility.
+    ///
+    /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
+    /// transfers funds to the merchant and refunds the remainder to the customer,
+    /// then closes the channel immediately.
     pub fn settle_channel(
         env: Env,
         channel_id: u64,
@@ -11300,8 +12454,7 @@ impl PaymentContract {
         Self::require_not_paused(&env, "settle_channel")?;
 
         let mut channel: PaymentChannel = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
 
@@ -11359,7 +12512,7 @@ impl PaymentContract {
         channel.settled_nonce = nonce;
         channel.open = false;
 
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
             &channel,
         );
@@ -11394,8 +12547,7 @@ impl PaymentContract {
         caller.require_auth();
 
         let mut channel: PaymentChannel = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
 
@@ -11420,7 +12572,7 @@ impl PaymentContract {
         }
 
         channel.open = false;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
             &channel,
         );
@@ -11445,10 +12597,198 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the channel is not found.
     pub fn get_channel(env: Env, channel_id: u64) -> Result<PaymentChannel, Error> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))
+    }
+
+    /// Retrieves the pending settlement for a channel (if any).
+    pub fn get_pending_settlement(env: Env, channel_id: u64) -> Option<PendingChannelSettlement> {
+        env.store()
+            .get(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )))
+    }
+
+    // ── SUBSCRIPTION: UPCOMING RENEWAL ANNOUNCEMENTS (Issue #679) ────────────
+
+    /// Emits `SubscriptionRenewalUpcoming` for each subscription due within `window_seconds`.
+    ///
+    /// Stores the last announced billing cycle per subscription to avoid duplicates.
+    /// Subscriptions not due within the window, or already announced for the current
+    /// cycle, emit nothing.
+    ///
+    /// # Arguments
+    /// * `ids` - Subscription IDs to check.
+    /// * `window_seconds` - How far ahead (in seconds from now) to look.
+    pub fn announce_upcoming_renewals(
+        env: Env,
+        ids: Vec<u64>,
+        window_seconds: u64,
+    ) -> Result<(), Error> {
+        let now = env.ledger().timestamp();
+        let window_end = now + window_seconds;
+
+        for subscription_id in ids.iter() {
+            let sub: Subscription =
+                match env
+                    .store()
+                    .get(&DataKey::Subscription(SubscriptionKey::Data(
+                        subscription_id,
+                    ))) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+            if sub.status != SubscriptionStatus::Active {
+                continue;
+            }
+
+            if sub.next_payment_at > window_end {
+                continue;
+            }
+
+            // Use the payment_count as the cycle identifier — it increments on each
+            // successful execution, so it uniquely identifies the upcoming cycle.
+            let upcoming_cycle = sub.payment_count + 1;
+
+            let last_announced: u64 = env
+                .store()
+                .get(&DataKey::Feature(
+                    FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id),
+                ))
+                .unwrap_or(0);
+
+            if last_announced >= upcoming_cycle {
+                // Already announced for this cycle
+                continue;
+            }
+
+            env.store().set(
+                &DataKey::Feature(FeatureKey::SubscriptionLastAnnouncedCycle(subscription_id)),
+                &upcoming_cycle,
+            );
+
+            (SubscriptionRenewalUpcoming {
+                subscription_id,
+                next_payment_at: sub.next_payment_at,
+                cycle: upcoming_cycle,
+            })
+            .publish(&env);
+        }
+
+        Ok(())
+    }
+
+    // ── SUBSCRIPTION: CHANGE PAYMENT TOKEN (Issue #680) ─────────────────────
+
+    /// Allows a customer to change the payment token for a subscription.
+    ///
+    /// The new token must be in the merchant's per-merchant allowed-token list
+    /// (or the global allowed list if no per-merchant list is configured).
+    /// The change takes effect at the next billing cycle.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscriber (must authorize).
+    /// * `subscription_id` - The subscription to update.
+    /// * `new_token` - The new token address.
+    pub fn change_subscription_token(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        new_token: Address,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if sub.status == SubscriptionStatus::Cancelled || sub.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        // Check merchant's per-merchant allowed tokens; fall back to global list
+        let merchant_tokens: Vec<Address> = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(
+                sub.merchant.clone(),
+            )))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let token_ok = if merchant_tokens.is_empty() {
+            // No per-merchant list: fall back to global allowed-token list
+            Self::is_token_allowed(&env, &new_token)
+        } else {
+            merchant_tokens.contains(&new_token)
+        };
+
+        if !token_ok {
+            return Err(Error::Feature(FeatureError::TokenNotAllowedForMerchant));
+        }
+
+        // Store the pending token change — applied at next billing cycle
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::NextToken(subscription_id)),
+            &new_token,
+        );
+
+        (SubscriptionTokenChanged {
+            subscription_id,
+            new_token,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Sets the per-merchant allowed token list.
+    ///
+    /// Only the merchant themselves may call this.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `tokens` - The list of accepted token addresses.
+    pub fn set_merchant_allowed_tokens(
+        env: Env,
+        merchant: Address,
+        tokens: Vec<Address>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::MerchantAllowedTokens(merchant)),
+            &tokens,
+        );
+        Ok(())
+    }
+
+    /// Sets the `refund_unused_on_cancel` flag for a merchant.
+    ///
+    /// Issue #681: When `true`, customers receive a prorated refund on mid-cycle
+    /// cancellation. Only the merchant may set this flag.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address (must authorize).
+    /// * `enabled` - `true` to enable prorated refunds, `false` to disable.
+    pub fn set_refund_unused_on_cancel(
+        env: Env,
+        merchant: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::RefundUnusedOnCancel(merchant)),
+            &enabled,
+        );
+        Ok(())
     }
 
     fn is_zero_address(env: &Env, address: &Address) -> bool {
@@ -11512,10 +12852,7 @@ impl PaymentContract {
             }
         }
 
-        let min_split: Option<i128> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::MinSplitAmount));
+        let min_split: Option<i128> = env.store().get(&DataKey::Config(ConfigKey::MinSplitAmount));
         if let Some(min_amount) = min_split {
             for r in recipients.iter() {
                 let share = (amount * r.share_bps as i128) / 10000;
@@ -11529,8 +12866,7 @@ impl PaymentContract {
         PaymentContract::check_and_update_spend_limit(&env, &customer, amount)?;
 
         let counter: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Counter))
             .unwrap_or(0);
         let payment_id = counter + 1;
@@ -11555,43 +12891,45 @@ impl PaymentContract {
             refunded_amount: 0,
         };
 
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Counter), &payment_id);
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Pending,
+            customer.clone(),
+        );
 
         // Index by customer
         let customer_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
                 customer.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Payments(customer.clone(), customer_count)),
             &payment_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::PaymentCount(customer.clone())),
             &(customer_count + 1),
         );
 
         // Index by merchant
         let merchant_count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
                 merchant.clone(),
             )))
             .unwrap_or(0);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Payments(merchant.clone(), merchant_count)),
             &payment_id,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::PaymentCount(merchant.clone())),
             &(merchant_count + 1),
         );
@@ -11601,15 +12939,14 @@ impl PaymentContract {
             const PAGE_SIZE: u64 = 100;
             let page_num = merchant_count / PAGE_SIZE;
             let mut page: Vec<u64> = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                     merchant.clone(),
                     page_num,
                 )))
                 .unwrap_or_else(|| Vec::new(&env));
             page.push_back(payment_id);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::MerchantPaymentsPage(
                     merchant.clone(),
                     page_num,
@@ -11620,8 +12957,7 @@ impl PaymentContract {
 
         // Update global analytics
         let mut analytics: PaymentAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::PaymentAnalytics))
             .unwrap_or(PaymentAnalytics {
                 total_payments_created: 0,
@@ -11641,27 +12977,24 @@ impl PaymentContract {
         if merchant_count == 0 {
             analytics.unique_merchants += 1;
             let global_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Config(ConfigKey::GlobalMerchantCount))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Merchant(MerchantDataKey::GlobalList(global_count)),
                 &merchant,
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Config(ConfigKey::GlobalMerchantCount),
                 &(global_count + 1),
             );
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::PaymentAnalytics), &analytics);
 
         // Update merchant analytics (per-merchant total volume)
         let mut m_analytics: MerchantAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::Analytics(
                 merchant.clone(),
             )))
@@ -11675,15 +13008,14 @@ impl PaymentContract {
             });
         m_analytics.total_payments += 1;
         m_analytics.total_volume += amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Merchant(MerchantDataKey::Analytics(merchant.clone())),
             &m_analytics,
         );
 
         // Update customer analytics
         let mut c_analytics: CustomerAnalytics = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::Analytics(
                 customer.clone(),
             )))
@@ -11709,15 +13041,14 @@ impl PaymentContract {
 
         // Track per-merchant volume
         let prev_merchant_vol: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Customer(CustomerDataKey::MerchantVolume(
                 customer.clone(),
                 merchant.clone(),
             )))
             .unwrap_or(0);
         let new_merchant_vol = prev_merchant_vol + amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::MerchantVolume(
                 customer.clone(),
                 merchant.clone(),
@@ -11726,17 +13057,16 @@ impl PaymentContract {
         );
         if prev_merchant_vol == 0 {
             let m_count: u64 = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Customer(CustomerDataKey::MerchantCount(
                     customer.clone(),
                 )))
                 .unwrap_or(0);
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::MerchantList(customer.clone(), m_count)),
                 &merchant,
             );
-            env.storage().instance().set(
+            env.store().set(
                 &DataKey::Customer(CustomerDataKey::MerchantCount(customer.clone())),
                 &(m_count + 1),
             );
@@ -11745,7 +13075,7 @@ impl PaymentContract {
             c_analytics.top_merchant_volume = new_merchant_vol;
             c_analytics.top_merchant = Some(merchant.clone());
         }
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Customer(CustomerDataKey::Analytics(customer.clone())),
             &c_analytics,
         );
@@ -11755,7 +13085,7 @@ impl PaymentContract {
             recipients,
             executed: false,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::SplitConfig(payment_id)),
             &config,
         );
@@ -11794,8 +13124,7 @@ impl PaymentContract {
         admin.require_auth();
 
         let mut config: PaymentSplitConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::SplitConfig(payment_id)))
             .ok_or(Error::Feature(FeatureError::SplitConfigNotFound))?;
 
@@ -11804,8 +13133,7 @@ impl PaymentContract {
         }
 
         let mut payment: Payment = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Data(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
 
@@ -11823,16 +13151,16 @@ impl PaymentContract {
         }
 
         config.executed = true;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::SplitConfig(payment_id)),
             &config,
         );
 
         // Mark payment as Completed to prevent subsequent complete_payment calls
         payment.status = PaymentStatus::Completed;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
 
         Ok(())
     }
@@ -11845,8 +13173,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(PaymentSplitConfig)` if a split was configured, `None` otherwise.
     pub fn get_split_config(env: Env, payment_id: u64) -> Option<PaymentSplitConfig> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::SplitConfig(payment_id)))
     }
 
@@ -11864,15 +13191,13 @@ impl PaymentContract {
     pub fn set_min_split_amount(env: Env, admin: Address, min_amount: i128) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::MinSplitAmount), &min_amount);
         Ok(())
     }
@@ -11882,9 +13207,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(i128)` if configured, `None` if no minimum is set.
     pub fn get_min_split_amount(env: Env) -> Option<i128> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::MinSplitAmount))
+        env.store().get(&DataKey::Config(ConfigKey::MinSplitAmount))
     }
 
     // ── FEE SWEEP (#216) ─────────────────────────────────────────────────────
@@ -11903,15 +13226,13 @@ impl PaymentContract {
     pub fn set_sweep_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::SweepRecipient), &recipient);
         Ok(())
     }
@@ -11933,44 +13254,37 @@ impl PaymentContract {
     pub fn sweep_platform_fees(env: Env, admin: Address) -> Result<i128, Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
         let recipient: Address = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::SweepRecipient))
             .ok_or(Error::Feature(FeatureError::SweepRecipientNotSet))?;
         let accumulated: i128 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0);
         if accumulated <= 0 {
             return Err(Error::Feature(FeatureError::NothingToSweep));
         }
         let fee_config: FeeConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))?;
         let token_client = token::Client::new(&env, &fee_config.fee_token);
         token_client.transfer(&env.current_contract_address(), &recipient, &accumulated);
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::AccumulatedFees), &0i128);
         let sweep_id: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::SweepCounter))
             .unwrap_or(0)
             + 1;
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Feature(FeatureKey::SweepCounter), &sweep_id);
         let record = FeeSweepRecord {
             sweep_id,
@@ -11979,7 +13293,7 @@ impl PaymentContract {
             recipient,
             swept_at: env.ledger().timestamp(),
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::SweepHistory(sweep_id)),
             &record,
         );
@@ -11995,8 +13309,7 @@ impl PaymentContract {
     /// A vector of `FeeSweepRecord`, ordered from oldest to newest within the limit.
     pub fn get_sweep_history(env: Env, limit: u32) -> Vec<FeeSweepRecord> {
         let total: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::SweepCounter))
             .unwrap_or(0);
         let mut result = Vec::new(&env);
@@ -12007,8 +13320,7 @@ impl PaymentContract {
         };
         for i in start..=total {
             if let Some(record) = env
-                .storage()
-                .instance()
+                .store()
                 .get(&DataKey::Feature(FeatureKey::SweepHistory(i)))
             {
                 result.push_back(record);
@@ -12022,8 +13334,7 @@ impl PaymentContract {
     /// # Returns
     /// Accumulated fees as `i128`.
     pub fn get_sweepable_balance(env: Env) -> i128 {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::AccumulatedFees))
             .unwrap_or(0)
     }
@@ -12052,8 +13363,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
@@ -12067,7 +13377,7 @@ impl PaymentContract {
             used: 0,
             period_start: now,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::CustomerSpendLimit(customer)),
             &spend_limit,
         );
@@ -12082,8 +13392,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(CustomerSpendLimit)` if a limit is configured, `None` otherwise.
     pub fn get_spend_limit(env: Env, customer: Address) -> Option<CustomerSpendLimit> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Feature(FeatureKey::CustomerSpendLimit(customer)))
     }
 
@@ -12105,15 +13414,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Feature(FeatureKey::CustomerSpendLimit(customer)));
         Ok(())
     }
@@ -12131,8 +13438,7 @@ impl PaymentContract {
     /// `true` if the spend is allowed, `false` if it would exceed the limit.
     pub fn check_spend_allowance(env: Env, customer: Address, amount: i128) -> bool {
         let limit: Option<CustomerSpendLimit> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Feature(FeatureKey::CustomerSpendLimit(customer)));
         match limit {
             None => true,
@@ -12154,8 +13460,7 @@ impl PaymentContract {
         amount: i128,
     ) -> Result<(), Error> {
         let limit: Option<CustomerSpendLimit> =
-            env.storage()
-                .instance()
+            env.store()
                 .get(&DataKey::Feature(FeatureKey::CustomerSpendLimit(
                     customer.clone(),
                 )));
@@ -12172,7 +13477,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SpendLimitExceeded));
         }
         limit.used += amount;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Feature(FeatureKey::CustomerSpendLimit(customer.clone())),
             &limit,
         );
@@ -12184,7 +13489,7 @@ impl PaymentContract {
     /// current period is restored, and `used` never drops below zero.
     fn restore_spend_limit(env: &Env, payment: &Payment) {
         let key = DataKey::Feature(FeatureKey::CustomerSpendLimit(payment.customer.clone()));
-        let mut limit: CustomerSpendLimit = match env.storage().instance().get(&key) {
+        let mut limit: CustomerSpendLimit = match env.store().get(&key) {
             Some(l) => l,
             None => return,
         };
@@ -12192,7 +13497,49 @@ impl PaymentContract {
             return;
         }
         limit.used = limit.used.saturating_sub(payment.amount).max(0);
-        env.storage().instance().set(&key, &limit);
+        env.store().set(&key, &limit);
+    }
+
+    /// Appends a `(status, timestamp, actor)` entry to a payment's status
+    /// history (#682), dropping the oldest entry once `MAX_STATUS_HISTORY` is
+    /// reached. No extra event is emitted: each transition already publishes
+    /// its own lifecycle event (`PaymentCompleted`, `PaymentRefunded`, ...).
+    fn record_status_change(env: &Env, payment_id: u64, status: PaymentStatus, actor: Address) {
+        let key = DataKey::Payment(PaymentKey::StatusHistory(payment_id));
+        let mut history: Vec<PaymentStatusEntry> =
+            env.store().get(&key).unwrap_or_else(|| Vec::new(env));
+        if history.len() >= MAX_STATUS_HISTORY {
+            history.pop_front();
+        }
+        history.push_back(PaymentStatusEntry {
+            status,
+            timestamp: env.ledger().timestamp(),
+            actor,
+        });
+        env.store().set(&key, &history);
+    }
+
+    fn get_tip(env: &Env, payment_id: u64) -> i128 {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::Tip(payment_id)))
+            .unwrap_or(0)
+    }
+
+    /// Returns a pending payment's escrowed tip to the customer (#675). The tip
+    /// record is kept so `get_payment_tip` still reports what was tipped.
+    fn return_tip(env: &Env, payment: &Payment) {
+        let tip = PaymentContract::get_tip(env, payment.id);
+        if tip <= 0 {
+            return;
+        }
+        let token_client = token::Client::new(env, &payment.token);
+        token_client.transfer(&env.current_contract_address(), &payment.customer, &tip);
+        (PaymentTipReturned {
+            payment_id: payment.id,
+            customer: payment.customer.clone(),
+            tip_amount: tip,
+        })
+        .publish(env);
     }
 
     // ── SUBSCRIPTION GROUPS (#218) ────────────────────────────────────────────
@@ -12212,12 +13559,11 @@ impl PaymentContract {
     ) -> Result<u64, Error> {
         owner.require_auth();
         let group_id: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::GroupCounter))
             .unwrap_or(0)
             + 1;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::GroupCounter),
             &group_id,
         );
@@ -12228,7 +13574,7 @@ impl PaymentContract {
             discount_bps,
             active: true,
         };
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Group(group_id)),
             &group,
         );
@@ -12259,8 +13605,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         let mut group: SubscriptionGroup = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Group(group_id)))
             .ok_or(Error::Subscription(SubscriptionError::GroupNotFound))?;
         if group.owner != owner {
@@ -12272,9 +13617,8 @@ impl PaymentContract {
             ));
         }
         if env
-            .storage()
-            .instance()
-            .get::<DataKey, u64>(&DataKey::Subscription(SubscriptionKey::GroupMembership(
+            .store()
+            .get::<u64>(&DataKey::Subscription(SubscriptionKey::GroupMembership(
                 subscription_id,
             )))
             .is_some()
@@ -12282,11 +13626,11 @@ impl PaymentContract {
             return Err(Error::Subscription(SubscriptionError::AlreadyInGroup));
         }
         group.subscription_ids.push_back(subscription_id);
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Group(group_id)),
             &group,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::GroupMembership(subscription_id)),
             &group_id,
         );
@@ -12313,8 +13657,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         owner.require_auth();
         let mut group: SubscriptionGroup = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Group(group_id)))
             .ok_or(Error::Subscription(SubscriptionError::GroupNotFound))?;
         if group.owner != owner {
@@ -12327,12 +13670,11 @@ impl PaymentContract {
             }
         }
         group.subscription_ids = new_ids;
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::Subscription(SubscriptionKey::Group(group_id)),
             &group,
         );
-        env.storage()
-            .instance()
+        env.store()
             .remove(&DataKey::Subscription(SubscriptionKey::GroupMembership(
                 subscription_id,
             )));
@@ -12347,8 +13689,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(SubscriptionGroup)` if the group exists, `None` otherwise.
     pub fn get_subscription_group(env: Env, group_id: u64) -> Option<SubscriptionGroup> {
-        env.storage()
-            .instance()
+        env.store()
             .get(&DataKey::Subscription(SubscriptionKey::Group(group_id)))
     }
 
@@ -12361,8 +13702,7 @@ impl PaymentContract {
     /// The earliest `next_payment_at` timestamp, or 0 if the group has no subscriptions.
     pub fn get_group_next_billing(env: Env, group_id: u64) -> u64 {
         let group: Option<SubscriptionGroup> = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Subscription(SubscriptionKey::Group(group_id)));
         let group = match group {
             None => return 0,
@@ -12371,9 +13711,8 @@ impl PaymentContract {
         let mut earliest: u64 = u64::MAX;
         for sub_id in group.subscription_ids.iter() {
             if let Some(sub) = env
-                .storage()
-                .instance()
-                .get::<DataKey, Subscription>(&DataKey::Subscription(SubscriptionKey::Data(sub_id)))
+                .store()
+                .get::<Subscription>(&DataKey::Subscription(SubscriptionKey::Data(sub_id)))
             {
                 if sub.next_payment_at < earliest {
                     earliest = sub.next_payment_at;
@@ -12407,15 +13746,13 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         let ms_config: MultiSigConfig = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Config(ConfigKey::MultiSigConfig))
             .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
         if !ms_config.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
-        env.storage()
-            .instance()
+        env.store()
             .set(&DataKey::Config(ConfigKey::FinalityConfig), &config);
         Ok(())
     }
@@ -12425,9 +13762,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(FinalityConfig)` if configured, `None` otherwise.
     pub fn get_finality_config(env: Env) -> Option<FinalityConfig> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FinalityConfig))
+        env.store().get(&DataKey::Config(ConfigKey::FinalityConfig))
     }
 
     /// Finalizes a pending settlement by transferring funds to the merchant.
@@ -12446,8 +13781,7 @@ impl PaymentContract {
     /// or the release time has not yet passed.
     pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
         if env
-            .storage()
-            .instance()
+            .store()
             .has(&DataKey::State(StateDataKey::SettlementFinalized(
                 payment_id,
             )))
@@ -12455,8 +13789,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::SettlementAlreadyFinalized));
         }
         let settlement: PendingSettlement = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Payment(PaymentKey::PendingSettlement(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
         let now = env.ledger().timestamp();
@@ -12469,7 +13802,7 @@ impl PaymentContract {
             &settlement.merchant,
             &settlement.amount,
         );
-        env.storage().instance().set(
+        env.store().set(
             &DataKey::State(StateDataKey::SettlementFinalized(payment_id)),
             &true,
         );
@@ -12485,8 +13818,7 @@ impl PaymentContract {
     /// A vector of `PendingSettlement` records that have not yet been finalized.
     pub fn get_pending_settlements(env: Env, merchant: Address) -> Vec<PendingSettlement> {
         let count: u64 = env
-            .storage()
-            .instance()
+            .store()
             .get(&DataKey::Merchant(MerchantDataKey::PendingSettlementCount(
                 merchant.clone(),
             )))
@@ -12494,18 +13826,20 @@ impl PaymentContract {
         let mut result = Vec::new(&env);
         for i in 0..count {
             if let Some(payment_id) =
-                env.storage()
-                    .instance()
-                    .get::<DataKey, u64>(&DataKey::Merchant(
-                        MerchantDataKey::PendingSettlementIndex(merchant.clone(), i),
-                    ))
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::PendingSettlementIndex(
+                        merchant.clone(),
+                        i,
+                    )))
             {
-                if !env.storage().instance().has(&DataKey::State(
-                    StateDataKey::SettlementFinalized(payment_id),
-                )) {
+                if !env
+                    .store()
+                    .has(&DataKey::State(StateDataKey::SettlementFinalized(
+                        payment_id,
+                    )))
+                {
                     if let Some(s) = env
-                        .storage()
-                        .instance()
+                        .store()
                         .get(&DataKey::Payment(PaymentKey::PendingSettlement(payment_id)))
                     {
                         result.push_back(s);
@@ -12560,10 +13894,7 @@ impl PaymentContract {
         routes.push_back(direct);
 
         // Fee-bearing route using configured fee (if any)
-        let fee_config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let fee_config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         if let Some(fc) = fee_config {
             if fc.active && fc.fee_bps > 0 {
                 let fee = (amount * fc.fee_bps as i128) / 10000;
@@ -12613,10 +13944,7 @@ impl PaymentContract {
         customer.require_auth();
 
         // Validate route is still valid at execution time
-        let fee_config: Option<FeeConfig> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let fee_config: Option<FeeConfig> = env.store().get(&DataKey::Config(ConfigKey::FeeConfig));
         let current_fee_bps = fee_config
             .filter(|fc| fc.active)
             .map(|fc| fc.fee_bps)
@@ -12687,15 +14015,13 @@ impl PaymentContract {
         }
 
         if env
-            .storage()
-            .persistent()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Tag(payment_id)))
         {
             return Err(Error::Payment(PaymentError::AlreadyProcessed));
         }
 
-        env.storage()
-            .persistent()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Tag(payment_id)), &tags);
 
         Ok(())
@@ -12710,9 +14036,8 @@ impl PaymentContract {
     /// A vector of `BytesN<32>` tag hashes. Returns an empty vector if no tags exist.
     pub fn get_payment_tags(env: Env, payment_id: u64) -> Vec<BytesN<32>> {
         match env
-            .storage()
-            .persistent()
-            .get::<_, Vec<BytesN<32>>>(&DataKey::Payment(PaymentKey::Tag(payment_id)))
+            .store()
+            .get::<Vec<BytesN<32>>>(&DataKey::Payment(PaymentKey::Tag(payment_id)))
         {
             Some(tags) => tags,
             None => Vec::new(&env),
@@ -12747,8 +14072,7 @@ impl PaymentContract {
         }
 
         let tags: Vec<BytesN<32>> = env
-            .storage()
-            .persistent()
+            .store()
             .get(&DataKey::Payment(PaymentKey::Tag(payment_id)))
             .ok_or(Error::Payment(PaymentError::NotFound))?;
 
@@ -12767,8 +14091,7 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::NotFound));
         }
 
-        env.storage()
-            .persistent()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Tag(payment_id)), &new_tags);
 
         Ok(())
@@ -12808,8 +14131,7 @@ impl PaymentContract {
 
         // Check if invoice already attached
         if env
-            .storage()
-            .persistent()
+            .store()
             .has(&DataKey::Payment(PaymentKey::Invoice(payment_id)))
         {
             return Err(Error::Payment(PaymentError::AlreadyProcessed));
@@ -12836,9 +14158,8 @@ impl PaymentContract {
 
         // Get next invoice ID
         let invoice_id: u64 = env
-            .storage()
-            .persistent()
-            .get::<_, u64>(&DataKey::Payment(PaymentKey::InvoiceCounter))
+            .store()
+            .get::<u64>(&DataKey::Payment(PaymentKey::InvoiceCounter))
             .unwrap_or(0)
             .checked_add(1)
             .ok_or(Error::Basic(BasicError::InvalidAmount))?;
@@ -12854,13 +14175,11 @@ impl PaymentContract {
             issued_at: env.ledger().timestamp(),
         };
 
-        env.storage()
-            .persistent()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::Invoice(payment_id)), &invoice);
-        env.storage()
-            .persistent()
+        env.store()
             .set(&DataKey::Payment(PaymentKey::InvoiceCounter), &invoice_id);
-        env.storage().persistent().set(
+        env.store().set(
             &DataKey::Payment(PaymentKey::InvoicePaymentId(invoice_id)),
             &payment_id,
         );
@@ -12877,11 +14196,9 @@ impl PaymentContract {
     /// `Some(PaymentInvoice)` if the invoice exists, `None` otherwise.
     pub fn get_invoice(env: Env, invoice_id: u64) -> Option<PaymentInvoice> {
         let payment_id: u64 = env
-            .storage()
-            .persistent()
+            .store()
             .get(&DataKey::Payment(PaymentKey::InvoicePaymentId(invoice_id)))?;
-        env.storage()
-            .persistent()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::Invoice(payment_id)))
     }
 
@@ -12893,8 +14210,7 @@ impl PaymentContract {
     /// # Returns
     /// `Some(PaymentInvoice)` if an invoice is attached, `None` otherwise.
     pub fn get_payment_invoice(env: Env, payment_id: u64) -> Option<PaymentInvoice> {
-        env.storage()
-            .persistent()
+        env.store()
             .get(&DataKey::Payment(PaymentKey::Invoice(payment_id)))
     }
 
@@ -12928,12 +14244,582 @@ impl PaymentContract {
 
         Ok(())
     }
+
+    // ── Issue #671: Query payments by status with pagination ──────────────
+
+    const STATUS_QUERY_LIMIT_CAP: u64 = 100;
+
+    /// Returns a paginated list of payments made by a customer, filtered by status.
+    ///
+    /// Scans the customer's payment list in creation order and collects only entries
+    /// whose status matches `status`. `offset` skips that many matching results;
+    /// `limit` is capped at 100.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer address to query
+    /// * `status` - The desired payment status
+    /// * `limit` - Maximum results to return (capped at 100)
+    /// * `offset` - Number of matching results to skip
+    pub fn get_customer_payments_by_status(
+        env: Env,
+        customer: Address,
+        status: PaymentStatus,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let effective_limit = limit.min(Self::STATUS_QUERY_LIMIT_CAP);
+        let total_count: u64 = env
+            .store()
+            .get(&DataKey::Customer(CustomerDataKey::PaymentCount(
+                customer.clone(),
+            )))
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut matched: u64 = 0;
+
+        for i in 0..total_count {
+            if results.len() as u64 >= effective_limit {
+                break;
+            }
+            if let Some(payment_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Customer(CustomerDataKey::Payments(
+                        customer.clone(),
+                        i,
+                    )))
+            {
+                if let Some(payment) = env
+                    .store()
+                    .get::<Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                {
+                    if payment.status == status {
+                        if matched >= offset {
+                            results.push_back(payment);
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Returns a paginated list of payments received by a merchant, filtered by status.
+    ///
+    /// Scans the merchant's payment list in creation order. `limit` is capped at 100.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to query
+    /// * `status` - The desired payment status
+    /// * `limit` - Maximum results to return (capped at 100)
+    /// * `offset` - Number of matching results to skip
+    pub fn get_merchant_payments_by_status(
+        env: Env,
+        merchant: Address,
+        status: PaymentStatus,
+        limit: u64,
+        offset: u64,
+    ) -> Vec<Payment> {
+        let effective_limit = limit.min(Self::STATUS_QUERY_LIMIT_CAP);
+        let total_count: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::PaymentCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+
+        let mut results = Vec::new(&env);
+        let mut matched: u64 = 0;
+
+        for i in 0..total_count {
+            if results.len() as u64 >= effective_limit {
+                break;
+            }
+            if let Some(payment_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::Payments(
+                        merchant.clone(),
+                        i,
+                    )))
+            {
+                if let Some(payment) = env
+                    .store()
+                    .get::<Payment>(&DataKey::Payment(PaymentKey::Data(payment_id)))
+                {
+                    if payment.status == status {
+                        if matched >= offset {
+                            results.push_back(payment);
+                        }
+                        matched += 1;
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    // ── Issue #672: Per-merchant default payment expiry ───────────────────
+
+    /// Set the default expiry duration (in seconds) for a merchant's payments.
+    ///
+    /// When `create_payment` is called with `expiration_duration == 0`, the merchant's
+    /// default (if set) is applied automatically.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant setting the default (must authorize)
+    /// * `seconds` - Default expiry in seconds; 0 clears the default
+    pub fn set_default_payment_expiry(
+        env: Env,
+        merchant: Address,
+        seconds: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_default_payment_expiry")?;
+        merchant.require_auth();
+
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(merchant.clone())),
+            &seconds,
+        );
+
+        (MerchantDefaultExpirySet { merchant, seconds }).publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the configured default expiry (in seconds) for a merchant, or 0 if none.
+    pub fn get_default_payment_expiry(env: Env, merchant: Address) -> u64 {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::DefaultPaymentExpiry(
+                merchant,
+            )))
+            .unwrap_or(0)
+    }
+
+    // ── Issue #673: Installment due dates and late fees ───────────────────
+
+    /// Attach an installment schedule to an existing Pending payment.
+    ///
+    /// The sum of all `entry.amount` values must equal `payment.amount`. Each entry carries
+    /// a `due_at` Unix timestamp. Only the payment's merchant may call this, and only while
+    /// the payment is Pending and no schedule has been set yet.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant that created the payment (must authorize)
+    /// * `payment_id` - ID of the target payment
+    /// * `entries` - Ordered list of `(due_at, amount)` installment entries
+    /// * `late_fee_flat` - Flat late fee in token base units (0 = none)
+    /// * `late_fee_bps` - Late fee as basis points of installment amount (0 = none)
+    pub fn set_installment_schedule(
+        env: Env,
+        merchant: Address,
+        payment_id: u64,
+        entries: Vec<InstallmentEntry>,
+        late_fee_flat: i128,
+        late_fee_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_installment_schedule")?;
+        merchant.require_auth();
+
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+
+        if env
+            .store()
+            .has(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                payment_id,
+            )))
+        {
+            return Err(Error::Payment(PaymentError::InstallmentScheduleAlreadySet));
+        }
+
+        // Validate total matches payment amount
+        let mut total: i128 = 0;
+        for entry in entries.iter() {
+            total = total.saturating_add(entry.amount);
+        }
+        if total != payment.amount {
+            return Err(Error::Payment(
+                PaymentError::InstallmentScheduleTotalMismatch,
+            ));
+        }
+
+        let installment_count = entries.len();
+        let schedule = InstallmentScheduleData {
+            payment_id,
+            entries,
+            late_fee_flat,
+            late_fee_bps,
+        };
+
+        env.store().set(
+            &DataKey::Payment(PaymentKey::InstallmentSchedule(payment_id)),
+            &schedule,
+        );
+
+        (InstallmentScheduleSet {
+            payment_id,
+            installment_count,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns the installment schedule attached to a payment, or None if none is set.
+    pub fn get_installment_schedule(env: Env, payment_id: u64) -> Option<InstallmentScheduleData> {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                payment_id,
+            )))
+    }
+
+    /// Check whether any installment in the schedule is overdue and emit `InstallmentOverdue`
+    /// for each one that is past its due date and not yet paid.
+    ///
+    /// This is a pure-read function that does not mutate state; callers drive it to discover
+    /// which installments need attention. Late fees are calculated for reporting but not
+    /// deducted here — they are applied on the next `pay_installment` call (off-chain
+    /// integration should pass the extra amount).
+    ///
+    /// # Arguments
+    /// * `payment_id` - The payment to check
+    ///
+    /// # Returns
+    /// The number of overdue installments detected.
+    pub fn check_installment_overdue(env: Env, payment_id: u64) -> u32 {
+        let schedule: InstallmentScheduleData =
+            match env
+                .store()
+                .get(&DataKey::Payment(PaymentKey::InstallmentSchedule(
+                    payment_id,
+                ))) {
+                Some(s) => s,
+                None => return 0,
+            };
+
+        let now = env.ledger().timestamp();
+        let mut count: u32 = 0;
+
+        for (idx, entry) in schedule.entries.iter().enumerate() {
+            if !entry.paid && now > entry.due_at {
+                let late_fee = if schedule.late_fee_bps > 0 {
+                    (entry.amount * schedule.late_fee_bps as i128) / 10_000
+                } else {
+                    schedule.late_fee_flat
+                };
+
+                (InstallmentOverdue {
+                    payment_id,
+                    installment_index: idx as u32,
+                    due_at: entry.due_at,
+                    amount: entry.amount,
+                    late_fee,
+                    checked_at: now,
+                })
+                .publish(&env);
+
+                count += 1;
+            }
+        }
+
+        count
+    }
+
+    // ── Issue #674: Notification hooks for payment lifecycle events ───────
+
+    const MAX_PAYMENT_HOOKS_PER_EVENT: u32 = 10;
+
+    fn validate_payment_hook_subscriber(env: &Env, subscriber: &Address) -> Result<(), Error> {
+        match env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+            subscriber,
+            &Symbol::new(env, "ping"),
+            ().into_val(env),
+        ) {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(Error::Payment(PaymentError::InvalidHookAddress)),
+        }
+    }
+
+    /// Register a notification hook for specific payment lifecycle events.
+    ///
+    /// The subscriber contract must expose a `ping()` function (reachability check) and
+    /// an `on_payment_event(event_type: PaymentEventType, payment_id: u64)` entry point.
+    /// A panicking subscriber never reverts the payment transaction.
+    ///
+    /// # Arguments
+    /// * `subscriber` - The contract to notify (must authorize)
+    /// * `events` - List of `PaymentEventType` values to subscribe to
+    ///
+    /// # Returns
+    /// The new hook ID.
+    pub fn register_payment_hook(
+        env: Env,
+        subscriber: Address,
+        events: Vec<PaymentEventType>,
+    ) -> Result<u64, Error> {
+        subscriber.require_auth();
+
+        if events.is_empty() {
+            return Err(Error::Payment(PaymentError::NoEventsSpecified));
+        }
+
+        Self::validate_payment_hook_subscriber(&env, &subscriber)?;
+
+        // Enforce per-event cap
+        for event_type in events.iter() {
+            let count: u32 = env
+                .store()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+
+            if count >= Self::MAX_PAYMENT_HOOKS_PER_EVENT {
+                return Err(Error::Payment(PaymentError::MaxHooksPerEventReached));
+            }
+        }
+
+        let hook_id: u64 = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::NotificationHookCounter))
+            .unwrap_or(0)
+            + 1;
+
+        env.store().set(
+            &DataKey::Payment(PaymentKey::NotificationHookCounter),
+            &hook_id,
+        );
+
+        let hook = PaymentNotificationHook {
+            hook_id,
+            subscriber: subscriber.clone(),
+            events: events.clone(),
+            active: true,
+        };
+
+        env.store().set(
+            &DataKey::Payment(PaymentKey::NotificationHook(hook_id)),
+            &hook,
+        );
+
+        // Index by event type
+        for event_type in events.iter() {
+            let count: u32 = env
+                .store()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+
+            env.store().set(
+                &DataKey::Merchant(MerchantDataKey::HooksByEvent(
+                    event_type.clone(),
+                    count as u64,
+                )),
+                &hook_id,
+            );
+
+            env.store().set(
+                &DataKey::Merchant(MerchantDataKey::HooksByEventCount(event_type.clone())),
+                &(count + 1),
+            );
+        }
+
+        // Index by subscriber
+        let sub_count: u32 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::SubscriberHookCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::SubscriberHooks(
+                subscriber.clone(),
+                sub_count as u64,
+            )),
+            &hook_id,
+        );
+
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::SubscriberHookCount(subscriber.clone())),
+            &(sub_count + 1),
+        );
+
+        (PaymentHookRegistered {
+            hook_id,
+            subscriber,
+            event_count: events.len(),
+        })
+        .publish(&env);
+
+        Ok(hook_id)
+    }
+
+    /// Deregister a previously registered payment hook.
+    ///
+    /// Only the original subscriber may deregister their hook.
+    pub fn deregister_payment_hook(
+        env: Env,
+        subscriber: Address,
+        hook_id: u64,
+    ) -> Result<(), Error> {
+        subscriber.require_auth();
+
+        let hook: PaymentNotificationHook = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::NotificationHook(hook_id)))
+            .ok_or(Error::Payment(PaymentError::HookNotFound))?;
+
+        if hook.subscriber != subscriber {
+            return Err(Error::Payment(PaymentError::HookNotOwnedBySubscriber));
+        }
+
+        let mut updated = hook.clone();
+        updated.active = false;
+
+        env.store().set(
+            &DataKey::Payment(PaymentKey::NotificationHook(hook_id)),
+            &updated,
+        );
+
+        // Decrement per-event counters
+        for event_type in hook.events.iter() {
+            let count: u32 = env
+                .store()
+                .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                    event_type.clone(),
+                )))
+                .unwrap_or(0);
+            if count > 0 {
+                env.store().set(
+                    &DataKey::Merchant(MerchantDataKey::HooksByEventCount(event_type.clone())),
+                    &(count - 1),
+                );
+            }
+        }
+
+        // Decrement subscriber counter
+        let sub_count: u32 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::SubscriberHookCount(
+                subscriber.clone(),
+            )))
+            .unwrap_or(0);
+        if sub_count > 0 {
+            env.store().set(
+                &DataKey::Merchant(MerchantDataKey::SubscriberHookCount(subscriber.clone())),
+                &(sub_count - 1),
+            );
+        }
+
+        (PaymentHookDeregistered {
+            hook_id,
+            subscriber,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns all active hooks registered for a specific payment event type.
+    pub fn get_payment_hooks(
+        env: Env,
+        event_type: PaymentEventType,
+    ) -> Vec<PaymentNotificationHook> {
+        let mut hooks = Vec::new(&env);
+
+        let count: u32 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                event_type.clone(),
+            )))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::HooksByEvent(
+                        event_type.clone(),
+                        i as u64,
+                    )))
+            {
+                if let Some(hook) = env
+                    .store()
+                    .get::<PaymentNotificationHook>(&DataKey::Payment(
+                        PaymentKey::NotificationHook(hook_id),
+                    ))
+                {
+                    if hook.active {
+                        hooks.push_back(hook);
+                    }
+                }
+            }
+        }
+
+        hooks
+    }
+
+    fn invoke_payment_hooks(env: &Env, event_type: PaymentEventType, payment_id: u64) {
+        let count: u32 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::HooksByEventCount(
+                event_type.clone(),
+            )))
+            .unwrap_or(0);
+
+        for i in 0..count {
+            if let Some(hook_id) =
+                env.store()
+                    .get::<u64>(&DataKey::Merchant(MerchantDataKey::HooksByEvent(
+                        event_type.clone(),
+                        i as u64,
+                    )))
+            {
+                if let Some(hook) = env
+                    .store()
+                    .get::<PaymentNotificationHook>(&DataKey::Payment(
+                        PaymentKey::NotificationHook(hook_id),
+                    ))
+                {
+                    if hook.active && hook.events.contains(&event_type) {
+                        let result = env.try_invoke_contract::<(), soroban_sdk::InvokeError>(
+                            &hook.subscriber,
+                            &Symbol::new(env, "on_payment_event"),
+                            (event_type.clone(), payment_id).into_val(env),
+                        );
+
+                        if result.is_err() {
+                            (PaymentHookInvocationFailed {
+                                hook_id: hook.hook_id,
+                                subscriber: hook.subscriber.clone(),
+                                event_type: event_type.clone(),
+                                payment_id,
+                            })
+                            .publish(env);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 mod test;
 
 #[cfg(test)]
 mod test_analytics;
+
+#[cfg(test)]
+mod test_issues_678_679_680_681;
 
 #[cfg(test)]
 mod test_trial;
@@ -12984,3 +14870,12 @@ mod test_glossary;
 
 #[cfg(test)]
 mod test_routed_payment;
+
+#[cfg(test)]
+mod test_skip_tip_status_history;
+
+#[cfg(test)]
+mod test_storage_tiers;
+
+#[cfg(test)]
+mod test_payment_request;

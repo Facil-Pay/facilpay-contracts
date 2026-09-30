@@ -1,0 +1,27 @@
+# Minimal contract used only by the refund contract's upgrade test (#643).
+# It is built once and committed as `test_fixtures/refund_upgrade_v2.wasm`;
+# rebuild it with `make` in this directory. It is not part of the workspace.
+[package]
+name = "refund-upgrade-v2"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = "23"
+
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[workspace]

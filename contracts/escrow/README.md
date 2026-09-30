@@ -749,3 +749,79 @@ operator runbook — caller permissions, each step's exact semantics, batch-size
 ---
 
 [⬅ Back to Main README](../../README.md)
+
+---
+
+## Partial release (issue #687)
+
+`release_partial(admin, escrow_id, amount)` releases part of a standard escrow's locked funds to the merchant.
+
+- Multiple calls accumulate in `escrow.released_amount`.
+- When `released_amount` reaches `amount` the escrow status becomes `Released`.
+- `refund_escrow` and dispute resolution operate on the **remaining balance** (`amount - released_amount`) only.
+- Emits `EscrowPartiallyReleased { escrow_id, recipient, amount, released_total, token }`.
+
+**Errors:** `NotAnAdmin`, `InvalidStatus` (escrow not Locked), `PartialReleaseExceedsBalance` (amount ≤ 0 or > remaining).
+
+---
+
+## Milestone deadlines with auto-refund (issue #688)
+
+`VestingMilestone` now carries an optional `deadline: Option<u64>` (ledger timestamp).
+
+`claim_missed_milestone(customer, escrow_id, milestone_id)` — callable by the customer after the deadline has passed if the milestone was never approved.
+
+- Approved or already-released milestones cannot be claimed.
+- Milestones without a deadline cannot be claimed via this path.
+- Emits `MissedMilestoneClaimed { escrow_id, milestone_id, customer, amount }`.
+
+**Errors:** `Unauthorized` (caller not the customer), `NotFound`, `MilestoneAlreadyReleased`, `MilestoneAlreadyClaimed`, `InvalidStatus` (approved or no deadline), `MilestoneDeadlineNotPassed`.
+
+---
+
+## Release to multiple beneficiaries (issue #689)
+
+`create_escrow_with_beneficiaries(customer, merchant, amount, token, release_timestamp, min_hold_period, expiry_timestamp, auto_refund_on_expiry, shares)` — like `create_escrow` but accepts a list of `BeneficiaryShare { address, bps }` whose `bps` values must sum to exactly **10 000** with no duplicate addresses.
+
+On release the payout is split across the configured beneficiaries proportionally; the last entry absorbs any rounding dust.
+
+**Errors (creation):** `InvalidBeneficiaryShares` (empty list or bps ≠ 10 000), `DuplicateBeneficiary`.
+
+---
+
+## Dispute reason code (issue #690)
+
+`dispute_escrow_with_reason(caller, escrow_id, reason, details_hash)` — like `dispute_escrow` but stores a `DisputeReason` (one of `NonDelivery`, `NotAsDescribed`, `Damaged`, `Fraud`, `Other`) and a 32-byte evidence hash.
+
+- The old `dispute_escrow` continues to work and now emits `EscrowDisputed` as before; it does **not** record a reason or hash.
+- Per-reason dispute counts are updated in storage and can be queried with `get_dispute_reason_count(reason) → u64`.
+- Emits `EscrowDisputedWithReason { escrow_id, disputed_by, reason: u32, details_hash }`.
+
+## Contract Upgrades
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `upgrade` | `admin: Address`, `new_wasm_hash: BytesN<32>` | `Result<(), Error>` | `admin` (multisig admin; only when `required_signatures == 1`) |
+
+`upgrade` calls `update_current_contract_wasm(new_wasm_hash)`. The contract address and all stored data are kept; the new code runs from the next invocation. When the multisig threshold is above 1, the direct call returns `Unauthorized` — instead propose `ActionType::UpgradeContract` with the 32-byte WASM hash as `data` via `propose_action`, collect approvals with `approve_action`, then `execute_action`.
+
+**Errors:** `Unauthorized` (caller is not a multisig admin, multisig not initialized, threshold > 1, or proposal `data` is not 32 bytes), `MigrationInProgress` (115, a storage migration started with `begin_migration` is still running).
+
+**Event:** `ContractUpgraded { old_schema_version, new_wasm_hash, upgraded_by }`.
+
+**Upgrade sequence:**
+1. Upload the new WASM (`stellar contract upload`) and note its hash.
+2. Make sure no storage migration is in progress.
+3. Call `upgrade` (or execute an `UpgradeContract` proposal). Keep the storage layout compatible.
+4. If the new code changes the storage layout, run `begin_migration` and the batch migration functions from the new code.
+
+## Storage TTL
+
+Every state-changing entry point first extends the instance storage TTL, so the contract is not archived after quiet periods. Escrow keeps all its state in instance storage, so this one bump covers every entry.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `INSTANCE_BUMP_THRESHOLD` | `30 * 17_280` ledgers (~30 days) | Extend only when the remaining TTL is below this |
+| `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
+
+17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.

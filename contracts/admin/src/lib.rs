@@ -3,7 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String,
 };
 
 #[contracterror]
@@ -16,6 +17,14 @@ pub enum Error {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContractAddresses {
+    pub payment: Address,
+    pub escrow: Address,
+    pub refund: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     Admin,
     Pauser,
@@ -24,62 +33,12 @@ pub enum DataKey {
     RefundContract,
 }
 
-/// Identifies which child contract a targeted admin action applies to.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChildKind {
-    Payment,
-    Escrow,
-    Refund,
-}
-
-/// Emitted when the pauser pauses a single function on one child contract.
+/// Event emitted when the coordinator's WASM is replaced in place (#644).
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmergencyFunctionPausedEvent {
-    pub target: ChildKind,
-    pub function_name: String,
-    pub paused_by: Address,
-    pub reason: String,
-    pub paused_at: u64,
-}
-
-/// Emitted when the pauser unpauses a single function on one child contract.
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EmergencyFunctionUnpausedEvent {
-    pub target: ChildKind,
-    pub function_name: String,
-    pub unpaused_by: Address,
-    pub unpaused_at: u64,
-}
-
-/// Verifies `pauser` is authenticated and matches the stored pauser.
-fn require_pauser(env: &Env, pauser: &Address) -> Result<(), Error> {
-    pauser.require_auth();
-
-    let stored_pauser: Address = env
-        .storage()
-        .instance()
-        .get(&DataKey::Pauser)
-        .ok_or(Error::NotInitialized)?;
-    if *pauser != stored_pauser {
-        return Err(Error::Unauthorized);
-    }
-    Ok(())
-}
-
-/// Returns the stored address of the child contract identified by `target`.
-fn child_contract(env: &Env, target: ChildKind) -> Result<Address, Error> {
-    let key = match target {
-        ChildKind::Payment => DataKey::PaymentContract,
-        ChildKind::Escrow => DataKey::EscrowContract,
-        ChildKind::Refund => DataKey::RefundContract,
-    };
-    env.storage()
-        .instance()
-        .get(&key)
-        .ok_or(Error::NotInitialized)
+pub struct AdminContractUpgraded {
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
 }
 
 #[contract]
@@ -87,6 +46,40 @@ pub struct AdminContract;
 
 #[contractimpl]
 impl AdminContract {
+    /// Replaces the coordinator's code with an already-uploaded WASM (#644).
+    ///
+    /// The contract address and all stored data (admin, pauser, child contract
+    /// addresses) are kept; the new code runs from the next invocation.
+    ///
+    /// # Parameters
+    /// - `admin`: the stored admin address, which must authorize the call.
+    /// - `new_wasm_hash`: hash of the WASM previously uploaded to the network.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized,
+    /// and `Error::Unauthorized` if `admin` is not the stored admin.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        (AdminContractUpgraded {
+            new_wasm_hash,
+            upgraded_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Initializes the admin contract with the addresses of the payment, escrow,
     /// and refund contracts.
     ///
@@ -436,6 +429,65 @@ impl AdminContract {
 
         Ok(())
     }
+
+    /// Returns the current admin address.
+    ///
+    /// # Returns
+    /// The `Address` of the current admin.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns the current pauser address.
+    ///
+    /// # Returns
+    /// The `Address` of the current pauser.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_pauser(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Pauser)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// Returns all child contract addresses.
+    ///
+    /// # Returns
+    /// A `ContractAddresses` struct containing the payment, escrow, and refund contract addresses.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized.
+    pub fn get_contracts(env: Env) -> Result<ContractAddresses, Error> {
+        let payment = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContract)
+            .ok_or(Error::NotInitialized)?;
+        let escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowContract)
+            .ok_or(Error::NotInitialized)?;
+        let refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundContract)
+            .ok_or(Error::NotInitialized)?;
+
+        Ok(ContractAddresses {
+            payment,
+            escrow,
+            refund,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -685,153 +737,88 @@ mod test {
     }
 
     #[test]
-    fn test_pause_function_only_affects_targeted_child() {
+    fn test_get_admin_returns_stored_admin() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, _admin, pauser, payment_contract, escrow_contract, refund_contract) =
-            setup_initialized(&env);
-        let payment = PaymentContractClient::new(&env, &payment_contract);
-        let escrow = EscrowContractClient::new(&env, &escrow_contract);
-        let refund = RefundContractClient::new(&env, &refund_contract);
+        let (client, admin, _, _, _, _) = setup_initialized(&env);
 
-        let function_name = String::from_str(&env, "process_refund");
-        let reason = String::from_str(&env, "refund processing incident");
-        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function_name, &reason);
-
-        assert!(refund.is_function_paused(&function_name));
-        assert!(!payment.is_function_paused(&function_name));
-        assert!(!escrow.is_function_paused(&function_name));
-
-        // Nothing is globally paused and other functions on the target stay live.
-        assert!(!refund.get_pause_state().globally_paused);
-        assert!(!payment.get_pause_state().globally_paused);
-        assert!(!escrow.get_pause_state().globally_paused);
-        assert!(!refund.is_function_paused(&String::from_str(&env, "request_refund")));
-
-        client.emergency_unpause_function(&pauser, &ChildKind::Refund, &function_name);
-        assert!(!refund.is_function_paused(&function_name));
+        assert_eq!(client.get_admin(), admin.clone());
     }
 
     #[test]
-    fn test_pause_function_targets_each_child() {
+    fn test_get_admin_returns_not_initialized_before_init() {
         let env = Env::default();
         env.mock_all_auths();
-
-        let (client, _admin, pauser, payment_contract, escrow_contract, _refund_contract) =
-            setup_initialized(&env);
-        let payment = PaymentContractClient::new(&env, &payment_contract);
-        let escrow = EscrowContractClient::new(&env, &escrow_contract);
-
-        let reason = String::from_str(&env, "incident");
-        let create_payment = String::from_str(&env, "create_payment");
-        let release_escrow = String::from_str(&env, "release_escrow");
-
-        client.emergency_pause_function(&pauser, &ChildKind::Payment, &create_payment, &reason);
-        client.emergency_pause_function(&pauser, &ChildKind::Escrow, &release_escrow, &reason);
-
-        assert!(payment.is_function_paused(&create_payment));
-        assert!(!payment.is_function_paused(&release_escrow));
-        assert!(escrow.is_function_paused(&release_escrow));
-        assert!(!escrow.is_function_paused(&create_payment));
-
-        client.emergency_unpause_function(&pauser, &ChildKind::Payment, &create_payment);
-        client.emergency_unpause_function(&pauser, &ChildKind::Escrow, &release_escrow);
-
-        assert!(!payment.is_function_paused(&create_payment));
-        assert!(!escrow.is_function_paused(&release_escrow));
-    }
-
-    #[test]
-    fn test_pause_function_rejects_non_pauser_and_uninitialized() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let function_name = String::from_str(&env, "process_refund");
-        let reason = String::from_str(&env, "incident");
-        let someone = Address::generate(&env);
 
         let fresh_id = env.register(AdminContract, ());
         let fresh = AdminContractClient::new(&env, &fresh_id);
-        assert_eq!(
-            fresh.try_emergency_pause_function(
-                &someone,
-                &ChildKind::Refund,
-                &function_name,
-                &reason
-            ),
-            Err(Ok(Error::NotInitialized))
-        );
-        assert_eq!(
-            fresh.try_emergency_unpause_function(&someone, &ChildKind::Refund, &function_name),
-            Err(Ok(Error::NotInitialized))
-        );
 
-        // The admin is not the pauser and must be rejected too.
-        let (client, admin, pauser, _, _, refund_contract) = setup_initialized(&env);
-        assert_eq!(
-            client.try_emergency_pause_function(
-                &admin,
-                &ChildKind::Refund,
-                &function_name,
-                &reason
-            ),
-            Err(Ok(Error::Unauthorized))
-        );
-        assert!(!RefundContractClient::new(&env, &refund_contract)
-            .is_function_paused(&function_name));
-
-        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function_name, &reason);
-        assert_eq!(
-            client.try_emergency_unpause_function(&someone, &ChildKind::Refund, &function_name),
-            Err(Ok(Error::Unauthorized))
-        );
-        assert!(RefundContractClient::new(&env, &refund_contract)
-            .is_function_paused(&function_name));
+        assert_eq!(fresh.try_get_admin(), Err(Ok(Error::NotInitialized)));
     }
 
     #[test]
-    fn test_pause_function_rejects_empty_function_name() {
+    fn test_get_pauser_returns_stored_pauser() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, _admin, pauser, _, _, _) = setup_initialized(&env);
-        let empty = String::from_str(&env, "");
-        let reason = String::from_str(&env, "incident");
+        let (client, _, pauser, _, _, _) = setup_initialized(&env);
 
-        assert_eq!(
-            client.try_emergency_pause_function(&pauser, &ChildKind::Payment, &empty, &reason),
-            Err(Ok(Error::InvalidFunctionName))
-        );
-        assert_eq!(
-            client.try_emergency_unpause_function(&pauser, &ChildKind::Payment, &empty),
-            Err(Ok(Error::InvalidFunctionName))
-        );
-    }
-
-    fn count_events_from(env: &Env, contract: &Address) -> usize {
-        use soroban_sdk::testutils::Events as _;
-
-        env.events()
-            .all()
-            .iter()
-            .filter(|(emitter, _, _)| emitter == contract)
-            .count()
+        assert_eq!(client.get_pauser(), pauser.clone());
     }
 
     #[test]
-    fn test_pause_function_emits_admin_events() {
+    fn test_get_pauser_returns_not_initialized_before_init() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, _admin, pauser, _, _, _) = setup_initialized(&env);
-        let function_name = String::from_str(&env, "complete_payment");
-        let reason = String::from_str(&env, "incident");
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
 
-        client.emergency_pause_function(&pauser, &ChildKind::Payment, &function_name, &reason);
-        assert_eq!(count_events_from(&env, &client.address), 1);
+        assert_eq!(fresh.try_get_pauser(), Err(Ok(Error::NotInitialized)));
+    }
 
-        client.emergency_unpause_function(&pauser, &ChildKind::Payment, &function_name);
-        assert_eq!(count_events_from(&env, &client.address), 1);
+    #[test]
+    fn test_get_contracts_returns_all_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, payment, escrow, refund) = setup_initialized(&env);
+
+        let contracts = client.get_contracts();
+        assert_eq!(contracts.payment, payment);
+        assert_eq!(contracts.escrow, escrow);
+        assert_eq!(contracts.refund, refund);
+    }
+
+    #[test]
+    fn test_get_contracts_returns_not_initialized_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let fresh_id = env.register(AdminContract, ());
+        let fresh = AdminContractClient::new(&env, &fresh_id);
+
+        assert_eq!(fresh.try_get_contracts(), Err(Ok(Error::NotInitialized)));
+    }
+
+    #[test]
+    fn test_get_contracts_reflects_updated_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, admin, pauser, _, _, _) = setup_initialized(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let new_escrow = setup_escrow(&env, &pauser);
+        let new_refund = setup_refund(&env, &pauser);
+
+        client.set_payment_contract(&admin, &new_payment);
+        client.set_escrow_contract(&admin, &new_escrow);
+        client.set_refund_contract(&admin, &new_refund);
+
+        let contracts = client.get_contracts();
+        assert_eq!(contracts.payment, new_payment);
+        assert_eq!(contracts.escrow, new_escrow);
+        assert_eq!(contracts.refund, new_refund);
     }
 }
