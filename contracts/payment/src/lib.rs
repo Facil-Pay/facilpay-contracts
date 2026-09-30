@@ -10996,6 +10996,167 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Registers the caller as an onboarded merchant (#669).
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address being registered (must authorize)
+    /// * `name` - Display name, 1 to `MAX_MERCHANT_NAME_LEN` bytes
+    /// * `metadata_hash` - Hash of the off-chain profile document
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `InvalidMerchantName` if the name is empty or too
+    /// long, or `MerchantAlreadyRegistered` if a profile already exists (including
+    /// a deactivated one, which only an admin can reactivate).
+    pub fn register_merchant(
+        env: Env,
+        merchant: Address,
+        name: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "register_merchant")?;
+        merchant.require_auth();
+        Self::validate_merchant_name(&name)?;
+
+        let key = DataKey::Merchant(MerchantDataKey::Profile(merchant.clone()));
+        if env.store().has(&key) {
+            return Err(Error::Payment(PaymentError::MerchantAlreadyRegistered));
+        }
+
+        let now = env.ledger().timestamp();
+        let profile = MerchantProfile {
+            merchant: merchant.clone(),
+            name: name.clone(),
+            metadata_hash: metadata_hash.clone(),
+            active: true,
+            registered_at: now,
+            updated_at: now,
+        };
+        env.store().set(&key, &profile);
+
+        (MerchantRegistered {
+            merchant,
+            name,
+            metadata_hash,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Updates a registered merchant's name and metadata hash (#669).
+    ///
+    /// Deactivated merchants may still update their profile; this does not
+    /// change their `active` status.
+    ///
+    /// # Arguments
+    /// * `merchant` - The registered merchant (must authorize)
+    /// * `name` - New display name, 1 to `MAX_MERCHANT_NAME_LEN` bytes
+    /// * `metadata_hash` - New hash of the off-chain profile document
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `InvalidMerchantName` / `MerchantNotRegistered`.
+    pub fn update_merchant_profile(
+        env: Env,
+        merchant: Address,
+        name: String,
+        metadata_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "update_merchant_profile")?;
+        merchant.require_auth();
+        Self::validate_merchant_name(&name)?;
+
+        let key = DataKey::Merchant(MerchantDataKey::Profile(merchant.clone()));
+        let mut profile: MerchantProfile = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::MerchantNotRegistered))?;
+        profile.name = name.clone();
+        profile.metadata_hash = metadata_hash.clone();
+        profile.updated_at = env.ledger().timestamp();
+        env.store().set(&key, &profile);
+
+        (MerchantProfileUpdated {
+            merchant,
+            name,
+            metadata_hash,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Deactivates a registered merchant (#669).
+    ///
+    /// While `require_registered_merchants` is on, a deactivated merchant cannot
+    /// receive new payments, subscriptions, payment requests or channels.
+    ///
+    /// # Arguments
+    /// * `admin` - A multisig admin (must authorize)
+    /// * `merchant` - The merchant to deactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Unauthorized`, `MerchantNotRegistered`, or
+    /// `MerchantInactive` if the merchant is already deactivated.
+    pub fn deactivate_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        Self::require_registry_admin(&env, &admin)?;
+        Self::set_merchant_active(&env, &merchant, false)?;
+        (MerchantDeactivated { merchant, admin }).publish(&env);
+        Ok(())
+    }
+
+    /// Reactivates a previously deactivated merchant (#669).
+    ///
+    /// # Arguments
+    /// * `admin` - A multisig admin (must authorize)
+    /// * `merchant` - The merchant to reactivate
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Unauthorized`, `MerchantNotRegistered`, or
+    /// `InvalidStatus` if the merchant is already active.
+    pub fn reactivate_merchant(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        Self::require_registry_admin(&env, &admin)?;
+        Self::set_merchant_active(&env, &merchant, true)?;
+        (MerchantReactivated { merchant, admin }).publish(&env);
+        Ok(())
+    }
+
+    /// Returns the registry profile of `merchant`, or `None` if unregistered (#669).
+    pub fn get_merchant(env: Env, merchant: Address) -> Option<MerchantProfile> {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::Profile(merchant)))
+    }
+
+    /// Turns enforcement of the merchant registry on or off (#669).
+    ///
+    /// When on, payments, payment requests, scheduled payments, subscriptions,
+    /// payment channels and split payments to unregistered or deactivated
+    /// merchants are rejected. Defaults to off, which leaves behaviour unchanged.
+    ///
+    /// # Arguments
+    /// * `admin` - A multisig admin (must authorize)
+    /// * `required` - Whether a registered, active merchant is required
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `Unauthorized` if `admin` is not an admin.
+    pub fn set_require_registered_merchants(
+        env: Env,
+        admin: Address,
+        required: bool,
+    ) -> Result<(), Error> {
+        Self::require_registry_admin(&env, &admin)?;
+        env.store().set(
+            &DataKey::Config(ConfigKey::RequireRegisteredMerchants),
+            &required,
+        );
+        (RequireRegisteredMerchantsSet { required, admin }).publish(&env);
+        Ok(())
+    }
+
+    /// Returns whether payments require a registered, active merchant (#669).
+    pub fn get_require_registered_merchants(env: Env) -> bool {
+        env.store()
+            .get(&DataKey::Config(ConfigKey::RequireRegisteredMerchants))
+            .unwrap_or(false)
+    }
+
     /// Returns the current global pause state of the contract.
     ///
     /// # Returns
@@ -11292,6 +11453,64 @@ impl PaymentContract {
             .unwrap_or(false);
         if merchant_paused {
             return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+        }
+        Ok(())
+    }
+
+    /// Rejects `merchant` when `require_registered_merchants` is on and the
+    /// merchant is unregistered or deactivated (#669). No-op when the flag is off.
+    fn require_registered_merchant(env: &Env, merchant: &Address) -> Result<(), Error> {
+        let required: bool = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::RequireRegisteredMerchants))
+            .unwrap_or(false);
+        if !required {
+            return Ok(());
+        }
+        let profile: MerchantProfile = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::Profile(merchant.clone())))
+            .ok_or(Error::Payment(PaymentError::MerchantNotRegistered))?;
+        if !profile.active {
+            return Err(Error::Payment(PaymentError::MerchantInactive));
+        }
+        Ok(())
+    }
+
+    fn require_registry_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        Ok(())
+    }
+
+    fn set_merchant_active(env: &Env, merchant: &Address, active: bool) -> Result<(), Error> {
+        let key = DataKey::Merchant(MerchantDataKey::Profile(merchant.clone()));
+        let mut profile: MerchantProfile = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::MerchantNotRegistered))?;
+        if profile.active == active {
+            return Err(if active {
+                Error::Payment(PaymentError::InvalidStatus)
+            } else {
+                Error::Payment(PaymentError::MerchantInactive)
+            });
+        }
+        profile.active = active;
+        profile.updated_at = env.ledger().timestamp();
+        env.store().set(&key, &profile);
+        Ok(())
+    }
+
+    fn validate_merchant_name(name: &String) -> Result<(), Error> {
+        if name.is_empty() || name.len() > MAX_MERCHANT_NAME_LEN {
+            return Err(Error::Payment(PaymentError::InvalidMerchantName));
         }
         Ok(())
     }
