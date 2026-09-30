@@ -2,7 +2,10 @@
 use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
+    String,
+};
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -29,11 +32,53 @@ pub enum DataKey {
     RefundContract,
 }
 
+/// Event emitted when the coordinator's WASM is replaced in place (#644).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminContractUpgraded {
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
+}
+
 #[contract]
 pub struct AdminContract;
 
 #[contractimpl]
 impl AdminContract {
+    /// Replaces the coordinator's code with an already-uploaded WASM (#644).
+    ///
+    /// The contract address and all stored data (admin, pauser, child contract
+    /// addresses) are kept; the new code runs from the next invocation.
+    ///
+    /// # Parameters
+    /// - `admin`: the stored admin address, which must authorize the call.
+    /// - `new_wasm_hash`: hash of the WASM previously uploaded to the network.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized,
+    /// and `Error::Unauthorized` if `admin` is not the stored admin.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        (AdminContractUpgraded {
+            new_wasm_hash,
+            upgraded_by: admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Initializes the admin contract with the addresses of the payment, escrow,
     /// and refund contracts.
     ///
