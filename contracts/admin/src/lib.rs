@@ -2,7 +2,9 @@
 use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String};
+use soroban_sdk::{
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String,
+};
 
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
@@ -10,6 +12,7 @@ pub enum Error {
     AlreadyInitialized = 1,
     NotInitialized = 2,
     Unauthorized = 3,
+    InvalidFunctionName = 4,
 }
 
 #[contracttype]
@@ -19,6 +22,64 @@ pub enum DataKey {
     PaymentContract,
     EscrowContract,
     RefundContract,
+}
+
+/// Identifies which child contract a targeted admin action applies to.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildKind {
+    Payment,
+    Escrow,
+    Refund,
+}
+
+/// Emitted when the pauser pauses a single function on one child contract.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyFunctionPausedEvent {
+    pub target: ChildKind,
+    pub function_name: String,
+    pub paused_by: Address,
+    pub reason: String,
+    pub paused_at: u64,
+}
+
+/// Emitted when the pauser unpauses a single function on one child contract.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmergencyFunctionUnpausedEvent {
+    pub target: ChildKind,
+    pub function_name: String,
+    pub unpaused_by: Address,
+    pub unpaused_at: u64,
+}
+
+/// Verifies `pauser` is authenticated and matches the stored pauser.
+fn require_pauser(env: &Env, pauser: &Address) -> Result<(), Error> {
+    pauser.require_auth();
+
+    let stored_pauser: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Pauser)
+        .ok_or(Error::NotInitialized)?;
+    if *pauser != stored_pauser {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+/// Returns the stored address of the child contract identified by `target`.
+fn child_contract(env: &Env, target: ChildKind) -> Result<Address, Error> {
+    let key = match target {
+        ChildKind::Payment => DataKey::PaymentContract,
+        ChildKind::Escrow => DataKey::EscrowContract,
+        ChildKind::Refund => DataKey::RefundContract,
+    };
+    env.storage()
+        .instance()
+        .get(&key)
+        .ok_or(Error::NotInitialized)
 }
 
 #[contract]
