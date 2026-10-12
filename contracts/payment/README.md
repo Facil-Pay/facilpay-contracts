@@ -1424,6 +1424,18 @@ stellar contract invoke --id $CONTRACT_ID \
 - [Escrow Contract](../escrow/README.md)
 - [Refund Contract](../refund/README.md)
 
+## Error Codes Reference
+
+The payment contract categorizes all numeric runtime errors into 5 dedicated error enums. For full details, tables, and trigger conditions, see [ERRORS.md](./ERRORS.md).
+
+| Error Enum | Code Range | Description |
+|---|:---:|---|
+| `BasicError` | 100–126 | Core contract authorization, validation, rate limiting, and administrative errors |
+| `PaymentError` | 200–243 | Payment lifecycle, installments, webhooks, requests, and merchant management |
+| `SubscriptionError` | 300–320 | Recurring billing, dunning, metered usage, trials, and pauses |
+| `ProposalError` | 400–406 | Multi-signature admin proposal and execution errors |
+| `FeatureError` | 500–545 | State channels, splits, loyalty, fee sweeps, and payment routing |
+
 ## Contract Upgrades
 
 | Function | Parameters | Returns | Auth |
