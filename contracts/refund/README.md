@@ -743,6 +743,68 @@ The effective policy is resolved via `get_effective_refund_policy(merchant)`, wh
 
 This is distinct from voucher redemption: inheritance is about the merchant refund policy that governs future refund decisions, while vouchers are per-refund credit instruments with their own expiry and redemption logic.
 
+### Refund Reserve
+
+Merchants can pre-fund a per-token reserve so that every refund payout is drawn from their own liquidity rather than a shared contract pool. Once a merchant has a reserve for a token, `process_refund` (and every path that processes a refund: `process_refund_batch`, `evaluate_auto_refund`, `resolve_appeal`) debits that reserve automatically. If the reserve is too low to cover a refund, processing fails before the payout is made.
+
+#### Purpose
+
+The reserve gives merchants explicit control over their refund liquidity:
+
+- Ensures refund payouts are backed by the merchant's own deposits rather than a shared pool.
+- Lets the contract admin enforce a minimum balance floor to guarantee a merchant can honour refunds at all times.
+- Enables `issue_promotional_vouchers()` to draw from the same reserve for goodwill credit.
+
+#### Who can deposit and withdraw
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `deposit_refund_reserve` | `merchant: Address`, `token: Address`, `amount: i128` | `Result<i128, Error>` (new balance) | `merchant` |
+| `withdraw_refund_reserve` | `merchant: Address`, `token: Address`, `amount: i128` | `Result<i128, Error>` (new balance) | `merchant` |
+
+- **Depositing** transfers `amount` of `token` from the merchant's wallet into the contract and increases the stored balance.
+- **Withdrawing** transfers `amount` back to the merchant. Withdrawals are subject to two guards: the balance must cover the requested amount (`InsufficientRefundReserve`, 67) and the resulting balance must stay at or above the admin-set minimum (`ReserveBelowMinimum`, 68).
+- Both functions require a positive `amount` (`InvalidAmount`, 1) and respect the global and per-function pause state.
+- The reserve is per `(merchant, token)` pair. A merchant can maintain separate reserves for USDC, XLM, or any other supported token.
+
+#### Minimum-reserve enforcement
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `set_min_refund_reserve` | `admin: Address`, `merchant: Address`, `token: Address`, `min_amount: i128` | `Result<(), Error>` | `admin` |
+| `get_min_refund_reserve` | `merchant: Address`, `token: Address` | `i128` (0 if unset) | — |
+
+The admin sets a non-negative floor on how much a merchant must keep in its reserve for a given token. `min_amount` must be ≥ 0 (`InvalidAmount`, 1 if negative).
+
+> **Note:** The minimum only restricts `withdraw_refund_reserve`. Refund payouts via `process_refund` may still draw the reserve below the floor — the minimum is a withdrawal guard, not a processing guard.
+
+#### Query functions
+
+| Function | Parameters | Returns |
+|---|---|---|
+| `get_refund_reserve` | `merchant: Address`, `token: Address` | `i128` — current balance (0 if no reserve exists) |
+| `has_refund_reserve` | `merchant: Address`, `token: Address` | `bool` — `true` if a reserve entry exists for this pair |
+
+`get_refund_reserve` returns `0` for merchants that have never deposited. Use `has_refund_reserve` to distinguish a zero balance from a merchant that has no reserve at all — a zero-balance reserve still gates `process_refund` for that token.
+
+#### How the reserve interacts with process_refund
+
+When `process_refund` runs:
+
+1. It checks `has_refund_reserve(merchant, token)`.
+2. **Reserve present** — the net refund amount (after platform fee deduction) is deducted from the reserve. If the balance is insufficient, the call fails with `InsufficientRefundReserve` (67) before any token transfer occurs. On success, `RefundReserveDebited` is emitted.
+3. **No reserve** — the refund is paid from the shared contract balance (legacy behaviour for merchants that have not opted into the reserve).
+
+The same logic applies in every code path that processes a refund: `process_refund_batch`, `evaluate_auto_refund`, and `resolve_appeal` (when upholding an appeal).
+
+#### Errors
+
+| Error | Code | When |
+|---|---|---|
+| `CoreError::InvalidAmount` | `1` | `amount` ≤ 0 for deposit/withdraw, or `min_amount` < 0 for `set_min_refund_reserve` |
+| `ExtError::InsufficientRefundReserve` | `67` | Withdrawal or refund payout exceeds the current balance |
+| `ExtError::ReserveBelowMinimum` | `68` | Withdrawal would leave the balance below the admin-set minimum |
+
 ### Payment Refund Caps
 
 - `set_payment_refund_cap()` — Admin sets a refund cap on a specific payment.
@@ -827,6 +889,15 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
 | `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
 | `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |
+
+### Refund Reserve Events
+
+| Event | Topic Name | Payload Fields | Fires When |
+|---|---|---|---|
+| `RefundReserveDeposited` | `refund_reserve_deposited` | `merchant`, `token`, `amount`, `new_balance` | `deposit_refund_reserve()` adds funds to the merchant's reserve |
+| `RefundReserveWithdrawn` | `refund_reserve_withdrawn` | `merchant`, `token`, `amount`, `new_balance` | `withdraw_refund_reserve()` removes funds from the merchant's reserve |
+| `RefundReserveDebited` | `refund_reserve_debited` | `merchant`, `token`, `refund_id`, `amount`, `new_balance` | `process_refund()` (and batch/auto/appeal paths) debits the merchant's reserve to fund a payout |
+| `MinRefundReserveSet` | `min_refund_reserve_set` | `merchant`, `token`, `min_amount` | `set_min_refund_reserve()` establishes or updates the withdrawal floor |
 
 ### Voucher Events
 
