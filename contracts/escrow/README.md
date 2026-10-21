@@ -2,6 +2,93 @@
 
 This contract manages secure, conditional fund holding for the Facil-Pay ecosystem, ensuring assets are only released when agreed-upon conditions are met by all parties.
 
+## Reputation: base score, tenure bonus, and decay
+
+The escrow contract maintains a `ReputationScore` per address. New addresses begin at **5,000 points**. Reputation changes on successful completion and dispute outcomes; tenure rewards and inactivity decay are configurable. All signatures below are from `contracts/escrow/src/lib.rs`.
+
+### Public API, authorization, errors, and events
+
+| Function (actual signature) | Authorization | Errors and emitted events |
+| --- | --- | --- |
+| `get_reputation(env: Env, address: Address) -> ReputationScore` | None | Read-only: returns a score adjusted for inactivity without persisting it. No event. |
+| `set_reputation_config(env: Env, admin: Address, config: ReputationConfig) -> Result<(), Error>` | `admin.require_auth()` and multisig admin membership | `BasicError::ContractPaused`, `BasicError::NotAnAdmin`; emits `ReputationConfigUpdated` with all four configuration fields. |
+| `set_tenure_reputation_config(env: Env, admin: Address, config: TenureReputationConfig) -> Result<(), Error>` | `admin.require_auth()` and multisig admin membership | `ContractPaused`, `NotAnAdmin`; emits `TenureConfigUpdated` (`base_score`, `weight_per_day`, `max_bonus_days`). |
+| `calculate_tenure_bonus(env: Env, escrow_id: u64) -> u32` | None | Returns zero without tenure configuration or for disputed escrows; invalid escrow IDs may panic through `get_escrow`. No event. |
+| `apply_tenure_bonus(env: Env, escrow_id: u64, participant: Address) -> Result<(), Error>` | No explicit `require_auth()` | `ContractPaused`; `EscrowError::NotFound` if tenure config missing; `EscrowError::AlreadyProcessed` for duplicate escrow/participant; invalid escrow ID may panic. Emits `TenureBonusGranted` and, when points increase, `ReputationUpdated`. |
+| `update_decay_config(env: Env, admin: Address, config: ReputationDecayConfig) -> Result<(), Error>` | `admin.require_auth()` and multisig admin membership | `ContractPaused`, `NotAnAdmin`. Does **not** emit an event in the current implementation. |
+| `apply_reputation_decay(env: Env, address: Address) -> Result<i128, Error>` | None | `ContractPaused`; returns the resulting score. Emits `ReputationDecayed` only if the score changes. |
+| `get_effective_reputation(env: Env, address: Address) -> i128` | None | Read-only calculated score; no explicit contract error or event. |
+
+`env` is the Soroban environment, `admin` the signing administrator, `address`/`participant` the reputation holder, `escrow_id` the target escrow, and `config` the corresponding policy structure.
+
+### Base score and transaction outcomes
+
+`ReputationConfig` fields and defaults:
+
+| Field | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `win_reward` | `i64` | 200 | Added to dispute winner |
+| `loss_penalty` | `i64` | 200 | Subtracted from dispute loser |
+| `completion_reward` | `i64` | 100 | Added on successful escrow completion |
+| `dispute_initiation_penalty` | `i64` | 50 | Configurable initiation penalty |
+
+Completion increments `total_transactions`; resolved disputes update `disputes_won` or `disputes_lost`. These update paths cap gains at 10,000 and floor dispute losses at zero, publishing `ReputationUpdated` (`address`, `old_score`, `new_score`). The current implementation's defaults are returned by `get_reputation_config(env: Env) -> ReputationConfig`.
+
+Example using the real configuration method:
+
+```rust
+let config = ReputationConfig {
+    win_reward: 200,
+    loss_penalty: 200,
+    completion_reward: 100,
+    dispute_initiation_penalty: 50,
+};
+client.set_reputation_config(&admin, &config);
+```
+
+### Tenure bonus
+
+`TenureReputationConfig` contains `base_score: u32`, `weight_per_day: u32`, and `max_bonus_days: u32`. For an undisputed escrow:
+
+```text
+days_active = floor((ledger_timestamp - escrow.created_at) / 86400)
+bonus = min(days_active * weight_per_day, max_bonus_days * weight_per_day)
+score_increase = base_score + bonus
+```
+
+The calculation uses saturating arithmetic, caps `bonus` at `u32::MAX`, and caps the stored reputation at 10,000. A disputed escrow (including one disputed in the past) is ineligible. `apply_tenure_bonus` records a one-time marker for each `(escrow_id, participant)`, even when the escrow is ineligible; a second application returns `AlreadyProcessed`. It is called during dispute-free `release_escrow`. `TenureBonusGranted` contains `escrow_id`, `participant`, and the duration-based `bonus` (not the flat base score). A score increase additionally emits `ReputationUpdated`.
+
+Example: `base_score = 20`, `weight_per_day = 5`, `max_bonus_days = 10`: a dispute-free escrow active for 7 full days earns 35 bonus points plus 20 base points, for 55 total (subject to the score cap). At 15 days the duration bonus remains capped at 50.
+
+### Inactivity decay
+
+`ReputationDecayConfig` fields and defaults:
+
+| Field | Type | Default |
+| --- | --- | --- |
+| `decay_rate_bps` | `i128` | 100 |
+| `decay_threshold_days` | `u64` | 30 |
+| `min_score` | `i128` | 0 |
+| `max_score` | `i128` | 10000 |
+
+After the threshold, the contract counts **full additional days** of inactivity and applies a linear (not compounded) reduction:
+
+```text
+days_inactive = floor((now - (last_updated + decay_threshold_days * 86400)) / 86400)
+decay = floor(stored_score * decay_rate_bps * days_inactive / 10000)
+effective_score = max(stored_score - decay, min_score)
+```
+
+Within the threshold, or before an additional full day passes, the score remains unchanged. `get_reputation` and `get_effective_reputation` calculate decay without persisting it; `apply_reputation_decay` writes the changed score, updates `last_updated`, and emits `ReputationDecayed` (`address`, `old_score`, `new_score`, `days_inactive`). If the result is unchanged, it returns without an event. The current `compute_decayed_score` implementation enforces `min_score` but does not use `max_score` as an upper clamp.
+
+Example: a stored score of 5,000, a 30-day threshold, and 100 bps/day with three additional full days of inactivity gives `5000 - (5000 * 100 * 3 / 10000) = 4850`.
+
+### Reputation-weighted dispute resolution
+
+The private `weighted_auto_resolve` function sums evidence weights separately for customer and merchant. Each evidence item contributes its submitter's **stored** `ReputationScore.score` to that side, rather than one vote per item. The merchant side wins only when its sum is strictly greater; ties return `false` (customer side). This routine reads stored reputation through `get_or_default_reputation`, **not** the lazily computed `get_effective_reputation`: unpersisted decay therefore does not change dispute evidence weighting. Applying decay first updates the stored score used by this calculation.
+
+---
+
 ## Public Functions
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
