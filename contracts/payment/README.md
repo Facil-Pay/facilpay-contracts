@@ -418,6 +418,7 @@ Emits `SubscriptionCancelledWithReason { subscription_id, cancelled_by, reason }
 `SubscriptionCancelled`.
 
 #### Skipping a Billing Cycle
+
 | Function                                      | Description                                                                                          |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `skip_next_cycle(customer, subscription_id)`  | Customer skips the next billing cycle without being charged. Returns the new `next_payment_at`.       |
