@@ -344,6 +344,9 @@ pub enum FeatureError {
     NoPendingSettlement = 544,
     // Issue #680: subscription token change
     TokenNotAllowedForMerchant = 545,
+    // Issue #767: auto-complete escrowed payment after confirmation timeout
+    NoConfirmationTimeout = 546,
+    ConfirmationTimeoutNotExpired = 547,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -389,7 +392,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=545).contains(&code) {
+            if (500..=547).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -1873,6 +1876,8 @@ pub struct EscrowedPayment {
     pub escrow_id: u64,
     pub escrow_contract: Address,
     pub auto_release_on_complete: bool,
+    pub confirmation_timeout_seconds: Option<u64>,
+    pub created_at: u64,
 }
 
 #[derive(Clone)]
@@ -4431,6 +4436,7 @@ impl PaymentContract {
         min_hold_period: u64,
         metadata: String,
         auto_release_on_complete: bool,
+        confirmation_timeout_seconds: Option<u64>,
     ) -> Result<(u64, u64), Error> {
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
@@ -4461,6 +4467,8 @@ impl PaymentContract {
             escrow_id,
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
+            confirmation_timeout_seconds,
+            created_at: env.ledger().timestamp(),
         };
         env.store().set(
             &DataKey::State(StateDataKey::EscrowedPayment(payment_id)),
@@ -4538,6 +4546,84 @@ impl PaymentContract {
         env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
         PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, admin);
+
+        (EscrowedPaymentCompleted {
+            payment_id,
+            escrow_id: bridge.escrow_id,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Auto-completes an escrowed payment after the confirmation timeout has passed.
+    /// Anyone can call this function if the timeout has expired and no dispute is open.
+    ///
+    /// # Arguments
+    /// * `caller` - Any address that wants to trigger the auto-completion (must authorize)
+    /// * `payment_id` - The ID of the escrowed payment to auto-complete
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if:
+    /// - The payment is not found or not in Pending status
+    /// - No confirmation timeout was set for this payment
+    /// - The timeout has not yet expired
+    /// - There is an unresolved dispute
+    /// - The escrow release fails
+    pub fn auto_complete_escrowed_payment(
+        env: Env,
+        caller: Address,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "auto_complete_escrowed_payment")?;
+        caller.require_auth();
+        
+        if !env
+            .store()
+            .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
+        {
+            return Err(Error::Payment(PaymentError::NotFound));
+        }
+
+        let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let mut payment = PaymentContract::get_payment(&env, payment_id);
+        
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        
+        Self::require_merchant_not_paused(&env, &payment.merchant)?;
+        PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
+
+        // Check if confirmation timeout was set
+        let timeout_seconds = bridge
+            .confirmation_timeout_seconds
+            .ok_or(Error::Feature(FeatureError::NoConfirmationTimeout))?;
+
+        // Check if timeout has passed
+        let current_time = env.ledger().timestamp();
+        let timeout_deadline = bridge.created_at + timeout_seconds;
+        
+        if current_time < timeout_deadline {
+            return Err(Error::Feature(FeatureError::ConfirmationTimeoutNotExpired));
+        }
+
+        // Release the escrow using the contract's identity (as a trusted bridge)
+        let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
+        if escrow_client
+            .try_release_escrow(
+                &env.current_contract_address(),
+                &bridge.escrow_id,
+                &bridge.auto_release_on_complete,
+            )
+            .is_err()
+        {
+            return Err(Error::Feature(FeatureError::EscrowBridgeFailed));
+        }
+
+        payment.status = PaymentStatus::Completed;
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
+        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, caller.clone());
 
         (EscrowedPaymentCompleted {
             payment_id,
