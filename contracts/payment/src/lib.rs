@@ -7,7 +7,7 @@
 use escrow::EscrowContractClient;
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, token, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
+    Bytes, BytesN, Env, IntoVal, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -115,6 +115,8 @@ pub enum SubscriptionKey {
     // Issue #756: pull-payment mandates
     Mandate(u64),
     MandateCounter,
+    // Issue #770: reason a subscription was cancelled
+    CancellationReason(u64),
 }
 
 #[derive(Clone)]
@@ -493,6 +495,11 @@ pub enum MerchantDataKey {
     SubscriberHookCount(Address),
     // Issue #669: merchant registry profile
     Profile(Address),
+    // Issue #770: churn counters, per merchant and per cancellation reason
+    ChurnTotal(Address),
+    ChurnCount(Address, u32),
+    // Issue #765: per-day merchant settlement bucket
+    DailySettlement(Address, u64),
 }
 
 // State and proposal data keys
@@ -729,6 +736,68 @@ pub struct Subscription {
 pub struct SubscriptionPriceProposal {
     pub new_amount: i128,
     pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
+}
+
+/// Reason a subscription was cancelled (#770).
+///
+/// Cancellations made through the legacy `cancel_subscription` entry point are
+/// recorded as [`CancellationReason::Unspecified`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum CancellationReason {
+    Unspecified,
+    TooExpensive,
+    MissingFeatures,
+    PoorQuality,
+    TechnicalIssues,
+    CustomerSupport,
+    SwitchingProvider,
+    BusinessClosure,
+    Other,
+}
+
+impl CancellationReason {
+    /// Stable numeric code for the reason, used as a storage key component.
+    pub fn code(&self) -> u32 {
+        match self {
+            CancellationReason::Unspecified => 0,
+            CancellationReason::TooExpensive => 1,
+            CancellationReason::MissingFeatures => 2,
+            CancellationReason::PoorQuality => 3,
+            CancellationReason::TechnicalIssues => 4,
+            CancellationReason::CustomerSupport => 5,
+            CancellationReason::SwitchingProvider => 6,
+            CancellationReason::BusinessClosure => 7,
+            CancellationReason::Other => 8,
+        }
+    }
+
+    /// Reverse of [`CancellationReason::code`].
+    pub fn from_code(code: u32) -> Option<CancellationReason> {
+        match code {
+            0 => Some(CancellationReason::Unspecified),
+            1 => Some(CancellationReason::TooExpensive),
+            2 => Some(CancellationReason::MissingFeatures),
+            3 => Some(CancellationReason::PoorQuality),
+            4 => Some(CancellationReason::TechnicalIssues),
+            5 => Some(CancellationReason::CustomerSupport),
+            6 => Some(CancellationReason::SwitchingProvider),
+            7 => Some(CancellationReason::BusinessClosure),
+            8 => Some(CancellationReason::Other),
+            _ => None,
+        }
+    }
+}
+
+/// Per-merchant churn summary (#770).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ChurnAnalytics {
+    pub merchant: Address,
+    /// Total number of subscriptions cancelled for this merchant.
+    pub total_cancellations: u64,
+    /// Number of cancellations per reason.
+    pub by_reason: Map<CancellationReason, u64>,
 }
 
 /// One entry in a payment's status history (#682).
@@ -1048,6 +1117,9 @@ pub struct MandateRevoked {
 pub struct PaymentCreated {
     pub payment_id: u64,
     pub customer: Address,
+    /// Address that funded the payment (#771). Equals `customer` unless the
+    /// payment was created through `create_payment_for`.
+    pub payer: Address,
     pub merchant: Address,
     pub amount: i128,
 }
@@ -1163,6 +1235,9 @@ pub struct PaymentCompleted {
 pub struct PaymentRefunded {
     pub payment_id: u64,
     pub customer: Address,
+    /// Address the refund was returned to (#771). Equals `customer` unless the
+    /// payment was created through `create_payment_for`.
+    pub payer: Address,
     pub amount: i128,
 }
 
@@ -1198,6 +1273,8 @@ pub struct PaymentCancelled {
 pub struct PaymentExpired {
     pub payment_id: u64,
     pub customer: Address,
+    /// Address the expired payment was returned to (#771).
+    pub payer: Address,
     pub refunded_amount: i128,
     pub expired_at: u64,
 }
@@ -1288,6 +1365,15 @@ pub struct RecurringPaymentFailed {
 pub struct SubscriptionCancelled {
     pub subscription_id: u64,
     pub cancelled_by: Address,
+}
+
+/// Emitted when a subscription is cancelled with a churn reason (#770).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionCancelledWithReason {
+    pub subscription_id: u64,
+    pub cancelled_by: Address,
+    pub reason: CancellationReason,
 }
 
 #[contractevent]
@@ -1387,6 +1473,16 @@ pub struct ChannelSettled {
     pub channel_id: u64,
     pub merchant_amount: i128,
     pub customer_refund: i128,
+}
+
+/// Emitted when a channel is closed cooperatively by both parties (#766).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelClosedCooperatively {
+    pub channel_id: u64,
+    pub merchant_amount: i128,
+    pub customer_refund: i128,
+    pub nonce: u64,
 }
 
 #[contractevent]
@@ -1771,6 +1867,14 @@ pub struct PartialPaymentRecord {
 pub struct Payment {
     pub id: u64,
     pub customer: Address,
+    /// Address that actually funds the payment (#771).
+    ///
+    /// Equal to `customer` for payments created with `create_payment`. When a
+    /// third party pays on behalf of a customer (`create_payment_for`) the
+    /// `customer` stays the *beneficiary* — the address the payment is
+    /// attributed to in analytics — while `payer` is the address whose funds
+    /// are used and to which refunds and expiry returns are sent.
+    pub payer: Address,
     pub merchant: Address,
     pub amount: i128,
     pub token: Address,
@@ -1950,6 +2054,33 @@ pub struct AnalyticsBucket {
     pub total_volume: i128,
     pub total_refunds: i128,
     pub failed_count: u64,
+}
+
+/// Per-merchant, per-day settlement summary (#765).
+///
+/// Buckets are keyed by `(merchant, day_index)` where `day_index` is the
+/// number of whole UTC days since the Unix epoch, so a bucket rolls over
+/// exactly at a UTC day boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct MerchantDailySettlement {
+    pub merchant: Address,
+    /// Ordinal of the UTC day (days since the Unix epoch).
+    pub day_index: u64,
+    /// Ledger timestamp of the first second of the day.
+    pub day_start: u64,
+    /// Ledger timestamp of the first second of the next day.
+    pub day_end: u64,
+    /// Number of payments created for the merchant on that day.
+    pub payment_count: u64,
+    /// Total value of the payments created on that day.
+    pub gross_volume: i128,
+    /// Platform fees collected on that day.
+    pub total_fees: i128,
+    /// Value refunded on that day (refunds count against the day they are processed).
+    pub refund_volume: i128,
+    /// `gross_volume - total_fees - refund_volume`.
+    pub net_volume: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3180,7 +3311,63 @@ impl PaymentContract {
         customer.require_auth();
         PaymentContract::do_create_payment(
             &env,
+            customer.clone(),
             customer,
+            merchant,
+            amount,
+            token,
+            currency,
+            expiration_duration,
+            metadata,
+        )
+    }
+
+    /// Creates a payment funded by a third-party payer on behalf of a customer
+    /// (#771).
+    ///
+    /// Parents, employers or sponsors can pay for another customer's purchase.
+    /// Only the `payer` authorizes the call — the `beneficiary` (the customer
+    /// the purchase is for) never has to sign for it.
+    ///
+    /// * The payment's `customer` is the `beneficiary`, so every customer-facing
+    ///   index and analytic (payment history, volume, loyalty, spend reports)
+    ///   is attributed to the beneficiary.
+    /// * The payment's `payer` is the address that funds the purchase: the
+    ///   merchant's proceeds and the platform fee are drawn from the payer, and
+    ///   refunds, cancellations and expiry returns are sent back to the payer.
+    ///
+    /// # Arguments
+    /// * `payer` - The address funding the payment (must authorize)
+    /// * `beneficiary` - The customer the payment is made for
+    /// * `merchant` - The merchant receiving the payment
+    /// * `amount` - The payment amount in base token units
+    /// * `token` - The SPL token address for the payment
+    /// * `currency` - The fiat currency associated with the payment
+    /// * `expiration_duration` - Seconds until the payment expires (0 for no expiration)
+    /// * `metadata` - Arbitrary metadata string for the payment
+    ///
+    /// # Returns
+    /// `Ok(payment_id)` on success, or an error if the token is not allowed, currency is
+    /// invalid, metadata is too large, the payer or beneficiary is flagged, rate limits
+    /// are exceeded, or the contract is paused.
+    pub fn create_payment_for(
+        env: Env,
+        payer: Address,
+        beneficiary: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        expiration_duration: u64,
+        metadata: String,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_payment")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
+        payer.require_auth();
+        PaymentContract::do_create_payment(
+            &env,
+            payer,
+            beneficiary,
             merchant,
             amount,
             token,
@@ -3319,6 +3506,7 @@ impl PaymentContract {
 
         let payment_id = PaymentContract::do_create_payment(
             &env,
+            customer.clone(),
             customer.clone(),
             request.merchant.clone(),
             request.amount,
@@ -3785,6 +3973,7 @@ impl PaymentContract {
 
         (PaymentCreated {
             payment_id,
+            payer: customer.clone(),
             customer,
             merchant,
             amount,
@@ -4034,8 +4223,14 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
+    /// Creates the payment record.
+    ///
+    /// `payer` is the address that funds the payment and `customer` is the
+    /// beneficiary the payment is attributed to. They are the same address for
+    /// ordinary payments; `create_payment_for` (#771) allows them to differ.
     fn do_create_payment(
         env: &Env,
+        payer: Address,
         customer: Address,
         merchant: Address,
         amount: i128,
@@ -4060,21 +4255,28 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::MetadataTooLarge));
         }
 
-        // Enforce sanctions/flag checks at creation entry point.
+        // Enforce sanctions/flag checks at creation entry point. The payer and
+        // the beneficiary must both be clean (#771).
+        if PaymentContract::is_address_flagged(env.clone(), payer.clone())
+            && !PaymentContract::is_allowlisted(env, &payer)
+        {
+            return Err(Error::Basic(BasicError::AddressFlagged));
+        }
         if PaymentContract::is_address_flagged(env.clone(), customer.clone())
             && !PaymentContract::is_allowlisted(env, &customer)
         {
             return Err(Error::Basic(BasicError::AddressFlagged));
         }
 
-        // Check rate limits and anti-fraud before processing
-        PaymentContract::check_rate_limit_internal(env, &customer, amount)?;
+        // Check rate limits and anti-fraud before processing. Rate and spend
+        // limits apply to the address that actually spends the funds (#771).
+        PaymentContract::check_rate_limit_internal(env, &payer, amount)?;
 
         // Check merchant rate limits
         PaymentContract::check_merchant_rate_limit(env, &merchant, amount)?;
 
         // Check customer spend limit (#217)
-        PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
+        PaymentContract::check_and_update_spend_limit(env, &payer, amount)?;
 
         let counter: u64 = env
             .store()
@@ -4102,6 +4304,7 @@ impl PaymentContract {
         let payment = Payment {
             id: payment_id,
             customer: customer.clone(),
+            payer: payer.clone(),
             merchant: merchant.clone(),
             amount,
             token,
@@ -4359,9 +4562,20 @@ impl PaymentContract {
             0,
         );
         PaymentContract::update_platform_daily_bucket(env, current_timestamp, amount, 0, 0);
+        // Issue #765: per-merchant daily settlement bucket.
+        PaymentContract::update_merchant_daily_settlement(
+            env,
+            payment.merchant.clone(),
+            current_timestamp,
+            1,
+            amount,
+            0,
+            0,
+        );
 
         (PaymentCreated {
             payment_id,
+            payer: payment.payer.clone(),
             customer: payment.customer,
             merchant: payment.merchant.clone(),
             amount: payment.amount,
@@ -4988,7 +5202,9 @@ impl PaymentContract {
         };
 
         if refund_amount > 0 {
-            token_client.transfer(&contract_address, &payment.customer, &refund_amount);
+            // #771: expiry returns go to the payer, which may be a third party
+            // paying on behalf of the customer.
+            token_client.transfer(&contract_address, &payment.payer, &refund_amount);
         }
 
         // Return any escrowed tip (#675)
@@ -5012,6 +5228,7 @@ impl PaymentContract {
         // Emit PaymentExpired event with refund info
         (PaymentExpired {
             payment_id,
+            payer: payment.payer.clone(),
             customer: payment.customer,
             refunded_amount: refund_amount,
             expired_at: env.ledger().timestamp(),
@@ -5147,15 +5364,28 @@ impl PaymentContract {
             payment.amount
         };
 
-        // Deduct platform fee (if configured) and get net amount for merchant
+        // Deduct platform fee (if configured) and get net amount for merchant.
+        // #771: the fee is drawn from the payer, which may be a third party.
         let (net_amount, fee_amount) = PaymentContract::deduct_fee(
             env,
             payment_id,
             charge_amount,
             payment.merchant.clone(),
             &payment.token,
-            &payment.customer,
+            &payment.payer,
             payment.currency.clone(),
+        );
+
+        // Issue #765: record the platform fee against the merchant's daily
+        // settlement bucket for the day the payment settles on.
+        PaymentContract::update_merchant_daily_settlement(
+            env,
+            payment.merchant.clone(),
+            env.ledger().timestamp(),
+            0,
+            0,
+            fee_amount,
+            0,
         );
 
         // The tip (#675) is already escrowed in the contract and is fee-exempt:
@@ -5261,7 +5491,7 @@ impl PaymentContract {
 
         token_client.transfer_from(
             &contract_address,
-            &payment.customer,
+            &payment.payer,
             &contract_address,
             &merchant_amount,
         );
@@ -6096,6 +6326,7 @@ impl PaymentContract {
 
         (PaymentRefunded {
             payment_id,
+            payer: payment.payer.clone(),
             customer: payment.customer,
             amount: payment.amount,
         })
@@ -6115,6 +6346,16 @@ impl PaymentContract {
             0,
         );
         PaymentContract::update_platform_daily_bucket(env, now, 0, payment.amount, 0);
+        // Issue #765: refunds count against the day they are processed.
+        PaymentContract::update_merchant_daily_settlement(
+            env,
+            payment.merchant.clone(),
+            now,
+            0,
+            0,
+            0,
+            payment.amount,
+        );
 
         Ok(())
     }
@@ -6190,6 +6431,7 @@ impl PaymentContract {
 
         (PaymentRefunded {
             payment_id,
+            payer: payment.payer.clone(),
             customer: payment.customer,
             amount: refund_amount,
         })
@@ -6197,6 +6439,17 @@ impl PaymentContract {
 
         // Issue #674
         PaymentContract::invoke_payment_hooks(&env, PaymentEventType::Refunded, payment_id);
+
+        // Issue #765: refunds count against the day they are processed.
+        PaymentContract::update_merchant_daily_settlement(
+            &env,
+            payment.merchant.clone(),
+            env.ledger().timestamp(),
+            0,
+            0,
+            0,
+            refund_amount,
+        );
 
         Ok(())
     }
@@ -6238,9 +6491,10 @@ impl PaymentContract {
         let tip = PaymentContract::get_tip(&env, payment_id);
         let refund_amount = payment.amount + tip;
         if refund_amount > 0 {
+            // #771: refunds go to the payer, not to the beneficiary.
             token::Client::new(&env, &payment.token).transfer(
                 &merchant,
-                &payment.customer,
+                &payment.payer,
                 &refund_amount,
             );
         }
@@ -6254,17 +6508,29 @@ impl PaymentContract {
         if tip > 0 {
             (PaymentTipReturned {
                 payment_id,
-                customer: payment.customer.clone(),
+                customer: payment.payer.clone(),
                 tip_amount: tip,
             })
             .publish(&env);
         }
         (PaymentRefunded {
             payment_id,
+            payer: payment.payer.clone(),
             customer: payment.customer,
             amount: payment.amount,
         })
         .publish(&env);
+
+        // Issue #765: refunds count against the day they are processed.
+        PaymentContract::update_merchant_daily_settlement(
+            &env,
+            payment.merchant.clone(),
+            env.ledger().timestamp(),
+            0,
+            0,
+            0,
+            payment.amount,
+        );
 
         Ok(())
     }
@@ -6403,6 +6669,17 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        // Issue #765: refunds count against the day they are processed.
+        PaymentContract::update_merchant_daily_settlement(
+            &env,
+            payment.merchant.clone(),
+            env.ledger().timestamp(),
+            0,
+            0,
+            0,
+            amount,
+        );
+
         Ok(())
     }
 
@@ -6432,8 +6709,10 @@ impl PaymentContract {
 
         let mut payment = PaymentContract::get_payment(env, payment_id);
 
-        // Check authorization: caller must be customer, merchant, or admin
-        let is_authorized = payment.customer == caller || payment.merchant == caller;
+        // Check authorization: caller must be customer, payer, merchant, or admin.
+        // #771: a third-party payer may cancel the payment it funded.
+        let is_authorized =
+            payment.customer == caller || payment.payer == caller || payment.merchant == caller;
         if !is_authorized {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
@@ -7596,6 +7875,19 @@ impl PaymentContract {
                     &sub.merchant,
                     subscription_id,
                 );
+                // Issue #770: a scheduled end-of-period cancellation still
+                // counts as churn for the merchant.
+                PaymentContract::record_churn(
+                    &env,
+                    &sub.merchant,
+                    &CancellationReason::Unspecified,
+                );
+                env.store().set(
+                    &DataKey::Subscription(SubscriptionKey::CancellationReason(
+                        subscription_id,
+                    )),
+                    &CancellationReason::Unspecified,
+                );
                 (RecurringPaymentExecuted {
                     subscription_id,
                     payment_count: sub.payment_count,
@@ -7930,10 +8222,41 @@ impl PaymentContract {
     }
 
     /// Cancel a subscription. Only the customer, merchant, or admin may call this.
+    ///
+    /// The cancellation is recorded as `CancellationReason::Unspecified` in the
+    /// merchant's churn analytics (#770).
     pub fn cancel_subscription(
         env: Env,
         caller: Address,
         subscription_id: u64,
+    ) -> Result<(), Error> {
+        PaymentContract::cancel_subscription_with_reason(
+            env,
+            caller,
+            subscription_id,
+            CancellationReason::Unspecified,
+        )
+    }
+
+    /// Cancels a subscription and records why it was cancelled (#770).
+    ///
+    /// Merchants can then see *why* customers churn: the reason is counted per
+    /// merchant and can be read back with `get_churn_analytics`.
+    ///
+    /// # Arguments
+    /// * `caller` - The customer, merchant or admin cancelling the subscription (must authorize)
+    /// * `subscription_id` - The subscription to cancel
+    /// * `reason_code` - Why the subscription is being cancelled
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the subscription does not exist, the
+    /// caller is not authorized to cancel it, or the subscription is already
+    /// cancelled or expired.
+    pub fn cancel_subscription_with_reason(
+        env: Env,
+        caller: Address,
+        subscription_id: u64,
+        reason_code: CancellationReason,
     ) -> Result<(), Error> {
         caller.require_auth();
 
@@ -7974,6 +8297,13 @@ impl PaymentContract {
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
             &sub,
         );
+        // Issue #770: remember the reason on the subscription itself.
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::CancellationReason(subscription_id)),
+            &reason_code,
+        );
+        // Issue #770: count the cancellation for the merchant, per reason.
+        PaymentContract::record_churn(&env, &sub.merchant, &reason_code);
 
         Self::remove_from_merchant_active_subscriptions(&env, &sub.merchant, subscription_id);
 
@@ -8036,11 +8366,108 @@ impl PaymentContract {
 
         (SubscriptionCancelled {
             subscription_id,
+            cancelled_by: caller.clone(),
+        })
+        .publish(&env);
+
+        // Issue #770: the reason the customer gave for leaving.
+        (SubscriptionCancelledWithReason {
+            subscription_id,
             cancelled_by: caller,
+            reason: reason_code,
         })
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Records a subscription cancellation in the merchant's churn counters (#770).
+    fn record_churn(env: &Env, merchant: &Address, reason: &CancellationReason) {
+        let total: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::ChurnTotal(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::ChurnTotal(merchant.clone())),
+            &(total + 1),
+        );
+
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::ChurnCount(
+                merchant.clone(),
+                reason.code(),
+            )))
+            .unwrap_or(0);
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::ChurnCount(
+                merchant.clone(),
+                reason.code(),
+            )),
+            &(count + 1),
+        );
+    }
+
+    /// Returns the churn analytics of a merchant (#770).
+    ///
+    /// The counters are per merchant: `total_cancellations` is the number of
+    /// subscriptions cancelled for this merchant and `by_reason` breaks the
+    /// cancellations down by the reason that was given.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant to report on.
+    ///
+    /// # Returns
+    /// A `ChurnAnalytics` record. A merchant without cancellations gets a
+    /// zero-valued record.
+    pub fn get_churn_analytics(env: Env, merchant: Address) -> ChurnAnalytics {
+        let total: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::ChurnTotal(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+
+        let mut by_reason: Map<CancellationReason, u64> = Map::new(&env);
+        for code in 0..=8u32 {
+            let count: u64 = env
+                .store()
+                .get(&DataKey::Merchant(MerchantDataKey::ChurnCount(
+                    merchant.clone(),
+                    code,
+                )))
+                .unwrap_or(0);
+            if count > 0 {
+                if let Some(reason) = CancellationReason::from_code(code) {
+                    by_reason.set(reason, count);
+                }
+            }
+        }
+
+        ChurnAnalytics {
+            merchant,
+            total_cancellations: total,
+            by_reason,
+        }
+    }
+
+    /// Returns the reason a subscription was cancelled with, if any (#770).
+    ///
+    /// # Arguments
+    /// * `subscription_id` - The subscription to inspect.
+    ///
+    /// # Returns
+    /// `Some(reason)` when the subscription was cancelled, `None` otherwise.
+    pub fn get_subscription_cancellation_reason(
+        env: Env,
+        subscription_id: u64,
+    ) -> Option<CancellationReason> {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::CancellationReason(
+                subscription_id,
+            )))
     }
 
     /// Transfer a subscription to another customer.
@@ -8776,7 +9203,8 @@ impl PaymentContract {
         };
 
         if refund_amount > 0 {
-            token_client.transfer(&contract_address, &payment.customer, &refund_amount);
+            // #771: refunds go to the payer, not to the beneficiary.
+            token_client.transfer(&contract_address, &payment.payer, &refund_amount);
 
             // Clear the cached outstanding balance so a later query recomputes
             // against the now-terminal payment instead of returning stale data.
@@ -10425,6 +10853,7 @@ impl PaymentContract {
             let result = PaymentContract::do_create_payment(
                 &env,
                 entry.customer.clone(),
+                entry.customer.clone(),
                 entry.merchant.clone(),
                 entry.amount,
                 entry.token.clone(),
@@ -10706,6 +11135,7 @@ impl PaymentContract {
             let payment = Payment {
                 id: payment_id,
                 customer: entry.customer.clone(),
+                payer: entry.customer.clone(),
                 merchant: entry.merchant.clone(),
                 amount: entry.amount,
                 token: entry.token.clone(),
@@ -10873,6 +11303,7 @@ impl PaymentContract {
         // Create the base payment first
         let payment_id = PaymentContract::do_create_payment(
             &env,
+            customer.clone(),
             customer.clone(),
             merchant.clone(),
             amount,
@@ -11319,6 +11750,83 @@ impl PaymentContract {
             })
     }
 
+    /// Returns the daily settlement summary of a merchant for one UTC day (#765).
+    ///
+    /// The summary lets a merchant reconcile a single day against their books:
+    /// how many payments were created, the gross volume, the platform fees
+    /// collected, the refunds processed and the resulting net volume.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant to report on.
+    /// * `day_index` - The UTC day to report on. The canonical identifier is
+    ///   the ordinal of the day (`days since the Unix epoch`); a day-start
+    ///   timestamp is accepted as well.
+    ///
+    /// # Returns
+    /// A `MerchantDailySettlement` record. Days without activity return a
+    /// zero-valued record.
+    pub fn get_merchant_daily_settlement(
+        env: Env,
+        merchant: Address,
+        day_index: u64,
+    ) -> MerchantDailySettlement {
+        let day_index = PaymentContract::resolve_day_index(day_index);
+        PaymentContract::daily_settlement_bucket(&env, &merchant, day_index)
+    }
+
+    /// Reads the stored settlement bucket of a merchant for an exact day.
+    fn daily_settlement_bucket(
+        env: &Env,
+        merchant: &Address,
+        day_index: u64,
+    ) -> MerchantDailySettlement {
+        let key = DataKey::Merchant(MerchantDataKey::DailySettlement(
+            merchant.clone(),
+            day_index,
+        ));
+        env.store()
+            .get(&key)
+            .unwrap_or_else(|| PaymentContract::empty_daily_settlement(merchant, day_index))
+    }
+
+    /// Returns the daily settlement summaries of a merchant for a range of days
+    /// (#765).
+    ///
+    /// The range is half-open, `[from_day_index, to_day_index)`. Days without
+    /// activity are reported as zero-valued entries so the result can be used
+    /// as a report. At most `max_days` entries are returned, so a long range
+    /// has to be requested in several calls.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant to report on.
+    /// * `from_day_index` - First day of the range (inclusive).
+    /// * `to_day_index` - Day after the last day of the range (exclusive).
+    /// * `max_days` - Maximum number of days to return.
+    ///
+    /// # Returns
+    /// A `Vec<MerchantDailySettlement>` ordered from the oldest day to the
+    /// newest.
+    pub fn get_merchant_daily_settlement_range(
+        env: Env,
+        merchant: Address,
+        from_day_index: u64,
+        to_day_index: u64,
+        max_days: u32,
+    ) -> Vec<MerchantDailySettlement> {
+        let from = PaymentContract::resolve_day_index(from_day_index);
+        let to = PaymentContract::resolve_day_index(to_day_index);
+        let mut out = Vec::new(&env);
+        let mut day = from;
+        let mut returned = 0u32;
+        while day < to && returned < max_days {
+            let bucket = PaymentContract::daily_settlement_bucket(&env, &merchant, day);
+            out.push_back(bucket);
+            day += 1;
+            returned += 1;
+        }
+        out
+    }
+
     /// Returns the top merchants across the platform by total volume.
     ///
     /// # Arguments
@@ -11410,6 +11918,71 @@ impl PaymentContract {
             &DataKey::Merchant(MerchantDataKey::AnalyticsBucket(merchant, bucket_start)),
             &bucket,
         );
+    }
+
+    /// Ordinal of the UTC day a timestamp falls in (days since the Unix epoch).
+    fn day_index(ts: u64) -> u64 {
+        ts / SECONDS_PER_DAY
+    }
+
+    /// Resolves the day a caller is referring to.
+    ///
+    /// The canonical identifier of a day is its ordinal (`day_index`), but a
+    /// day-start timestamp is accepted as well so that callers can pass either
+    /// form. Values below one day are always treated as an ordinal.
+    fn resolve_day_index(value: u64) -> u64 {
+        if value >= SECONDS_PER_DAY {
+            value / SECONDS_PER_DAY
+        } else {
+            value
+        }
+    }
+
+    /// Builds an empty settlement bucket for a merchant and day (#765).
+    fn empty_daily_settlement(merchant: &Address, day_index: u64) -> MerchantDailySettlement {
+        MerchantDailySettlement {
+            merchant: merchant.clone(),
+            day_index,
+            day_start: day_index * SECONDS_PER_DAY,
+            day_end: day_index * SECONDS_PER_DAY + SECONDS_PER_DAY,
+            payment_count: 0,
+            gross_volume: 0,
+            total_fees: 0,
+            refund_volume: 0,
+            net_volume: 0,
+        }
+    }
+
+    /// Updates a merchant's settlement bucket for the UTC day of `ts` (#765).
+    ///
+    /// Buckets roll over at UTC day boundaries: the ledger timestamp decides
+    /// which day a payment, fee or refund is booked on.
+    fn update_merchant_daily_settlement(
+        env: &Env,
+        merchant: Address,
+        ts: u64,
+        count_delta: u64,
+        gross_delta: i128,
+        fee_delta: i128,
+        refund_delta: i128,
+    ) {
+        let day_index = PaymentContract::day_index(ts);
+        let key = DataKey::Merchant(MerchantDataKey::DailySettlement(
+            merchant.clone(),
+            day_index,
+        ));
+        let mut bucket: MerchantDailySettlement = env
+            .store()
+            .get(&key)
+            .unwrap_or_else(|| PaymentContract::empty_daily_settlement(&merchant, day_index));
+
+        bucket.payment_count += count_delta;
+        bucket.gross_volume += gross_delta;
+        bucket.total_fees += fee_delta;
+        bucket.refund_volume += refund_delta;
+        bucket.net_volume = bucket.gross_volume - bucket.total_fees - bucket.refund_volume;
+
+        env.store().set(&key, &bucket);
     }
 
     fn update_platform_daily_bucket(
@@ -13454,6 +14027,114 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Closes a payment channel cooperatively, without waiting out the challenge
+    /// window (#766).
+    ///
+    /// When both parties agree on the final balance there is no reason to wait
+    /// for the dispute window to elapse: this entry point settles the channel
+    /// immediately. It requires an authorization from **both** the channel's
+    /// customer and its merchant.
+    ///
+    /// Any pending unilateral settlement (`initiate_settlement`) is cancelled:
+    /// the cooperative close supersedes it.
+    ///
+    /// # Arguments
+    /// * `channel_id` - The ID of the channel to close.
+    /// * `customer_amount` - Amount returned to the customer.
+    /// * `merchant_amount` - Amount paid out to the merchant.
+    /// * `nonce` - Strictly increasing nonce; must be greater than the channel's
+    ///   `settled_nonce`.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns `FeatureError::ChannelNotFound` if the channel does not exist,
+    /// `FeatureError::ChannelClosed` if it is already closed,
+    /// `FeatureError::InvalidNonce` if the nonce is not strictly greater than
+    /// the settled nonce, `BasicError::InvalidAmount` if either amount is
+    /// negative and `FeatureError::BalanceSumMismatch` if the two amounts do
+    /// not add up to `deposited - settled`.
+    pub fn close_channel_cooperative(
+        env: Env,
+        channel_id: u64,
+        customer_amount: i128,
+        merchant_amount: i128,
+        nonce: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "close_channel_cooperative")?;
+
+        let mut channel: PaymentChannel = env
+            .store()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        // Both parties must agree on the final balance (#766).
+        channel.customer.require_auth();
+        channel.merchant.require_auth();
+
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        // Enforce strictly increasing nonce to prevent stale state replay.
+        if nonce <= channel.settled_nonce {
+            return Err(Error::Feature(FeatureError::InvalidNonce));
+        }
+
+        if customer_amount < 0 || merchant_amount < 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        // The two amounts must add up to the balance that is still in the
+        // channel (#766).
+        let remaining = channel.deposited - channel.settled;
+        if customer_amount
+            .checked_add(merchant_amount)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != remaining
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
+
+        // A cooperative close cancels any pending unilateral settlement.
+        env.store()
+            .remove(&DataKey::Feature(FeatureKey::PendingChannelSettlement(
+                channel_id,
+            )));
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+
+        if merchant_amount > 0 {
+            token_client.transfer(&contract_address, &channel.merchant, &merchant_amount);
+        }
+        if customer_amount > 0 {
+            token_client.transfer(&contract_address, &channel.customer, &customer_amount);
+        }
+
+        channel.settled = channel.settled + merchant_amount;
+        channel.settled_nonce = nonce;
+        channel.open = false;
+
+        env.store().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+
+        (ChannelClosedCooperatively {
+            channel_id,
+            merchant_amount,
+            customer_refund: customer_amount,
+            nonce,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Legacy direct settlement (no challenge window) — kept for backward compatibility.
     ///
     /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
@@ -13895,6 +14576,7 @@ impl PaymentContract {
         let payment = Payment {
             id: payment_id,
             customer: customer.clone(),
+            payer: customer.clone(),
             merchant: merchant.clone(),
             amount,
             token,
@@ -14108,6 +14790,7 @@ impl PaymentContract {
 
         (PaymentCreated {
             payment_id,
+            payer: customer.clone(),
             customer,
             merchant,
             amount,
@@ -14504,7 +15187,9 @@ impl PaymentContract {
     /// (cancelled, expired or refunded while Pending). Only usage from the
     /// current period is restored, and `used` never drops below zero.
     fn restore_spend_limit(env: &Env, payment: &Payment) {
-        let key = DataKey::Feature(FeatureKey::CustomerSpendLimit(payment.customer.clone()));
+        // #771: the spend limit is consumed by the address that funds the
+        // payment, so the allowance is restored for the payer.
+        let key = DataKey::Feature(FeatureKey::CustomerSpendLimit(payment.payer.clone()));
         let mut limit: CustomerSpendLimit = match env.store().get(&key) {
             Some(l) => l,
             None => return,
@@ -14541,7 +15226,7 @@ impl PaymentContract {
             .unwrap_or(0)
     }
 
-    /// Returns a pending payment's escrowed tip to the customer (#675). The tip
+    /// Returns a pending payment's escrowed tip to the payer (#675, #771). The tip
     /// record is kept so `get_payment_tip` still reports what was tipped.
     fn return_tip(env: &Env, payment: &Payment) {
         let tip = PaymentContract::get_tip(env, payment.id);
@@ -14549,10 +15234,10 @@ impl PaymentContract {
             return;
         }
         let token_client = token::Client::new(env, &payment.token);
-        token_client.transfer(&env.current_contract_address(), &payment.customer, &tip);
+        token_client.transfer(&env.current_contract_address(), &payment.payer, &tip);
         (PaymentTipReturned {
             payment_id: payment.id,
-            customer: payment.customer.clone(),
+            customer: payment.payer.clone(),
             tip_amount: tip,
         })
         .publish(env);

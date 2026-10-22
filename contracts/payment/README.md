@@ -56,6 +56,7 @@ Instance storage is a single ledger entry that is loaded in full on every call a
 | Function                                                                                     | Description                                                                                                                                                  |
 | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `create_payment(customer, merchant, amount, token, currency, expiration_duration, metadata)` | Customer initiates a payment; tokens are transferred from the customer to the contract and the payment is stored as `Pending`. Returns the new `payment_id`. When `expiration_duration == 0` and the merchant has set a default expiry via `set_default_payment_expiry`, that default is used automatically. |
+| `create_payment_for(payer, beneficiary, merchant, amount, token, currency, expiration_duration, metadata)` | **(Issue #771)** A third party pays on behalf of a customer. Only the `payer` authorizes the call; the payment is attributed to the `beneficiary` in analytics and every refund or expiry return is sent back to the `payer`. Returns the new `payment_id`. |
 | `complete_payment(admin, payment_id)`                                                        | Admin releases a `Pending` payment to the merchant. For amounts above the configured large-payment threshold a multi-sig proposal is auto-created instead.   |
 | `refund_payment(admin, payment_id)`                                                          | Admin refunds a `Pending` payment, marking it `Refunded` and returning any installments already collected via `pay_installment` to the customer.             |
 | `partial_refund(admin, payment_id, refund_amount)`                                           | Admin issues a partial refund on a `Completed` payment, returning only `refund_amount` to the customer.                                                      |
@@ -65,6 +66,35 @@ Instance storage is a single ledger entry that is loaded in full on every call a
 | `expire_payment(payment_id)`                                                                 | Anyone can call this once a payment is past its expiration timestamp; tokens are returned to the customer.                                                   |
 | `is_payment_expired(payment_id)`                                                             | Returns `true` if the payment's expiration timestamp has passed.                                                                                             |
 | `update_payment_notes(admin, payment_id, notes)`                                             | Admin updates free-text notes on a payment.                                                                                                                  |
+
+### Third-Party Payer (Issue #771)
+
+Parents, employers or sponsors can pay for another customer's purchase. `create_payment_for`
+separates the two roles:
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `create_payment_for` | `payer: Address`, `beneficiary: Address`, `merchant: Address`, `amount: i128`, `token: Address`, `currency: Currency`, `expiration_duration: u64`, `metadata: String` | `Result<u64, Error>` — the new `payment_id` | `payer` (the beneficiary never has to sign) |
+
+- **Attribution.** The payment's `customer` is the `beneficiary`. Every customer-facing index and
+  analytic — payment history, volume, loyalty points, top merchants — is attributed to the
+  beneficiary, so the merchant's books still show the purchase as the customer's.
+- **Funding.** The payment's `payer` is the address whose funds are used: the merchant's proceeds
+  and the platform fee are drawn from the payer when the payment settles.
+- **Refunds.** `refund_payment`, `partial_refund`, `refund_completed_payment`, `cancel_payment` and
+  `expire_payment` all send the money back to the **payer**, not to the beneficiary. The same
+  applies to an escrowed tip.
+- **Limits.** Rate limits and spend limits are applied to the payer, because the payer is the
+  address that spends the funds. The spent allowance is restored for the payer when the payment
+  never settles.
+- **Cancellation.** `cancel_payment` accepts the payer as well as the customer and the merchant.
+- **Errors.** `create_payment_for` can return any error `create_payment` returns
+  (`BasicError::AddressFlagged`, `BasicError::RateLimitExceeded`, `BasicError::SpendLimitExceeded`,
+  `PaymentError::TokenNotAllowed`, `BasicError::InvalidCurrency`, `BasicError::MetadataTooLarge`,
+  `BasicError::InvalidAmount`, `BasicError::ContractPaused` / `FunctionPaused`, …).
+
+The `Payment` record gained a `payer` field. For payments created with `create_payment` it is
+equal to `customer`, so existing flows are unchanged.
 
 ### Payment Requests (Issue #662)
 
@@ -193,9 +223,36 @@ Payment analytics are exposed through read-only query functions. Aggregate recor
 | `get_customer_monthly_volume(customer, month_timestamp)` | **Per customer and month.** Returns the customer's total spending volume for the month bucket beginning at `month_timestamp` as `i128`. |
 | `get_merchant_analytics_range(merchant, from, to)` | **Per merchant and hour.** Returns recorded `AnalyticsBucket` values for hourly buckets in the half-open range `[from, to)`. Each bucket contains `bucket_start`, `bucket_end`, `total_payments`, `total_volume`, `total_refunds`, and `failed_count`. It returns an error when `from >= to`. |
 | `get_platform_analytics_daily(day_timestamp)` | **Contract-wide and day.** Returns the `AnalyticsBucket` for the epoch-aligned day containing `day_timestamp`, with daily `total_payments`, `total_volume`, `total_refunds`, and `failed_count` plus the bucket boundaries. |
+| `get_merchant_daily_settlement(merchant, day_index)` | **Per merchant and day (Issue #765).** Returns the `MerchantDailySettlement` summary of one UTC day: `payment_count`, `gross_volume`, `total_fees`, `refund_volume` and `net_volume`. |
+| `get_merchant_daily_settlement_range(merchant, from_day_index, to_day_index, max_days)` | **Per merchant and day range (Issue #765).** Returns at most `max_days` daily settlement summaries for the half-open range `[from_day_index, to_day_index)`. |
 | `get_top_merchants_by_volume(limit)` | **Contract-wide ranking.** Returns up to `limit` `(merchant, total_volume)` pairs for all registered merchants, sorted by descending total volume. |
 
 If a requested aggregate has no recorded data, the contract returns a zero-valued default for that aggregate. The daily platform query accepts any timestamp in the target day, while monthly customer queries must use the start timestamp of the intended month bucket.
+
+#### Daily Merchant Settlement Report (Issue #765)
+
+`get_platform_analytics_daily` reports on the platform as a whole. Merchants need the same view
+for their own books, so the contract keeps a settlement bucket per `(merchant, day_index)`.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `get_merchant_daily_settlement` | `merchant: Address`, `day_index: u64` | `MerchantDailySettlement` |
+| `get_merchant_daily_settlement_range` | `merchant: Address`, `from_day_index: u64`, `to_day_index: u64`, `max_days: u32` | `Vec<MerchantDailySettlement>` |
+
+- **Days.** A day is identified by its `day_index`, the number of whole UTC days since the Unix
+  epoch. Buckets roll over exactly at a UTC day boundary, using the ledger timestamp. A day-start
+  timestamp is accepted as well, so `get_merchant_daily_settlement(merchant, 86400)` and
+  `get_merchant_daily_settlement(merchant, 1)` address the same day.
+- **Contents.** `MerchantDailySettlement` holds `merchant`, `day_index`, `day_start`, `day_end`,
+  `payment_count` (payments created that day), `gross_volume` (their total value), `total_fees`
+  (platform fees collected that day), `refund_volume` (refunds processed that day) and
+  `net_volume` (`gross_volume - total_fees - refund_volume`).
+- **Refunds.** Refunds count against the day they are **processed**, not the day the payment was
+  created, so a refund issued today reduces today's bucket. This applies to `refund_payment`,
+  `partial_refund`, `refund_completed_payment` and refunds recorded by the refund contract.
+- **Range.** The range is half-open, `[from_day_index, to_day_index)`, and returns at most
+  `max_days` entries. Days without activity are reported as zero-valued entries so the result can
+  be used as a report; a long range has to be requested in several calls.
 
 ### Scheduled Payments
 
@@ -314,7 +371,8 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | ----------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `create_subscription(customer, merchant, amount, token, currency, interval, duration, max_retries, metadata, trial_period_seconds)` | Create a recurring subscription; an optional free trial delays the first charge. Returns the `subscription_id`. |
 | `execute_recurring_payment(subscription_id)`                                                                                        | Execute the next billing cycle for an active subscription.                                                      |
-| `cancel_subscription(caller, subscription_id)`                                                                                      | Cancel a subscription.                                                                                          |
+| `cancel_subscription(caller, subscription_id)`                                                                                      | Cancel a subscription. The cancellation is recorded as `CancellationReason::Unspecified`.                                                                  |
+| `cancel_subscription_with_reason(caller, subscription_id, reason_code)`                                                            | **(Issue #770)** Cancel a subscription and record *why* it was cancelled. The reason is counted per merchant and per reason.                                   |
 | `pause_subscription(admin, subscription_id)`                                                                                        | Pause a subscription, pausing the billing clock.                                                                |
 | `resume_subscription(admin, subscription_id, proration_enabled)`                                                                    | Resume a paused subscription, optionally prorating the next billing date.                                       |
 | `extend_trial(admin, subscription_id, extension_seconds)`                                                                           | Extend the trial period of a subscription.                                                                      |
@@ -327,8 +385,39 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `set_merchant_allowed_tokens(merchant, tokens)`                                                                                     | **(Issue #680)** Set the list of tokens a merchant accepts for subscriptions. Only the merchant may call this. |
 | `set_refund_unused_on_cancel(merchant, enabled)`                                                                                    | **(Issue #681)** Toggle prorated refunds on mid-cycle cancellation for a merchant. When `true`, cancelling a subscription returns the unused fraction of the current cycle to the customer. |
 
-#### Skipping a Billing Cycle
+#### Cancellation Reasons & Churn Analytics (Issue #770)
 
+Merchants can finally see *why* customers leave. `cancel_subscription_with_reason` records a
+`CancellationReason` with every cancellation, and the contract counts those cancellations per
+merchant and per reason.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `cancel_subscription_with_reason` | `caller: Address`, `subscription_id: u64`, `reason_code: CancellationReason` | `Result<(), Error>` | `caller` (customer, merchant or admin) |
+| `get_churn_analytics` | `merchant: Address` | `ChurnAnalytics { merchant, total_cancellations, by_reason }` | — |
+| `get_subscription_cancellation_reason` | `subscription_id: u64` | `Option<CancellationReason>` | — |
+
+`CancellationReason` variants: `Unspecified`, `TooExpensive`, `MissingFeatures`, `PoorQuality`,
+`TechnicalIssues`, `CustomerSupport`, `SwitchingProvider`, `BusinessClosure`, `Other`.
+
+- **Backwards compatibility.** The existing `cancel_subscription(caller, subscription_id)` keeps
+  working and records the cancellation as `Unspecified`. A subscription that ends because a
+  previously scheduled `cancel_at_period_end` was reached is also recorded as `Unspecified`.
+- **Counters.** The counters are per merchant: `total_cancellations` is the number of subscriptions
+  cancelled for that merchant and `by_reason` maps every reason to the number of cancellations
+  recorded for it. A merchant without cancellations gets a zero-valued record.
+- **Storage.** The reason is also stored on the subscription itself, so
+  `get_subscription_cancellation_reason(subscription_id)` reports why a specific subscription was
+  cancelled.
+- **Errors.** `cancel_subscription_with_reason` returns `SubscriptionError::NotFound` (300) if the
+  subscription does not exist, `BasicError::Unauthorized` (100) if the caller is neither the
+  customer, the merchant nor an admin, and `PaymentError::InvalidStatus` (203) if the subscription
+  is already cancelled or expired.
+
+Emits `SubscriptionCancelledWithReason { subscription_id, cancelled_by, reason }` in addition to
+`SubscriptionCancelled`.
+
+#### Skipping a Billing Cycle
 | Function                                      | Description                                                                                          |
 | --------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | `skip_next_cycle(customer, subscription_id)`  | Customer skips the next billing cycle without being charged. Returns the new `next_payment_at`.       |
@@ -746,6 +835,7 @@ client.cancel_subscription(&customer, &sub_id_1);
 | `initiate_settlement(channel_id, merchant_amount, nonce, signature)`                                | **Phase 1 (Issue #678)** — Begin settlement. Records a `PendingChannelSettlement` and opens the challenge window. Either party may submit a higher-nonce state during the window. |
 | `challenge_settlement(channel_id, merchant_amount, nonce, signature)`                              | **Phase 2 (Issue #678)** — Replace the pending settlement with a higher-nonce signed state during the challenge window. Resets the window timer.                               |
 | `finalize_settlement(channel_id)`                                                                   | **Phase 3 (Issue #678)** — Transfer funds and close the channel after the challenge window has elapsed. Reverts with `ChallengeWindowOpen` if called too early.                |
+| `close_channel_cooperative(channel_id, customer_amount, merchant_amount, nonce)`                      | **(Issue #766)** — Close the channel immediately when both parties agree on the final balance. Requires auth from the customer *and* the merchant.                    |
 | `settle_channel(channel_id, merchant_amount, nonce, signature)`                                     | Legacy direct settlement (no challenge window). Kept for backward compatibility.                                                                                               |
 | `close_channel_expired(caller, channel_id)`                                                         | Anyone can close an expired channel, refunding the deposited balance to the customer.                                                                                          |
 | `get_channel(channel_id)`                                                                           | Retrieve the `PaymentChannel` record.                                                                                                                                          |
@@ -764,6 +854,33 @@ that under-pays the customer.
 New error codes: `ChallengeWindowOpen = 542`, `ChallengeWindowClosed = 543`, `NoPendingSettlement = 544`.
 
 New events: `SettlementInitiated { channel_id, merchant_amount, nonce, window_ends_at }`, `SettlementChallenged { channel_id, new_nonce, new_merchant_amount }`.
+
+#### Cooperative Channel Close (Issue #766)
+
+When both parties agree on the final balance there is no reason to wait for the dispute window to
+elapse. `close_channel_cooperative` settles the channel right away.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `close_channel_cooperative` | `channel_id: u64`, `customer_amount: i128`, `merchant_amount: i128`, `nonce: u64` | `Result<(), Error>` | the channel's **customer and merchant** |
+
+- **Both parties.** The entry point requires an authorization from the channel's customer *and* its
+  merchant, so a single party can never close a channel unilaterally.
+- **Conservation.** `customer_amount + merchant_amount` must equal `deposited - settled`, otherwise
+  the call reverts with `FeatureError::BalanceSumMismatch` (541). Negative amounts revert with
+  `BasicError::InvalidAmount` (121).
+- **Nonce.** The `nonce` must be strictly greater than the channel's `settled_nonce`, otherwise the
+  call reverts with `FeatureError::InvalidNonce` (514). This keeps stale off-chain states from being
+  replayed.
+- **Pending settlements.** A pending unilateral settlement (`initiate_settlement`) is cancelled by
+  the cooperative close — the cooperative close supersedes it.
+- **Outcome.** The merchant's amount is transferred to the merchant, the customer's amount is
+  returned to the customer, `settled` and `settled_nonce` are updated and the channel is closed.
+- **Errors.** `FeatureError::ChannelNotFound` (512), `FeatureError::ChannelClosed` (515),
+  `FeatureError::InvalidNonce` (514), `FeatureError::BalanceSumMismatch` (541),
+  `BasicError::InvalidAmount` (121) and `BasicError::ContractPaused` / `FunctionPaused` (116 / 117).
+
+Emits `ChannelClosedCooperatively { channel_id, merchant_amount, customer_refund, nonce }`.
 
 ### Split Payments
 
@@ -1191,6 +1308,9 @@ assert_eq!(
 | `get_customer_monthly_volume(customer, month_timestamp)` | Return a customer's total volume for the billing month containing `month_timestamp`. |
 | `get_merchant_analytics_range(merchant, from, to)`       | Return per-day analytics buckets for a merchant over a date range.                   |
 | `get_platform_analytics_daily(day_timestamp)`            | Return the platform-wide analytics bucket for a specific day.                        |
+| `get_merchant_daily_settlement(merchant, day_index)`     | **(Issue #765)** Return a merchant's settlement summary for a single UTC day.        |
+| `get_merchant_daily_settlement_range(merchant, from, to, max_days)` | **(Issue #765)** Return at most `max_days` daily settlement summaries for a merchant. |
+| `get_churn_analytics(merchant)`                          | **(Issue #770)** Return a merchant's subscription churn counters, per reason.        |
 | `get_top_merchants_by_volume(limit)`                     | Return the top-N merchants ranked by total volume.                                   |
 
 ### Loyalty
@@ -1258,7 +1378,7 @@ assert_eq!(
 
 Key types referenced by the functions above:
 
-- **`Payment`** — stores `id`, `customer`, `merchant`, `amount`, `token`, `currency`, `status`, `created_at`, `expires_at`, and `metadata`.
+- **`Payment`** — stores `id`, `customer`, `payer`, `merchant`, `amount`, `token`, `currency`, `status`, `created_at`, `expires_at`, and `metadata`. `payer` is the address that funds the payment (Issue #771) and equals `customer` for ordinary payments.
 - **`PaymentStatus`** — `Pending | Completed | Refunded | PartialRefunded | Cancelled`
 - **`Currency`** — `XLM | USDC | USDT | BTC | ETH`
 - **`Subscription`** — full subscription record including trial, pause, and dunning state.
@@ -1269,6 +1389,9 @@ Key types referenced by the functions above:
 - **`MerchantProfile`** — `merchant`, `name`, `metadata_hash`, `active`, `registered_at`, `updated_at`; a registered merchant's profile.
 - **`PaymentStatusEntry`** — `status`, `timestamp`, `actor`; one entry per payment status change.
 - **`SubscriptionSkipUsage`** — `window_start`, `count`; skips used in the current rolling year.
+- **`CancellationReason`** (Issue #770) — `Unspecified | TooExpensive | MissingFeatures | PoorQuality | TechnicalIssues | CustomerSupport | SwitchingProvider | BusinessClosure | Other`.
+- **`ChurnAnalytics`** (Issue #770) — `merchant`, `total_cancellations`, `by_reason`; a merchant's churn summary.
+- **`MerchantDailySettlement`** (Issue #765) — `merchant`, `day_index`, `day_start`, `day_end`, `payment_count`, `gross_volume`, `total_fees`, `refund_volume`, `net_volume`; a merchant's settlement summary for one UTC day.
 
 ---
 
@@ -1280,11 +1403,11 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 
 | Event                         | Topic Name                    | Payload Fields                                            | Fires When                                                                            |
 | ----------------------------- | ----------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `PaymentCreated`              | `PaymentCreated`              | `payment_id`, `customer`, `merchant`, `amount`            | `create_payment()` succeeds, payment stored as `Pending`                              |
+| `PaymentCreated`              | `PaymentCreated`              | `payment_id`, `customer`, `payer`, `merchant`, `amount`   | `create_payment()` / `create_payment_for()` succeed, payment stored as `Pending`        |
 | `PaymentCompleted`            | `PaymentCompleted`            | `payment_id`, `merchant`, `amount`                        | `complete_payment()` succeeds, funds released to merchant                             |
-| `PaymentRefunded`             | `PaymentRefunded`             | `payment_id`, `customer`, `amount`                        | `refund_payment()` succeeds, funds returned to customer                               |
+| `PaymentRefunded`             | `PaymentRefunded`             | `payment_id`, `customer`, `payer`, `amount`               | `refund_payment()` succeeds, funds returned to the payer                              |
 | `PaymentCancelled`            | `PaymentCancelled`            | `payment_id`, `cancelled_by`, `timestamp`                 | `cancel_payment()` succeeds                                                           |
-| `PaymentExpired`              | `PaymentExpired`              | `payment_id`, `customer`, `refunded_amount`, `expired_at` | `expire_payment()` called after expiration window passes                              |
+| `PaymentExpired`              | `PaymentExpired`              | `payment_id`, `customer`, `payer`, `refunded_amount`, `expired_at` | `expire_payment()` called after expiration window passes                  |
 | `MerchantDefaultExpirySet`    | `MerchantDefaultExpirySet`    | `merchant`, `seconds`                                     | `set_default_payment_expiry()` updates or clears a merchant's default expiry duration |
 | `PaymentHookRegistered`       | `PaymentHookRegistered`       | `hook_id`, `subscriber`, `event_count`                    | `register_payment_hook()` succeeds                                                    |
 | `PaymentHookDeregistered`     | `PaymentHookDeregistered`     | `hook_id`, `subscriber`                                   | `deregister_payment_hook()` deactivates a hook                                        |
@@ -1328,6 +1451,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RecurringPaymentExecuted` | `RecurringPaymentExecuted` | `subscription_id`, `payment_count`, `amount`, `next_payment_at` | `execute_recurring_payment()` completes a billing cycle |
 | `RecurringPaymentFailed`   | `RecurringPaymentFailed`   | `subscription_id`, `retry_count`                                | `execute_recurring_payment()` fails and enters dunning  |
 | `SubscriptionCancelled`    | `SubscriptionCancelled`    | `subscription_id`, `cancelled_by`                               | `cancel_subscription()` terminates subscription         |
+| `SubscriptionCancelledWithReason` | `SubscriptionCancelledWithReason` | `subscription_id`, `cancelled_by`, `reason`         | `cancel_subscription_with_reason()` terminates a subscription and records the churn reason (Issue #770) |
 
 ### Subscription Trial & Pause Events
 
@@ -1366,6 +1490,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `ChannelOpened`        | `ChannelOpened`        | `channel_id`, `customer`, `merchant`, `amount`     | `open_channel()` creates a new off-chain channel          |
 | `ChannelSettled`       | `ChannelSettled`       | `channel_id`, `merchant_amount`, `customer_refund` | `settle_channel()` finalizes settlement on-chain          |
 | `ChannelExpiredClosed` | `ChannelExpiredClosed` | `channel_id`, `refunded_to`                        | `close_channel_expired()` refunds expired channel balance |
+| `ChannelClosedCooperatively` | `ChannelClosedCooperatively` | `channel_id`, `merchant_amount`, `customer_refund`, `nonce` | `close_channel_cooperative()` settles a channel agreed by both parties (Issue #766) |
 
 ### Split Payment Events
 
