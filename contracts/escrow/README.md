@@ -748,6 +748,177 @@ operator runbook — caller permissions, each step's exact semantics, batch-size
 
 ---
 
+## Escrow Lifecycle Hooks
+
+The escrow contract supports a lightweight publish-subscribe system so external contracts can be notified when an escrow changes state. A subscriber registers once and receives a cross-contract call every time any of its chosen event types fires.
+
+### Event types
+
+| `EscrowEventType` variant | Fires when |
+| :------------------------ | :--------- |
+| `Created` | A new escrow is created via `create_escrow`, `create_escrow_with_reference`, or `create_escrow_with_beneficiaries` |
+| `Released` | An escrow is fully released to the merchant |
+| `Disputed` | An escrow enters the `Disputed` state |
+| `Resolved` | A dispute is resolved (either party wins, or a split) |
+| `Refunded` | Funds are returned to the customer (expiry, mutual cancel, watchdog customer-favor) |
+| `Cancelled` | An escrow is cancelled (mutual cancel, admin cancel) |
+| `StatusChanged` | Any status transition — a catch-all that fires alongside every specific event above |
+
+### Subscriber interface
+
+The subscriber must be a deployed contract that exposes exactly two entry points:
+
+```rust
+// Liveness probe called during registration to confirm the contract is reachable
+fn ping(env: Env);
+
+// Called by the escrow contract whenever a subscribed event fires
+fn on_escrow_event(env: Env, event_type: EscrowEventType, escrow_id: u64);
+```
+
+If `ping()` cannot be called successfully, registration is rejected with `ActionError::InvalidHookAddress` (code 322). If `on_escrow_event()` fails at notification time, the escrow contract emits an `EscrowHookInvocationFailed` event and continues — a failing hook does not revert or block the triggering transaction.
+
+### Function reference
+
+| Function | Signature | Auth | Description |
+| :------- | :-------- | :--- | :---------- |
+| `register_escrow_hook` | `register_escrow_hook(env: Env, subscriber: Address, events: Vec<EscrowEventType>) -> Result<u64, Error>` | `subscriber.require_auth()` | Registers `subscriber` to receive notifications for each event type in `events`. Returns the new `hook_id`. |
+| `deregister_escrow_hook` | `deregister_escrow_hook(env: Env, subscriber: Address, hook_id: u64) -> Result<(), Error>` | `subscriber.require_auth()` | Marks the hook inactive. Only the original subscriber may deregister it. |
+| `get_escrow_hooks` | `get_escrow_hooks(env: Env, event_type: EscrowEventType) -> Vec<EscrowNotificationHook>` | None (read-only) | Returns all currently active hooks registered for `event_type`. |
+
+### `EscrowNotificationHook` struct
+
+| Field | Type | Description |
+| :---- | :--- | :---------- |
+| `hook_id` | `u64` | Unique identifier assigned at registration |
+| `subscriber` | `Address` | Contract address that will be called |
+| `events` | `Vec<EscrowEventType>` | Event types this hook is subscribed to |
+| `active` | `bool` | `true` while active; set to `false` on deregistration |
+
+### Registration rules
+
+- The contract must not be paused (`BasicError::ContractPaused`, code 103) when registering or deregistering.
+- `events` must not be empty — an empty list returns `EscrowError::InvalidStatus` (code 201).
+- A maximum of **10 hooks per event type** is enforced (`MAX_ESCROW_HOOKS_PER_EVENT = 10`). Exceeding this limit returns `ActionError::MaxHooksPerEventReached` (code 321).
+- The subscriber is validated by calling `ping()` before the hook is stored. A contract that fails the probe returns `ActionError::InvalidHookAddress` (code 322).
+
+### Deregistration rules
+
+- Deregistration marks the hook as inactive (`active = false`) but retains the record in storage for audit purposes.
+- Only the subscriber that originally registered the hook may deregister it. A mismatch returns `ActionError::HookNotOwnedBySubscriber` (code 320).
+- If the `hook_id` does not exist, the call returns `ActionError::HookNotFound` (code 319).
+
+### Events
+
+| Event | Topic | Payload fields | Fires when |
+| :---- | :---- | :------------- | :--------- |
+| `EscrowHookRegistered` | `escrow_hook_registered` | `hook_id`, `subscriber`, `event_count` | `register_escrow_hook` succeeds |
+| `EscrowHookDeregistered` | `escrow_hook_deregistered` | `hook_id`, `subscriber` | `deregister_escrow_hook` succeeds |
+| `EscrowHookInvocationFailed` | `escrow_hook_invocation_failed` | `hook_id`, `subscriber`, `event_type`, `escrow_id` | A subscribed hook's `on_escrow_event` call fails at notification time |
+
+### Error reference
+
+| Error | Code | When |
+| :---- | :--- | :--- |
+| `BasicError::ContractPaused` | 103 | Contract is paused during registration or deregistration |
+| `EscrowError::InvalidStatus` | 201 | `events` is empty on registration |
+| `ActionError::HookNotFound` | 319 | `hook_id` does not exist on deregistration |
+| `ActionError::HookNotOwnedBySubscriber` | 320 | Caller is not the original subscriber |
+| `ActionError::MaxHooksPerEventReached` | 321 | Per-event hook limit (10) would be exceeded |
+| `ActionError::InvalidHookAddress` | 322 | Subscriber contract does not respond to `ping()` |
+
+### Usage example
+
+```rust
+// Register for Created and Released events
+let hook_id = client.register_escrow_hook(
+    &subscriber_address,
+    &vec![&env, EscrowEventType::Created, EscrowEventType::Released],
+);
+
+// Query all active hooks for the Created event
+let hooks = client.get_escrow_hooks(&EscrowEventType::Created);
+
+// Deregister when no longer needed
+client.deregister_escrow_hook(&subscriber_address, &hook_id);
+```
+
+---
+
+## Escrow Queries and Pagination
+
+The escrow contract exposes several paginated query functions for listing escrows by status, customer, or merchant. All paginated functions use a zero-based `offset` + `limit` model.
+
+### Pagination semantics
+
+- `offset` is zero-indexed: passing `offset = 0` starts from the first record.
+- `limit` is the maximum number of records to return in one call.
+- For `get_escrows_by_customer` and `get_escrows_by_merchant`, the effective range is `[offset, (offset + limit).min(total_count))` — so passing `offset = 0, limit = 20` on a customer with 5 escrows returns all 5.
+- For `get_escrows_by_status`, the status index is append-only. Entries whose stored status no longer matches the requested status (because the escrow transitioned) are skipped during iteration. `offset` and `limit` count only the matching entries, not the raw index slots scanned.
+- Passing `limit = 0` returns an empty vector.
+- Passing `offset >= total_count` returns an empty vector.
+- None of these functions revert; they always return a (possibly empty) vector.
+
+### Function reference
+
+| Function | Signature | Auth | Description |
+| :------- | :-------- | :--- | :---------- |
+| `get_escrows_by_status` | `get_escrows_by_status(env: Env, status: EscrowStatus, limit: u64, offset: u64) -> Vec<Escrow>` | None | Returns up to `limit` escrows whose current status matches `status`, starting from the `offset`-th matching entry. |
+| `get_escrow_count_by_status` | `get_escrow_count_by_status(env: Env, status: EscrowStatus) -> u64` | None | Returns the number of escrows whose current status is `status`. Reads from a maintained counter without loading individual escrow records. |
+| `get_escrows_by_customer` | `get_escrows_by_customer(env: Env, customer: Address, limit: u64, offset: u64) -> Vec<Escrow>` | None | Returns up to `limit` escrows for which `customer` is the customer party, starting at `offset`. |
+| `get_escrow_count_by_customer` | `get_escrow_count_by_customer(env: Env, customer: Address) -> u64` | None | Returns the total number of escrows in which `customer` appears as the customer. |
+| `get_escrows_by_merchant` | `get_escrows_by_merchant(env: Env, merchant: Address, limit: u64, offset: u64) -> Vec<Escrow>` | None | Returns up to `limit` escrows for which `merchant` is the merchant party, starting at `offset`. |
+| `get_escrow_count_by_merchant` | `get_escrow_count_by_merchant(env: Env, merchant: Address) -> u64` | None | Returns the total number of escrows in which `merchant` appears as the merchant. |
+
+### Status values
+
+`EscrowStatus` variants accepted by the status query functions:
+
+| Variant | Meaning |
+| :------ | :------ |
+| `Locked` | Funds are held; release conditions not yet met |
+| `Released` | Funds have been transferred to the merchant |
+| `Disputed` | A dispute has been filed by one of the parties |
+| `Resolved` | A dispute was resolved in favor of the customer (refund) or via split |
+| `Cancelled` | The escrow was cancelled (e.g. mutual cancel, watchdog customer-favor) |
+
+### Pagination examples
+
+**Page through all Locked escrows in batches of 10:**
+
+```rust
+let page_size: u64 = 10;
+let total = client.get_escrow_count_by_status(&EscrowStatus::Locked);
+let mut offset: u64 = 0;
+
+while offset < total {
+    let page = client.get_escrows_by_status(&EscrowStatus::Locked, &page_size, &offset);
+    // process page ...
+    offset += page_size;
+}
+```
+
+**Fetch the second page (items 10–19) of a merchant's escrows:**
+
+```rust
+let page = client.get_escrows_by_merchant(&merchant_address, &10u64, &10u64);
+```
+
+**Get a customer's total escrow count before paginating:**
+
+```rust
+let total = client.get_escrow_count_by_customer(&customer_address);
+let first_page = client.get_escrows_by_customer(&customer_address, &20u64, &0u64);
+```
+
+### Implementation notes
+
+- **`get_escrows_by_status` index** — the contract maintains an append-only status list per `EscrowStatus` variant. When an escrow's status changes (e.g. `Locked` → `Released`), the new status entry is appended and the old entry's count is decremented. The old slot in the list is never removed; the query function skips slots whose escrow's live status no longer matches the requested status. This means `get_escrow_count_by_status` returns the count of escrows currently in that status, while the underlying list may contain stale entries that are silently skipped during pagination.
+- **`get_escrows_by_customer` / `get_escrows_by_merchant` index** — entries are appended at creation time and are never removed. The count reflects the total number of escrows ever created for that address, regardless of current status.
+- **`total_volume` note** — `MerchantAnalytics.total_volume` is a raw sum across all tokens the merchant accepts. Because different tokens have different denominations and exchange rates, this figure is not meaningful as a monetary total; use it only as a rough activity indicator or filter by token before summing.
+
+---
+
 [⬅ Back to Main README](../../README.md)
 
 ---
