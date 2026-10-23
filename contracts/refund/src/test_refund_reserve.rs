@@ -97,6 +97,7 @@ fn deposit_and_withdraw_move_tokens_and_track_storage() {
         3_500
     );
     assert!(has_event(&s.env, "refund_reserve_withdrawn"));
+    assert!(!has_event(&s.env, "refund_reserve_low"));
     assert_eq!(s.client.get_refund_reserve(&s.merchant, &s.token), 3_500);
     assert_eq!(balance(&s, &s.merchant), MERCHANT_FUNDS - 3_500);
     assert_eq!(balance(&s, &s.contract_id), 3_500);
@@ -105,9 +106,95 @@ fn deposit_and_withdraw_move_tokens_and_track_storage() {
     s.client
         .withdraw_refund_reserve(&s.merchant, &s.token, &3_500);
     assert_eq!(s.client.get_refund_reserve(&s.merchant, &s.token), 0);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
     assert!(s.client.has_refund_reserve(&s.merchant, &s.token));
     assert_eq!(balance(&s, &s.merchant), MERCHANT_FUNDS);
     assert_eq!(balance(&s, &s.contract_id), 0);
+}
+
+#[test]
+fn refund_reserve_low_fires_only_when_crossing_below_warning_level() {
+    let s = setup();
+    s.client
+        .deposit_refund_reserve(&s.merchant, &s.token, &5_000);
+    s.client
+        .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &2_000);
+    assert!(has_event(&s.env, "refund_reserve_warning_level_set"));
+    assert_eq!(
+        s.client.get_refund_reserve_warning_level(&s.merchant, &s.token),
+        2_000
+    );
+
+    // Still above the warning level: no alert.
+    s.client
+        .withdraw_refund_reserve(&s.merchant, &s.token, &1_000);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
+
+    // Crossing below the warning level fires the alert once.
+    s.client
+        .withdraw_refund_reserve(&s.merchant, &s.token, &2_500);
+    assert!(has_event(&s.env, "refund_reserve_low"));
+
+    // Staying below does not re-fire on subsequent withdrawals.
+    s.env.events().all();
+    s.client
+        .withdraw_refund_reserve(&s.merchant, &s.token, &500);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
+
+    // Topping back up above the level re-arms the alert.
+    s.client
+        .deposit_refund_reserve(&s.merchant, &s.token, &2_000);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
+    s.client
+        .withdraw_refund_reserve(&s.merchant, &s.token, &2_500);
+    assert!(has_event(&s.env, "refund_reserve_low"));
+}
+
+#[test]
+fn refund_reserve_low_fires_on_refund() {
+    let s = setup();
+    s.client
+        .deposit_refund_reserve(&s.merchant, &s.token, &3_000);
+    s.client
+        .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &1_000);
+
+    s.client
+        .refund(&s.merchant, &s.token, &s.merchant, &1_500);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
+
+    s.client
+        .refund(&s.merchant, &s.token, &s.merchant, &1_000);
+    assert!(has_event(&s.env, "refund_reserve_low"));
+}
+
+#[test]
+fn set_refund_reserve_warning_level_is_admin_only() {
+    let s = setup();
+    let stranger = Address::generate(&s.env);
+
+    s.client
+        .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &1_000);
+    assert!(authorized(&s.env, &s.admin, "set_refund_reserve_warning_level"));
+
+    assert_eq!(
+        s.client
+            .try_set_refund_reserve_warning_level(&s.merchant, &s.merchant, &s.token, &0),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    assert_eq!(
+        s.client
+            .try_set_refund_reserve_warning_level(&stranger, &s.merchant, &s.token, &0),
+        Err(Ok(Error::Core(CoreError::Unauthorized)))
+    );
+    assert_eq!(
+        s.client
+            .try_set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &-1),
+        Err(Ok(Error::Core(CoreError::InvalidAmount)))
+    );
+    assert_eq!(
+        s.client.get_refund_reserve_warning_level(&s.merchant, &s.token),
+        1_000
+    );
 }
 
 #[test]

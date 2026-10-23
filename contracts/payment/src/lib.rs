@@ -115,8 +115,9 @@ pub enum SubscriptionKey {
     // Issue #756: pull-payment mandates
     Mandate(u64),
     MandateCounter,
-    // Issue #770: reason a subscription was cancelled
-    CancellationReason(u64),
+    // Issue #753: seat-based subscriptions
+    Seats(u64),
+    SeatCredit(u64),
 }
 
 #[derive(Clone)]
@@ -278,6 +279,8 @@ pub enum SubscriptionError {
     MandatePerChargeExceeded = 325,
     MandateTotalExceeded = 326,
     MandatePeriodCapExceeded = 327,
+    // Issue #753: seat-based subscriptions
+    InvalidQuantity = 328,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -401,7 +404,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=327).contains(&code) {
+            if (300..=328).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
@@ -738,66 +741,14 @@ pub struct SubscriptionPriceProposal {
     pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
 }
 
-/// Reason a subscription was cancelled (#770).
-///
-/// Cancellations made through the legacy `cancel_subscription` entry point are
-/// recorded as [`CancellationReason::Unspecified`].
-#[derive(Clone, Debug, Eq, PartialEq)]
+// issue #753: seat count and per-seat price of a subscription. The billed
+// `Subscription::amount` is always `unit_amount * quantity`. Subscriptions
+// without a stored record are treated as `quantity = 1, unit_amount = amount`.
+#[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-pub enum CancellationReason {
-    Unspecified,
-    TooExpensive,
-    MissingFeatures,
-    PoorQuality,
-    TechnicalIssues,
-    CustomerSupport,
-    SwitchingProvider,
-    BusinessClosure,
-    Other,
-}
-
-impl CancellationReason {
-    /// Stable numeric code for the reason, used as a storage key component.
-    pub fn code(&self) -> u32 {
-        match self {
-            CancellationReason::Unspecified => 0,
-            CancellationReason::TooExpensive => 1,
-            CancellationReason::MissingFeatures => 2,
-            CancellationReason::PoorQuality => 3,
-            CancellationReason::TechnicalIssues => 4,
-            CancellationReason::CustomerSupport => 5,
-            CancellationReason::SwitchingProvider => 6,
-            CancellationReason::BusinessClosure => 7,
-            CancellationReason::Other => 8,
-        }
-    }
-
-    /// Reverse of [`CancellationReason::code`].
-    pub fn from_code(code: u32) -> Option<CancellationReason> {
-        match code {
-            0 => Some(CancellationReason::Unspecified),
-            1 => Some(CancellationReason::TooExpensive),
-            2 => Some(CancellationReason::MissingFeatures),
-            3 => Some(CancellationReason::PoorQuality),
-            4 => Some(CancellationReason::TechnicalIssues),
-            5 => Some(CancellationReason::CustomerSupport),
-            6 => Some(CancellationReason::SwitchingProvider),
-            7 => Some(CancellationReason::BusinessClosure),
-            8 => Some(CancellationReason::Other),
-            _ => None,
-        }
-    }
-}
-
-/// Per-merchant churn summary (#770).
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct ChurnAnalytics {
-    pub merchant: Address,
-    /// Total number of subscriptions cancelled for this merchant.
-    pub total_cancellations: u64,
-    /// Number of cancellations per reason.
-    pub by_reason: Map<CancellationReason, u64>,
+pub struct SubscriptionSeats {
+    pub quantity: u32,
+    pub unit_amount: i128,
 }
 
 /// One entry in a payment's status history (#682).
@@ -1623,6 +1574,18 @@ pub struct SubscriptionCancelScheduled {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCancelUndone {
     pub subscription_id: u64,
+}
+
+// issue #753: seat count changed mid-cycle
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionQuantityChanged {
+    pub subscription_id: u64,
+    pub old_quantity: u32,
+    pub new_quantity: u32,
+    pub unit_amount: i128,
+    pub new_amount: i128,
+    pub proration_amount: i128, // positive = charged now, negative = credited to the next charges
 }
 
 // issue #665: merchant-proposed price change requiring customer consent
@@ -7675,11 +7638,15 @@ impl PaymentContract {
             Self::require_registered_merchant(&env, &sub.merchant)?;
 
             // Check customer spend limit (#282)
-            let charge_amount = PaymentContract::get_discounted_subscription_amount(
+            let gross_amount = PaymentContract::get_discounted_subscription_amount(
                 &env,
                 subscription_id,
                 sub.amount,
             );
+            // issue #753: deduct any seat-proration credit
+            let seat_credit = Self::get_subscription_seat_credit(env.clone(), subscription_id);
+            let credit_used = seat_credit.min(gross_amount).max(0);
+            let charge_amount = gross_amount - credit_used;
             if PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
                 .is_err()
             {
@@ -7688,16 +7655,22 @@ impl PaymentContract {
 
             let token_client = token::Client::new(&env, &sub.token);
             let contract_address = env.current_contract_address();
-            let transfer_ok = token_client
-                .try_transfer_from(
-                    &contract_address,
-                    &sub.customer,
-                    &sub.merchant,
-                    &charge_amount,
-                )
-                .is_ok();
+            let transfer_ok = (credit_used > 0 && charge_amount == 0)
+                || token_client
+                    .try_transfer_from(
+                        &contract_address,
+                        &sub.customer,
+                        &sub.merchant,
+                        &charge_amount,
+                    )
+                    .is_ok();
 
             if transfer_ok {
+                Self::set_subscription_seat_credit(
+                    &env,
+                    subscription_id,
+                    seat_credit - credit_used,
+                );
                 sub.payment_count += 1;
                 sub.retry_count = 0;
                 sub.next_payment_at += sub.interval;
@@ -7813,8 +7786,12 @@ impl PaymentContract {
         }
 
         // Check customer spend limit (#282)
-        let charge_amount =
+        let gross_amount =
             PaymentContract::get_discounted_subscription_amount(&env, subscription_id, sub.amount);
+        // issue #753: deduct any seat-proration credit
+        let seat_credit = Self::get_subscription_seat_credit(env.clone(), subscription_id);
+        let credit_used = seat_credit.min(gross_amount).max(0);
+        let charge_amount = gross_amount - credit_used;
         if PaymentContract::check_and_update_spend_limit(&env, &sub.customer, charge_amount)
             .is_err()
         {
@@ -7839,16 +7816,19 @@ impl PaymentContract {
         let token_client = token::Client::new(&env, &sub.token);
         let contract_address = env.current_contract_address();
 
-        let transfer_ok = token_client
-            .try_transfer_from(
-                &contract_address,
-                &sub.customer,
-                &sub.merchant,
-                &charge_amount,
-            )
-            .is_ok();
+        let transfer_ok = (credit_used > 0 && charge_amount == 0)
+            || token_client
+                .try_transfer_from(
+                    &contract_address,
+                    &sub.customer,
+                    &sub.merchant,
+                    &charge_amount,
+                )
+                .is_ok();
 
         if transfer_ok {
+            Self::set_subscription_seat_credit(&env, subscription_id, seat_credit - credit_used);
+
             // Mark converted on first post-trial charge
             if sub.trial_data.ends_at > 0 && !sub.trial_data.converted {
                 sub.trial_data.converted = true;
@@ -7922,6 +7902,13 @@ impl PaymentContract {
                 };
                 if now >= effective {
                     sub.amount = proposal.new_amount;
+                    // issue #753: on a seat-based subscription the new price is per seat
+                    let seats_key = DataKey::Subscription(SubscriptionKey::Seats(subscription_id));
+                    if let Some(mut seats) = env.store().get::<SubscriptionSeats>(&seats_key) {
+                        seats.unit_amount = proposal.new_amount;
+                        sub.amount = proposal.new_amount.saturating_mul(seats.quantity as i128);
+                        env.store().set(&seats_key, &seats);
+                    }
                     env.store()
                         .remove(&DataKey::Subscription(SubscriptionKey::PriceProposal(
                             subscription_id,
@@ -13621,6 +13608,187 @@ impl PaymentContract {
         );
 
         Ok(())
+    }
+
+    // ── SEAT-BASED SUBSCRIPTIONS (#753) ─────────────────────────────────────
+
+    /// Get a subscription's seat count and per-seat price.
+    ///
+    /// Subscriptions that never had their quantity changed (including every
+    /// subscription created before seats existed) report `quantity = 1` and
+    /// `unit_amount = amount`.
+    pub fn get_subscription_seats(env: Env, subscription_id: u64) -> SubscriptionSeats {
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .expect("Subscription not found");
+        Self::load_subscription_seats(&env, &sub)
+    }
+
+    /// Get the unused proration credit from seat decreases. It is deducted
+    /// from the subscription's next recurring charges.
+    pub fn get_subscription_seat_credit(env: Env, subscription_id: u64) -> i128 {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::SeatCredit(
+                subscription_id,
+            )))
+            .unwrap_or(0)
+    }
+
+    /// Change the number of seats on a subscription mid-cycle.
+    ///
+    /// The billed amount becomes `unit_amount * new_quantity` from the next
+    /// billing date. If proration is enabled for the subscription (see
+    /// `set_subscription_proration`), the difference for the rest of the
+    /// current cycle is settled now:
+    /// `(new_amount - old_amount) * (next_payment_at - now) / interval`.
+    /// A positive difference is charged to the customer immediately; a
+    /// negative one is stored as a credit and deducted from the next
+    /// recurring charges. No proration is applied while proration is disabled
+    /// or during a trial. Emits `SubscriptionQuantityChanged`.
+    ///
+    /// # Arguments
+    /// * `customer` - The subscription's customer (must be authorized).
+    /// * `subscription_id` - The subscription to change.
+    /// * `new_quantity` - The new number of seats; must be at least 1.
+    ///
+    /// # Errors
+    /// Returns `NotFound` if the subscription does not exist.
+    /// Returns `Unauthorized` if the caller is not the subscription's customer.
+    /// Returns `InvalidQuantity` if `new_quantity` is 0.
+    /// Returns `NotActive` if the subscription is not `Active`.
+    /// Returns `BillingOverflow` if `unit_amount * new_quantity` overflows.
+    /// Returns `MerchantPaused`, `SpendLimitExceeded` or `TransferFailed` if a
+    /// prorated charge cannot be collected.
+    pub fn update_subscription_quantity(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+        new_quantity: u32,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if new_quantity == 0 {
+            return Err(Error::Subscription(SubscriptionError::InvalidQuantity));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+
+        let mut seats = Self::load_subscription_seats(&env, &sub);
+        let old_quantity = seats.quantity;
+        let new_amount = seats
+            .unit_amount
+            .checked_mul(new_quantity as i128)
+            .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+
+        let now = env.ledger().timestamp();
+        let in_trial = sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at;
+        let prorate = sub.pause_data.proration_enabled && !in_trial && sub.next_payment_at > now;
+        let proration_amount = if prorate {
+            // Same formula as resume_subscription: diff * remaining / interval
+            let remaining_time = (sub.next_payment_at - now).min(sub.interval);
+            let diff = (new_amount - sub.amount)
+                .checked_mul(remaining_time as i128)
+                .ok_or(Error::Payment(PaymentError::BillingOverflow))?;
+            diff / sub.interval as i128
+        } else {
+            0
+        };
+
+        if proration_amount > 0 {
+            let merchant_paused: bool = env
+                .store()
+                .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                    sub.merchant.clone(),
+                )))
+                .unwrap_or(false);
+            if merchant_paused {
+                return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+            }
+
+            if PaymentContract::check_and_update_spend_limit(&env, &sub.customer, proration_amount)
+                .is_err()
+            {
+                return Err(Error::Feature(FeatureError::SpendLimitExceeded));
+            }
+
+            let token_client = token::Client::new(&env, &sub.token);
+            let contract_address = env.current_contract_address();
+            let transfer_ok = token_client
+                .try_transfer_from(
+                    &contract_address,
+                    &sub.customer,
+                    &sub.merchant,
+                    &proration_amount,
+                )
+                .is_ok();
+            if !transfer_ok {
+                return Err(Error::Payment(PaymentError::TransferFailed));
+            }
+        } else if proration_amount < 0 {
+            let credit = Self::get_subscription_seat_credit(env.clone(), subscription_id);
+            Self::set_subscription_seat_credit(
+                &env,
+                subscription_id,
+                credit.saturating_sub(proration_amount),
+            );
+        }
+
+        seats.quantity = new_quantity;
+        sub.amount = new_amount;
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Seats(subscription_id)),
+            &seats,
+        );
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
+            &sub,
+        );
+
+        (SubscriptionQuantityChanged {
+            subscription_id,
+            old_quantity,
+            new_quantity,
+            unit_amount: seats.unit_amount,
+            new_amount,
+            proration_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Seat record for a subscription, defaulting to one seat at the full
+    /// amount for subscriptions that predate seats.
+    fn load_subscription_seats(env: &Env, sub: &Subscription) -> SubscriptionSeats {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::Seats(sub.id)))
+            .unwrap_or(SubscriptionSeats {
+                quantity: 1,
+                unit_amount: sub.amount,
+            })
+    }
+
+    fn set_subscription_seat_credit(env: &Env, subscription_id: u64, credit: i128) {
+        let key = DataKey::Subscription(SubscriptionKey::SeatCredit(subscription_id));
+        if credit > 0 {
+            env.store().set(&key, &credit);
+        } else {
+            env.store().remove(&key);
+        }
     }
 
     // ── PAYMENT CHANNEL METHODS (#125) ──────────────────────────────────────

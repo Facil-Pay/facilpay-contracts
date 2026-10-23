@@ -384,6 +384,8 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `change_subscription_token(customer, subscription_id, new_token)`                                                                   | **(Issue #680)** Change the payment token for a subscription from the next billing cycle. `new_token` must be in the merchant's per-merchant allowed-token list (or the global list if none is set). |
 | `set_merchant_allowed_tokens(merchant, tokens)`                                                                                     | **(Issue #680)** Set the list of tokens a merchant accepts for subscriptions. Only the merchant may call this. |
 | `set_refund_unused_on_cancel(merchant, enabled)`                                                                                    | **(Issue #681)** Toggle prorated refunds on mid-cycle cancellation for a merchant. When `true`, cancelling a subscription returns the unused fraction of the current cycle to the customer. |
+| `update_subscription_quantity(customer, subscription_id, new_quantity)`                                                             | **(Issue #753)** Change the seat count; the billed amount becomes `unit_amount * new_quantity`. See [Seat-Based Subscriptions](#seat-based-subscriptions-issue-753). |
+| `get_subscription_seats(subscription_id)` / `get_subscription_seat_credit(subscription_id)`                                         | **(Issue #753)** Seat count and per-seat price; unused proration credit from seat decreases. |
 
 #### Cancellation Reasons & Churn Analytics (Issue #770)
 
@@ -530,6 +532,46 @@ When `enabled = true` and `cancel_subscription` is called mid-cycle:
 3. The contract attempts to transfer `refund_amount` from the merchant back to the customer. If the transfer succeeds, `SubscriptionProratedRefund { subscription_id, refund_amount }` is emitted.
 
 When `enabled = false` (the default), cancellation behaviour is unchanged.
+
+#### Seat-Based Subscriptions (Issue #753)
+
+A subscription bills `unit_amount * quantity` per cycle, so merchants can bill per seat and customers can change the seat count mid-cycle.
+
+| Function | Description |
+| --- | --- |
+| `update_subscription_quantity(customer, subscription_id, new_quantity)` | Customer (must authorize) changes the seat count. Charges or credits the prorated difference for the rest of the cycle. |
+| `get_subscription_seats(subscription_id)` | Returns `SubscriptionSeats { quantity, unit_amount }`. Panics if the subscription does not exist. |
+| `get_subscription_seat_credit(subscription_id)` | Returns the unused proration credit (`0` if none) that will be deducted from the next recurring charges. |
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `customer` | `Address` | Must be the subscription's customer |
+| `subscription_id` | `u64` | An existing, `Active` subscription |
+| `new_quantity` | `u32` | `>= 1`. The new number of seats |
+
+How it works:
+
+- **Existing subscriptions.** A subscription that has never had its quantity changed (including every subscription created before this feature) is treated as `quantity = 1` and `unit_amount = amount`. No migration call is needed; the seat record is written on the first `update_subscription_quantity`.
+- **New amount.** `amount` becomes `unit_amount * new_quantity` and is what `execute_recurring_payment` charges from the next billing date on.
+- **Proration.** Follows the same rules as `set_subscription_proration` / `resume_subscription`. When proration is enabled for the subscription, the difference for the rest of the cycle is `(new_amount - old_amount) * (next_payment_at - now) / interval` (rounded toward zero). When proration is disabled, or the subscription is still in its trial, nothing is prorated and the new amount simply applies from the next charge.
+  - **Increase.** The prorated amount is pulled from the customer to the merchant immediately with `transfer_from` (the customer needs an allowance, as for recurring charges). The merchant pause flag and the customer's spend limit apply. If the pull fails, the whole call reverts and the quantity is unchanged.
+  - **Decrease.** The prorated amount is added to the subscription's seat credit. `execute_recurring_payment` deducts the credit from the next charges (after any group discount) until it is used up; a cycle fully covered by credit moves no funds.
+- **Price changes.** If a price proposal is applied to a seat-based subscription, the new price is the per-seat `unit_amount` and `amount` becomes `new_price * quantity`.
+
+Example: a 30-day subscription at 10 per seat, 5 seats (`amount = 50`), with proration enabled. Ten days before the next billing date the customer calls `update_subscription_quantity(customer, id, 8)`: `amount` becomes 80 and `(80 - 50) * 10 / 30 = 10` is charged now. Calling it again with `2` the same day sets `amount = 20` and stores a credit of `(20 - 80) * 10 / 30 = -20`, so the next charge of 20 is fully covered.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not the subscription's customer |
+| `PaymentError::TransferFailed` | `206` | The prorated charge could not be pulled from the customer |
+| `PaymentError::BillingOverflow` | `221` | `unit_amount * new_quantity` (or the proration) overflows |
+| `SubscriptionError::NotFound` | `300` | No subscription with this ID |
+| `SubscriptionError::NotActive` | `301` | The subscription is not `Active` (paused, in dunning, cancelled, …) |
+| `SubscriptionError::MerchantPaused` | `317` | A prorated charge is due but the merchant is paused |
+| `SubscriptionError::InvalidQuantity` | `328` | `new_quantity` is `0` |
+| `FeatureError::SpendLimitExceeded` | `527` | The prorated charge would exceed the customer's spend limit |
+
+Emits `SubscriptionQuantityChanged { subscription_id, old_quantity, new_quantity, unit_amount, new_amount, proration_amount }`. `proration_amount` is positive when charged, negative when credited, and `0` when nothing was prorated.
 
 ### Metered Billing
 
@@ -1371,7 +1413,7 @@ assert_eq!(
 
 | Function                                                      | Description                                                                       |
 | ------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| `set_subscription_proration(admin, subscription_id, enabled)` | Enable or disable billing proration when a subscription is resumed after a pause. |
+| `set_subscription_proration(admin, subscription_id, enabled)` | Enable or disable billing proration when a subscription is resumed after a pause or its seat count changes (see [Seat-Based Subscriptions](#seat-based-subscriptions-issue-753)). |
 
 ---
 
@@ -1390,9 +1432,7 @@ Key types referenced by the functions above:
 - **`MerchantProfile`** — `merchant`, `name`, `metadata_hash`, `active`, `registered_at`, `updated_at`; a registered merchant's profile.
 - **`PaymentStatusEntry`** — `status`, `timestamp`, `actor`; one entry per payment status change.
 - **`SubscriptionSkipUsage`** — `window_start`, `count`; skips used in the current rolling year.
-- **`CancellationReason`** (Issue #770) — `Unspecified | TooExpensive | MissingFeatures | PoorQuality | TechnicalIssues | CustomerSupport | SwitchingProvider | BusinessClosure | Other`.
-- **`ChurnAnalytics`** (Issue #770) — `merchant`, `total_cancellations`, `by_reason`; a merchant's churn summary.
-- **`MerchantDailySettlement`** (Issue #765) — `merchant`, `day_index`, `day_start`, `day_end`, `payment_count`, `gross_volume`, `total_fees`, `refund_volume`, `net_volume`; a merchant's settlement summary for one UTC day.
+- **`SubscriptionSeats`** — `quantity`, `unit_amount`; a subscription's seat count and per-seat price (`amount = unit_amount * quantity`).
 
 ---
 
@@ -1452,7 +1492,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RecurringPaymentExecuted` | `RecurringPaymentExecuted` | `subscription_id`, `payment_count`, `amount`, `next_payment_at` | `execute_recurring_payment()` completes a billing cycle |
 | `RecurringPaymentFailed`   | `RecurringPaymentFailed`   | `subscription_id`, `retry_count`                                | `execute_recurring_payment()` fails and enters dunning  |
 | `SubscriptionCancelled`    | `SubscriptionCancelled`    | `subscription_id`, `cancelled_by`                               | `cancel_subscription()` terminates subscription         |
-| `SubscriptionCancelledWithReason` | `SubscriptionCancelledWithReason` | `subscription_id`, `cancelled_by`, `reason`         | `cancel_subscription_with_reason()` terminates a subscription and records the churn reason (Issue #770) |
+| `SubscriptionQuantityChanged` | `subscription_quantity_changed` | `subscription_id`, `old_quantity`, `new_quantity`, `unit_amount`, `new_amount`, `proration_amount` | `update_subscription_quantity()` changes the seat count |
 
 ### Subscription Trial & Pause Events
 

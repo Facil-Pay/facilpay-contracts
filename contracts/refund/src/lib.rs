@@ -744,6 +744,18 @@ pub struct CounterOfferAccepted {
     pub accepted_amount: i128,
 }
 
+// Issue #813: customer rejection of a counter-offer
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CounterOfferRejected {
+    pub refund_id: u64,
+    pub customer: Address,
+    pub requested_amount: i128,
+    pub offered_amount: i128,
+    pub expired: bool,
+    pub escalated: bool,
+}
+
 // Issue #695: customer withdrawal of a pending refund request
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3386,6 +3398,16 @@ impl RefundContract {
     ) -> Result<u64, Error> {
         caller.require_auth();
 
+        Self::escalate_to_arbitration_internal(env, caller, refund_id, fee_token, fee_amount)
+    }
+
+    fn escalate_to_arbitration_internal(
+        env: Env,
+        caller: Address,
+        refund_id: u64,
+        fee_token: Address,
+        fee_amount: i128,
+    ) -> Result<u64, Error> {
         let refund: Refund = env
             .storage()
             .instance()
@@ -10537,6 +10559,112 @@ impl RefundContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Reject the merchant's counter-offer.
+    ///
+    /// Discards the offer and returns the refund to review: it stays
+    /// `Requested` at its original amount, so the merchant or admin can still
+    /// approve, reject or make a new offer. An expired offer can also be
+    /// rejected; it is treated as rejected either way. Emits
+    /// `CounterOfferRejected`.
+    ///
+    /// # Arguments
+    /// * `customer` - The refund's customer (must be authorized).
+    /// * `refund_id` - The ID of the refund whose offer is rejected.
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if the caller is not the refund's customer.
+    /// Returns `InvalidStatus` if the refund is no longer `Requested`.
+    /// Returns `CounterOfferNotFound` if no offer is pending.
+    pub fn reject_counter_offer(env: Env, customer: Address, refund_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "reject_counter_offer")?;
+        customer.require_auth();
+
+        Self::reject_counter_offer_internal(&env, customer, refund_id, false)?;
+        Ok(())
+    }
+
+    /// Reject the merchant's counter-offer and escalate the refund to
+    /// arbitration in the same call.
+    ///
+    /// The counter-offer is treated as the merchant declining the full
+    /// requested amount: the refund moves to `PendingAppeal` (with the offering
+    /// merchant as `rejected_by`) and an arbitration case is opened exactly as
+    /// `escalate_to_arbitration` does, charging the arbitration fee (and stake,
+    /// if enabled) to the customer. Any failure reverts the whole call. Emits
+    /// `CounterOfferRejected`, `RefundRejected` and `RefundEscalatedToArbitration`.
+    ///
+    /// # Arguments
+    /// * `customer` - The refund's customer (must be authorized).
+    /// * `refund_id` - The ID of the refund whose offer is rejected.
+    /// * `fee_token` - The token address used to pay the arbitration fee.
+    /// * `fee_amount` - The amount of the arbitration fee.
+    ///
+    /// # Returns
+    /// The newly created arbitration case ID.
+    ///
+    /// # Errors
+    /// Returns the same errors as `reject_counter_offer`, plus any error from
+    /// `escalate_to_arbitration` (`InvalidAmount`, `QuorumNotReached`,
+    /// `AlreadyProcessed`).
+    pub fn reject_counter_offer_escalate(
+        env: Env,
+        customer: Address,
+        refund_id: u64,
+        fee_token: Address,
+        fee_amount: i128,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "reject_counter_offer_escalate")?;
+        customer.require_auth();
+
+        let merchant =
+            Self::reject_counter_offer_internal(&env, customer.clone(), refund_id, true)?;
+        Self::begin_refund_rejection(
+            &env,
+            merchant,
+            refund_id,
+            String::from_str(&env, "counter-offer rejected"),
+        )?;
+        Self::escalate_to_arbitration_internal(env, customer, refund_id, fee_token, fee_amount)
+    }
+
+    /// Validate and discard a pending counter-offer, emitting
+    /// `CounterOfferRejected`. Returns the offering merchant.
+    fn reject_counter_offer_internal(
+        env: &Env,
+        customer: Address,
+        refund_id: u64,
+        escalated: bool,
+    ) -> Result<Address, Error> {
+        let refund = Self::get_refund(env, refund_id)?;
+        if refund.customer != customer {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if refund.status != RefundStatus::Requested {
+            return Err(Error::Core(CoreError::InvalidStatus));
+        }
+        let offer: CounterOffer = env
+            .storage()
+            .instance()
+            .get(&RefundExtKey::CounterOffer(refund_id))
+            .ok_or(Error::Ext(ExtError::CounterOfferNotFound))?;
+        let expired = env.ledger().timestamp() > offer.expires_at;
+
+        Self::clear_counter_offer(env, refund_id);
+
+        CounterOfferRejected {
+            refund_id,
+            customer,
+            requested_amount: refund.amount,
+            offered_amount: offer.amount,
+            expired,
+            escalated,
+        }
+        .publish(env);
+
+        Ok(offer.merchant)
     }
 
     /// Get the merchant's pending counter-offer for a refund, if any.
