@@ -49,6 +49,7 @@ Every privileged function performs two authorization checks:
 | `set_escrow_contract(admin, escrow_contract)` | Updates the stored escrow contract address. | Admin member, threshold 1 only |
 | `set_refund_contract(admin, refund_contract)` | Updates the stored refund contract address. | Admin member, threshold 1 only |
 | `upgrade(admin, new_wasm_hash)` | Replaces the coordinator WASM. | Admin member, threshold 1 only |
+| `upgrade_children(admin, payment_hash, escrow_hash, refund_hash)` | Pauses, upgrades and unpauses all three child contracts in one call. See [Coordinated Child Upgrades](#coordinated-child-upgrades). | Admin member, threshold 1 only |
 | `set_admins(admin, admins, threshold)` | Replaces the admin set and threshold. | Admin member, threshold 1 only |
 | `propose_action(proposer, action)` | Proposes a privileged action. | Admin member |
 | `approve_action(approver, proposal_id)` | Approves an open proposal. | Admin member |
@@ -114,7 +115,7 @@ Privileged coordinator calls (child contract setters, `upgrade`, and changing th
 
 ### Direct calls vs. proposals
 
-- While the threshold is **1**, any admin member may call `set_payment_contract`, `set_escrow_contract`, `set_refund_contract`, `upgrade` and `set_admins` directly. This is how a freshly initialized coordinator bootstraps a multisig.
+- While the threshold is **1**, any admin member may call `set_payment_contract`, `set_escrow_contract`, `set_refund_contract`, `upgrade`, `upgrade_children` and `set_admins` directly. This is how a freshly initialized coordinator bootstraps a multisig.
 - Once the threshold is **above 1**, those direct calls fail with `MultisigRequired`, and the action must go through `propose_action` → `approve_action` → `execute_action`.
 
 ### `AdminAction`
@@ -126,6 +127,7 @@ Privileged coordinator calls (child contract setters, `upgrade`, and changing th
 | `SetRefundContract(Address)` | Updates the stored refund contract. |
 | `Upgrade(BytesN<32>)` | Replaces the coordinator WASM (emits `AdminContractUpgraded` with `upgraded_by` = executor). |
 | `SetAdmins(Vec<Address>, u32)` | Replaces the admin set and threshold (emits `AdminSetUpdated`). |
+| `UpgradeChildren(BytesN<32>, BytesN<32>, BytesN<32>)` | Upgrades the payment, escrow and refund contracts (in that order of hashes) exactly like `upgrade_children`, with `upgraded_by` = executor. If any child call fails, the whole `execute_action` reverts and the proposal stays unexecuted. |
 
 ### `set_admins(admin, admins, threshold)`
 
@@ -361,3 +363,38 @@ Replaces the coordinator's WASM in place via `update_current_contract_wasm`. The
 **Errors:** `NotInitialized` (2) if the contract was never initialized, `Unauthorized` (3) if `admin` is not in the admin set, `MultisigRequired` (12) if the threshold is above 1.
 
 **Event:** `AdminContractUpgraded { new_wasm_hash, upgraded_by }`.
+
+## Coordinated Child Upgrades
+
+Upgrading the payment, escrow and refund contracts in three separate transactions leaves the platform half-upgraded in between. `upgrade_children` does all three in one call.
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `upgrade_children` | `admin: Address`, `payment_hash: BytesN<32>`, `escrow_hash: BytesN<32>`, `refund_hash: BytesN<32>` | `Result<(), Error>` | `admin` (admin-set member; threshold 1 only, otherwise propose `AdminAction::UpgradeChildren`) |
+
+Each hash is the hash of a WASM already uploaded to the network.
+
+What the call does, in order:
+
+1. Pauses each child (`pause_contract`) with reason `"coordinated upgrade"`.
+2. Calls `upgrade` on the payment, escrow and refund contracts, emitting one `ChildContractUpgraded` per child.
+3. Unpauses each child (`unpause_contract`); the new code handles this call.
+
+A child that was already globally paused before the call (for example, during an emergency pause) is neither paused again nor unpaused, so an emergency pause stays in place.
+
+**Any failure reverts the whole call.** If any child rejects a call (for example, a hash that was never uploaded, escrow's `MigrationInProgress`, or the coordinator not being authorized), the transaction fails with that child's error. No child is upgraded and none is left paused.
+
+**Setup: the coordinator must be authorized on each child.** The coordinator calls the children as itself (`env.current_contract_address()`), so before using `upgrade_children`:
+
+- **Payment and escrow:** add the coordinator's contract address to the child's admin multisig. Their `upgrade` also requires `required_signatures == 1`.
+- **Refund:** make the coordinator's contract address the refund contract's admin.
+
+**Errors:** `NotInitialized` (2) if the contract was never initialized, `Unauthorized` (3) if `admin` is not in the admin set, `MultisigRequired` (12) if the threshold is above 1. Child errors abort the call as described above.
+
+**Events:**
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `ChildContractUpgraded` | `child_kind: ChildKind`, `contract: Address`, `new_wasm_hash: BytesN<32>`, `upgraded_by: Address`, `upgraded_at: u64` | `upgrade_children` and executed `UpgradeChildren` proposals, once per child |
+
+The children also emit their own pause, `ContractUpgraded` and unpause events.

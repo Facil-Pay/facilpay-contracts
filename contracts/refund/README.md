@@ -146,6 +146,8 @@ stellar contract invoke \
 - `withdraw_refund_request()` — Customer withdraws a refund still in `Requested` status. See [Withdrawing a Refund Request](#withdrawing-a-refund-request).
 - `counter_offer()` — Merchant offers a smaller refund than requested. See [Counter-Offers](#counter-offers).
 - `accept_counter_offer()` — Customer accepts the merchant's counter-offer, approving the refund at the offered amount.
+- `reject_counter_offer()` — Customer rejects the merchant's counter-offer; the refund goes back to review.
+- `reject_counter_offer_escalate()` — Customer rejects the counter-offer and escalates the refund to arbitration in one call.
 - `get_counter_offer()` — Gets the pending counter-offer for a refund, if any.
 
 ### Withdrawing a Refund Request
@@ -181,25 +183,31 @@ Merchants can counter a refund request with a partial amount instead of only app
 | --- | --- | --- |
 | `counter_offer` | `merchant: Address` (must authorize), `refund_id: u64`, `amount: i128` | `Result<(), Error>` |
 | `accept_counter_offer` | `customer: Address` (must authorize), `refund_id: u64` | `Result<(), Error>` |
+| `reject_counter_offer` | `customer: Address` (must authorize), `refund_id: u64` | `Result<(), Error>` |
+| `reject_counter_offer_escalate` | `customer: Address` (must authorize), `refund_id: u64`, `fee_token: Address`, `fee_amount: i128` | `Result<u64, Error>` (the new arbitration case ID) |
 | `get_counter_offer` | `refund_id: u64` | `Option<CounterOffer>` (`refund_id`, `merchant`, `amount`, `offered_at`, `expires_at`) |
 
 - **Making an offer.** The refund must be `Requested`, and `amount` must be greater than `0` and less than the requested amount. The offer stays open for 7 days (`expires_at = offered_at + 604800`). A new offer replaces the previous one.
 - **Accepting an offer.** The customer can accept up to and including `expires_at`. The refund's `amount` is set to the offered amount, and the per-payment refund-cap usage shrinks to match. The refund is then approved (`approved_by` is the merchant), so `process_refund()` pays out the accepted amount.
-- **Expiry.** An expired offer can no longer be accepted, and the original request stays `Requested` at its original amount. The admin can still approve or reject it, and the merchant can make a new offer.
+- **Rejecting an offer.** `reject_counter_offer` discards the offer and returns the refund to review: it stays `Requested` at its original amount, so the admin can still approve or reject it and the merchant can make a new offer.
+- **Rejecting and escalating.** `reject_counter_offer_escalate` treats the offer as the merchant declining the full amount. It discards the offer, moves the refund to `PendingAppeal` (`rejected_by` is the offering merchant, reason `"counter-offer rejected"`) and opens an arbitration case exactly like `escalate_to_arbitration`, charging the arbitration fee (and stake, if enabled) to the customer. If any step fails, the whole call reverts and the offer stays pending.
+- **Expiry.** An expired offer can no longer be accepted, and the original request stays `Requested` at its original amount. The admin can still approve or reject it, and the merchant can make a new offer. An expired offer is treated as rejected: the customer can still call either reject function on it, and `CounterOfferRejected` reports `expired: true`.
 - **Other decisions.** Approving, rejecting, TTL-expiring or withdrawing the refund discards any pending offer.
 - **Response SLA.** A counter-offer does not stop the merchant's response-SLA clock.
 
 | Error | Code | When |
 | --- | --- | --- |
 | `CoreError::RefundNotFound` | `2` | No refund with this ID |
-| `CoreError::Unauthorized` | `3` | `counter_offer`: caller is not the refund's merchant. `accept_counter_offer`: caller is not the refund's customer |
+| `CoreError::Unauthorized` | `3` | `counter_offer`: caller is not the refund's merchant. `accept_counter_offer` / `reject_counter_offer` / `reject_counter_offer_escalate`: caller is not the refund's customer |
 | `CoreError::InvalidStatus` | `7` | Refund is not `Requested` |
 | `CoreError::RefundWindowExpired` | `11` | `accept_counter_offer`: the refund's TTL has expired |
 | `ExtError::InvalidCounterOffer` | `72` | `counter_offer`: `amount <= 0` or `amount >= requested amount` |
-| `ExtError::CounterOfferNotFound` | `73` | `accept_counter_offer`: no offer is pending |
+| `ExtError::CounterOfferNotFound` | `73` | `accept_counter_offer` / `reject_counter_offer` / `reject_counter_offer_escalate`: no offer is pending |
+| `CoreError::InvalidAmount` / `QuorumNotReached` / `AlreadyProcessed` | `1` / `15` / `8` | `reject_counter_offer_escalate`: escalation failed (same rules as `escalate_to_arbitration`) |
+| `CoreError::FunctionPaused` / `ContractPaused` | `18` / `17` | The contract or the called function is paused |
 | `ExtError::CounterOfferExpired` | `74` | `accept_counter_offer`: the offer's `expires_at` has passed |
 
-Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and `RefundApproved` from `accept_counter_offer`.
+Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and `RefundApproved` from `accept_counter_offer`. Emits `CounterOfferRejected` from `reject_counter_offer`. Emits `CounterOfferRejected`, `RefundRejected` and `RefundEscalatedToArbitration` (plus `StakeDeposited` when staking is enabled) from `reject_counter_offer_escalate`.
 
 ### Appeals
 
@@ -274,13 +282,130 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `get_requires_admin_approval()` — Checks if merchant requires admin approval.
 - `set_requires_admin_approval()` — Merchant sets whether admin approval is required.
 - `get_auto_approve_below()` — Gets the auto-approval threshold amount for a merchant.
-- `set_auto_approve_below()` — Merchant sets the auto-approval threshold.
+- `set_auto_approve_below()` — Merchant sets the auto-approval threshold (capped by the admin ceiling).
+- `get_auto_approve_below_ceiling()` / `set_auto_approve_below_ceiling()` — Platform-wide cap on merchant auto-approval thresholds. See [Auto-Approval Ceiling](#auto-approval-ceiling).
+- `schedule_refund_policy_change()` / `cancel_scheduled_refund_policy()` / `get_scheduled_refund_policy()` / `activate_scheduled_refund_policy()` — Future-dated policy changes. See [Scheduled Refund Policy Changes](#scheduled-refund-policy-changes).
+- `set_refund_cooldown_config()` / `get_refund_cooldown_config()` — Minimum gap between a customer's refund requests. See [Refund Cooldown](#refund-cooldown).
 - `get_inherit_from_parent()` — Checks if merchant inherits policy from parent.
 - `set_inherit_from_parent()` — Merchant sets policy inheritance from parent.
 - `get_applicable_refund_bps()` — Gets the max refund basis points for a merchant and payment.
 - `get_policy_inheritance_chain()` — Returns the merchant's inheritance ancestry chain.
 - `set_merchant_parent()` — Admin sets the parent merchant for policy inheritance.
 - `get_merchant_parent()` — Gets the direct parent merchant of a given merchant.
+
+#### Scheduled Refund Policy Changes
+
+A merchant can schedule a policy change that takes effect at a future ledger timestamp, so customers can be told about new terms before they apply.
+
+| Function | Parameters | Auth | Returns |
+| --- | --- | --- | --- |
+| `schedule_refund_policy_change` | `merchant: Address`, `tiers: Vec<RefundTier>`, `effective_at: u64` | `merchant` | `Result<(), Error>` |
+| `cancel_scheduled_refund_policy` | `merchant: Address` | `merchant` | `Result<(), Error>` |
+| `get_scheduled_refund_policy` | `merchant: Address` | none | `Option<ScheduledRefundPolicy>` (`merchant`, `tiers`, `effective_at`, `scheduled_at`) |
+| `activate_scheduled_refund_policy` | `merchant: Address` | none (permissionless) | `Result<u32, Error>` (the new policy version) |
+
+How it works:
+
+- **Scheduling.** `effective_at` must be strictly after the current ledger timestamp. Each tier's `max_refund_bps` must be in `1..=10000`. Tiers are sorted by `days_from_purchase`. A merchant has at most one pending change: scheduling again replaces it. If the pending change has already come due, it is applied first so it is not silently discarded.
+- **Taking effect.** From `effective_at` on, `get_refund_policy` (and so `get_effective_refund_policy` and refund requests) returns the new tiers, even before anything is written to storage.
+- **Writing it to storage.** The change is written as a new policy version, dated `effective_at`, the next time the merchant calls `set_refund_policy`, `deactivate_refund_policy` or `schedule_refund_policy_change`, the next time `request_refund` uses the merchant's policy, or when anyone calls `activate_scheduled_refund_policy`. Because the version is dated `effective_at`, `get_refund_policy_at_time` is correct even if the write happens later. The new policy keeps the existing policy's `created_at` and `default_window_seconds` (30 days if there was no policy) and is `active`.
+- **Cancelling.** `cancel_scheduled_refund_policy` only works before `effective_at`. A change that is already due cannot be cancelled: the call applies it and returns `ScheduledPolicyNotFound`.
+
+Timeline example (the merchant's current policy allows 100% within 30 days):
+
+```text
+t = 1_000      schedule_refund_policy_change(merchant, [{days_from_purchase: 14, max_refund_bps: 5000}], 2_000)
+               -> RefundPolicyChangeScheduled { merchant, tiers_count: 1, effective_at: 2_000 }
+               get_refund_policy(merchant)              -> old policy (100% within 30 days)
+               get_scheduled_refund_policy(merchant)    -> Some({ effective_at: 2_000, scheduled_at: 1_000, .. })
+t = 1_500      activate_scheduled_refund_policy(merchant) -> Err(ScheduledPolicyNotDue)
+               (cancel_scheduled_refund_policy(merchant) would still succeed here)
+t = 2_000      get_refund_policy(merchant)              -> new policy (50% within 14 days), not yet stored
+t = 2_300      activate_scheduled_refund_policy(merchant) -> Ok(version)
+               -> RefundPolicySet { merchant, tiers_count: 1 }
+               -> RefundPolicyChangeActivated { merchant, version, effective_at: 2_000 }
+               get_scheduled_refund_policy(merchant)    -> None
+               get_refund_policy_at_time(merchant, 2_100) -> the new version (dated 2_000)
+```
+
+```bash
+stellar contract invoke --id <REFUND_CONTRACT_ID> --source <MERCHANT_SECRET> --network testnet \
+  -- schedule_refund_policy_change \
+  --merchant <MERCHANT_ADDRESS> \
+  --tiers '[{"days_from_purchase": 14, "max_refund_bps": 5000}]' \
+  --effective_at 2000
+```
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::RefundExceedsPolicy` | `12` | `schedule_refund_policy_change`: a tier's `max_refund_bps` is outside `1..=10000` |
+| `ExtError::InvalidEffectiveTime` | `69` | `schedule_refund_policy_change`: `effective_at` is not after the current ledger timestamp |
+| `ExtError::ScheduledPolicyNotFound` | `70` | `cancel_scheduled_refund_policy`: nothing pending, or the pending change is already due. `activate_scheduled_refund_policy`: nothing pending |
+| `ExtError::ScheduledPolicyNotDue` | `71` | `activate_scheduled_refund_policy`: `effective_at` has not been reached |
+
+Emits `RefundPolicyChangeScheduled` from `schedule_refund_policy_change`, `RefundPolicyChangeCancelled` from `cancel_scheduled_refund_policy`, and `RefundPolicySet` followed by `RefundPolicyChangeActivated` whenever a due change is written (by `activate_scheduled_refund_policy` or lazily by the functions listed above). `get_scheduled_refund_policy` emits nothing.
+
+#### Auto-Approval Ceiling
+
+A merchant's `set_auto_approve_below` threshold lets refunds at or below that amount skip review. The admin sets a platform-wide ceiling on that threshold.
+
+| Function | Parameters | Auth | Returns |
+| --- | --- | --- | --- |
+| `set_auto_approve_below_ceiling` | `admin: Address`, `value: i128` | `admin` (must be the contract admin) | `Result<(), Error>` |
+| `get_auto_approve_below_ceiling` | none | none | `i128` (`0` if never set) |
+| `set_auto_approve_below` | `merchant: Address`, `value: i128` | `merchant` | `Result<(), Error>` |
+| `get_auto_approve_below` | `merchant: Address` | none | `i128` (`0` if never set) |
+
+How the ceiling limits a merchant:
+
+- **When the merchant sets a threshold.** `set_auto_approve_below` fails with `AutoApproveThresholdExceedsCeiling` if `value` is greater than the current ceiling. The default ceiling is `0`, so merchants cannot enable auto-approval until the admin raises it.
+- **When a refund is requested.** The threshold actually used is `min(merchant threshold, current ceiling)`. If the admin lowers the ceiling later, merchants whose stored threshold is now higher are capped at the new ceiling straight away; their stored value is not changed.
+- A refund is auto-approved only if the effective merchant does not require admin approval (`get_requires_admin_approval` is `false`) and `amount <= min(threshold, ceiling)`.
+
+Example: the admin calls `set_auto_approve_below_ceiling(admin, 500)`. A merchant's `set_auto_approve_below(merchant, 1_000)` fails with code `32`, while `set_auto_approve_below(merchant, 300)` succeeds. A 250 refund is then auto-approved and a 400 refund stays `Requested`. If the admin later lowers the ceiling to `200`, the same 250 refund would stay `Requested`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | `set_auto_approve_below_ceiling`: caller is not the contract admin, or no admin is set |
+| `CoreError::AutoApproveThresholdExceedsCeiling` | `32` | `set_auto_approve_below`: `value` is greater than the ceiling |
+
+None of these functions emit events; read the current values with the getters.
+
+#### Refund Cooldown
+
+The admin can require a minimum gap between refund requests from the same customer.
+
+| Function | Parameters | Auth | Returns |
+| --- | --- | --- | --- |
+| `set_refund_cooldown_config` | `admin: Address`, `config: RefundCooldownConfig` | `admin` (must be the contract admin) | `Result<(), Error>` |
+| `get_refund_cooldown_config` | none | none | `Option<RefundCooldownConfig>` (`None` if never set) |
+
+`RefundCooldownConfig` fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `cooldown_seconds` | `u64` | Minimum time between two refund requests for the same customer |
+| `enabled` | `bool` | Whether the cooldown is enforced. When `false`, requests are not checked and no new cooldown is recorded |
+
+How it works:
+
+- Each successful refund request (while the cooldown is enabled) records the customer's request time together with the `cooldown_seconds` in force at that moment.
+- A later request from that customer fails with `RefundCooldownActive` while `now - last_request_at < cooldown_seconds` (using the recorded value, so changing `cooldown_seconds` does not move an existing cooldown). The request is allowed again from `last_request_at + cooldown_seconds`.
+- Disabling the config (`enabled: false`) stops all checks immediately. Withdrawing a request does not reset the cooldown.
+
+```bash
+stellar contract invoke --id <REFUND_CONTRACT_ID> --source <ADMIN_SECRET> --network testnet \
+  -- set_refund_cooldown_config \
+  --admin <ADMIN_ADDRESS> \
+  --config '{"cooldown_seconds": 86400, "enabled": true}'
+```
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | `set_refund_cooldown_config`: caller is not the contract admin, or no admin is set |
+| `CoreError::RefundCooldownActive` | `33` | `request_refund` (and the other refund-request entry points): the customer is still inside their cooldown |
+
+`set_refund_cooldown_config` and `get_refund_cooldown_config` emit no events. When a request is blocked, `RefundCooldownEnforced` (`customer`, `last_refund_at`, `cooldown_seconds`, `available_at`) is published, but because the call then fails the event is rolled back with the transaction; it is only visible in simulation/diagnostics.
 
 ### Query Functions
 
@@ -882,6 +1007,10 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | Event                                       | Topic Name | Payload Fields | Fires When                                                           |
 | ------------------------------------------- | ---------- | -------------- | -------------------------------------------------------------------- |
 | (Policy changes tracked via function calls) | —          | —              | Use `get_refund_policy_history()` to audit policy versions over time |
+| `RefundPolicySet` | `refund_policy_set` | `merchant`, `tiers_count` | A policy is written, including when a scheduled change is activated |
+| `RefundPolicyChangeScheduled` | `refund_policy_change_scheduled` | `merchant`, `tiers_count`, `effective_at` | `schedule_refund_policy_change()` records a pending change |
+| `RefundPolicyChangeCancelled` | `refund_policy_change_cancelled` | `merchant`, `effective_at` | `cancel_scheduled_refund_policy()` discards a pending change |
+| `RefundPolicyChangeActivated` | `refund_policy_change_activated` | `merchant`, `version`, `effective_at` | A due scheduled change is written as a new policy version |
 
 | `CategoryRefundCapSet` | `category_refund_cap_set` | `merchant`, `category`, `max_bps` | `set_category_refund_cap()` |
 

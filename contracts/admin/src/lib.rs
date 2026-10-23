@@ -3,8 +3,8 @@ use escrow::EscrowContractClient;
 use payments::PaymentContractClient;
 use refund::RefundContractClient;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, BytesN, Env,
-    String, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    BytesN, Env, String, Vec,
 };
 
 /// Schema version of the coordinator itself, reported by `get_platform_versions` (#817).
@@ -79,6 +79,8 @@ pub enum AdminAction {
     Upgrade(BytesN<32>),
     /// Replace the admin set and threshold.
     SetAdmins(Vec<Address>, u32),
+    /// Upgrade the payment, escrow and refund contracts together (#819).
+    UpgradeChildren(BytesN<32>, BytesN<32>, BytesN<32>),
 }
 
 /// A pending or executed multisig proposal (#816).
@@ -151,6 +153,27 @@ pub enum ChildKind {
     Payment,
     Escrow,
     Refund,
+}
+
+/// Emitted when a child contract address is updated (#651).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildContractUpdated {
+    pub child_kind: ChildKind,
+    pub new_address: Address,
+    pub updated_by: Address,
+    pub updated_at: u64,
+}
+
+/// Emitted once per child contract replaced by `upgrade_children` (#819).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildContractUpgraded {
+    pub child_kind: ChildKind,
+    pub contract: Address,
+    pub new_wasm_hash: BytesN<32>,
+    pub upgraded_by: Address,
+    pub upgraded_at: u64,
 }
 
 /// Emitted when the pauser pauses a single function on one child contract.
@@ -428,7 +451,90 @@ fn apply_action(env: &Env, action: AdminAction, executed_by: Address) {
             .set(&DataKey::RefundContract, &addr),
         AdminAction::Upgrade(hash) => upgrade_wasm(env, hash, executed_by),
         AdminAction::SetAdmins(admins, threshold) => store_admin_set(env, admins, threshold),
+        AdminAction::UpgradeChildren(payment_hash, escrow_hash, refund_hash) => {
+            if let Err(e) =
+                upgrade_children_wasm(env, payment_hash, escrow_hash, refund_hash, executed_by)
+            {
+                panic_with_error!(env, e);
+            }
+        }
     }
+}
+
+/// Pauses every child, replaces each child's WASM and unpauses them again,
+/// all inside the current invocation (#819). The coordinator acts on the
+/// children as itself, so its own address must be an admin on each child
+/// (a single-signature admin on payment and escrow). Any child call that fails
+/// panics, which reverts the whole invocation, including the pauses. A child
+/// that was already globally paused before the upgrade is left paused.
+fn upgrade_children_wasm(
+    env: &Env,
+    payment_hash: BytesN<32>,
+    escrow_hash: BytesN<32>,
+    refund_hash: BytesN<32>,
+    upgraded_by: Address,
+) -> Result<(), Error> {
+    let (payment, escrow, refund) = child_contracts(env)?;
+    let coordinator = env.current_contract_address();
+    let reason = String::from_str(env, "coordinated upgrade");
+
+    let payment_client = PaymentContractClient::new(env, &payment);
+    let escrow_client = EscrowContractClient::new(env, &escrow);
+    let refund_client = RefundContractClient::new(env, &refund);
+
+    let payment_was_paused = payment_client.get_pause_state().globally_paused;
+    let escrow_was_paused = escrow_client.get_pause_state().globally_paused;
+    let refund_was_paused = refund_client.get_pause_state().globally_paused;
+
+    if !payment_was_paused {
+        payment_client.pause_contract(&coordinator, &reason);
+    }
+    if !escrow_was_paused {
+        escrow_client.pause_contract(&coordinator, &reason);
+    }
+    if !refund_was_paused {
+        refund_client.pause_contract(&coordinator, &reason);
+    }
+
+    let now = env.ledger().timestamp();
+    payment_client.upgrade(&coordinator, &payment_hash);
+    ChildContractUpgraded {
+        child_kind: ChildKind::Payment,
+        contract: payment,
+        new_wasm_hash: payment_hash,
+        upgraded_by: upgraded_by.clone(),
+        upgraded_at: now,
+    }
+    .publish(env);
+    escrow_client.upgrade(&coordinator, &escrow_hash);
+    ChildContractUpgraded {
+        child_kind: ChildKind::Escrow,
+        contract: escrow,
+        new_wasm_hash: escrow_hash,
+        upgraded_by: upgraded_by.clone(),
+        upgraded_at: now,
+    }
+    .publish(env);
+    refund_client.upgrade(&coordinator, &refund_hash);
+    ChildContractUpgraded {
+        child_kind: ChildKind::Refund,
+        contract: refund,
+        new_wasm_hash: refund_hash,
+        upgraded_by,
+        upgraded_at: now,
+    }
+    .publish(env);
+
+    if !payment_was_paused {
+        payment_client.unpause_contract(&coordinator);
+    }
+    if !escrow_was_paused {
+        escrow_client.unpause_contract(&coordinator);
+    }
+    if !refund_was_paused {
+        refund_client.unpause_contract(&coordinator);
+    }
+    Ok(())
 }
 
 fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
@@ -492,6 +598,47 @@ impl AdminContract {
         require_single_admin(&env, &admin)?;
         upgrade_wasm(&env, new_wasm_hash, admin);
         Ok(())
+    }
+
+    /// Upgrades the payment, escrow and refund contracts in one call (#819).
+    ///
+    /// Pauses all three children, replaces each child's WASM, then unpauses
+    /// them, so the platform is never left half-upgraded. If any step fails
+    /// the whole call reverts and no child is upgraded or left paused. A child
+    /// that was already globally paused (e.g. by an emergency pause) is not
+    /// unpaused.
+    ///
+    /// The coordinator calls the children as itself, so its own contract
+    /// address must be authorized on each child: an admin of the payment and
+    /// escrow multisig configs (with `required_signatures == 1`, which their
+    /// `upgrade` requires) and the refund contract's admin.
+    ///
+    /// # Parameters
+    /// - `admin`: an admin-set member, who must authorize the call.
+    /// - `payment_hash`: hash of the new payment WASM, already uploaded.
+    /// - `escrow_hash`: hash of the new escrow WASM, already uploaded.
+    /// - `refund_hash`: hash of the new refund WASM, already uploaded.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the contract has not been initialized,
+    /// `Error::Unauthorized` if `admin` is not in the admin set, and
+    /// `Error::MultisigRequired` if the threshold is above 1 (use
+    /// `propose_action` with `AdminAction::UpgradeChildren` instead). A child
+    /// rejecting the coordinator, or a WASM hash that is not uploaded, aborts
+    /// the call with the child's error.
+    ///
+    /// # Events
+    /// Emits one `ChildContractUpgraded` per child, plus the children's own
+    /// pause, unpause and upgrade events.
+    pub fn upgrade_children(
+        env: Env,
+        admin: Address,
+        payment_hash: BytesN<32>,
+        escrow_hash: BytesN<32>,
+        refund_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        require_single_admin(&env, &admin)?;
+        upgrade_children_wasm(&env, payment_hash, escrow_hash, refund_hash, admin)
     }
 
     /// Initializes the admin contract with the addresses of the payment, escrow,
