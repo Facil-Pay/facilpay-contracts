@@ -835,6 +835,264 @@ operator runbook — caller permissions, each step's exact semantics, batch-size
 
 ---
 
+## Escrow Expiry and Renewal
+
+Escrows can be created with an optional expiry timestamp. When an escrow expires, it transitions to `Cancelled`, and funds are refunded to the customer (minus any configured keeper reward). A separate renewal mechanism allows customers or merchants to extend an escrow's lifetime before it expires, subject to admin-configured constraints.
+
+### Global Expiry Configuration
+
+`set_global_expiry_config(admin, default_expiry_seconds, keeper_reward_bps)` stores a contract-wide policy that governs how expiry behaves.
+
+| Field | Type | Meaning |
+| :---- | :--- | :------ |
+| `default_expiry_seconds` | `u64` | Informational default for new escrows (not automatically applied; callers supply the concrete `expiry_timestamp` at creation time). |
+| `keeper_reward_bps` | `u32` | Share of the platform fee paid to the keeper address that triggers expiry, in basis points. `10000` = 100 %. Must be ≤ 10 000; higher values are rejected with `InvalidBps`. |
+
+`GlobalExpiryConfig` is stored under `ConfigKey::GlobalExpiryConfig`. If it has never been set, `expire_escrow` falls back to a zero-reward config (no keeper reward is paid).
+
+#### Auth
+
+`admin.require_auth()` is called, and `admin` must be in the multisig admin set. The contract must not be paused.
+
+#### Errors
+
+| Error | Code | Condition |
+| :---- | :--- | :-------- |
+| `BasicError::NotAnAdmin` | `101` | Caller is not in the multisig admin set |
+| `BasicError::InvalidBps` | `111` | `keeper_reward_bps > 10000` |
+| `BasicError::ContractPaused` | `103` | Contract is globally paused |
+
+---
+
+### Checking Expiry
+
+`is_escrow_expired(escrow_id) -> bool` is a read-only query with no auth requirement.
+
+It returns `false` in any of the following cases:
+- The escrow does not exist.
+- The escrow's `expiry_timestamp` is `0` (no expiry was configured at creation).
+- `ledger_timestamp < expiry_timestamp` (the deadline has not been reached yet).
+
+It returns `true` only when the escrow exists, has a non-zero `expiry_timestamp`, and `ledger_timestamp >= expiry_timestamp`.
+
+This function never mutates state and can be called without authorization.
+
+---
+
+### Triggering Expiry
+
+`expire_escrow(keeper, escrow_id)` processes an expired escrow. Any address can call it; the `keeper` parameter names the address that receives the keeper reward.
+
+#### What it does
+
+1. Validates that the escrow is `Locked` and its `expiry_timestamp` has been reached.
+2. Sets the escrow status to `Cancelled`.
+3. Computes the keeper reward:
+
+```
+platform_fee = escrow.amount * escrow.fee_bps / 10000
+keeper_reward = platform_fee * global_config.keeper_reward_bps / 10000
+```
+
+4. Transfers `escrow.amount - keeper_reward` back to the customer.
+5. If `keeper_reward > 0`, transfers the reward to `keeper` and emits a `KeeperReward` event.
+6. Emits `EscrowExpired { escrow_id, refunded_to: customer, amount: customer_refund_amount }`.
+
+#### Keeper reward model
+
+The reward is carved from the **platform fee**, not the principal. An escrow with `fee_bps = 0` produces no platform fee and therefore no keeper reward regardless of `keeper_reward_bps`. The customer always receives at minimum `escrow.amount - platform_fee`.
+
+#### Disputed escrows are blocked
+
+`expire_escrow` returns `EscrowError::InvalidStatus` (code `201`) when the escrow is in `Disputed` state. Active disputes must be resolved or withdrawn before expiry can be triggered.
+
+#### Auth
+
+No admin role is required. Any caller can act as the keeper. The contract must not be paused.
+
+#### Errors
+
+| Error | Code | Condition |
+| :---- | :--- | :-------- |
+| `EscrowError::NotFound` | `200` | Escrow does not exist |
+| `EscrowError::EscrowAlreadyExpired` | `210` | Escrow status is already `Released`, `Resolved`, or `Cancelled` |
+| `EscrowError::InvalidStatus` | `201` | Escrow is in `Disputed` state |
+| `EscrowError::EscrowNotExpired` | `209` | `expiry_timestamp` is `0` or deadline has not been reached yet |
+| `BasicError::ContractPaused` | `103` | Contract is globally paused |
+
+#### Events
+
+| Event | Topic | Payload fields | Fires when |
+| :---- | :---- | :------------- | :--------- |
+| `EscrowExpired` | `escrow_expired` | `escrow_id`, `refunded_to`, `amount` | Expiry succeeds; `amount` is the customer refund (after keeper reward) |
+| `KeeperReward` | `keeper_reward` | `escrow_id`, `keeper`, `reward_amount`, `trigger_type: "expiry"` | `keeper_reward > 0` |
+
+---
+
+### auto_refund_on_expiry
+
+The `auto_refund_on_expiry` flag is stored on each `Escrow` record. It is set at creation time (passed as a parameter to `create_escrow` and `create_escrow_with_reference`) and signals to off-chain keepers that this escrow should be expired automatically on their behalf. The contract itself does not run automatic expiry on any schedule — a keeper (an external account or bot) must explicitly call `expire_escrow` after the deadline.
+
+When `auto_refund_on_expiry` is `true`, the intended workflow is:
+1. A keeper monitors escrows for expired entries where this flag is set.
+2. The keeper calls `expire_escrow(keeper_address, escrow_id)` to trigger the refund.
+3. The keeper receives the configured `keeper_reward_bps` share of the platform fee as compensation.
+
+When `auto_refund_on_expiry` is `false`, the customer is expected to call `expire_escrow` themselves or arrange for the expiry to be processed manually.
+
+---
+
+### Renewal Configuration
+
+`set_renewal_config(admin, config)` stores a contract-wide `EscrowRenewalConfig` that governs whether extensions are allowed and what constraints apply.
+
+#### `EscrowRenewalConfig` fields
+
+| Field | Type | Meaning |
+| :---- | :--- | :------ |
+| `enabled` | `bool` | If `false`, all `extend_escrow_expiry` calls return `EscrowError::RenewalDisabled`. |
+| `max_renewals` | `u32` | Maximum number of times any single escrow can be renewed. Tracked per escrow. |
+| `renewal_fee_bps` | `u32` | Fee charged to the caller on each extension, as a basis-point share of the escrow amount. Recorded in the renewal history but not currently transferred on-chain (the fee value is stored for audit purposes). |
+| `min_renewal_period` | `u64` | Minimum extension length in seconds. The extension size is `new_expiry_timestamp - current_expiry_timestamp` (or `now` if no current expiry). |
+| `max_renewal_period` | `u64` | Maximum extension length in seconds. |
+
+The config is stored under `DisputeKey::EscrowRenewalConfig`. If no config exists, `extend_escrow_expiry` proceeds without checking the renewal constraints (no limit on renewals is enforced when the config is absent).
+
+#### Auth
+
+`admin.require_auth()` is called, and `admin` must be in the multisig admin set. The contract must not be paused.
+
+#### Events
+
+| Event | Topic | Payload fields | Fires when |
+| :---- | :---- | :------------- | :--------- |
+| `EscrowRenewalConfigUpdated` | `escrow_renewal_config_updated` | `max_renewals`, `renewal_fee_bps`, `min_renewal_period`, `max_renewal_period`, `updated_by` | Config is saved successfully |
+
+#### Errors
+
+| Error | Code | Condition |
+| :---- | :--- | :-------- |
+| `BasicError::NotAnAdmin` | `101` | Caller is not in the multisig admin set |
+| `BasicError::ContractPaused` | `103` | Contract is globally paused |
+
+---
+
+### Extending Expiry
+
+`extend_escrow_expiry(caller, escrow_id, new_expiry_timestamp)` lets the escrow customer or merchant push the expiry deadline forward.
+
+#### Preconditions
+
+- `caller` must be the escrow's `customer` or `merchant` (`Unauthorized` otherwise).
+- The escrow must be in `Locked` status.
+- `new_expiry_timestamp` must be strictly after the current ledger timestamp (`EscrowAlreadyExpired` if not).
+- If the escrow already has an `expiry_timestamp > 0`, `new_expiry_timestamp` must be strictly after the current expiry (`NewExpiryNotAfterCurrent`).
+
+#### Renewal config enforcement (when a config exists)
+
+When `EscrowRenewalConfig` has been set by an admin, the following additional checks apply:
+
+1. `config.enabled` must be `true` (`RenewalDisabled` if not).
+2. The per-escrow renewal count (stored under `DisputeKey::EscrowRenewalCount(escrow_id)`) must be less than `config.max_renewals` (`MaxRenewalsReached` if not).
+3. The extension size — `new_expiry_timestamp - current_expiry_timestamp` (or `now` when there is no current expiry) — must satisfy `min_renewal_period ≤ extension ≤ max_renewal_period` (`RenewalPeriodTooShort` or `RenewalPeriodTooLong`).
+
+#### What it does on success
+
+1. Computes and stores the `renewal_fee = escrow.amount * renewal_fee_bps / 10_000` (recorded in history; not transferred).
+2. Increments the per-escrow renewal count.
+3. Writes an `EscrowRenewal` record.
+4. Updates `escrow.expiry_timestamp` to `new_expiry_timestamp`.
+5. Updates `escrow.last_activity_at`.
+6. Emits `EscrowRenewed`.
+
+#### Auth
+
+`caller.require_auth()` is called. No admin role is needed. Contract must not be paused.
+
+#### Errors
+
+| Error | Code | Condition |
+| :---- | :--- | :-------- |
+| `EscrowError::NotFound` | `200` | Escrow does not exist |
+| `BasicError::Unauthorized` | `100` | Caller is neither the customer nor the merchant |
+| `EscrowError::InvalidStatus` | `201` | Escrow is not `Locked` |
+| `EscrowError::EscrowAlreadyExpired` | `210` | `new_expiry_timestamp ≤ ledger_timestamp` |
+| `EscrowError::NewExpiryNotAfterCurrent` | `224` | `new_expiry_timestamp ≤ current expiry_timestamp` |
+| `EscrowError::RenewalDisabled` | `222` | Config exists but `enabled = false` |
+| `EscrowError::MaxRenewalsReached` | `223` | Per-escrow renewal count has hit `max_renewals` |
+| `EscrowError::RenewalPeriodTooShort` | `225` | Extension shorter than `min_renewal_period` |
+| `EscrowError::RenewalPeriodTooLong` | `226` | Extension longer than `max_renewal_period` |
+| `BasicError::ContractPaused` | `103` | Contract is globally paused |
+
+#### Events
+
+| Event | Topic | Payload fields | Fires when |
+| :---- | :---- | :------------- | :--------- |
+| `EscrowRenewed` | `escrow_renewed` | `escrow_id`, `renewed_by`, `new_expiry_timestamp`, `renewal_fee`, `renewal_count` | Extension succeeds |
+
+---
+
+### Renewal Storage and Lifecycle
+
+Renewal history is stored per escrow using two keys:
+
+| Key | Type | Meaning |
+| :-- | :--- | :------ |
+| `DisputeKey::EscrowRenewalCount(escrow_id)` | `u32` | Running count of successful renewals for this escrow. Starts at `0`; incremented by `extend_escrow_expiry`. |
+| `DisputeKey::EscrowRenewal(escrow_id)` | `EscrowRenewal` | Most recent renewal record. Each successful call overwrites this entry. |
+
+The `EscrowRenewal` struct captures a full audit trail for each extension:
+
+| Field | Type | Meaning |
+| :---- | :--- | :------ |
+| `renewal_id` | `u64` | Equal to the new `renewal_count` after this extension. |
+| `escrow_id` | `u64` | The escrow that was extended. |
+| `renewed_by` | `Address` | Customer or merchant address that called `extend_escrow_expiry`. |
+| `new_expiry_timestamp` | `u64` | The updated expiry timestamp written to the escrow. |
+| `renewal_fee` | `i128` | Fee computed at extension time (`amount * renewal_fee_bps / 10_000`). Stored for audit; not transferred. |
+| `renewed_at` | `u64` | Ledger timestamp at the time of the call. |
+| `renewal_count` | `u32` | Renewal count after this extension (same as `renewal_id`). |
+
+Renewal records persist for the lifetime of the contract's instance storage (see **Storage TTL** above). They are not deleted when an escrow expires, is released, or is resolved.
+
+---
+
+### Typical Expiry and Renewal Workflow
+
+```
+1. Admin calls set_global_expiry_config(admin, 2_592_000, 500)
+   → 30-day default, keepers earn 5% of the platform fee
+
+2. Admin calls set_renewal_config(admin, EscrowRenewalConfig {
+     enabled: true, max_renewals: 3,
+     renewal_fee_bps: 50,          // 0.5% of escrow amount
+     min_renewal_period: 86_400,   // 1 day minimum extension
+     max_renewal_period: 7_776_000 // 90 day maximum extension
+   })
+
+3. Customer creates an escrow with expiry_timestamp = now + 2_592_000
+   and auto_refund_on_expiry = true
+
+4. Before expiry, merchant calls extend_escrow_expiry(
+     merchant, escrow_id, now + 5_184_000)
+   → Extends by 30 days; renewal_count becomes 1
+
+5. At expiry, keeper calls expire_escrow(keeper_address, escrow_id)
+   → Customer is refunded; keeper earns 5% of the platform fee
+```
+
+### Function Summary
+
+| Function | Signature | Auth | Returns |
+| :------- | :-------- | :--- | :------ |
+| `set_global_expiry_config` | `(admin: Address, default_expiry_seconds: u64, keeper_reward_bps: u32) -> Result<(), Error>` | Multisig admin | `Ok(())` |
+| `is_escrow_expired` | `(escrow_id: u64) -> bool` | None | `true` when past deadline |
+| `expire_escrow` | `(keeper: Address, escrow_id: u64) -> Result<(), Error>` | None (any caller) | `Ok(())` |
+| `set_renewal_config` | `(admin: Address, config: EscrowRenewalConfig) -> Result<(), Error>` | Multisig admin | `Ok(())` |
+| `extend_escrow_expiry` | `(caller: Address, escrow_id: u64, new_expiry_timestamp: u64) -> Result<(), Error>` | Customer or merchant | `Ok(())` |
+
+---
+
 [⬅ Back to Main README](../../README.md)
 
 ---
