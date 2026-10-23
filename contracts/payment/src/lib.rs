@@ -53,6 +53,8 @@ pub enum ConfigKey {
     RequireRegisteredMerchants,
     // Issue #809: refund contract allowed to call `record_refund`
     RefundContract,
+    // Issue #772: configurable batch size limit for recurring payments
+    RecurringPaymentBatchLimit,
 }
 
 #[derive(Clone)]
@@ -1309,6 +1311,15 @@ pub struct RecurringPaymentExecuted {
 pub struct RecurringPaymentFailed {
     pub subscription_id: u64,
     pub retry_count: u64,
+}
+
+// Issue #772: result for batch recurring payment execution
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct BatchRecurringPaymentResult {
+    pub subscription_id: u64,
+    pub success: bool,
+    pub error_code: u32, // 0 = success, non-zero maps to Error enum
 }
 
 #[contractevent]
@@ -7948,6 +7959,74 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Issue #772: Execute recurring payments for multiple subscriptions in a single transaction.
+    /// This allows keepers to batch-process multiple due subscriptions efficiently.
+    /// A failure on one item does not revert the others.
+    ///
+    /// # Arguments
+    /// * `subscription_ids` - Vector of subscription IDs to process.
+    ///
+    /// # Returns
+    /// A vector of results, one per subscription ID, indicating success or failure.
+    ///
+    /// # Errors
+    /// - `InvalidInput` if the batch is empty or exceeds the configured limit.
+    pub fn execute_recurring_payments_batch(
+        env: Env,
+        subscription_ids: Vec<u64>,
+    ) -> Result<Vec<BatchRecurringPaymentResult>, Error> {
+        let len = subscription_ids.len();
+        let batch_limit = Self::get_recurring_payment_batch_limit(env.clone());
+
+        if len == 0 || len > batch_limit {
+            return Err(Error::Basic(BasicError::InvalidInput));
+        }
+
+        let mut results = Vec::new(&env);
+
+        for i in 0..len {
+            let subscription_id = subscription_ids.get(i).unwrap();
+            
+            let result = match Self::execute_recurring_payment(env.clone(), subscription_id) {
+                Ok(_) => BatchRecurringPaymentResult {
+                    subscription_id,
+                    success: true,
+                    error_code: 0,
+                },
+                Err(e) => {
+                    let error_code = Self::error_to_code(&e);
+                    BatchRecurringPaymentResult {
+                        subscription_id,
+                        success: false,
+                        error_code,
+                    }
+                }
+            };
+
+            results.push_back(result);
+        }
+
+        Ok(results)
+    }
+
+    /// Helper function to map errors to numeric codes for batch results.
+    fn error_to_code(error: &Error) -> u32 {
+        match error {
+            Error::Basic(BasicError::Unauthorized) => 1,
+            Error::Basic(BasicError::InvalidInput) => 2,
+            Error::Basic(BasicError::NotFound) => 3,
+            Error::Subscription(SubscriptionError::NotFound) => 10,
+            Error::Subscription(SubscriptionError::NotActive) => 11,
+            Error::Subscription(SubscriptionError::PaymentNotDue) => 12,
+            Error::Subscription(SubscriptionError::Ended) => 13,
+            Error::Subscription(SubscriptionError::MerchantPaused) => 14,
+            Error::Subscription(SubscriptionError::RetryTooEarly) => 15,
+            Error::Subscription(SubscriptionError::DunningNotFound) => 16,
+            Error::Feature(FeatureError::SpendLimitExceeded) => 20,
+            _ => 999, // Unknown error
+        }
+    }
+
     /// Creates a new metered (usage-based) subscription.
     ///
     /// The merchant authorises creation. Usage is reported separately via `report_usage`
@@ -8973,6 +9052,41 @@ impl PaymentContract {
                 initial_backoff_seconds: 3600, // 1 hour
                 max_retries: 5,
             })
+    }
+
+    /// Issue #772: Set the maximum batch size for recurring payment execution.
+    /// Only callable by an admin.
+    pub fn set_recurring_payment_batch_limit(
+        env: Env,
+        admin: Address,
+        limit: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let ms_config: MultiSigConfig = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !ms_config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if limit == 0 || limit > 100 {
+            return Err(Error::Basic(BasicError::InvalidInput));
+        }
+
+        env.store()
+            .set(&DataKey::Config(ConfigKey::RecurringPaymentBatchLimit), &limit);
+
+        Ok(())
+    }
+
+    /// Issue #772: Returns the current batch limit for recurring payments.
+    /// Returns default of 50 if not set.
+    pub fn get_recurring_payment_batch_limit(env: Env) -> u32 {
+        env.store()
+            .get(&DataKey::Config(ConfigKey::RecurringPaymentBatchLimit))
+            .unwrap_or(50u32)
     }
 
     /// Returns the dunning state for a subscription, if any.
