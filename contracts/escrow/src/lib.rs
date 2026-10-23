@@ -269,6 +269,12 @@ pub enum ActionError {
     AmendmentRequiresBothParties = 326,
     MerchantCreationPaused = 327,
     ResolverMustBeDifferent = 328,
+    // Settlement offer errors
+    SettlementOfferAlreadyExists = 329,
+    SettlementOfferNotFound = 330,
+    SettlementOfferExpired = 331,
+    SettlementOfferAlreadyAccepted = 332,
+    InvalidSettlementAmount = 333,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -315,7 +321,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (300..=328).contains(&code) {
+            if (300..=333).contains(&code) {
                 return Ok(Error::Action(unsafe {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
