@@ -12,3 +12,5 @@ target
 # Jupyter notebooks
 *.ipynb
 contracts/**/*.ipynb
+config.bat
+node_modules
