@@ -952,6 +952,8 @@ Emits `ChannelClosedCooperatively { channel_id, merchant_amount, customer_refund
 | `set_payment_forward(merchant, forward_to, forward_bps)` | Configure a merchant's payments to forward `forward_bps` basis points to `forward_to`. |
 | `remove_payment_forward(merchant)`                    | Remove the forwarding configuration for a merchant.                                    |
 | `get_forward_config(merchant)`                        | Retrieve the `PaymentForwardConfig` for a merchant.                                    |
+| `set_max_forward_depth(admin, max_depth)`             | Set the maximum forward-chain depth checked by the loop guard (see below).             |
+| `get_max_forward_depth()`                             | Return the configured maximum forward depth, or `5` if never set.                      |
 
 #### How Payment Forwarding Works
 
@@ -976,10 +978,23 @@ completion — integrators do not need to do anything special when calling `comp
 
 - Forwarding chains are validated to prevent infinite transfer loops. When a forward is
   set, the contract walks the existing forward chain beginning at `forward_to` up to a
-  maximum depth (default `5`, configurable via `MaxForwardDepth`). If the chain eventually
-  returns to the configuring `merchant`, or exceeds the maximum depth, the call reverts
-  with `ForwardLoop`. This means a merchant cannot configure a forward that would route
-  funds back to itself (directly or transitively).
+  maximum depth (default `5`, configurable via `set_max_forward_depth`, below). If the
+  chain eventually returns to the configuring `merchant`, or exceeds the maximum depth,
+  the call reverts with `ForwardLoop`. This means a merchant cannot configure a forward
+  that would route funds back to itself (directly or transitively).
+
+**`set_max_forward_depth(admin: Address, max_depth: u32) -> Result<(), Error>`**
+
+Admin-only. Requires `admin.require_auth()` and `admin` to be a member of the
+`MultiSigConfig` admin set (`Error::Basic(BasicError::Unauthorized)` otherwise;
+`Error::Basic(BasicError::MultiSigNotInitialized)` if multi-sig was never configured).
+Also fails with the contract's "function paused" error if `set_max_forward_depth` is
+individually paused. Stores `max_depth` as the new `MaxForwardDepth` config value used by
+the loop guard above. Emits no event.
+
+**`get_max_forward_depth() -> u32`**
+
+No parameters, no auth. Returns the stored `MaxForwardDepth`, or `5` if it was never set.
 
 **Do fees apply to forwarding?**
 
@@ -1384,6 +1399,16 @@ assert_eq!(
 | `set_auto_escrow_rule(admin, merchant, rule)` | Configure a rule to automatically escrow payments above a threshold for a merchant. |
 | `get_auto_escrow_rule(merchant)`              | Return the auto-escrow rule for a merchant.                                         |
 | `remove_auto_escrow_rule(admin, merchant)`    | Remove the auto-escrow rule for a merchant.                                         |
+
+**`trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error>`**
+
+Internal function (not a Soroban contract entry point — it takes `&Env`, not `Env`, and has no client binding). `complete_payment()` calls it automatically after a payment completes, and ignores its result so a missing/inactive rule never blocks the payment:
+
+- Returns `Error::Payment(PaymentError::NotFound)` if the payment doesn't exist, or if the payment's token does not match the rule's `token`.
+- Returns `Error::Feature(FeatureError::AutoEscrowAlreadyTriggered)` if auto-escrow has already fired for this payment.
+- Returns `Error::Feature(FeatureError::AutoEscrowRuleNotFound)` if no rule exists for the merchant, or the rule's `active` flag is `false`.
+- Returns `Ok(())` without creating an escrow if `payment.amount < rule.min_amount`, or if the computed escrow amount (`payment.amount * rule.escrow_bps / 10000`) is `0`.
+- Otherwise it calls `create_escrow` on `rule.escrow_contract` (30-day release, 7-day additional expiry window), records the escrow id against the payment, and emits `AutoEscrowTriggered { payment_id, merchant, escrow_id, amount, escrow_amount }`.
 
 ### Payment Metadata & Memos
 

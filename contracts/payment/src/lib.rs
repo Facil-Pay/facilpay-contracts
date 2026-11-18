@@ -17287,6 +17287,9 @@ mod test_metered_billing;
 #[cfg(test)]
 mod test_installment_refund;
 
+#[cfg(test)]
+mod test_installment_schedule;
+
 mod test_fee_sweep;
 #[cfg(test)]
 mod test_split_payment;
