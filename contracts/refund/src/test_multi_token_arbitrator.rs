@@ -21,7 +21,18 @@ fn setup_env() -> (Env, Address, Address, Address, Address) {
     (env, admin, merchant, customer, token)
 }
 
-fn deploy_contract(env: &Env, admin: &Address) -> RefundContractClient {
+const ARBITRATION_FEE: i128 = 100;
+
+/// Registers a Stellar asset to pay the arbitration fee and funds `payer` with it.
+fn fee_token(env: &Env, admin: &Address, payer: &Address) -> Address {
+    let token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    token::StellarAssetClient::new(env, &token).mint(payer, &10_000);
+    token
+}
+
+fn deploy_contract<'a>(env: &'a Env, admin: &Address) -> RefundContractClient<'a> {
     let contract_id = env.register_contract(None, RefundContract);
     let client = RefundContractClient::new(env, &contract_id);
     client.initialize(admin);
@@ -61,7 +72,7 @@ fn test_multi_token_registry_allows_supported_token() {
     let client = deploy_contract(&env, &admin);
 
     // Add token to supported list
-    client.add_supported_token(&admin, &token, &true);
+    client.register_refund_token(&admin, &token);
 
     // Request refund with supported token should succeed
     let result = client.try_request_refund(
@@ -88,7 +99,7 @@ fn test_multi_token_registry_rejects_unsupported_token() {
     let unsupported_token = Address::generate(&env);
 
     // Add only one token to registry
-    client.add_supported_token(&admin, &supported_token, &true);
+    client.register_refund_token(&admin, &supported_token);
 
     // Try to request refund with unsupported token
     let result = client.try_request_refund(
@@ -117,7 +128,8 @@ fn test_multi_token_registry_inactive_token_rejected() {
     let client = deploy_contract(&env, &admin);
 
     // Add token but mark it as inactive
-    client.add_supported_token(&admin, &token, &false);
+    client.register_refund_token(&admin, &token);
+    client.deregister_refund_token(&admin, &token);
 
     // Try to request refund with inactive token
     let result = client.try_request_refund(
@@ -146,7 +158,8 @@ fn test_multi_token_registry_reactivate_token() {
     let client = deploy_contract(&env, &admin);
 
     // Add token as inactive
-    client.add_supported_token(&admin, &token, &false);
+    client.register_refund_token(&admin, &token);
+    client.deregister_refund_token(&admin, &token);
 
     // Verify it's rejected
     let result = client.try_request_refund(
@@ -163,7 +176,7 @@ fn test_multi_token_registry_reactivate_token() {
     assert!(result.is_err());
 
     // Reactivate the token
-    client.add_supported_token(&admin, &token, &true);
+    client.register_refund_token(&admin, &token);
 
     // Now it should work
     let result = client.try_request_refund(
@@ -190,9 +203,10 @@ fn test_multi_token_registry_multiple_tokens() {
     let token3 = Address::generate(&env);
 
     // Add multiple tokens
-    client.add_supported_token(&admin, &token1, &true);
-    client.add_supported_token(&admin, &token2, &true);
-    client.add_supported_token(&admin, &token3, &false); // Inactive
+    client.register_refund_token(&admin, &token1);
+    client.register_refund_token(&admin, &token2);
+    client.register_refund_token(&admin, &token3); // Inactive
+    client.deregister_refund_token(&admin, &token3);
 
     // Test with token1 (active) - should work
     let result1 = client.try_request_refund(
@@ -245,6 +259,7 @@ fn test_multi_token_registry_multiple_tokens() {
 fn test_arbitrator_availability_all_available() {
     let (env, admin, merchant, customer, token) = setup_env();
     let client = deploy_contract(&env, &admin);
+    let fee_token = fee_token(&env, &admin, &customer);
 
     // Register 3 arbitrators
     let arb1 = Address::generate(&env);
@@ -275,14 +290,14 @@ fn test_arbitrator_availability_all_available() {
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
     
-    let appeal_id = client.file_appeal(
+    client.file_appeal(
         &customer,
         &refund_id,
         &String::from_str(&env, "I disagree"),
     );
 
     // Escalate to arbitration - should succeed with 3 available arbitrators
-    let result = client.try_escalate_to_arbitration(&customer, &appeal_id);
+    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_ok());
 }
 
@@ -290,6 +305,7 @@ fn test_arbitrator_availability_all_available() {
 fn test_arbitrator_availability_one_unavailable() {
     let (env, admin, merchant, customer, token) = setup_env();
     let client = deploy_contract(&env, &admin);
+    let fee_token = fee_token(&env, &admin, &customer);
 
     // Register 3 arbitrators
     let arb1 = Address::generate(&env);
@@ -323,20 +339,21 @@ fn test_arbitrator_availability_one_unavailable() {
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
     
-    let appeal_id = client.file_appeal(
+    client.file_appeal(
         &customer,
         &refund_id,
         &String::from_str(&env, "I disagree"),
     );
 
     // This might fail if minimum 3 arbitrators required, or succeed with 2
-    let _ = client.try_escalate_to_arbitration(&customer, &appeal_id);
+    let _ = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
 }
 
 #[test]
 fn test_arbitrator_availability_insufficient_available() {
     let (env, admin, merchant, customer, token) = setup_env();
     let client = deploy_contract(&env, &admin);
+    let fee_token = fee_token(&env, &admin, &customer);
 
     // Register 3 arbitrators
     let arb1 = Address::generate(&env);
@@ -370,14 +387,14 @@ fn test_arbitrator_availability_insufficient_available() {
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
     
-    let appeal_id = client.file_appeal(
+    client.file_appeal(
         &customer,
         &refund_id,
         &String::from_str(&env, "I disagree"),
     );
 
     // Should fail with QuorumNotReached error
-    let result = client.try_escalate_to_arbitration(&customer, &appeal_id);
+    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_err());
     match result {
         Err(Ok(Error::Core(CoreError::QuorumNotReached))) => (),
@@ -414,11 +431,11 @@ fn test_arbitrator_availability_admin_override() {
     client.register_arbitrator(&admin, &arb);
 
     // Admin sets arbitrator as unavailable (e.g., unresponsive arbitrator)
-    client.admin_set_arbitrator_availability(&admin, &arb, &false);
+    client.admin_set_arbiter_availability(&admin, &arb, &false);
     assert_eq!(client.is_arbitrator_available(&arb), false);
 
     // Admin can restore availability
-    client.admin_set_arbitrator_availability(&admin, &arb, &true);
+    client.admin_set_arbiter_availability(&admin, &arb, &true);
     assert_eq!(client.is_arbitrator_available(&arb), true);
 }
 
@@ -441,12 +458,13 @@ fn test_arbitrator_availability_non_registered_returns_false() {
 fn test_combined_multi_token_and_arbitrator_flow() {
     let (env, admin, merchant, customer, _) = setup_env();
     let client = deploy_contract(&env, &admin);
+    let fee_token = fee_token(&env, &admin, &customer);
 
     // Setup multi-token registry
     let token1 = Address::generate(&env);
     let token2 = Address::generate(&env);
-    client.add_supported_token(&admin, &token1, &true);
-    client.add_supported_token(&admin, &token2, &true);
+    client.register_refund_token(&admin, &token1);
+    client.register_refund_token(&admin, &token2);
 
     // Setup arbitrators
     let arb1 = Address::generate(&env);
@@ -472,14 +490,14 @@ fn test_combined_multi_token_and_arbitrator_flow() {
     // Reject and escalate
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
     
-    let appeal_id = client.file_appeal(
+    client.file_appeal(
         &customer,
         &refund_id,
         &String::from_str(&env, "I disagree"),
     );
 
     // All arbitrators available - should succeed
-    let result = client.try_escalate_to_arbitration(&customer, &appeal_id);
+    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_ok());
 
     // Now set one arbitrator as unavailable for future cases

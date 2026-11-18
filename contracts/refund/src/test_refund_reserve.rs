@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, AuthorizedFunction, Events};
-use soroban_sdk::{token, Address, Env, Symbol, TryFromVal};
+use soroban_sdk::{token, Address, Env, String, Symbol, TryFromVal};
 
 const MERCHANT_FUNDS: i128 = 10_000;
 
@@ -158,13 +158,32 @@ fn refund_reserve_low_fires_on_refund() {
     s.client
         .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &1_000);
 
-    s.client
-        .refund(&s.merchant, &s.token, &s.merchant, &1_500);
-    assert!(!has_event(&s.env, "refund_reserve_low"));
+    let customer = Address::generate(&s.env);
+    let process = |payment_id: u64, amount: i128| {
+        let refund_id = s.client.request_refund(
+            &s.merchant,
+            &payment_id,
+            &customer,
+            &amount,
+            &amount,
+            &s.token,
+            &String::from_str(&s.env, "reserve-funded refund"),
+            &RefundReasonCode::ProductDefect,
+            &0_u64,
+        );
+        s.client.approve_refund(&s.admin, &refund_id);
+        s.client.process_refund(&s.admin, &refund_id);
+    };
 
-    s.client
-        .refund(&s.merchant, &s.token, &s.merchant, &1_000);
+    // 3_000 -> 1_500: still at or above the warning level.
+    process(1, 1_500);
+    assert!(!has_event(&s.env, "refund_reserve_low"));
+    assert_eq!(s.client.get_refund_reserve(&s.merchant, &s.token), 1_500);
+
+    // 1_500 -> 500: crosses below the warning level.
+    process(2, 1_000);
     assert!(has_event(&s.env, "refund_reserve_low"));
+    assert_eq!(s.client.get_refund_reserve(&s.merchant, &s.token), 500);
 }
 
 #[test]

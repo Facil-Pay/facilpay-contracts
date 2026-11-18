@@ -92,6 +92,7 @@ fn watchdog_config(enabled: bool, favor_customer_on_release: bool) -> WatchdogCo
         inactivity_release_seconds: INACTIVITY,
         enabled,
         favor_customer_on_release,
+        keeper_reward_bps: 0,
     }
 }
 
@@ -340,7 +341,7 @@ fn test_watchdog_ineligible_before_window_and_releases_to_merchant_after() {
         set_time(&s, t);
         assert!(!s.client.is_watchdog_eligible(&escrow_id));
         assert_eq!(
-            s.client.try_trigger_watchdog_release(&escrow_id),
+            s.client.try_trigger_watchdog_release(&Address::generate(&s.env), &escrow_id),
             Err(Ok(Error::Action(ActionError::NotReady)))
         );
     }
@@ -349,7 +350,7 @@ fn test_watchdog_ineligible_before_window_and_releases_to_merchant_after() {
 
     set_time(&s, RELEASE_AT + INACTIVITY);
     assert!(s.client.is_watchdog_eligible(&escrow_id));
-    s.client.trigger_watchdog_release(&escrow_id);
+    s.client.trigger_watchdog_release(&Address::generate(&s.env), &escrow_id);
 
     assert!(has_event(&s.env, "watchdog_release_triggered"));
     assert_eq!(
@@ -362,7 +363,7 @@ fn test_watchdog_ineligible_before_window_and_releases_to_merchant_after() {
     // Once released it is no longer eligible, and cannot be released twice.
     assert!(!s.client.is_watchdog_eligible(&escrow_id));
     assert_eq!(
-        s.client.try_trigger_watchdog_release(&escrow_id),
+        s.client.try_trigger_watchdog_release(&Address::generate(&s.env), &escrow_id),
         Err(Ok(Error::Action(ActionError::NotReady)))
     );
     assert_eq!(balance(&s, &s.merchant), AMOUNT);
@@ -377,7 +378,7 @@ fn test_watchdog_can_favor_customer() {
     let customer_before = balance(&s, &s.customer);
 
     set_time(&s, RELEASE_AT + INACTIVITY);
-    s.client.trigger_watchdog_release(&escrow_id);
+    s.client.trigger_watchdog_release(&Address::generate(&s.env), &escrow_id);
 
     assert_eq!(
         s.client.get_escrow(&escrow_id).status,
@@ -401,7 +402,7 @@ fn test_watchdog_disabled_by_default_and_when_turned_off() {
         .set_watchdog_config(&s.admin, &watchdog_config(false, false));
     assert!(!s.client.is_watchdog_eligible(&escrow_id));
     assert_eq!(
-        s.client.try_trigger_watchdog_release(&escrow_id),
+        s.client.try_trigger_watchdog_release(&Address::generate(&s.env), &escrow_id),
         Err(Ok(Error::Action(ActionError::NotReady)))
     );
     assert_eq!(balance(&s, &s.contract_id), AMOUNT);
@@ -419,7 +420,7 @@ fn test_watchdog_skips_missing_and_disputed_escrows() {
     assert!(!s.client.is_watchdog_eligible(&escrow_id));
     assert!(!s.client.is_watchdog_eligible(&999));
     assert_eq!(
-        s.client.try_trigger_watchdog_release(&escrow_id),
+        s.client.try_trigger_watchdog_release(&Address::generate(&s.env), &escrow_id),
         Err(Ok(Error::Action(ActionError::NotReady)))
     );
     assert_eq!(balance(&s, &s.contract_id), AMOUNT);

@@ -1120,11 +1120,11 @@ Merchants keep a per-token refund reserve on the contract. Refunds and withdrawa
 
 | Function | Parameters | Returns | Auth |
 | --- | --- | --- | --- |
-| `set_refund_reserve_warning_level` | `merchant: Address`, `token: Address`, `warning_level: i128` | `Result<(), Error>` | `merchant` |
-| `get_refund_reserve_warning_level` | `merchant: Address`, `token: Address` | `Option<i128>` (`None` if not set) | — |
+| `set_refund_reserve_warning_level` | `admin: Address`, `merchant: Address`, `token: Address`, `warning_level: i128` | `Result<(), Error>` | admin |
+| `get_refund_reserve_warning_level` | `merchant: Address`, `token: Address` | `i128` (`0` if not set) | — |
 | `get_refund_reserve` | `merchant: Address`, `token: Address` | `i128` | — |
 
-`set_refund_reserve_warning_level` stores the level at which the merchant wants to be warned. `warning_level` must be `>= 0`; a negative value fails with `CoreError::InvalidAmount` (1). Setting the level does not emit an event by itself.
+`set_refund_reserve_warning_level` stores the level at which the merchant wants to be warned. `warning_level` must be `>= 0`; a negative value fails with `CoreError::InvalidAmount` (1), and a caller other than the admin fails with `CoreError::Unauthorized` (3). Setting the level emits `RefundReserveWarningLevelSet` but never `RefundReserveLow` by itself.
 
 **When `RefundReserveLow` fires.** The event is emitted from any path that reduces the reserve (a refund payout or a reserve withdrawal) when the resulting balance is **below** the merchant's warning level. It fires only on the transition: once the reserve is already below the level, further reductions do not re-emit it. The alert re-arms after the reserve is topped back up to or above the warning level. If no warning level is set for the merchant/token pair, no alert is emitted.
 

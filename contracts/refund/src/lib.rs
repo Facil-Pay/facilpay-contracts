@@ -370,6 +370,8 @@ pub enum ExtError {
     // Processing deadline for approved refunds
     ProcessingDeadlineMissed = 82,
     ProcessingDeadlineNotConfigured = 83,
+    // Refund sync to payment contract
+    RefundAlreadySynced = 84,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1496,6 +1498,8 @@ pub enum RefundExtKey {
     // Per-merchant refund reserve: balance and admin-set floor per (merchant, token).
     MerchantRefundReserve(Address, Address),
     MinRefundReserve(Address, Address),
+    // Issue #814: admin-set low-reserve alert level per (merchant, token).
+    RefundReserveWarningLevel(Address, Address),
     // Pending future-dated refund policy change for a merchant.
     ScheduledRefundPolicy(Address),
     // Pending merchant counter-offer for a refund.
@@ -1763,6 +1767,26 @@ pub struct RefundReserveDebited {
     pub refund_id: u64,
     pub amount: i128,
     pub new_balance: i128,
+}
+
+/// Event emitted when the admin sets a merchant's refund reserve warning level (#814).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveWarningLevelSet {
+    pub merchant: Address,
+    pub token: Address,
+    pub warning_level: i128,
+}
+
+/// Event emitted when a merchant's refund reserve drops below its warning
+/// level (#814). Fires once per crossing.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveLow {
+    pub merchant: Address,
+    pub token: Address,
+    pub balance: i128,
+    pub warning_level: i128,
 }
 
 /// Event emitted when the admin sets a merchant's minimum refund reserve.
@@ -3037,7 +3061,70 @@ impl RefundContract {
             .has(&RefundExtKey::MerchantRefundReserve(merchant, token))
     }
 
+    /// Set the balance at which a merchant's refund reserve for `token` is
+    /// considered low (#814). Admin-only. When a withdrawal or refund takes the
+    /// reserve from at-or-above this level to below it, `RefundReserveLow` is
+    /// emitted.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    /// Returns `InvalidAmount` if `warning_level` is negative.
+    pub fn set_refund_reserve_warning_level(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        warning_level: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if warning_level < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let key = RefundExtKey::RefundReserveWarningLevel(merchant.clone(), token.clone());
+        env.storage().persistent().set(&key, &warning_level);
+        Self::extend_refund_ext_ttl(&env, &key);
+
+        (RefundReserveWarningLevelSet {
+            merchant,
+            token,
+            warning_level,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the merchant's refund reserve warning level for `token`
+    /// (`0`, meaning no alerts, if not set).
+    pub fn get_refund_reserve_warning_level(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::RefundReserveWarningLevel(merchant, token))
+            .unwrap_or(0)
+    }
+
     fn set_refund_reserve(env: &Env, merchant: &Address, token: &Address, balance: i128) {
+        // Issue #814: alert when the reserve crosses below its warning level.
+        let old_balance: i128 = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::MerchantRefundReserve(
+                merchant.clone(),
+                token.clone(),
+            ))
+            .unwrap_or(0);
+        let warning_level =
+            Self::get_refund_reserve_warning_level(env.clone(), merchant.clone(), token.clone());
+        if balance < warning_level && old_balance >= warning_level {
+            (RefundReserveLow {
+                merchant: merchant.clone(),
+                token: token.clone(),
+                balance,
+                warning_level,
+            })
+            .publish(env);
+        }
+
         env.storage().persistent().set(
             &RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone()),
             &balance,
@@ -5328,7 +5415,8 @@ impl RefundContract {
                         RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
                         RefundReasonCode::Unauthorized => unauthorized += 1,
                         RefundReasonCode::CustomerRequest => customer_request += 1,
-                        RefundReasonCode::Other => other += 1,
+                        // Merchant-defined custom codes are bucketed with Other.
+                        RefundReasonCode::Other | RefundReasonCode::Custom(_) => other += 1,
                     }
                 }
             }
@@ -7729,6 +7817,7 @@ impl RefundContract {
             RefundReasonCode::Unauthorized => 3,
             RefundReasonCode::CustomerRequest => 4,
             RefundReasonCode::Other => 5,
+            RefundReasonCode::Custom(_) => 6,
         }
     }
 

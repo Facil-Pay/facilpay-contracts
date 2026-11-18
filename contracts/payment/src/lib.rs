@@ -87,6 +87,9 @@ pub enum PaymentKey {
     Request(u64),
     // Issue #809: refund-contract refund ids already applied to a payment
     RefundSynced(u64),
+    // Reusable merchant payment links
+    PaymentLinkCounter,
+    PaymentLink(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -120,6 +123,8 @@ pub enum SubscriptionKey {
     // Issue #753: seat-based subscriptions
     Seats(u64),
     SeatCredit(u64),
+    // Issue #770: churn reason recorded on cancellation
+    CancellationReason(u64),
 }
 
 #[derive(Clone)]
@@ -187,6 +192,8 @@ pub enum BasicError {
     InvalidInterval = 124,
     InvalidBps = 125,
     SchemaAlreadyAtTarget = 126,
+    InvalidInput = 127,
+    NotFound = 128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -245,6 +252,12 @@ pub enum PaymentError {
     InvalidMerchantName = 243,
     // Issue #809: refund sync from the refund contract
     RefundContractNotSet = 244,
+    // Reusable merchant payment links
+    InvalidPaymentLinkAmount = 245,
+    PaymentLinkNotFound = 246,
+    PaymentLinkInactive = 247,
+    PaymentLinkExpired = 248,
+    PaymentLinkUsageCapReached = 249,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -283,6 +296,9 @@ pub enum SubscriptionError {
     MandatePeriodCapExceeded = 327,
     // Issue #753: seat-based subscriptions
     InvalidQuantity = 328,
+    // Subscription transfers
+    SubscriptionNotTransferable = 329,
+    InvalidTransferRecipient = 330,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -409,17 +425,17 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=328).contains(&code) {
+            if (300..=330).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
             }
-            if (200..=244).contains(&code) {
+            if (200..=249).contains(&code) {
                 return Ok(Error::Payment(unsafe {
                     core::mem::transmute::<u32, PaymentError>(code)
                 }));
             }
-            if (100..=126).contains(&code) {
+            if (100..=128).contains(&code) {
                 return Ok(Error::Basic(unsafe {
                     core::mem::transmute::<u32, BasicError>(code)
                 }));
@@ -560,6 +576,7 @@ impl DataKey {
                     | PaymentKey::LargePaymentCounter
                     | PaymentKey::NotificationHookCounter
                     | PaymentKey::RequestCounter
+                    | PaymentKey::PaymentLinkCounter
             ),
             DataKey::Subscription(k) => matches!(
                 k,
@@ -754,6 +771,68 @@ pub struct SubscriptionPriceProposal {
 pub struct SubscriptionSeats {
     pub quantity: u32,
     pub unit_amount: i128,
+}
+
+/// Reason a subscription was cancelled (#770).
+///
+/// Cancellations made through the legacy `cancel_subscription` entry point are
+/// recorded as [`CancellationReason::Unspecified`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum CancellationReason {
+    Unspecified,
+    TooExpensive,
+    MissingFeatures,
+    PoorQuality,
+    TechnicalIssues,
+    CustomerSupport,
+    SwitchingProvider,
+    BusinessClosure,
+    Other,
+}
+
+impl CancellationReason {
+    /// Stable numeric code for the reason, used as a storage key component.
+    pub fn code(&self) -> u32 {
+        match self {
+            CancellationReason::Unspecified => 0,
+            CancellationReason::TooExpensive => 1,
+            CancellationReason::MissingFeatures => 2,
+            CancellationReason::PoorQuality => 3,
+            CancellationReason::TechnicalIssues => 4,
+            CancellationReason::CustomerSupport => 5,
+            CancellationReason::SwitchingProvider => 6,
+            CancellationReason::BusinessClosure => 7,
+            CancellationReason::Other => 8,
+        }
+    }
+
+    /// Reverse of [`CancellationReason::code`].
+    pub fn from_code(code: u32) -> Option<CancellationReason> {
+        match code {
+            0 => Some(CancellationReason::Unspecified),
+            1 => Some(CancellationReason::TooExpensive),
+            2 => Some(CancellationReason::MissingFeatures),
+            3 => Some(CancellationReason::PoorQuality),
+            4 => Some(CancellationReason::TechnicalIssues),
+            5 => Some(CancellationReason::CustomerSupport),
+            6 => Some(CancellationReason::SwitchingProvider),
+            7 => Some(CancellationReason::BusinessClosure),
+            8 => Some(CancellationReason::Other),
+            _ => None,
+        }
+    }
+}
+
+/// Per-merchant churn summary (#770).
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct ChurnAnalytics {
+    pub merchant: Address,
+    /// Total number of subscriptions cancelled for this merchant.
+    pub total_cancellations: u64,
+    /// Number of cancellations per reason.
+    pub by_reason: Map<CancellationReason, u64>,
 }
 
 /// One entry in a payment's status history (#682).
@@ -1333,7 +1412,7 @@ pub struct SubscriptionCancelled {
 }
 
 /// Emitted when a subscription is cancelled with a churn reason (#770).
-#[contractevent]
+#[contractevent(topics = ["sub_cancelled_with_reason"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCancelledWithReason {
     pub subscription_id: u64,
@@ -3691,7 +3770,6 @@ impl PaymentContract {
             link.currency.clone(),
             0, // no expiry on the payment itself
             link.metadata.clone(),
-            String::from_str(&env, ""),
         )?;
 
         // Update link usage
@@ -4624,7 +4702,6 @@ impl PaymentContract {
         min_hold_period: u64,
         metadata: String,
         auto_release_on_complete: bool,
-        confirmation_timeout_seconds: Option<u64>,
     ) -> Result<(u64, u64), Error> {
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
@@ -4655,7 +4732,9 @@ impl PaymentContract {
             escrow_id,
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
-            confirmation_timeout_seconds,
+            // Set separately via `set_escrow_confirm_timeout`
+            // (contract functions are capped at 10 parameters).
+            confirmation_timeout_seconds: None,
             created_at: env.ledger().timestamp(),
         };
         env.store().set(
@@ -4740,6 +4819,46 @@ impl PaymentContract {
             escrow_id: bridge.escrow_id,
         })
         .publish(&env);
+        Ok(())
+    }
+
+    /// Sets the confirmation timeout for an escrowed payment, after which
+    /// `auto_complete_escrowed_payment` may release the escrow.
+    ///
+    /// # Arguments
+    /// * `customer` - The payment's customer (must authorize)
+    /// * `payment_id` - The ID of the escrowed payment
+    /// * `timeout_seconds` - Seconds after escrow creation before auto-completion is allowed
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an error if the payment is not found, the caller is
+    /// not the customer, or the payment is no longer Pending.
+    pub fn set_escrow_confirm_timeout(
+        env: Env,
+        customer: Address,
+        payment_id: u64,
+        timeout_seconds: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if !env
+            .store()
+            .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
+        {
+            return Err(Error::Payment(PaymentError::NotFound));
+        }
+        let mut bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        bridge.confirmation_timeout_seconds = Some(timeout_seconds);
+        env.store().set(
+            &DataKey::State(StateDataKey::EscrowedPayment(payment_id)),
+            &bridge,
+        );
         Ok(())
     }
 
@@ -7276,8 +7395,8 @@ impl PaymentContract {
         // Linear search through pages to find and remove the subscription
         for page in 0..=((count - 1) / 100) {
             let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
-            if let Some(mut page_subs): Option<Vec<u64>> = env.store().get(&key) {
-                if let Some(pos) = page_subs.iter().position(|&id| id == subscription_id) {
+            if let Some(mut page_subs) = env.store().get::<Vec<u64>>(&key) {
+                if let Some(pos) = page_subs.iter().position(|id| id == subscription_id) {
                     page_subs.remove(pos as u32);
                     if page_subs.is_empty() {
                         env.store().remove(&key);
@@ -8062,7 +8181,7 @@ impl PaymentContract {
         subscription_ids: Vec<u64>,
     ) -> Result<Vec<BatchRecurringPaymentResult>, Error> {
         let len = subscription_ids.len();
-        let batch_limit = Self::get_recurring_payment_batch_limit(env.clone());
+        let batch_limit = Self::get_recurring_batch_limit(env.clone());
 
         if len == 0 || len > batch_limit {
             return Err(Error::Basic(BasicError::InvalidInput));
@@ -8612,7 +8731,7 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Some(reason)` when the subscription was cancelled, `None` otherwise.
-    pub fn get_subscription_cancellation_reason(
+    pub fn get_sub_cancel_reason(
         env: Env,
         subscription_id: u64,
     ) -> Option<CancellationReason> {
@@ -8678,12 +8797,12 @@ impl PaymentContract {
         if sub.status == SubscriptionStatus::InDunning
             || sub.status == SubscriptionStatus::Suspended
         {
-            return Err(Error::Payment(PaymentError::SubscriptionNotTransferable));
+            return Err(Error::Subscription(SubscriptionError::SubscriptionNotTransferable));
         }
 
         // New customer must be different from current customer
         if sub.customer == new_customer {
-            return Err(Error::Payment(PaymentError::InvalidTransferRecipient));
+            return Err(Error::Subscription(SubscriptionError::InvalidTransferRecipient));
         }
 
         let old_customer = sub.customer.clone();
@@ -8703,11 +8822,11 @@ impl PaymentContract {
         Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
 
         // Transfer any dunning state to new customer if it exists
-        if let Some(dunning_state): Option<DunningState> = env.store().get(&DataKey::Subscription(
-            SubscriptionKey::DunningState(subscription_id),
+        if let Some(_dunning_state) = env.store().get::<DunningState>(&DataKey::State(
+            StateDataKey::DunningState(subscription_id),
         )) {
-            env.store().remove(&DataKey::Subscription(
-                SubscriptionKey::DunningState(subscription_id),
+            env.store().remove(&DataKey::State(
+                StateDataKey::DunningState(subscription_id),
             ));
             // Clear dunning for clean transfer
         }
@@ -9142,7 +9261,7 @@ impl PaymentContract {
 
     /// Issue #772: Set the maximum batch size for recurring payment execution.
     /// Only callable by an admin.
-    pub fn set_recurring_payment_batch_limit(
+    pub fn set_recurring_batch_limit(
         env: Env,
         admin: Address,
         limit: u32,
@@ -9169,7 +9288,7 @@ impl PaymentContract {
 
     /// Issue #772: Returns the current batch limit for recurring payments.
     /// Returns default of 50 if not set.
-    pub fn get_recurring_payment_batch_limit(env: Env) -> u32 {
+    pub fn get_recurring_batch_limit(env: Env) -> u32 {
         env.store()
             .get(&DataKey::Config(ConfigKey::RecurringPaymentBatchLimit))
             .unwrap_or(50u32)
@@ -11993,7 +12112,7 @@ impl PaymentContract {
     /// # Returns
     /// A `Vec<MerchantDailySettlement>` ordered from the oldest day to the
     /// newest.
-    pub fn get_merchant_daily_settlement_range(
+    pub fn get_merchant_settlement_range(
         env: Env,
         merchant: Address,
         from_day_index: u64,

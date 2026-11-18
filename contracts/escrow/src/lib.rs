@@ -275,6 +275,13 @@ pub enum ActionError {
     SettlementOfferExpired = 331,
     SettlementOfferAlreadyAccepted = 332,
     InvalidSettlementAmount = 333,
+    // Release delegate
+    ReleaseDelegateNotSet = 334,
+    // Milestone amendments
+    MilestoneNotFound = 335,
+    MilestoneAmendmentAlreadyExists = 336,
+    MilestoneAmendmentNotFound = 337,
+    MilestoneAmendmentAlreadyAccepted = 338,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -321,7 +328,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (300..=333).contains(&code) {
+            if (300..=338).contains(&code) {
                 return Ok(Error::Action(unsafe {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
@@ -360,7 +367,7 @@ impl TryFromVal<Env, Val> for Error {
 
 // Observer storage keys (separate enum to stay within Soroban symbol limits).
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
 pub enum EscrowStatus {
     Locked,
@@ -2107,7 +2114,7 @@ pub struct MerchantEscrowCreationPaused {
     pub reason: String,
 }
 
-#[contractevent]
+#[contractevent(topics = ["merchant_escrow_unpaused"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MerchantEscrowCreationUnpaused {
     pub merchant: Address,
@@ -7946,6 +7953,8 @@ impl EscrowContract {
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
             released_amount: 0,
+            release_delegate: None,
+            last_dispute_withdrawn_at: None,
         };
 
         env.storage()
@@ -12222,6 +12231,8 @@ impl EscrowContract {
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
             released_amount: 0,
+            release_delegate: None,
+            last_dispute_withdrawn_at: None,
         };
 
         env.storage()
@@ -13000,6 +13011,8 @@ impl EscrowContract {
             auto_resolve_in_favor_of: AutoResolveFavor::Customer,
             evidence_deadline: None,
             released_amount: 0,
+            release_delegate: None,
+            last_dispute_withdrawn_at: None,
         };
 
         env.storage()

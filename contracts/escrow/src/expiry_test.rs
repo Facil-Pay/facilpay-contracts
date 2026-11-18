@@ -38,7 +38,7 @@ fn test_expire_escrow_success() {
     env.ledger().set_timestamp(3001);
     assert!(client.is_escrow_expired(&escrow_id));
 
-    client.expire_escrow(&escrow_id);
+    client.expire_escrow(&Address::generate(&env), &escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Cancelled);
@@ -57,7 +57,7 @@ fn test_expire_escrow_premature_fails() {
 
     // Still before expiry
     env.ledger().set_timestamp(2500);
-    let result = client.try_expire_escrow(&escrow_id);
+    let result = client.try_expire_escrow(&Address::generate(&env), &escrow_id);
     assert!(result.is_err());
 }
 
@@ -76,7 +76,7 @@ fn test_expire_disputed_escrow_fails() {
 
     // Advance past expiry
     env.ledger().set_timestamp(4000);
-    let result = client.try_expire_escrow(&escrow_id);
+    let result = client.try_expire_escrow(&Address::generate(&env), &escrow_id);
     assert!(result.is_err());
 }
 
@@ -86,7 +86,7 @@ fn test_set_global_expiry_config() {
     env.mock_all_auths();
     let (client, admin, _, _, _) = setup(&env);
 
-    client.set_global_expiry_config(&admin, &86400_u64);
+    client.set_global_expiry_config(&admin, &86400_u64, &0_u32);
     // No panic = success; config stored correctly
 }
 

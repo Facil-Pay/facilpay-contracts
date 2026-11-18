@@ -4532,6 +4532,8 @@ fn test_resolve_escrowed_payment_dispute_in_favor_of_customer_refunds_customer()
     let amount = 1_000_i128;
 
     payment_client.initialize(&admin);
+    // Escrow only lets its own admins (or an assigned resolver) resolve disputes.
+    escrow_client.initialize(&admin);
     token_admin_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
 
@@ -4599,6 +4601,8 @@ fn test_resolve_escrowed_payment_dispute_in_favor_of_merchant_releases_merchant(
     let amount = 1_000_i128;
 
     payment_client.initialize(&admin);
+    // Escrow only lets its own admins (or an assigned resolver) resolve disputes.
+    escrow_client.initialize(&admin);
     token_admin_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &payment_contract_id, &amount, &10_000);
 

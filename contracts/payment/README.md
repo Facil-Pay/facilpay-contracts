@@ -224,7 +224,7 @@ Payment analytics are exposed through read-only query functions. Aggregate recor
 | `get_merchant_analytics_range(merchant, from, to)` | **Per merchant and hour.** Returns recorded `AnalyticsBucket` values for hourly buckets in the half-open range `[from, to)`. Each bucket contains `bucket_start`, `bucket_end`, `total_payments`, `total_volume`, `total_refunds`, and `failed_count`. It returns an error when `from >= to`. |
 | `get_platform_analytics_daily(day_timestamp)` | **Contract-wide and day.** Returns the `AnalyticsBucket` for the epoch-aligned day containing `day_timestamp`, with daily `total_payments`, `total_volume`, `total_refunds`, and `failed_count` plus the bucket boundaries. |
 | `get_merchant_daily_settlement(merchant, day_index)` | **Per merchant and day (Issue #765).** Returns the `MerchantDailySettlement` summary of one UTC day: `payment_count`, `gross_volume`, `total_fees`, `refund_volume` and `net_volume`. |
-| `get_merchant_daily_settlement_range(merchant, from_day_index, to_day_index, max_days)` | **Per merchant and day range (Issue #765).** Returns at most `max_days` daily settlement summaries for the half-open range `[from_day_index, to_day_index)`. |
+| `get_merchant_settlement_range(merchant, from_day_index, to_day_index, max_days)` | **Per merchant and day range (Issue #765).** Returns at most `max_days` daily settlement summaries for the half-open range `[from_day_index, to_day_index)`. |
 | `get_top_merchants_by_volume(limit)` | **Contract-wide ranking.** Returns up to `limit` `(merchant, total_volume)` pairs for all registered merchants, sorted by descending total volume. |
 
 If a requested aggregate has no recorded data, the contract returns a zero-valued default for that aggregate. The daily platform query accepts any timestamp in the target day, while monthly customer queries must use the start timestamp of the intended month bucket.
@@ -237,7 +237,7 @@ for their own books, so the contract keeps a settlement bucket per `(merchant, d
 | Function | Parameters | Returns |
 | --- | --- | --- |
 | `get_merchant_daily_settlement` | `merchant: Address`, `day_index: u64` | `MerchantDailySettlement` |
-| `get_merchant_daily_settlement_range` | `merchant: Address`, `from_day_index: u64`, `to_day_index: u64`, `max_days: u32` | `Vec<MerchantDailySettlement>` |
+| `get_merchant_settlement_range` | `merchant: Address`, `from_day_index: u64`, `to_day_index: u64`, `max_days: u32` | `Vec<MerchantDailySettlement>` |
 
 - **Days.** A day is identified by its `day_index`, the number of whole UTC days since the Unix
   epoch. Buckets roll over exactly at a UTC day boundary, using the ledger timestamp. A day-start
@@ -397,7 +397,7 @@ merchant and per reason.
 | --- | --- | --- | --- |
 | `cancel_subscription_with_reason` | `caller: Address`, `subscription_id: u64`, `reason_code: CancellationReason` | `Result<(), Error>` | `caller` (customer, merchant or admin) |
 | `get_churn_analytics` | `merchant: Address` | `ChurnAnalytics { merchant, total_cancellations, by_reason }` | — |
-| `get_subscription_cancellation_reason` | `subscription_id: u64` | `Option<CancellationReason>` | — |
+| `get_sub_cancel_reason` | `subscription_id: u64` | `Option<CancellationReason>` | — |
 
 `CancellationReason` variants: `Unspecified`, `TooExpensive`, `MissingFeatures`, `PoorQuality`,
 `TechnicalIssues`, `CustomerSupport`, `SwitchingProvider`, `BusinessClosure`, `Other`.
@@ -409,7 +409,7 @@ merchant and per reason.
   cancelled for that merchant and `by_reason` maps every reason to the number of cancellations
   recorded for it. A merchant without cancellations gets a zero-valued record.
 - **Storage.** The reason is also stored on the subscription itself, so
-  `get_subscription_cancellation_reason(subscription_id)` reports why a specific subscription was
+  `get_sub_cancel_reason(subscription_id)` reports why a specific subscription was
   cancelled.
 - **Errors.** `cancel_subscription_with_reason` returns `SubscriptionError::NotFound` (300) if the
   subscription does not exist, `BasicError::Unauthorized` (100) if the caller is neither the
@@ -1352,7 +1352,7 @@ assert_eq!(
 | `get_merchant_analytics_range(merchant, from, to)`       | Return per-day analytics buckets for a merchant over a date range.                   |
 | `get_platform_analytics_daily(day_timestamp)`            | Return the platform-wide analytics bucket for a specific day.                        |
 | `get_merchant_daily_settlement(merchant, day_index)`     | **(Issue #765)** Return a merchant's settlement summary for a single UTC day.        |
-| `get_merchant_daily_settlement_range(merchant, from, to, max_days)` | **(Issue #765)** Return at most `max_days` daily settlement summaries for a merchant. |
+| `get_merchant_settlement_range(merchant, from, to, max_days)` | **(Issue #765)** Return at most `max_days` daily settlement summaries for a merchant. |
 | `get_churn_analytics(merchant)`                          | **(Issue #770)** Return a merchant's subscription churn counters, per reason.        |
 | `get_top_merchants_by_volume(limit)`                     | Return the top-N merchants ranked by total volume.                                   |
 

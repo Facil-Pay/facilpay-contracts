@@ -59,6 +59,8 @@ fn enable_collateral(s: &Setup) {
             collateral_amount: COLLATERAL,
             collateral_enabled: true,
             min_collateral_ratio_bps: 1_000, // 10% of ESCROW_AMOUNT
+            dispute_fee_bps: 0,
+            dispute_cooldown_seconds: 0,
         },
     );
 }
