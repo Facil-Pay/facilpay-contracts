@@ -4236,16 +4236,16 @@ impl RefundContract {
     ) -> Result<(), Error> {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
-        
+
         let config = RefundProcessingDeadlineConfig {
             deadline_seconds,
             enabled,
         };
-        
+
         env.storage()
             .instance()
             .set(&SystemKey::RefundProcessingDeadlineConfig, &config);
-        
+
         Ok(())
     }
 
@@ -4331,7 +4331,7 @@ impl RefundContract {
         refund_id: u64,
     ) -> Result<(), Error> {
         customer.require_auth();
-        
+
         let refund: Refund = env
             .storage()
             .instance()

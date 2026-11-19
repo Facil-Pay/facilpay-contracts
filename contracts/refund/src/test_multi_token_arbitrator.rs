@@ -289,15 +289,12 @@ fn test_arbitrator_availability_all_available() {
     );
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
-    
-    client.file_appeal(
-        &customer,
-        &refund_id,
-        &String::from_str(&env, "I disagree"),
-    );
+
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "I disagree"));
 
     // Escalate to arbitration - should succeed with 3 available arbitrators
-    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
+    let result =
+        client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_ok());
 }
 
@@ -338,12 +335,8 @@ fn test_arbitrator_availability_one_unavailable() {
     );
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
-    
-    client.file_appeal(
-        &customer,
-        &refund_id,
-        &String::from_str(&env, "I disagree"),
-    );
+
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "I disagree"));
 
     // This might fail if minimum 3 arbitrators required, or succeed with 2
     let _ = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
@@ -386,15 +379,12 @@ fn test_arbitrator_availability_insufficient_available() {
     );
 
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
-    
-    client.file_appeal(
-        &customer,
-        &refund_id,
-        &String::from_str(&env, "I disagree"),
-    );
+
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "I disagree"));
 
     // Should fail with QuorumNotReached error
-    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
+    let result =
+        client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_err());
     match result {
         Err(Ok(Error::Core(CoreError::QuorumNotReached))) => (),
@@ -489,15 +479,12 @@ fn test_combined_multi_token_and_arbitrator_flow() {
 
     // Reject and escalate
     client.reject_refund(&admin, &refund_id, &String::from_str(&env, "Denied"));
-    
-    client.file_appeal(
-        &customer,
-        &refund_id,
-        &String::from_str(&env, "I disagree"),
-    );
+
+    client.file_appeal(&customer, &refund_id, &String::from_str(&env, "I disagree"));
 
     // All arbitrators available - should succeed
-    let result = client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
+    let result =
+        client.try_escalate_to_arbitration(&customer, &refund_id, &fee_token, &ARBITRATION_FEE);
     assert!(result.is_ok());
 
     // Now set one arbitrator as unavailable for future cases
@@ -519,7 +506,7 @@ fn test_combined_multi_token_and_arbitrator_flow() {
 
     // Approve this one to show the flow works end-to-end
     client.approve_refund(&admin, &refund_id2);
-    
+
     let refund = client.get_refund(&refund_id2);
     assert_eq!(refund.status, RefundStatus::Approved);
 }

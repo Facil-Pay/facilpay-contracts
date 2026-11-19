@@ -121,7 +121,8 @@ fn refund_reserve_low_fires_only_when_crossing_below_warning_level() {
         .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &2_000);
     assert!(has_event(&s.env, "refund_reserve_warning_level_set"));
     assert_eq!(
-        s.client.get_refund_reserve_warning_level(&s.merchant, &s.token),
+        s.client
+            .get_refund_reserve_warning_level(&s.merchant, &s.token),
         2_000
     );
 
@@ -193,7 +194,11 @@ fn set_refund_reserve_warning_level_is_admin_only() {
 
     s.client
         .set_refund_reserve_warning_level(&s.admin, &s.merchant, &s.token, &1_000);
-    assert!(authorized(&s.env, &s.admin, "set_refund_reserve_warning_level"));
+    assert!(authorized(
+        &s.env,
+        &s.admin,
+        "set_refund_reserve_warning_level"
+    ));
 
     assert_eq!(
         s.client
@@ -211,7 +216,8 @@ fn set_refund_reserve_warning_level_is_admin_only() {
         Err(Ok(Error::Core(CoreError::InvalidAmount)))
     );
     assert_eq!(
-        s.client.get_refund_reserve_warning_level(&s.merchant, &s.token),
+        s.client
+            .get_refund_reserve_warning_level(&s.merchant, &s.token),
         1_000
     );
 }
