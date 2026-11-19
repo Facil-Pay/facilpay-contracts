@@ -667,6 +667,58 @@ Returns the full `ClawbackRequest` record including `escrow_id`, `initiated_by`,
 
 ---
 
+## Recurring Escrows (Templates)
+
+`create_escrow_from_template(customer, template_id) -> escrow_id` creates one escrow from a reusable `EscrowTemplate` (`template_id, owner, token, amount, release_delay_seconds, description, created_at, active`, set up via `create_template` and turned off via `deactivate_template`). Retainer-style agreements that need a fresh escrow every period build on top of this with a recurring schedule.
+
+### Creating a schedule
+
+```
+create_recurring_escrow_schedule(customer, template_id, interval, count) -> schedule_id
+```
+
+- `customer` must authorize; they fund every escrow the schedule goes on to create.
+- `template_id` must reference an existing, active template (`EscrowError::TemplateNotFound` / `TemplateInactive` otherwise).
+- `interval` (seconds between escrows) and `count` (total number of escrows the schedule will create) must both be non-zero (`EscrowError::InvalidRecurringScheduleParams` otherwise).
+- Stores a `RecurringEscrowSchedule { schedule_id, customer, template_id, interval, total_count, created_count: 0, next_due_at, active: true }` with `next_due_at = now + interval` — the schedule governs escrows *after* this call, it does not create one itself.
+- Emits `RecurringEscrowScheduleCreated { schedule_id, customer, template_id, next_due_at }` (topic `recurring_escrow_created`).
+
+### Triggering the next escrow
+
+```
+trigger_next_recurring_escrow(schedule_id) -> escrow_id
+```
+
+Permissionless — anyone may call this once the next escrow is due; the customer's own authorization still has to be present in the submitted transaction for the underlying token transfer, so a non-customer caller needs a pre-signed authorization entry from the customer (the same non-root-authorization pattern used elsewhere in this codebase for permissionless keeper calls).
+
+- `EscrowError::RecurringScheduleNotFound` — no schedule with this id.
+- `EscrowError::RecurringScheduleInactive` — the schedule was cancelled via `cancel_recurring_escrow_schedule`.
+- `EscrowError::RecurringScheduleComplete` — `created_count` already reached `total_count`.
+- `EscrowError::TemplateNotFound` / `TemplateInactive` — the underlying template has since been removed or deactivated. This is re-checked fresh on every call rather than cached on the schedule (returning an error rolls back any storage writes made during the call, so a flag can't be persisted on this path) — since there is no way to reactivate a template once deactivated, re-checking it has the same effect: the schedule is permanently stopped from here on.
+- `ActionError::NotReady` — called before `next_due_at`.
+- On success: creates an escrow from the template exactly like `create_escrow_from_template` does, increments `created_count`, and advances `next_due_at` by `interval`. Emits `RecurringEscrowTriggered { schedule_id, escrow_id, created_count, next_due_at }`.
+
+### Cancelling a schedule
+
+```
+cancel_recurring_escrow_schedule(customer, schedule_id) -> ()
+```
+
+- `customer` must authorize and must match the schedule's `customer` (`BasicError::Unauthorized` otherwise).
+- `EscrowError::RecurringScheduleNotFound` if the schedule does not exist.
+- Marks the schedule inactive; a subsequent `trigger_next_recurring_escrow` call fails with `RecurringScheduleInactive`. Calling it again on an already-inactive schedule succeeds as a no-op.
+- Emits `RecurringEscrowScheduleCancelled { schedule_id }` (topic `recurring_escrow_cancelled`).
+
+### Querying a schedule
+
+```
+get_recurring_escrow_schedule(schedule_id) -> Option<RecurringEscrowSchedule>
+```
+
+Returns the full schedule record, or `None` if it does not exist.
+
+---
+
 ## Escrow Hierarchy
 
 The hierarchy feature lets a single parent escrow own a tree of child escrows. This models complex multi-party or multi-milestone structures — for example, a master contract that has separate sub-agreements for each deliverable — where the top-level payment must not settle until every downstream obligation is resolved.

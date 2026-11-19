@@ -545,6 +545,10 @@ pub enum StateDataKey {
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
     SettlementFinalized(u64),
     ScheduledPaymentCounter,
+    // Issue #775: index of subscriptions by `next_payment_at` so keepers can
+    // query due subscriptions without scanning every one.
+    SubscriptionDueIndex,
+    SubscriptionDueBucket(u64), // next_payment_at -> Vec<subscription_id>
 }
 
 // Issue #648: storage tier routing.
@@ -3727,11 +3731,7 @@ impl PaymentContract {
     /// # Returns
     /// The created payment's ID, or an error if the link is inactive, expired,
     /// or has reached its usage cap.
-    pub fn use_payment_link(
-        env: Env,
-        customer: Address,
-        link_id: u64,
-    ) -> Result<u64, Error> {
+    pub fn use_payment_link(env: Env, customer: Address, link_id: u64) -> Result<u64, Error> {
         customer.require_auth();
         Self::require_not_paused(&env, "use_payment_link")?;
         Self::require_not_paused(&env, "create_payment")?;
@@ -3797,11 +3797,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` on success, or an error if the link doesn't exist or the
     /// caller is not its merchant.
-    pub fn deactivate_payment_link(
-        env: Env,
-        merchant: Address,
-        link_id: u64,
-    ) -> Result<(), Error> {
+    pub fn deactivate_payment_link(env: Env, merchant: Address, link_id: u64) -> Result<(), Error> {
         merchant.require_auth();
 
         let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
@@ -3817,11 +3813,7 @@ impl PaymentContract {
         link.status = PaymentLinkStatus::Inactive;
         env.store().set(&link_key, &link);
 
-        PaymentLinkDeactivated {
-            link_id,
-            merchant,
-        }
-        .publish(&env);
+        PaymentLinkDeactivated { link_id, merchant }.publish(&env);
 
         Ok(())
     }
@@ -3835,11 +3827,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` on success, or an error if the link doesn't exist, the
     /// caller is not its merchant, or the link is expired.
-    pub fn reactivate_payment_link(
-        env: Env,
-        merchant: Address,
-        link_id: u64,
-    ) -> Result<(), Error> {
+    pub fn reactivate_payment_link(env: Env, merchant: Address, link_id: u64) -> Result<(), Error> {
         merchant.require_auth();
 
         let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
@@ -3861,11 +3849,7 @@ impl PaymentContract {
         link.status = PaymentLinkStatus::Active;
         env.store().set(&link_key, &link);
 
-        PaymentLinkReactivated {
-            link_id,
-            merchant,
-        }
-        .publish(&env);
+        PaymentLinkReactivated { link_id, merchant }.publish(&env);
 
         Ok(())
     }
@@ -3937,7 +3921,7 @@ impl PaymentContract {
 
         token::Client::new(&env, &payment.token).transfer(
             &customer,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &tip_amount,
         );
         let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
@@ -4883,7 +4867,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         Self::require_not_paused(&env, "auto_complete_escrowed_payment")?;
         caller.require_auth();
-        
+
         if !env
             .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
@@ -4893,11 +4877,11 @@ impl PaymentContract {
 
         let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
         let mut payment = PaymentContract::get_payment(&env, payment_id);
-        
+
         if payment.status != PaymentStatus::Pending {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
-        
+
         Self::require_merchant_not_paused(&env, &payment.merchant)?;
         PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
 
@@ -4909,7 +4893,7 @@ impl PaymentContract {
         // Check if timeout has passed
         let current_time = env.ledger().timestamp();
         let timeout_deadline = bridge.created_at + timeout_seconds;
-        
+
         if current_time < timeout_deadline {
             return Err(Error::Feature(FeatureError::ConfirmationTimeoutNotExpired));
         }
@@ -4930,7 +4914,12 @@ impl PaymentContract {
         payment.status = PaymentStatus::Completed;
         env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, caller.clone());
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Completed,
+            caller.clone(),
+        );
 
         (EscrowedPaymentCompleted {
             payment_id,
@@ -7349,6 +7338,131 @@ impl PaymentContract {
         );
     }
 
+    // ── Issue #775: due-date index ──────────────────────────────────────
+    //
+    // Keeps a sorted `Vec<u64>` of distinct `next_payment_at` values that
+    // currently have at least one subscription (the "index"), plus a
+    // `Vec<u64>` of subscription ids per value (the "bucket"), mirroring the
+    // escalation-timeout queue in the escrow contract. This lets
+    // `get_subscriptions_due_before` walk only the due buckets instead of
+    // scanning every subscription.
+
+    /// Adds `sub_id` to the due-bucket for `next_payment_at`, inserting the
+    /// timestamp into the sorted index if this is its first entry.
+    fn index_due_subscription(env: &Env, next_payment_at: u64, sub_id: u64) {
+        let bucket_key = DataKey::State(StateDataKey::SubscriptionDueBucket(next_payment_at));
+        let mut bucket: Vec<u64> = env.store().get(&bucket_key).unwrap_or(Vec::new(env));
+        let is_new_bucket = bucket.is_empty();
+        bucket.push_back(sub_id);
+        env.store().set(&bucket_key, &bucket);
+
+        if is_new_bucket {
+            let index_key = DataKey::State(StateDataKey::SubscriptionDueIndex);
+            let mut index: Vec<u64> = env.store().get(&index_key).unwrap_or(Vec::new(env));
+            let mut pos = index.len();
+            for i in 0..index.len() {
+                if index.get(i).unwrap() > next_payment_at {
+                    pos = i;
+                    break;
+                }
+            }
+            index.insert(pos, next_payment_at);
+            env.store().set(&index_key, &index);
+        }
+    }
+
+    /// Removes `sub_id` from the due-bucket for `next_payment_at`, removing
+    /// the timestamp from the sorted index if the bucket becomes empty.
+    fn deindex_due_subscription(env: &Env, next_payment_at: u64, sub_id: u64) {
+        let bucket_key = DataKey::State(StateDataKey::SubscriptionDueBucket(next_payment_at));
+        let bucket: Vec<u64> = match env.store().get(&bucket_key) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut remaining = Vec::new(env);
+        for id in bucket.iter() {
+            if id != sub_id {
+                remaining.push_back(id);
+            }
+        }
+
+        if remaining.is_empty() {
+            env.store().remove(&bucket_key);
+            let index_key = DataKey::State(StateDataKey::SubscriptionDueIndex);
+            let index: Vec<u64> = env.store().get(&index_key).unwrap_or(Vec::new(env));
+            let mut new_index = Vec::new(env);
+            for value in index.iter() {
+                if value != next_payment_at {
+                    new_index.push_back(value);
+                }
+            }
+            env.store().set(&index_key, &new_index);
+        } else {
+            env.store().set(&bucket_key, &remaining);
+        }
+    }
+
+    /// Returns active subscriptions whose `next_payment_at` is at or before
+    /// `timestamp`, using the due-date index rather than scanning every
+    /// subscription. Only `SubscriptionStatus::Active` subscriptions are
+    /// returned; paused, cancelled, expired, in-dunning and suspended
+    /// subscriptions are excluded.
+    ///
+    /// # Arguments
+    /// * `timestamp` - Upper bound (inclusive) on `next_payment_at`.
+    /// * `offset` - Number of matching (active, due) subscriptions to skip.
+    /// * `limit` - Maximum number of subscriptions to return.
+    pub fn get_subscriptions_due_before(
+        env: Env,
+        timestamp: u64,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<Subscription> {
+        let index: Vec<u64> = env
+            .store()
+            .get(&DataKey::State(StateDataKey::SubscriptionDueIndex))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        let mut skipped = 0u64;
+
+        for due_at in index.iter() {
+            if due_at > timestamp {
+                break;
+            }
+            if result.len() as u64 >= limit {
+                break;
+            }
+
+            let bucket: Vec<u64> = env
+                .store()
+                .get(&DataKey::State(StateDataKey::SubscriptionDueBucket(due_at)))
+                .unwrap_or(Vec::new(&env));
+
+            for sub_id in bucket.iter() {
+                if result.len() as u64 >= limit {
+                    break;
+                }
+                let sub: Option<Subscription> = env
+                    .store()
+                    .get(&DataKey::Subscription(SubscriptionKey::Data(sub_id)));
+                if let Some(sub) = sub {
+                    if sub.status != SubscriptionStatus::Active {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    result.push_back(sub);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Returns active subscription IDs for a merchant (100 per page).
     pub fn get_merchant_subscriptions(env: Env, merchant: Address, page: u64) -> Vec<u64> {
         env.store()
@@ -7365,15 +7479,14 @@ impl PaymentContract {
                 customer.clone(),
             )))
             .unwrap_or(0);
-        
+
         let page = count / 100;
-        let page_index = count % 100;
-        
+
         let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
         let mut page_subs: Vec<u64> = env.store().get(&key).unwrap_or_else(|| Vec::new(env));
         page_subs.push_back(subscription_id);
         env.store().set(&key, &page_subs);
-        
+
         env.store().set(
             &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
             &(count + 1),
@@ -7387,7 +7500,7 @@ impl PaymentContract {
                 customer.clone(),
             )))
             .unwrap_or(0);
-        
+
         if count == 0 {
             return;
         }
@@ -7696,6 +7809,8 @@ impl PaymentContract {
 
         Self::add_to_merchant_active_subscriptions(&env, &merchant, sub_id);
 
+        Self::index_due_subscription(&env, sub.next_payment_at, sub_id);
+
         (SubscriptionCreated {
             subscription_id: sub_id,
             customer: sub.customer.clone(),
@@ -7806,12 +7921,15 @@ impl PaymentContract {
             && now >= sub.pause_data.last_paused_at + sub.pause_data.max_pause_seconds
         {
             let pause_duration = now - sub.pause_data.last_paused_at;
+            let old_next_payment_at = sub.next_payment_at;
             sub.pause_data.total_pause_duration += pause_duration;
             sub.next_payment_at += pause_duration;
             if sub.ends_at > 0 {
                 sub.ends_at += pause_duration;
             }
             sub.status = SubscriptionStatus::Active;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -7889,12 +8007,16 @@ impl PaymentContract {
                 );
                 sub.payment_count += 1;
                 sub.retry_count = 0;
+                let old_next_payment_at = sub.next_payment_at;
                 sub.next_payment_at += sub.interval;
                 sub.status = SubscriptionStatus::Active;
 
                 if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                     sub.status = SubscriptionStatus::Expired;
                 }
+
+                Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+                Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
                 env.store().set(
                     &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -7993,7 +8115,10 @@ impl PaymentContract {
 
         // Skip charge if still within trial period
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at += sub.interval;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -8057,7 +8182,10 @@ impl PaymentContract {
 
             sub.payment_count += 1;
             sub.retry_count = 0;
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at += sub.interval;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
             // issue #664: honour scheduled cancellation — mark Cancelled after this final charge
             if sub.cancel_at_period_end {
@@ -8079,9 +8207,7 @@ impl PaymentContract {
                     &CancellationReason::Unspecified,
                 );
                 env.store().set(
-                    &DataKey::Subscription(SubscriptionKey::CancellationReason(
-                        subscription_id,
-                    )),
+                    &DataKey::Subscription(SubscriptionKey::CancellationReason(subscription_id)),
                     &CancellationReason::Unspecified,
                 );
                 (RecurringPaymentExecuted {
@@ -8191,7 +8317,7 @@ impl PaymentContract {
 
         for i in 0..len {
             let subscription_id = subscription_ids.get(i).unwrap();
-            
+
             let result = match Self::execute_recurring_payment(env.clone(), subscription_id) {
                 Ok(_) => BatchRecurringPaymentResult {
                     subscription_id,
@@ -8673,10 +8799,7 @@ impl PaymentContract {
             )))
             .unwrap_or(0);
         env.store().set(
-            &DataKey::Merchant(MerchantDataKey::ChurnCount(
-                merchant.clone(),
-                reason.code(),
-            )),
+            &DataKey::Merchant(MerchantDataKey::ChurnCount(merchant.clone(), reason.code())),
             &(count + 1),
         );
     }
@@ -8731,10 +8854,7 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Some(reason)` when the subscription was cancelled, `None` otherwise.
-    pub fn get_sub_cancel_reason(
-        env: Env,
-        subscription_id: u64,
-    ) -> Option<CancellationReason> {
+    pub fn get_sub_cancel_reason(env: Env, subscription_id: u64) -> Option<CancellationReason> {
         env.store()
             .get(&DataKey::Subscription(SubscriptionKey::CancellationReason(
                 subscription_id,
@@ -8797,12 +8917,16 @@ impl PaymentContract {
         if sub.status == SubscriptionStatus::InDunning
             || sub.status == SubscriptionStatus::Suspended
         {
-            return Err(Error::Subscription(SubscriptionError::SubscriptionNotTransferable));
+            return Err(Error::Subscription(
+                SubscriptionError::SubscriptionNotTransferable,
+            ));
         }
 
         // New customer must be different from current customer
         if sub.customer == new_customer {
-            return Err(Error::Subscription(SubscriptionError::InvalidTransferRecipient));
+            return Err(Error::Subscription(
+                SubscriptionError::InvalidTransferRecipient,
+            ));
         }
 
         let old_customer = sub.customer.clone();
@@ -8822,12 +8946,12 @@ impl PaymentContract {
         Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
 
         // Transfer any dunning state to new customer if it exists
-        if let Some(_dunning_state) = env.store().get::<DunningState>(&DataKey::State(
-            StateDataKey::DunningState(subscription_id),
-        )) {
-            env.store().remove(&DataKey::State(
-                StateDataKey::DunningState(subscription_id),
-            ));
+        if let Some(_dunning_state) = env
+            .store()
+            .get::<DunningState>(&DataKey::State(StateDataKey::DunningState(subscription_id)))
+        {
+            env.store()
+                .remove(&DataKey::State(StateDataKey::DunningState(subscription_id)));
             // Clear dunning for clean transfer
         }
 
@@ -8956,7 +9080,10 @@ impl PaymentContract {
         sub.pause_data.total_pause_duration += pause_duration;
 
         // Shift next billing date by pause duration
+        let old_next_payment_at = sub.next_payment_at;
         sub.next_payment_at += pause_duration;
+        Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         // Shift ends_at if it's a fixed-duration subscription
         if sub.ends_at > 0 {
@@ -9119,6 +9246,8 @@ impl PaymentContract {
 
         let skipped_payment_at = sub.next_payment_at;
         sub.next_payment_at += sub.interval;
+        Self::deindex_due_subscription(&env, skipped_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -9261,11 +9390,7 @@ impl PaymentContract {
 
     /// Issue #772: Set the maximum batch size for recurring payment execution.
     /// Only callable by an admin.
-    pub fn set_recurring_batch_limit(
-        env: Env,
-        admin: Address,
-        limit: u32,
-    ) -> Result<(), Error> {
+    pub fn set_recurring_batch_limit(env: Env, admin: Address, limit: u32) -> Result<(), Error> {
         admin.require_auth();
 
         let ms_config: MultiSigConfig = env
@@ -9280,8 +9405,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidInput));
         }
 
-        env.store()
-            .set(&DataKey::Config(ConfigKey::RecurringPaymentBatchLimit), &limit);
+        env.store().set(
+            &DataKey::Config(ConfigKey::RecurringPaymentBatchLimit),
+            &limit,
+        );
 
         Ok(())
     }
@@ -9353,12 +9480,16 @@ impl PaymentContract {
         if transfer_ok {
             sub.payment_count += 1;
             sub.retry_count = 0;
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at = now + sub.interval;
             sub.status = SubscriptionStatus::Active;
 
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
             }
+
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -9466,7 +9597,10 @@ impl PaymentContract {
         // Reset to active state
         sub.status = SubscriptionStatus::Active;
         sub.retry_count = 0;
+        let old_next_payment_at = sub.next_payment_at;
         sub.next_payment_at = env.ledger().timestamp() + sub.interval;
+        Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -14602,7 +14736,7 @@ impl PaymentContract {
             token_client.transfer(&contract_address, &channel.customer, &customer_amount);
         }
 
-        channel.settled = channel.settled + merchant_amount;
+        channel.settled += merchant_amount;
         channel.settled_nonce = nonce;
         channel.open = false;
 
@@ -17296,6 +17430,9 @@ mod test_spend_limits;
 
 #[cfg(test)]
 mod test_subscription_groups;
+
+#[cfg(test)]
+mod test_subscriptions_due;
 
 #[cfg(test)]
 mod test_finality_delay;

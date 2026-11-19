@@ -386,6 +386,18 @@ The cross-contract verification flow is exercised by `test_cross_contract_escrow
 | `set_refund_unused_on_cancel(merchant, enabled)`                                                                                    | **(Issue #681)** Toggle prorated refunds on mid-cycle cancellation for a merchant. When `true`, cancelling a subscription returns the unused fraction of the current cycle to the customer. |
 | `update_subscription_quantity(customer, subscription_id, new_quantity)`                                                             | **(Issue #753)** Change the seat count; the billed amount becomes `unit_amount * new_quantity`. See [Seat-Based Subscriptions](#seat-based-subscriptions-issue-753). |
 | `get_subscription_seats(subscription_id)` / `get_subscription_seat_credit(subscription_id)`                                         | **(Issue #753)** Seat count and per-seat price; unused proration credit from seat decreases. |
+| `get_subscriptions_due_before(timestamp, offset, limit)`                                                                            | **(Issue #775)** Paginated list of **active** subscriptions whose `next_payment_at <= timestamp`, read from a due-date index instead of scanning every subscription. See below. |
+
+**`get_subscriptions_due_before(env: Env, timestamp: u64, offset: u64, limit: u64) -> Vec<Subscription>`**
+
+Lets a keeper find subscriptions due for billing without scanning every subscription in storage. The contract keeps an index of subscription ids bucketed by `next_payment_at`, updated every time a subscription's `next_payment_at` changes (on creation, each billing cycle, pause/resume, skipped cycles, and dunning retries/resets). `get_subscriptions_due_before` walks that index in ascending `next_payment_at` order, from the oldest due bucket up to `timestamp`, and returns only subscriptions whose `status` is `SubscriptionStatus::Active` — `Paused`, `Cancelled`, `Expired`, `InDunning` and `Suspended` subscriptions are skipped even if their `next_payment_at` falls at or before `timestamp`.
+
+- **`timestamp`** — upper bound (inclusive) on `next_payment_at`.
+- **`offset`** — number of matching (active, due) subscriptions to skip, for pagination.
+- **`limit`** — maximum number of subscriptions to return.
+- No authorization required; read-only.
+- **Errors:** none — returns an empty `Vec` if nothing matches.
+- **Events:** none.
 
 #### Cancellation Reasons & Churn Analytics (Issue #770)
 
