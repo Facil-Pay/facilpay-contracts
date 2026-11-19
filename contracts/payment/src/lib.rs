@@ -3727,11 +3727,7 @@ impl PaymentContract {
     /// # Returns
     /// The created payment's ID, or an error if the link is inactive, expired,
     /// or has reached its usage cap.
-    pub fn use_payment_link(
-        env: Env,
-        customer: Address,
-        link_id: u64,
-    ) -> Result<u64, Error> {
+    pub fn use_payment_link(env: Env, customer: Address, link_id: u64) -> Result<u64, Error> {
         customer.require_auth();
         Self::require_not_paused(&env, "use_payment_link")?;
         Self::require_not_paused(&env, "create_payment")?;
@@ -3797,11 +3793,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` on success, or an error if the link doesn't exist or the
     /// caller is not its merchant.
-    pub fn deactivate_payment_link(
-        env: Env,
-        merchant: Address,
-        link_id: u64,
-    ) -> Result<(), Error> {
+    pub fn deactivate_payment_link(env: Env, merchant: Address, link_id: u64) -> Result<(), Error> {
         merchant.require_auth();
 
         let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
@@ -3817,11 +3809,7 @@ impl PaymentContract {
         link.status = PaymentLinkStatus::Inactive;
         env.store().set(&link_key, &link);
 
-        PaymentLinkDeactivated {
-            link_id,
-            merchant,
-        }
-        .publish(&env);
+        PaymentLinkDeactivated { link_id, merchant }.publish(&env);
 
         Ok(())
     }
@@ -3835,11 +3823,7 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(())` on success, or an error if the link doesn't exist, the
     /// caller is not its merchant, or the link is expired.
-    pub fn reactivate_payment_link(
-        env: Env,
-        merchant: Address,
-        link_id: u64,
-    ) -> Result<(), Error> {
+    pub fn reactivate_payment_link(env: Env, merchant: Address, link_id: u64) -> Result<(), Error> {
         merchant.require_auth();
 
         let link_key = DataKey::Payment(PaymentKey::PaymentLink(link_id));
@@ -3861,11 +3845,7 @@ impl PaymentContract {
         link.status = PaymentLinkStatus::Active;
         env.store().set(&link_key, &link);
 
-        PaymentLinkReactivated {
-            link_id,
-            merchant,
-        }
-        .publish(&env);
+        PaymentLinkReactivated { link_id, merchant }.publish(&env);
 
         Ok(())
     }
@@ -3937,7 +3917,7 @@ impl PaymentContract {
 
         token::Client::new(&env, &payment.token).transfer(
             &customer,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &tip_amount,
         );
         let total_tip = PaymentContract::get_tip(&env, payment_id) + tip_amount;
@@ -4883,7 +4863,7 @@ impl PaymentContract {
     ) -> Result<(), Error> {
         Self::require_not_paused(&env, "auto_complete_escrowed_payment")?;
         caller.require_auth();
-        
+
         if !env
             .store()
             .has(&DataKey::Payment(PaymentKey::Data(payment_id)))
@@ -4893,11 +4873,11 @@ impl PaymentContract {
 
         let bridge = PaymentContract::get_escrowed_payment(env.clone(), payment_id)?;
         let mut payment = PaymentContract::get_payment(&env, payment_id);
-        
+
         if payment.status != PaymentStatus::Pending {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
-        
+
         Self::require_merchant_not_paused(&env, &payment.merchant)?;
         PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
 
@@ -4909,7 +4889,7 @@ impl PaymentContract {
         // Check if timeout has passed
         let current_time = env.ledger().timestamp();
         let timeout_deadline = bridge.created_at + timeout_seconds;
-        
+
         if current_time < timeout_deadline {
             return Err(Error::Feature(FeatureError::ConfirmationTimeoutNotExpired));
         }
@@ -4930,7 +4910,12 @@ impl PaymentContract {
         payment.status = PaymentStatus::Completed;
         env.store()
             .set(&DataKey::Payment(PaymentKey::Data(payment_id)), &payment);
-        PaymentContract::record_status_change(&env, payment_id, PaymentStatus::Completed, caller.clone());
+        PaymentContract::record_status_change(
+            &env,
+            payment_id,
+            PaymentStatus::Completed,
+            caller.clone(),
+        );
 
         (EscrowedPaymentCompleted {
             payment_id,
@@ -7365,15 +7350,14 @@ impl PaymentContract {
                 customer.clone(),
             )))
             .unwrap_or(0);
-        
+
         let page = count / 100;
-        let page_index = count % 100;
-        
+
         let key = DataKey::Customer(CustomerDataKey::Subscriptions(customer.clone(), page));
         let mut page_subs: Vec<u64> = env.store().get(&key).unwrap_or_else(|| Vec::new(env));
         page_subs.push_back(subscription_id);
         env.store().set(&key, &page_subs);
-        
+
         env.store().set(
             &DataKey::Customer(CustomerDataKey::SubscriptionCount(customer.clone())),
             &(count + 1),
@@ -7387,7 +7371,7 @@ impl PaymentContract {
                 customer.clone(),
             )))
             .unwrap_or(0);
-        
+
         if count == 0 {
             return;
         }
@@ -8079,9 +8063,7 @@ impl PaymentContract {
                     &CancellationReason::Unspecified,
                 );
                 env.store().set(
-                    &DataKey::Subscription(SubscriptionKey::CancellationReason(
-                        subscription_id,
-                    )),
+                    &DataKey::Subscription(SubscriptionKey::CancellationReason(subscription_id)),
                     &CancellationReason::Unspecified,
                 );
                 (RecurringPaymentExecuted {
@@ -8191,7 +8173,7 @@ impl PaymentContract {
 
         for i in 0..len {
             let subscription_id = subscription_ids.get(i).unwrap();
-            
+
             let result = match Self::execute_recurring_payment(env.clone(), subscription_id) {
                 Ok(_) => BatchRecurringPaymentResult {
                     subscription_id,
@@ -8673,10 +8655,7 @@ impl PaymentContract {
             )))
             .unwrap_or(0);
         env.store().set(
-            &DataKey::Merchant(MerchantDataKey::ChurnCount(
-                merchant.clone(),
-                reason.code(),
-            )),
+            &DataKey::Merchant(MerchantDataKey::ChurnCount(merchant.clone(), reason.code())),
             &(count + 1),
         );
     }
@@ -8731,10 +8710,7 @@ impl PaymentContract {
     ///
     /// # Returns
     /// `Some(reason)` when the subscription was cancelled, `None` otherwise.
-    pub fn get_sub_cancel_reason(
-        env: Env,
-        subscription_id: u64,
-    ) -> Option<CancellationReason> {
+    pub fn get_sub_cancel_reason(env: Env, subscription_id: u64) -> Option<CancellationReason> {
         env.store()
             .get(&DataKey::Subscription(SubscriptionKey::CancellationReason(
                 subscription_id,
@@ -8797,12 +8773,16 @@ impl PaymentContract {
         if sub.status == SubscriptionStatus::InDunning
             || sub.status == SubscriptionStatus::Suspended
         {
-            return Err(Error::Subscription(SubscriptionError::SubscriptionNotTransferable));
+            return Err(Error::Subscription(
+                SubscriptionError::SubscriptionNotTransferable,
+            ));
         }
 
         // New customer must be different from current customer
         if sub.customer == new_customer {
-            return Err(Error::Subscription(SubscriptionError::InvalidTransferRecipient));
+            return Err(Error::Subscription(
+                SubscriptionError::InvalidTransferRecipient,
+            ));
         }
 
         let old_customer = sub.customer.clone();
@@ -8822,12 +8802,12 @@ impl PaymentContract {
         Self::add_to_customer_subscriptions(&env, &new_customer, subscription_id);
 
         // Transfer any dunning state to new customer if it exists
-        if let Some(_dunning_state) = env.store().get::<DunningState>(&DataKey::State(
-            StateDataKey::DunningState(subscription_id),
-        )) {
-            env.store().remove(&DataKey::State(
-                StateDataKey::DunningState(subscription_id),
-            ));
+        if let Some(_dunning_state) = env
+            .store()
+            .get::<DunningState>(&DataKey::State(StateDataKey::DunningState(subscription_id)))
+        {
+            env.store()
+                .remove(&DataKey::State(StateDataKey::DunningState(subscription_id)));
             // Clear dunning for clean transfer
         }
 
@@ -9261,11 +9241,7 @@ impl PaymentContract {
 
     /// Issue #772: Set the maximum batch size for recurring payment execution.
     /// Only callable by an admin.
-    pub fn set_recurring_batch_limit(
-        env: Env,
-        admin: Address,
-        limit: u32,
-    ) -> Result<(), Error> {
+    pub fn set_recurring_batch_limit(env: Env, admin: Address, limit: u32) -> Result<(), Error> {
         admin.require_auth();
 
         let ms_config: MultiSigConfig = env
@@ -9280,8 +9256,10 @@ impl PaymentContract {
             return Err(Error::Basic(BasicError::InvalidInput));
         }
 
-        env.store()
-            .set(&DataKey::Config(ConfigKey::RecurringPaymentBatchLimit), &limit);
+        env.store().set(
+            &DataKey::Config(ConfigKey::RecurringPaymentBatchLimit),
+            &limit,
+        );
 
         Ok(())
     }
@@ -14602,7 +14580,7 @@ impl PaymentContract {
             token_client.transfer(&contract_address, &channel.customer, &customer_amount);
         }
 
-        channel.settled = channel.settled + merchant_amount;
+        channel.settled += merchant_amount;
         channel.settled_nonce = nonce;
         channel.open = false;
 
@@ -17335,3 +17313,6 @@ mod test_mandates;
 
 #[cfg(test)]
 mod test_refund_sync;
+
+#[cfg(test)]
+mod test_payment_hooks;
