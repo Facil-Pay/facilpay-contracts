@@ -69,6 +69,9 @@ pub enum EscrowKey {
     Hierarchy(u64),
     Template(u64),
     TemplateCounter,
+    // Issue #787: recurring escrow schedules
+    RecurringSchedule(u64),
+    RecurringScheduleCounter,
     SubAccount(u64, u64),
     SubAccountCounter(u64),
     EscrowHierarchy(u64),
@@ -231,6 +234,11 @@ pub enum EscrowError {
     InvalidBeneficiaryShares = 233,
     DuplicateBeneficiary = 234,
     DisputeCooldownActive = 235,
+    // Issue #787: recurring escrow schedules
+    InvalidRecurringScheduleParams = 339,
+    RecurringScheduleNotFound = 340,
+    RecurringScheduleInactive = 341,
+    RecurringScheduleComplete = 342,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -333,7 +341,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=235).contains(&code) {
+            if (200..=235).contains(&code) || (339..=342).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -505,6 +513,20 @@ pub struct EscrowTemplate {
     pub release_delay_seconds: u64,
     pub description: String,
     pub created_at: u64,
+    pub active: bool,
+}
+
+// Issue #787: recurring escrows created periodically from a template.
+#[derive(Clone)]
+#[contracttype]
+pub struct RecurringEscrowSchedule {
+    pub schedule_id: u64,
+    pub customer: Address,
+    pub template_id: u64,
+    pub interval: u64,
+    pub total_count: u32,
+    pub created_count: u32,
+    pub next_due_at: u64,
     pub active: bool,
 }
 
@@ -887,6 +909,30 @@ pub struct EscrowCreatedFromTemplate {
     pub escrow_id: u64,
     pub template_id: u64,
     pub customer: Address,
+}
+
+#[contractevent(topics = ["recurring_escrow_created"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringEscrowScheduleCreated {
+    pub schedule_id: u64,
+    pub customer: Address,
+    pub template_id: u64,
+    pub next_due_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringEscrowTriggered {
+    pub schedule_id: u64,
+    pub escrow_id: u64,
+    pub created_count: u32,
+    pub next_due_at: u64,
+}
+
+#[contractevent(topics = ["recurring_escrow_cancelled"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringEscrowScheduleCancelled {
+    pub schedule_id: u64,
 }
 
 /// Event emitted when an escrow is renewed
@@ -3143,6 +3189,13 @@ impl EscrowContract {
             .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
         {
             return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        let target_escrow = Self::get_escrow(&env, escrow_id);
+        if target_escrow.status == EscrowStatus::Released
+            || target_escrow.status == EscrowStatus::Resolved
+        {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
 
         if let Some(request_id) = env
@@ -13563,6 +13616,237 @@ impl EscrowContract {
         Ok(escrow_id)
     }
 
+    /// Creates a recurring escrow schedule against an existing template (#787).
+    ///
+    /// Each call to `trigger_next_recurring_escrow` after this creates one more
+    /// escrow from the template, `interval` seconds apart, until `count` escrows
+    /// have been created or the template is deactivated or the schedule is
+    /// cancelled.
+    ///
+    /// # Arguments
+    /// * `customer` - The customer who will fund each escrow. Must authorize.
+    /// * `template_id` - The template each escrow is created from.
+    /// * `interval` - Seconds between escrows. Must be positive.
+    /// * `count` - Total number of escrows the schedule will create. Must be positive.
+    ///
+    /// # Returns
+    /// The new schedule's id.
+    ///
+    /// # Errors
+    /// Returns `TemplateNotFound` / `TemplateInactive` if the template is missing
+    /// or deactivated. Returns `InvalidRecurringScheduleParams` if `interval` or
+    /// `count` is zero.
+    ///
+    /// # Events
+    /// Emits `RecurringEscrowScheduleCreated`.
+    pub fn create_recurring_escrow_schedule(
+        env: Env,
+        customer: Address,
+        template_id: u64,
+        interval: u64,
+        count: u32,
+    ) -> Result<u64, Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "create_recurring_escrow_schedule")?;
+
+        if interval == 0 || count == 0 {
+            return Err(Error::Escrow(EscrowError::InvalidRecurringScheduleParams));
+        }
+
+        let template: EscrowTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Template(template_id)))
+            .ok_or(Error::Escrow(EscrowError::TemplateNotFound))?;
+
+        if !template.active {
+            return Err(Error::Escrow(EscrowError::TemplateInactive));
+        }
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::RecurringScheduleCounter))
+            .unwrap_or(0);
+        let schedule_id = counter + 1;
+        let next_due_at = env.ledger().timestamp() + interval;
+
+        let schedule = RecurringEscrowSchedule {
+            schedule_id,
+            customer: customer.clone(),
+            template_id,
+            interval,
+            total_count: count,
+            created_count: 0,
+            next_due_at,
+            active: true,
+        };
+
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)),
+            &schedule,
+        );
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::RecurringScheduleCounter),
+            &schedule_id,
+        );
+
+        RecurringEscrowScheduleCreated {
+            schedule_id,
+            customer,
+            template_id,
+            next_due_at,
+        }
+        .publish(&env);
+
+        Ok(schedule_id)
+    }
+
+    /// Creates the next escrow due on a recurring schedule (#787).
+    ///
+    /// Permissionless: anyone may call this once the next escrow is due; the
+    /// customer's authorization for the underlying fund transfer must still be
+    /// present in the submitted transaction.
+    ///
+    /// # Arguments
+    /// * `schedule_id` - The recurring schedule to advance.
+    ///
+    /// # Returns
+    /// The id of the newly created escrow.
+    ///
+    /// # Errors
+    /// Returns `RecurringScheduleNotFound` if the schedule does not exist.
+    /// Returns `RecurringScheduleInactive` if the schedule was cancelled via
+    /// `cancel_recurring_escrow_schedule`.
+    /// Returns `RecurringScheduleComplete` if `count` escrows have already been created.
+    /// Returns `TemplateNotFound` / `TemplateInactive` if the underlying template has
+    /// since been removed or deactivated. This is checked fresh on every call (there is
+    /// no way to reactivate a template once deactivated), so a deactivated template
+    /// permanently stops the schedule from here on.
+    /// Returns `ActionError::NotReady` if `next_due_at` has not yet been reached.
+    ///
+    /// # Events
+    /// Emits `RecurringEscrowTriggered`.
+    pub fn trigger_next_recurring_escrow(env: Env, schedule_id: u64) -> Result<u64, Error> {
+        Self::bump_instance_ttl(&env);
+        Self::require_not_paused(&env, "trigger_next_recurring_escrow")?;
+
+        let mut schedule: RecurringEscrowSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)))
+            .ok_or(Error::Escrow(EscrowError::RecurringScheduleNotFound))?;
+
+        if !schedule.active {
+            return Err(Error::Escrow(EscrowError::RecurringScheduleInactive));
+        }
+        if schedule.created_count >= schedule.total_count {
+            return Err(Error::Escrow(EscrowError::RecurringScheduleComplete));
+        }
+
+        // The template is re-checked on every call rather than caching its
+        // state on the schedule: a returned `Err` rolls back any storage
+        // writes made during this invocation, so "permanently stopping" a
+        // deactivated template's schedule can't be done by persisting a flag
+        // here. Since this contract has no way to reactivate a template once
+        // `deactivate_template` is called, re-checking it fresh each time is
+        // equivalent to permanently stopping the schedule.
+        let template: EscrowTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Template(schedule.template_id)))
+            .ok_or(Error::Escrow(EscrowError::TemplateNotFound))?;
+        if !template.active {
+            return Err(Error::Escrow(EscrowError::TemplateInactive));
+        }
+
+        if env.ledger().timestamp() < schedule.next_due_at {
+            return Err(Error::Action(ActionError::NotReady));
+        }
+
+        let release_timestamp = env.ledger().timestamp() + template.release_delay_seconds;
+        let escrow_id = Self::create_escrow(
+            env.clone(),
+            schedule.customer.clone(),
+            template.owner.clone(),
+            template.amount,
+            template.token.clone(),
+            release_timestamp,
+            0,
+            0,
+            false,
+        )?;
+
+        schedule.created_count += 1;
+        schedule.next_due_at += schedule.interval;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)),
+            &schedule,
+        );
+
+        RecurringEscrowTriggered {
+            schedule_id,
+            escrow_id,
+            created_count: schedule.created_count,
+            next_due_at: schedule.next_due_at,
+        }
+        .publish(&env);
+
+        Ok(escrow_id)
+    }
+
+    /// Cancels a recurring escrow schedule (#787).
+    ///
+    /// # Arguments
+    /// * `customer` - Must match the schedule's customer and authorize.
+    /// * `schedule_id` - The schedule to cancel.
+    ///
+    /// # Errors
+    /// Returns `RecurringScheduleNotFound` if the schedule does not exist.
+    /// Returns `Unauthorized` if `customer` does not match the schedule's customer.
+    ///
+    /// # Events
+    /// Emits `RecurringEscrowScheduleCancelled`. A no-op (still emits the event)
+    /// if the schedule was already inactive.
+    pub fn cancel_recurring_escrow_schedule(
+        env: Env,
+        customer: Address,
+        schedule_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut schedule: RecurringEscrowSchedule = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)))
+            .ok_or(Error::Escrow(EscrowError::RecurringScheduleNotFound))?;
+
+        if schedule.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        schedule.active = false;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)),
+            &schedule,
+        );
+
+        RecurringEscrowScheduleCancelled { schedule_id }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Returns a recurring escrow schedule by id (#787).
+    pub fn get_recurring_escrow_schedule(
+        env: Env,
+        schedule_id: u64,
+    ) -> Option<RecurringEscrowSchedule> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::RecurringSchedule(schedule_id)))
+    }
+
     /// Executes batch release escrows.
     ///
     /// # Arguments
@@ -15647,3 +15931,6 @@ mod insurance_watchdog_test;
 
 #[cfg(test)]
 mod oracle_conditional_test;
+
+#[cfg(test)]
+mod clawback_test;

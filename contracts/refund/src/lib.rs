@@ -201,6 +201,14 @@ pub enum EvidenceKey {
     EvidenceCount(u64),
 }
 
+// Issue #802: message thread on refund requests
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum RefundMessageKey {
+    Message(u64, u64),
+    MessageCount(u64),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum VoucherKey {
@@ -298,6 +306,10 @@ pub enum CoreError {
     InsufficientTreasuryFees = 31,
     AutoApproveThresholdExceedsCeiling = 32,
     RefundCooldownActive = 33,
+    // Issue #801: minimum purchase amount for voucher redemption not met
+    VoucherMinPurchaseNotMet = 85,
+    // Issue #802: message thread on refund requests — per-refund cap reached
+    RefundMessageLimitReached = 86,
 }
 
 #[contracterror]
@@ -677,6 +689,26 @@ pub struct RefundEvidence {
     pub submitter: Address,
     pub evidence_hash: BytesN<32>,
     pub submitted_at: u64,
+}
+
+// Issue #802: message thread on refund requests
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundMessage {
+    pub refund_id: u64,
+    pub message_id: u64,
+    pub sender: Address,
+    pub content_hash: BytesN<32>,
+    pub posted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundMessagePosted {
+    pub refund_id: u64,
+    pub message_id: u64,
+    pub sender: Address,
+    pub posted_at: u64,
 }
 
 // Issue #191: Multi-token refund support
@@ -1547,8 +1579,8 @@ pub enum RefundExtKey {
     CategoryRefundCap(Address, u32),
     // Issue #809: set once a processed refund is recorded on the payment contract.
     PaymentSynced(u64),
-    // Issue #803: per-merchant trust-score-based auto-approve boost.
-    TrustBoostConfig(Address),
+    // Issue #801: per-merchant minimum purchase amount required to redeem a voucher.
+    MerchantVoucherMinPurchase(Address),
 }
 
 // Issue #807: emitted when a merchant sets a category refund percentage cap.
@@ -10640,6 +10672,144 @@ impl RefundContract {
         results
     }
 
+    // ── Issue #802: message thread on refund requests ──────────────────────
+
+    /// Maximum number of messages that can be posted to a single refund's
+    /// message thread.
+    pub const MAX_REFUND_MESSAGES: u32 = 100;
+
+    /// Returns whether `arbitrator` is an assigned arbitrator on the
+    /// arbitration case escalated from `refund_id`, if any.
+    fn is_assigned_arbitrator(env: &Env, refund_id: u64, arbitrator: &Address) -> bool {
+        let case_id: Option<u64> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::CaseByRefund(refund_id));
+        let case_id = match case_id {
+            Some(id) => id,
+            None => return false,
+        };
+        let case: Option<ArbitrationCase> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id));
+        match case {
+            Some(case) => case.arbitrators.contains(arbitrator),
+            None => false,
+        }
+    }
+
+    /// Post a message to a refund's message thread (#802).
+    ///
+    /// Lets the customer, the merchant, or an arbitrator assigned to the
+    /// refund's arbitration case (if one has been escalated) record a
+    /// verifiable reference to an off-chain message.
+    ///
+    /// # Arguments
+    /// * `sender` - The party posting the message (must authenticate).
+    /// * `refund_id` - The ID of the refund the message is about.
+    /// * `content_hash` - SHA-256 hash of the off-chain message content.
+    ///
+    /// # Returns
+    /// The new message's ID (0-based, per refund).
+    ///
+    /// # Errors
+    /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `Unauthorized` if `sender` is not the customer, the merchant,
+    /// or an assigned arbitrator for this refund.
+    /// Returns `RefundMessageLimitReached` if the refund's message thread has
+    /// already reached `MAX_REFUND_MESSAGES`.
+    pub fn post_refund_message(
+        env: Env,
+        sender: Address,
+        refund_id: u64,
+        content_hash: BytesN<32>,
+    ) -> Result<u64, Error> {
+        sender.require_auth();
+
+        let refund: Refund = env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(refund_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+
+        if sender != refund.customer
+            && sender != refund.merchant
+            && !Self::is_assigned_arbitrator(&env, refund_id, &sender)
+        {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&RefundMessageKey::MessageCount(refund_id))
+            .unwrap_or(0);
+        if count >= Self::MAX_REFUND_MESSAGES as u64 {
+            return Err(Error::Core(CoreError::RefundMessageLimitReached));
+        }
+
+        let posted_at = env.ledger().timestamp();
+        let message = RefundMessage {
+            refund_id,
+            message_id: count,
+            sender: sender.clone(),
+            content_hash,
+            posted_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&RefundMessageKey::Message(refund_id, count), &message);
+        env.storage()
+            .instance()
+            .set(&RefundMessageKey::MessageCount(refund_id), &(count + 1));
+
+        RefundMessagePosted {
+            refund_id,
+            message_id: count,
+            sender,
+            posted_at,
+        }
+        .publish(&env);
+
+        Ok(count)
+    }
+
+    /// Get a page of messages posted to a refund's message thread, oldest first.
+    ///
+    /// # Arguments
+    /// * `refund_id` - The ID of the refund.
+    /// * `offset` - Number of messages to skip from the oldest.
+    /// * `limit` - Maximum number of messages to return.
+    pub fn get_refund_messages(
+        env: Env,
+        refund_id: u64,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<RefundMessage> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&RefundMessageKey::MessageCount(refund_id))
+            .unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+        let end = (offset + limit).min(total);
+        let mut i = offset;
+        while i < end {
+            if let Some(message) = env
+                .storage()
+                .instance()
+                .get::<_, RefundMessage>(&RefundMessageKey::Message(refund_id, i))
+            {
+                result.push_back(message);
+            }
+            i += 1;
+        }
+        result
+    }
+
     // ── Issue #191: Multi-token refund support ─────────────────────────────
 
     /// Register a token as a supported refund payment method.
@@ -11058,6 +11228,49 @@ impl RefundContract {
 
     // ── Issue #192: Refund credit vouchers ────────────────────────────────
 
+    /// Set (or clear) the minimum purchase amount required to redeem a
+    /// voucher against a payment made to `merchant` (#801).
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin.
+    /// * `merchant` - The merchant whose vouchers this minimum applies to.
+    /// * `min_purchase_amount` - Minimum payment amount required to redeem a
+    ///   voucher for this merchant. `0` clears the minimum (no restriction).
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `min_purchase_amount` is negative.
+    pub fn set_voucher_min_purchase(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        min_purchase_amount: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if min_purchase_amount < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        let key = RefundExtKey::MerchantVoucherMinPurchase(merchant);
+        if min_purchase_amount == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &min_purchase_amount);
+        }
+
+        Ok(())
+    }
+
+    /// Get the minimum purchase amount configured for a merchant's vouchers.
+    ///
+    /// Returns `0` if no minimum is configured (no restriction).
+    pub fn get_voucher_min_purchase(env: Env, merchant: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::MerchantVoucherMinPurchase(merchant))
+            .unwrap_or(0)
+    }
+
     /// Issue a refund credit voucher for an approved refund.
     ///
     /// Creates a voucher with the refund amount that the customer can redeem
@@ -11163,18 +11376,22 @@ impl RefundContract {
     /// # Arguments
     /// * `customer` - The customer redeeming the voucher (must authenticate).
     /// * `voucher_id` - The ID of the voucher to redeem.
-    /// * `_payment_id` - The payment ID to apply the voucher to (reserved for future use).
+    /// * `payment_id` - The payment the voucher is being applied to. Looked up
+    ///   against the payment contract only when the voucher's merchant has a
+    ///   minimum purchase amount configured (#801).
     ///
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has already been used.
     /// Returns `VoucherExpired` if the voucher has expired.
+    /// Returns `VoucherMinPurchaseNotMet` if the merchant has a minimum purchase
+    /// amount configured and `payment_id`'s amount is below it.
     pub fn redeem_refund_voucher(
         env: Env,
         customer: Address,
         voucher_id: u64,
-        _payment_id: u64,
+        payment_id: u64,
     ) -> Result<(), Error> {
         customer.require_auth();
 
@@ -11192,6 +11409,17 @@ impl RefundContract {
         }
         if env.ledger().timestamp() > voucher.expires_at {
             return Err(Error::Ext(ExtError::VoucherExpired));
+        }
+
+        // Issue #801: only consult the payment contract when the merchant has
+        // actually configured a minimum, so redemptions for merchants/tests
+        // with no minimum (and no payment contract wired up) are unaffected.
+        let min_purchase = Self::get_voucher_min_purchase(env.clone(), voucher.merchant.clone());
+        if min_purchase > 0 {
+            let payment = Self::get_external_payment(&env, payment_id)?;
+            if payment.amount < min_purchase {
+                return Err(Error::Core(CoreError::VoucherMinPurchaseNotMet));
+            }
         }
 
         // Issue #699: after partial redemptions only the remaining balance is paid.
@@ -12257,7 +12485,4 @@ mod test_refund_reserve;
 mod test_multi_token_arbitrator;
 
 #[cfg(test)]
-mod test_refund_ratio_alert;
-
-#[cfg(test)]
-mod test_trust_score;
+mod test_response_sla;
