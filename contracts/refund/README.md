@@ -371,6 +371,45 @@ Example: the admin calls `set_auto_approve_below_ceiling(admin, 500)`. A merchan
 
 None of these functions emit events; read the current values with the getters.
 
+#### Customer Trust Score and Auto-Approve Boost (Issue #803)
+
+A merchant can let customers with a good history and no fraud flags get a *higher* auto-approve-below threshold than other customers, instead of the one flat threshold from [Auto-Approval Ceiling](#auto-approval-ceiling) above.
+
+| Function | Parameters | Auth | Returns |
+| --- | --- | --- | --- |
+| `get_customer_trust_score` | `customer: Address` | none | `u32` (basis points, `0` to `10000`) |
+| `set_trust_boost_config` | `merchant: Address`, `min_trust_score_bps: u32`, `boosted_threshold: i128` | `merchant` | `Result<(), Error>` |
+| `get_trust_boost_config` | `merchant: Address` | none | `Option<TrustBoostConfig>` |
+| `remove_trust_boost_config` | `merchant: Address` | `merchant` | `Result<(), Error>` |
+
+**The trust score formula** (deterministic — a pure function of on-chain refund history and fraud-flag state at the moment of the call):
+
+- If `check_fraud_signals(customer)` returns `Some` (an active fraud signal — see [Fraud Detection](#fraud-detection)), the score is `0`, unconditionally. Reviewing a signal with `mark_fraud_reviewed` does not clear it, so a once-flagged customer never qualifies for a boost again.
+- If the customer has never requested a refund (`get_customer_refund_summary(customer).total_requested == 0`), the score is `0`.
+- Otherwise it is a weighted average of three components, each in basis points:
+  - `approval_bps = total_approved * 10000 / total_requested` — **50% weight**.
+  - `volume_bps = min(total_requested, 10) * 1000` — **20% weight**. Each of the customer's first 10 refund requests contributes 1000bps; 10 or more requests maxes this component at 10000.
+  - `tenure_bps = min(tenure_days, 365) * 10000 / 365` — **30% weight**, where `tenure_days` is the number of days since the customer's earliest refund request, capped at one year.
+  - `trust_score = (approval_bps * 50 + volume_bps * 20 + tenure_bps * 30) / 100`, clamped to `0..=10000`.
+
+**The boost**
+
+`set_trust_boost_config(merchant, min_trust_score_bps, boosted_threshold)` lets a merchant configure a second, higher threshold that applies only to customers whose trust score is at or above `min_trust_score_bps`. When a refund is requested, the threshold `auto_below` actually used becomes:
+
+```
+below = min(merchant_threshold, platform_ceiling)
+if a TrustBoostConfig is set for the merchant and customer_trust_score >= min_trust_score_bps:
+    below = min(max(below, boosted_threshold), platform_ceiling)
+```
+
+The platform-wide `get_auto_approve_below_ceiling()` is still a hard cap — a merchant's boost can raise their own effective threshold above `set_auto_approve_below`, but never above the platform ceiling. `remove_trust_boost_config` turns the boost off entirely, reverting to the flat `set_auto_approve_below` threshold.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::InvalidAmount` | `1` | `set_trust_boost_config`: `min_trust_score_bps` is above `10000`, or `boosted_threshold` is negative |
+
+No events are emitted by any of these functions.
+
 #### Refund Cooldown
 
 The admin can require a minimum gap between refund requests from the same customer.
@@ -551,6 +590,51 @@ not consult the breaker.
 `get_circuit_breaker_state()` returns the full state (tripped flag, trip count,
 last observed rate, auto-reset timestamp); `check_circuit_breaker()` is a
 read-only helper returning `true` only while tripped and still within cooldown.
+
+### Merchant Refund-Ratio Alerts (Issue #804)
+
+- `set_refund_ratio_alert_config(admin, config)` — Admin sets the alert threshold, rolling window, and enabled flag.
+- `get_refund_ratio_alert_config()` — Returns the current `RefundRatioAlertConfig`, if any.
+- `get_merchant_refund_ratio_window(merchant)` — Returns a merchant's current rolling `MerchantRatioWindowState`, if any refund has been approved for them since the config was set.
+
+Unlike the circuit breaker (which blocks new refund *requests*), this is a
+pure alerting signal evaluated when a refund is **approved**, and it never
+blocks the approval.
+
+**Configuration**
+
+```rust
+pub struct RefundRatioAlertConfig {
+    pub threshold_bps: u32,  // alert threshold, in basis points
+    pub window_seconds: u64, // rolling window over which volume is summed
+    pub enabled: bool,       // master on/off switch
+}
+```
+
+`set_refund_ratio_alert_config(admin: Address, config: RefundRatioAlertConfig) -> Result<(), Error>` requires `admin.require_auth()` and that `admin` matches the stored contract admin; otherwise it returns `Unauthorized`. If no config has ever been set, or `enabled` is `false`, no alert is ever evaluated.
+
+**What it tracks**
+
+For each merchant, the contract keeps a rolling `MerchantRatioWindowState`:
+
+```rust
+pub struct MerchantRatioWindowState {
+    pub window_start: u64,
+    pub refund_volume: i128,  // sum of approved refund amounts in this window
+    pub payment_volume: i128, // sum of the corresponding verified original payment amounts
+    pub alert_fired: bool,    // whether this window has already alerted
+}
+```
+
+Each time `approve_refund` (or `approve_refund_batch`) approves a refund for a merchant — after the approval itself has already succeeded — the refund's `amount` is added to `refund_volume` and its `original_payment_amount` (the payment amount verified against the payment contract at request time) is added to `payment_volume`. If `now >= window_start + window_seconds` (or no window exists yet), the window resets first (`refund_volume`/`payment_volume` back to `0`, `alert_fired` back to `false`) before adding this approval's amounts — so the ratio is always "refunds relative to verified payment volume" within the current window only.
+
+**What triggers the alert**
+
+When `payment_volume > 0`, the contract computes `ratio_bps = refund_volume * 10000 / payment_volume`. If `ratio_bps > threshold_bps` **and** the window hasn't already alerted (`alert_fired == false`), it emits `MerchantRefundRatioExceeded { merchant, ratio_bps, threshold_bps, window_start, triggered_at }` and sets `alert_fired = true`. Because `alert_fired` only clears when the window rolls over, **the alert fires at most once per window** even if further approvals in the same window keep the ratio above the threshold.
+
+**Errors and events**
+
+No new error variants — this feature can never fail or revert a call. Event: `MerchantRefundRatioExceeded { merchant: Address, ratio_bps: u32, threshold_bps: u32, window_start: u64, triggered_at: u64 }`, emitted from `approve_refund_internal`.
 
 ### Fraud Detection
 

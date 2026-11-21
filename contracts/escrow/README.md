@@ -119,6 +119,75 @@ These are distinct timers rather than one combined timeout. Escalation timeout i
 
 ---
 
+## Escrow Fees
+
+The contract can charge a fee on released escrow funds, configured either platform-wide (the "global" config) or per token (an "override" that replaces the global config entirely for that token).
+
+### `EscrowFeeConfig`
+
+```rust
+pub struct EscrowFeeConfig {
+    pub fee_bps: i128,
+    pub fee_recipient: Address,
+    pub enabled: bool,
+}
+```
+
+### Function reference
+
+| Function | Parameters | Returns | Auth | Errors |
+|---|---|---|---|---|
+| `set_escrow_fee_config` | `env: Env`, `admin: Address`, `config: EscrowFeeConfig` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)` if `admin` is not in the multisig admin set. Unlike `set_token_escrow_fee_config` below, this function does **not** validate `config.fee_bps` against `0..=10000` — any `i128` value is accepted and stored as-is. |
+| `get_escrow_fee_config` | `env: Env` | `EscrowFeeConfig` | None | None. Defaults to `{ fee_bps: 0, fee_recipient: <contract address>, enabled: false }` if never set. |
+| `set_token_escrow_fee_config` | `env: Env`, `admin: Address`, `token: Address`, `config: EscrowFeeConfig` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`; `Error::Basic(BasicError::InvalidBps)` if `config.fee_bps` is outside `0..=10000`. |
+| `get_token_escrow_fee_config` | `env: Env`, `token: Address` | `Option<EscrowFeeConfig>` | None | None. `None` if no override is set for `token`. |
+| `remove_token_escrow_fee_config` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`. |
+| `get_effective_escrow_fee_config` | `env: Env`, `token: Address` | `EscrowFeeConfig` | None | None. |
+| `get_accumulated_escrow_fees` | `env: Env`, `token: Address` | `i128` | None | None. Defaults to `0`. |
+| `withdraw_escrow_fees` | `env: Env`, `admin: Address`, `token: Address`, `to: Address` | `Result<i128, Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`. Returns `Ok(0)` with no transfer and no event if the accumulated balance for `token` is already `0`. |
+
+All of the above also require the contract not be paused for that specific function name (`require_not_paused`), which can return the usual pause-related errors independent of the ones listed above.
+
+### How the effective fee is chosen (global vs. per-token)
+
+`get_effective_escrow_fee_config(token)` is the single source of truth for "what fee applies to this token right now":
+
+1. If a token-specific override exists for `token` (set via `set_token_escrow_fee_config`), that override is returned in full — including its own `fee_bps`, `fee_recipient`, and `enabled` flag. The override is a complete replacement, not a partial patch over the global config.
+2. Otherwise, the global config from `get_escrow_fee_config()` is returned.
+
+`remove_token_escrow_fee_config(token)` deletes the override, so a subsequent `get_effective_escrow_fee_config(token)` call falls back to the global config again.
+
+### When fees are charged
+
+Fees are **not** charged when `get_effective_escrow_fee_config` is called — that function only reports the config. The actual fee lifecycle has two distinct moments:
+
+1. **Rate snapshot, at escrow creation.** `create_escrow` calls `get_effective_escrow_fee_config` for the escrow's token once, at creation time, and snapshots the resulting rate onto the escrow record itself: `fee_bps = if fee_config.enabled { fee_config.fee_bps } else { 0 }`. A later call to `set_escrow_fee_config` or `set_token_escrow_fee_config` never retroactively changes the rate on an escrow that already exists — only escrows created after the change see the new rate.
+2. **Fee computation and transfer, at release.** When an escrow is released, the fee amount is computed from the escrow's own snapshotted rate — `fee_amount = (escrow.amount * escrow.fee_bps) / 10000` — not from a freshly re-read config. If `fee_amount > 0`, the effective fee config for the escrow's token is looked up again at this point, but only to resolve where the fee goes:
+   - If the resolved `fee_recipient` is the contract's own address, the fee amount is added to that token's running balance in `get_accumulated_escrow_fees(token)` (no external transfer yet).
+   - Otherwise, the fee amount is transferred directly to `fee_recipient` and is never reflected in `get_accumulated_escrow_fees`.
+   Either way, `EscrowFeeCollected { escrow_id, fee_amount, recipient }` is emitted, and the remaining `escrow.amount - fee_amount` goes to the recipient of the release (normally the merchant).
+
+### Events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `EscrowFeeConfigUpdated` | `fee_bps: i128` | `set_escrow_fee_config` |
+| `TokenEscrowFeeConfigUpdated` | `token: Address`, `fee_bps: i128`, `enabled: bool` | `set_token_escrow_fee_config` |
+| `TokenEscrowFeeConfigRemoved` | `token: Address` | `remove_token_escrow_fee_config` |
+| `EscrowFeeCollected` | `escrow_id: u64`, `fee_amount: i128`, `recipient: Address` | Any escrow release path that charges a non-zero fee |
+| `EscrowFeesWithdrawn` | `amount: i128`, `withdrawn_by: Address` | `withdraw_escrow_fees` (only when the accumulated balance was non-zero) |
+
+### Worked example
+
+1. An admin calls `set_escrow_fee_config(env, admin, EscrowFeeConfig { fee_bps: 250, fee_recipient: <contract address>, enabled: true })` — a global 2.5% fee, collected by the contract itself. No token-specific override exists for USDC.
+2. A customer calls `create_escrow(..., token: <USDC address>, amount: 1_000_0000000, ...)` (1,000 USDC, 7 decimals omitted for readability). Since there's no override for USDC, `get_effective_escrow_fee_config` returns the global config, and the new escrow snapshots `fee_bps = 250`.
+3. Three months later, the admin calls `set_escrow_fee_config` again with `fee_bps: 500`. This escrow is unaffected — its snapshotted `fee_bps` is still `250`. Only escrows created after this point would see `500`.
+4. The escrow is released via `release_escrow`. The fee is computed from the escrow's own snapshot: `fee_amount = 1_000 * 250 / 10_000 = 25` USDC. The merchant receives `1_000 - 25 = 975` USDC. `EscrowFeeCollected { escrow_id, fee_amount: 25_0000000, recipient: <contract address> }` is emitted.
+5. Because `fee_recipient` resolved to the contract's own address, the 25 USDC is not transferred anywhere yet — it is added to the running total returned by `get_accumulated_escrow_fees(env, <USDC address>)`.
+6. Later, an admin calls `withdraw_escrow_fees(env, admin, <USDC address>, <treasury address>)`, which transfers the full accumulated balance (25 USDC, plus whatever else has accumulated from other released escrows since the last withdrawal) to the treasury address, zeroes the accumulated balance, and emits `EscrowFeesWithdrawn { amount: 25_0000000, withdrawn_by: admin }`.
+
+---
+
 ## Order References
 
 An escrow can be linked to an off-chain order in a verifiable way by creating it with a 32-byte reference, typically a hash of the merchant's order ID. Each reference is unique per merchant and stays bound to its escrow for the escrow's whole lifetime, including after it is released, refunded or cancelled. Two different merchants may use the same reference.
