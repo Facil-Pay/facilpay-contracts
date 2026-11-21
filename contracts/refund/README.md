@@ -736,6 +736,28 @@ Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotB
 - `get_refund_evidence()` — Gets evidence submitted by a specific party.
 - `get_all_refund_evidence()` — Gets all evidence entries for a refund dispute.
 
+### Refund Messages
+
+- `post_refund_message()` — Customer, merchant, or an assigned arbitrator posts a verifiable reference to an off-chain message about a refund.
+- `get_refund_messages()` — Paginated list of a refund's messages, oldest first.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `post_refund_message` | `sender: Address` (must authorize), `refund_id: u64`, `content_hash: BytesN<32>` | `Result<u64, Error>` (the new message's id) |
+| `get_refund_messages` | `refund_id: u64`, `offset: u64`, `limit: u64` | `Vec<RefundMessage>` |
+
+`content_hash` is the SHA-256 hash of the off-chain message content; the contract only stores and orders the reference, not the content itself.
+
+`sender` must be the refund's `customer`, its `merchant`, or an arbitrator currently assigned to the refund's arbitration case (looked up via the case escalated from this `refund_id`, if any — see [Arbitration](#arbitration)). Any other address is rejected. Each refund's thread is capped at `RefundContract::MAX_REFUND_MESSAGES` (100) messages; further posts fail once the cap is reached.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::RefundNotFound` | `2` | No refund with this ID |
+| `CoreError::Unauthorized` | `3` | `sender` is not the customer, merchant, or an assigned arbitrator |
+| `CoreError::RefundMessageLimitReached` | `86` | The refund's thread already has `MAX_REFUND_MESSAGES` messages |
+
+Emits `RefundMessagePosted { refund_id, message_id, sender, posted_at }` from `post_refund_message`.
+
 ### Multi-Token Support
 
 - `register_refund_token()` — Admin registers a token as a supported refund method.
@@ -755,6 +777,27 @@ Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotB
 - `get_vouchers_transferable()` — Whether a merchant's new vouchers are issued transferable (default `true`).
 - `is_voucher_transferable()` — Whether a specific voucher can be transferred.
 - `issue_promotional_vouchers()` — Merchant issues goodwill credit vouchers to many customers at once, funded from its refund reserve.
+- `set_voucher_min_purchase()` — Admin sets (or clears) the minimum purchase amount required to redeem a merchant's vouchers.
+- `get_voucher_min_purchase()` — Gets the minimum purchase amount configured for a merchant's vouchers.
+
+#### Minimum purchase for voucher redemption
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `set_voucher_min_purchase` | `admin: Address` (must authorize), `merchant: Address`, `min_purchase_amount: i128` | `Result<(), Error>` |
+| `get_voucher_min_purchase` | `merchant: Address` | `i128` |
+
+`set_voucher_min_purchase` sets the minimum amount a target payment must have for a customer to redeem any of `merchant`'s vouchers against it. Passing `0` clears the minimum (no restriction, the default). `get_voucher_min_purchase` returns `0` when no minimum is configured.
+
+`redeem_refund_voucher(customer, voucher_id, payment_id)` now uses `payment_id` to look up the target payment via the configured payment contract (see [Cross-Contract](#cross-contract)), but **only when the voucher's merchant has a minimum configured** — redemptions for merchants with no minimum, or in deployments with no payment contract wired up, are unaffected. When a minimum is configured, the payment's `amount` must be at least the minimum or the call fails.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::InvalidAmount` | `1` | `min_purchase_amount` is negative |
+| `CoreError::Unauthorized` | `3` | Caller is not the contract admin |
+| `CoreError::VoucherMinPurchaseNotMet` | `85` | A minimum is configured for the voucher's merchant and the target payment's amount is below it |
+
+No new event is emitted; `set_voucher_min_purchase` is a plain config setter.
 
 #### Voucher transfers
 
