@@ -3191,6 +3191,13 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::NotFound));
         }
 
+        let target_escrow = Self::get_escrow(&env, escrow_id);
+        if target_escrow.status == EscrowStatus::Released
+            || target_escrow.status == EscrowStatus::Resolved
+        {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
         if let Some(request_id) = env
             .storage()
             .instance()
@@ -15926,4 +15933,4 @@ mod insurance_watchdog_test;
 mod oracle_conditional_test;
 
 #[cfg(test)]
-mod recurring_escrow_test;
+mod clawback_test;

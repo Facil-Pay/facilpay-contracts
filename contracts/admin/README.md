@@ -61,6 +61,8 @@ Every privileged function performs two authorization checks:
 |---|---|---|
 | `get_admins()` | The admin set. `NotInitialized` before `initialize`. | `Vec<Address>` |
 | `get_threshold()` | The signature threshold. `NotInitialized` before `initialize`. | `u32` |
+| `get_pauser()` | The stored pauser address. `NotInitialized` before `initialize`. | `Address` |
+| `get_contracts()` | The stored child contract addresses. `NotInitialized` before `initialize`. | `ContractAddresses` containing `payment`, `escrow`, `refund` |
 | `get_proposal(proposal_id)` | A proposal by id. `ProposalNotFound` if unknown. | `AdminProposal` |
 | `get_emergency_pause_expiry()` | When the current bounded pause may be expired, or `None` if no bounded pause is in effect. | `Option<u64>` |
 | `get_incident_log(offset, limit)` | A page of the emergency-action incident log, oldest first. See [Incident Log](#incident-log). | `Vec<IncidentEntry>` |
@@ -288,6 +290,8 @@ In addition to the child contract's own `FunctionPausedEvent` / `FunctionUnpause
 |---|---|---|
 | `EmergencyFunctionPausedEvent` | `target: ChildKind`, `function_name: String`, `paused_by: Address`, `reason: String`, `paused_at: u64` | `emergency_pause_function` |
 | `EmergencyFunctionUnpausedEvent` | `target: ChildKind`, `function_name: String`, `unpaused_by: Address`, `unpaused_at: u64` | `emergency_unpause_function` |
+
+`EmergencyFunctionUnpausedEvent` is published under the topic `emergency_fn_unpaused`.
 
 ## Incident Log
 

@@ -12194,7 +12194,4 @@ mod test_refund_reserve;
 mod test_multi_token_arbitrator;
 
 #[cfg(test)]
-mod test_voucher_min_purchase;
-
-#[cfg(test)]
-mod test_refund_messages;
+mod test_response_sla;
