@@ -51,7 +51,7 @@ Every privileged function performs two authorization checks:
 | `upgrade(admin, new_wasm_hash)` | Replaces the coordinator WASM. | Admin member, threshold 1 only |
 | `upgrade_children(admin, payment_hash, escrow_hash, refund_hash)` | Pauses, upgrades and unpauses all three child contracts in one call. See [Coordinated Child Upgrades](#coordinated-child-upgrades). | Admin member, threshold 1 only |
 | `set_admins(admin, admins, threshold)` | Replaces the admin set and threshold. | Admin member, threshold 1 only |
-| `propose_action(proposer, action)` | Proposes a privileged action. | Admin member |
+| `propose_action(proposer, action, description_hash)` | Proposes a privileged action with an optional hash of its off-chain rationale. | Admin member |
 | `approve_action(approver, proposal_id)` | Approves an open proposal. | Admin member |
 | `execute_action(executor, proposal_id)` | Runs a proposal that has reached the threshold. | Admin member |
 
@@ -141,11 +141,17 @@ Privileged coordinator calls (child contract setters, `upgrade`, and changing th
 
 Errors: `NotInitialized`, `Unauthorized`, `MultisigRequired`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminSetUpdated`.
 
-### `propose_action(proposer, action) -> u64`
+### `propose_action(proposer, action, description_hash) -> u64`
 
 Creates a proposal and records the proposer's approval. The proposal expires `PROPOSAL_TTL_SECONDS` (7 days) after creation. `SetAdmins` proposals are validated up front.
 
-Errors: `NotInitialized`, `Unauthorized`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminProposalCreated`.
+| Parameter | Type | Description |
+|---|---|---|
+| `proposer` | `Address` | Admin member creating the proposal; must authorize. |
+| `action` | `AdminAction` | Privileged action to execute after approval. |
+| `description_hash` | `Option<BytesN<32>>` | Optional SHA-256 hash of the off-chain rationale/review for the proposal. Stored on the proposal and emitted in the event; `None` when no rationale is linked. |
+
+Errors: `NotInitialized`, `Unauthorized`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminProposalCreated`. Proposals stored before this parameter was added remain readable and report `description_hash: None`.
 
 ### `approve_action(approver, proposal_id)`
 
@@ -168,6 +174,7 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64, // created_at + PROPOSAL_TTL_SECONDS; open while now <= expires_at
     pub executed: bool,
+    pub description_hash: Option<BytesN<32>>, // off-chain rationale hash (#875)
 }
 ```
 
@@ -175,7 +182,7 @@ pub struct AdminProposal {
 
 | Event | Fields | Emitted by |
 |---|---|---|
-| `AdminProposalCreated` | `proposal_id: u64`, `proposer: Address`, `action: AdminAction`, `expires_at: u64` | `propose_action` |
+| `AdminProposalCreated` | `proposal_id: u64`, `proposer: Address`, `action: AdminAction`, `expires_at: u64`, `description_hash: Option<BytesN<32>>` | `propose_action` |
 | `AdminProposalApproved` | `proposal_id: u64`, `approver: Address`, `approvals: u32` | `approve_action` |
 | `AdminProposalExecuted` | `proposal_id: u64`, `executed_by: Address` | `execute_action` |
 | `AdminSetUpdated` | `admins: Vec<Address>`, `threshold: u32` | `set_admins`, executed `SetAdmins` proposals |

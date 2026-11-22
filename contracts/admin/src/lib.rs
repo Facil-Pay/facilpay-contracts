@@ -94,6 +94,21 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    /// Optional hash of the off-chain rationale for this proposal (#875).
+    pub description_hash: Option<BytesN<32>>,
+}
+
+/// Proposal shape used before #875, kept so existing stored proposals stay readable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyAdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
 }
 
 /// Schema versions across the platform (#817). A child is `None` when its
@@ -114,6 +129,7 @@ pub struct AdminProposalCreated {
     pub proposer: Address,
     pub action: AdminAction,
     pub expires_at: u64,
+    pub description_hash: Option<BytesN<32>>,
 }
 
 #[contractevent]
@@ -538,10 +554,29 @@ fn upgrade_children_wasm(
 }
 
 fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
-    env.storage()
+    if let Some(proposal) = env
+        .storage()
         .persistent()
         .get(&DataKey::Proposal(proposal_id))
-        .ok_or(Error::ProposalNotFound)
+    {
+        return Ok(proposal);
+    }
+    // Proposals stored before #875 have no description hash.
+    let legacy: LegacyAdminProposal = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Proposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)?;
+    Ok(AdminProposal {
+        id: legacy.id,
+        action: legacy.action,
+        proposer: legacy.proposer,
+        approvals: legacy.approvals,
+        created_at: legacy.created_at,
+        expires_at: legacy.expires_at,
+        executed: legacy.executed,
+        description_hash: None,
+    })
 }
 
 /// Rejects proposals that already ran or whose approval window has closed.
@@ -1182,7 +1217,12 @@ impl AdminContract {
     ///
     /// # Events
     /// Emits `AdminProposalCreated`.
-    pub fn propose_action(env: Env, proposer: Address, action: AdminAction) -> Result<u64, Error> {
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action: AdminAction,
+        description_hash: Option<BytesN<32>>,
+    ) -> Result<u64, Error> {
         require_admin_member(&env, &proposer)?;
         if let AdminAction::SetAdmins(admins, threshold) = &action {
             validate_admin_set(admins, *threshold)?;
@@ -1204,6 +1244,7 @@ impl AdminContract {
             created_at,
             expires_at,
             executed: false,
+            description_hash: description_hash.clone(),
         };
         env.storage().instance().set(&DataKey::ProposalCount, &id);
         env.storage()
@@ -1215,6 +1256,7 @@ impl AdminContract {
             proposer,
             action,
             expires_at,
+            description_hash: description_hash.clone(),
         }
         .publish(&env);
 
@@ -1825,6 +1867,7 @@ mod test {
         let id = client.propose_action(
             &admin,
             &AdminAction::SetPaymentContract(new_payment.clone()),
+            &None,
         );
         assert_eq!(
             client.try_execute_action(&admin, &id),
@@ -1856,10 +1899,10 @@ mod test {
         let action = AdminAction::SetRefundContract(stranger.clone());
 
         assert_eq!(
-            client.try_propose_action(&pauser, &action),
+            client.try_propose_action(&pauser, &action, &None),
             Err(Ok(Error::Unauthorized))
         );
-        let id = client.propose_action(&admin, &action);
+        let id = client.propose_action(&admin, &action, &None);
         assert_eq!(
             client.try_approve_action(&stranger, &id),
             Err(Ok(Error::Unauthorized))
@@ -1881,7 +1924,7 @@ mod test {
         let (client, admin, a2, a3, pauser) = setup_multisig(&env);
         let new_escrow = setup_escrow(&env, &pauser);
 
-        let id = client.propose_action(&admin, &AdminAction::SetEscrowContract(new_escrow));
+        let id = client.propose_action(&admin, &AdminAction::SetEscrowContract(new_escrow), &None);
         client.approve_action(&a2, &id);
 
         let expires_at = client.get_proposal(&id).expires_at;
@@ -1905,10 +1948,11 @@ mod test {
         let new_refund = setup_refund(&env, &pauser);
 
         // a3 approves a pending action, then is removed from the set.
-        let pending = client.propose_action(&a3, &AdminAction::SetRefundContract(new_refund));
+        let pending =
+            client.propose_action(&a3, &AdminAction::SetRefundContract(new_refund), &None);
 
         let new_set = Vec::from_array(&env, [admin.clone(), a2.clone()]);
-        let id = client.propose_action(&admin, &AdminAction::SetAdmins(new_set.clone(), 2));
+        let id = client.propose_action(&admin, &AdminAction::SetAdmins(new_set.clone(), 2), &None);
         client.approve_action(&a2, &id);
         client.execute_action(&admin, &id);
         assert_eq!(client.get_admins(), new_set);
@@ -1922,7 +1966,7 @@ mod test {
 
         // Invalid SetAdmins proposals are rejected up front.
         assert_eq!(
-            client.try_propose_action(&admin, &AdminAction::SetAdmins(new_set, 5)),
+            client.try_propose_action(&admin, &AdminAction::SetAdmins(new_set, 5), &None),
             Err(Ok(Error::InvalidThreshold))
         );
     }
