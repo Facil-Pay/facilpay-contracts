@@ -1518,3 +1518,11 @@ Parties can move an escrow's release date without cancelling or disputing when d
 **Authorization:** `caller` must authorize and be the escrow customer, the merchant, or an observer whose `expires_at` is still in the future (`Unauthorized`, code 100). The escrow must exist (`NotFound`, 200). Notes are capped at 50 per escrow (`MaxNotesPerEscrowReached`, 347).
 
 **Event:** `EscrowNoteAdded { escrow_id, author, content_hash }` is emitted for each note and includes the author.
+
+## Absolute Fee Cap (issue #885)
+
+`EscrowFeeConfig` now has an optional `max_fee: Option<i128>` field (token units). It applies to both the global config (`set_escrow_fee_config`) and per-token overrides (`set_token_escrow_fee_config`); `None` preserves the previous uncapped behaviour. `get_escrow_fee_config`, `get_token_escrow_fee_config` and `get_effective_escrow_fee_config` return the field, and `EscrowFeeConfigUpdated` / `TokenEscrowFeeConfigUpdated` now include `max_fee`.
+
+The charge for a payout is `min(amount * fee_bps / 10_000, max_fee)` when a cap is configured. The escrow still snapshots `fee_bps` at creation; the cap is read from the effective (per-token or global) config when fees are charged, so it is applied consistently by full release, partial release, partial disputes, conditional/oracle releases, batch releases and sub-account releases. Fees transferred to the contract are accumulated under `ParticipantKey::AccumulatedFees(token)`, which is what `get_accumulated_escrow_fees(env, token)` returns; capped fees therefore produce capped accumulation. Keeper rewards derived from platform fees also use the capped amount.
+
+**Errors:** `InvalidMaxFee` (348) is returned by both config setters if `max_fee` is `Some` with a negative value. Existing stored configs decode with `max_fee: None` only if written as `None`; configs persisted before this field was added should be migrated with `begin_migration`/batch migration before the new code reads them.

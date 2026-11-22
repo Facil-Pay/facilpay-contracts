@@ -4634,6 +4634,7 @@ fn test_escrow_fee_deduction_and_withdrawal() {
         fee_bps: 500,
         fee_recipient: contract_id.clone(),
         enabled: true,
+        max_fee: None,
     };
     client.set_escrow_fee_config(&admin, &config);
 
@@ -4689,6 +4690,7 @@ fn test_escrow_fee_zero_bps_path() {
         fee_bps: 0,
         fee_recipient: contract_id.clone(),
         enabled: false,
+        max_fee: None,
     };
     client.set_escrow_fee_config(&admin, &config);
 
@@ -4727,6 +4729,7 @@ fn test_fee_config_snapshot_isolation() {
         fee_bps: 0,
         fee_recipient: contract_id.clone(),
         enabled: false,
+        max_fee: None,
     };
     client.set_escrow_fee_config(&admin, &config_initial);
 
@@ -4737,6 +4740,7 @@ fn test_fee_config_snapshot_isolation() {
         fee_bps: 1000,
         fee_recipient: contract_id.clone(),
         enabled: true,
+        max_fee: None,
     };
     client.set_escrow_fee_config(&admin, &config_new);
 

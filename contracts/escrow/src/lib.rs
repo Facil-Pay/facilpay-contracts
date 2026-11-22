@@ -302,6 +302,8 @@ pub enum ActionError {
     InvalidDisputedAmount = 346,
     // Issue #884: escrow note log
     MaxNotesPerEscrowReached = 347,
+    // Issue #885: absolute fee cap
+    InvalidMaxFee = 348,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -418,6 +420,8 @@ pub struct EscrowFeeConfig {
     pub fee_bps: i128,
     pub fee_recipient: Address,
     pub enabled: bool,
+    /// Optional absolute cap in token units; `None` means uncapped.
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -439,6 +443,7 @@ pub struct EscrowFeesWithdrawn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowFeeConfigUpdated {
     pub fee_bps: i128,
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -447,6 +452,7 @@ pub struct TokenEscrowFeeConfigUpdated {
     pub token: Address,
     pub fee_bps: i128,
     pub enabled: bool,
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -2392,6 +2398,9 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_not_paused(&env, "set_escrow_fee_config")?;
+        if config.max_fee.is_some_and(|cap| cap < 0) {
+            return Err(Error::Action(ActionError::InvalidMaxFee));
+        }
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -2401,6 +2410,7 @@ impl EscrowContract {
             .set(&DataKey::Config(ConfigKey::EscrowFeeConfig), &config);
         EscrowFeeConfigUpdated {
             fee_bps: config.fee_bps,
+            max_fee: config.max_fee,
         }
         .publish(&env);
         Ok(())
@@ -2424,6 +2434,7 @@ impl EscrowContract {
                 fee_bps: 0,
                 fee_recipient: env.current_contract_address(),
                 enabled: false,
+                max_fee: None,
             })
     }
 
@@ -2461,6 +2472,9 @@ impl EscrowContract {
         if !(0..=10000).contains(&config.fee_bps) {
             return Err(Error::Basic(BasicError::InvalidBps));
         }
+        if config.max_fee.is_some_and(|cap| cap < 0) {
+            return Err(Error::Action(ActionError::InvalidMaxFee));
+        }
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::TokenEscrowFeeConfig(token.clone())),
             &config,
@@ -2469,6 +2483,7 @@ impl EscrowContract {
             token,
             fee_bps: config.fee_bps,
             enabled: config.enabled,
+            max_fee: config.max_fee,
         }
         .publish(&env);
         Ok(())
@@ -2538,8 +2553,10 @@ impl EscrowContract {
     /// Fee charged for `amount` using the rate snapshotted on the escrow.
     fn escrow_fee_amount(env: &Env, escrow: &Escrow, amount: i128) -> i128 {
         let raw = (amount * escrow.fee_bps) / 10000;
-        let _ = env;
-        raw
+        match Self::effective_fee_config(env, &escrow.token).max_fee {
+            Some(cap) => core::cmp::min(raw, cap),
+            None => raw,
+        }
     }
 
     fn effective_fee_config(env: &Env, token: &Address) -> EscrowFeeConfig {
@@ -4913,7 +4930,7 @@ impl EscrowContract {
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         }
 
-        let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let merchant_amount = escrow.amount - fee_amount;
 
         if fee_amount > 0 {
@@ -5091,7 +5108,7 @@ impl EscrowContract {
             return Err(Error::Action(ActionError::PartialReleaseExceedsBalance));
         }
 
-        let fee_amount = (amount * escrow.fee_bps) / 10000;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, amount);
         let merchant_amount = amount - fee_amount;
 
         if fee_amount > 0 {
@@ -5590,9 +5607,8 @@ impl EscrowContract {
                 fee_amount,
             )?;
             if fee_config.fee_recipient == env.current_contract_address() {
-                let key = DataKey::Participant(ParticipantKey::AccumulatedFees(
-                    escrow.token.clone(),
-                ));
+                let key =
+                    DataKey::Participant(ParticipantKey::AccumulatedFees(escrow.token.clone()));
                 let acc: i128 = env.storage().instance().get(&key).unwrap_or(0);
                 env.storage().instance().set(&key, &(acc + fee_amount));
             }
@@ -9610,7 +9626,7 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-                let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+                let fee_amount = EscrowContract::escrow_fee_amount(env, &escrow, escrow.amount);
                 let merchant_amount = escrow.amount - fee_amount;
 
                 if fee_amount > 0 {
@@ -12003,7 +12019,7 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         // Calculate keeper reward from platform fee
-        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let platform_fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let keeper_reward = if config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
             (platform_fee_amount * config.keeper_reward_bps as i128) / 10000
         } else {
@@ -12572,7 +12588,7 @@ impl EscrowContract {
                 .instance()
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-            let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+            let fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
             let merchant_amount = escrow.amount - fee_amount;
 
             if fee_amount > 0 {
@@ -13505,7 +13521,7 @@ impl EscrowContract {
                 keeper_reward_bps: 0,
             });
 
-        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let platform_fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let keeper_reward = if expiry_config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
             (platform_fee_amount * expiry_config.keeper_reward_bps as i128) / 10000
         } else {
@@ -14582,7 +14598,10 @@ impl EscrowContract {
         }
 
         let fee_bps = Self::effective_sub_account_fee_bps(&sub, escrow.fee_bps);
-        let fee_amount = (sub.amount * fee_bps) / 10000;
+        let fee_cap = Self::effective_fee_config(&env, &escrow.token)
+            .max_fee
+            .unwrap_or(i128::MAX);
+        let fee_amount = core::cmp::min((sub.amount * fee_bps) / 10000, fee_cap);
         let merchant_amount = sub.amount - fee_amount;
 
         if fee_amount > 0 {
@@ -16074,12 +16093,7 @@ impl EscrowContract {
 
     /// Returns notes for an escrow in insertion order, paginated by
     /// `offset` and `limit`.
-    pub fn get_escrow_notes(
-        env: Env,
-        escrow_id: u64,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<EscrowNote> {
+    pub fn get_escrow_notes(env: Env, escrow_id: u64, offset: u32, limit: u32) -> Vec<EscrowNote> {
         let mut notes = Vec::new(&env);
         let count: u64 = env
             .storage()
@@ -16255,7 +16269,9 @@ impl EscrowContract {
     pub fn get_release_date_proposal(env: Env, escrow_id: u64) -> Option<ReleaseDateProposal> {
         env.storage()
             .instance()
-            .get(&DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id)))
+            .get(&DataKey::Dispute(DisputeKey::ReleaseDateProposal(
+                escrow_id,
+            )))
     }
 }
 
