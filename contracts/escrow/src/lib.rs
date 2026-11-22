@@ -105,6 +105,9 @@ pub enum EscrowKey {
     TermsAmendmentCount(u64),
     // Merchant pause state
     MerchantPauseState(Address),
+    // Issue #880: bounded status history (escrow_id, index)
+    StatusHistory(u64, u32),
+    StatusHistoryCount(u64),
 }
 
 #[derive(Clone)]
@@ -396,6 +399,15 @@ pub enum EscrowStatus {
     Disputed,
     Resolved,
     Cancelled,
+}
+
+/// Issue #880: one bounded status-transition record per escrow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EscrowStatusEntry {
+    pub status: EscrowStatus,
+    pub changed_by: Address,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2229,6 +2241,8 @@ pub const INSTANCE_BUMP_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
 /// Instance TTL is extended to this many ledgers (~90 days) so the contract
 /// survives long quiet periods without being archived (#646).
 pub const INSTANCE_BUMP_AMOUNT: u32 = 90 * LEDGERS_PER_DAY;
+/// Issue #880: maximum number of status-history entries kept per escrow.
+pub const MAX_STATUS_HISTORY: u32 = 10;
 
 // Issue #649: Persistent storage TTL constants for per-record and per-user data
 #[allow(dead_code)]
@@ -3882,6 +3896,64 @@ impl EscrowContract {
         Ok(())
     }
 
+    // ── Issue #880: bounded escrow status history ────────────────────────────
+
+    /// Returns status transitions in chronological order (empty for unknown ids).
+    pub fn get_escrow_status_history(env: Env, escrow_id: u64) -> Vec<EscrowStatusEntry> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)))
+            .unwrap_or(0);
+        let mut history = Vec::new(&env);
+        for i in 0..count {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get(&DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i)))
+            {
+                history.push_back(entry);
+            }
+        }
+        history
+    }
+
+    /// Appends one entry, dropping the oldest once `MAX_STATUS_HISTORY` is reached.
+    fn append_status_history(env: &Env, escrow_id: u64, entry: &EscrowStatusEntry) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)))
+            .unwrap_or(0);
+        if count < MAX_STATUS_HISTORY {
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, count)),
+                entry,
+            );
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)),
+                &(count + 1),
+            );
+        } else {
+            // Shift left: index 0 is the oldest entry.
+            for i in 1..MAX_STATUS_HISTORY {
+                let next: EscrowStatusEntry = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i)))
+                    .expect("status history entry");
+                env.storage().instance().set(
+                    &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i - 1)),
+                    &next,
+                );
+            }
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, MAX_STATUS_HISTORY - 1)),
+                entry,
+            );
+        }
+    }
+
     fn internal_create_escrow(
         env: Env,
         customer: Address,
@@ -5234,6 +5306,17 @@ impl EscrowContract {
 
         // Issue #879: close out the merchant's open exposure
         Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
+        // Issue #880: record the transition alongside the status event
+        Self::append_status_history(
+            &env,
+            escrow_id,
+            &EscrowStatusEntry {
+                status: EscrowStatus::Released,
+                changed_by: _admin.clone(),
+                timestamp: current_time,
+            },
+        );
 
         // Emit unified status change event
         EscrowStatusChanged {
@@ -16068,6 +16151,17 @@ impl EscrowContract {
             amount: refund_amount,
         }
         .publish(&env);
+
+        // Issue #880: record the transition alongside the status event
+        Self::append_status_history(
+            &env,
+            escrow_id,
+            &EscrowStatusEntry {
+                status: EscrowStatus::Resolved,
+                changed_by: caller.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Emit unified status change event
         EscrowStatusChanged {

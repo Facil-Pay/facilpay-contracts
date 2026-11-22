@@ -1507,3 +1507,20 @@ limit is configured, creation is unrestricted.
 Creation fails with `EscrowError::ExposureLimitExceeded` (code `344`) when `current exposure +
 amount` would exceed the configured limit. The check applies to `create_escrow` and its variants,
 templates, batch entries (per-entry error code `344`), and child escrows.
+
+## Escrow Status History (Issue #880)
+
+Every transition that publishes `EscrowStatusChanged` also appends an entry to a per-escrow bounded
+history. When `MAX_STATUS_HISTORY` (10) is reached, the oldest entry is dropped. History is
+read-only through the getter; no additional errors or events are introduced (the existing
+`EscrowStatusChanged { escrow_id, old_status, new_status, changed_by, timestamp }` event is emitted
+as before).
+
+| Function | Parameters | Returns | Notes |
+|---|---|---|---|
+| `get_escrow_status_history` | `env: Env`, `escrow_id: u64` | `Vec<EscrowStatusEntry>` | Read-only; empty for unknown ids. Entries are chronological (oldest first). |
+
+`EscrowStatusEntry { status: EscrowStatus, changed_by: Address, timestamp: u64 }` records the new
+status, the address that performed the transition, and the ledger timestamp of the change. The
+history is written on release (`release_escrow`) and refund (`refund_escrow_to`), mirroring each
+`EscrowStatusChanged` event.
