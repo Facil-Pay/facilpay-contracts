@@ -1263,6 +1263,188 @@ On release the payout is split across the configured beneficiaries proportionall
 - Per-reason dispute counts are updated in storage and can be queried with `get_dispute_reason_count(reason) → u64`.
 - Emits `EscrowDisputedWithReason { escrow_id, disputed_by, reason: u32, details_hash }`.
 
+---
+
+## Multi-Party and Multi-Token Escrows
+
+Two escrow variants exist alongside the standard single-customer/single-merchant/single-token `Escrow`: a **multi-party** escrow that splits one token's payout across several participants once a weighted quorum approves, and a **multi-token** escrow that locks several different tokens under one agreement for a single customer/merchant pair.
+
+### Multi-Party Escrow
+
+**`Participant`**
+
+```rust
+pub struct Participant {
+    pub address: Address,
+    pub role: ParticipantRole,
+    pub share_bps: u32,  // payout share in basis points (out of 10000)
+    pub weight_bps: u32, // voting weight in basis points (out of 10000)
+    pub approved: bool,
+    pub approved_at: Option<u64>,
+}
+```
+
+`share_bps` controls how much of `total_amount` a participant receives on release; `weight_bps` is their declared voting weight toward the release quorum. The two are tracked separately on the struct, but see the ⚠️ note below on `create_multi_party_escrow` — in the current code they are not kept separate in practice until `set_participant_weight` is called.
+
+**`create_multi_party_escrow(env, customer: Address, participants: Vec<Participant>, total_amount: i128, token: Address, release_timestamp: u64) -> Result<u64, Error>`**
+
+- `customer` must authorize (`require_auth`); this is the funder, not a registered participant.
+- Requires 2–10 participants. Errors `Escrow(InvalidStatus)` if there are fewer than 2 or more than 10, if the participants' `share_bps` don't sum to exactly `10000`, or if their `weight_bps` don't sum to exactly `10000`.
+- Errors `Basic(DuplicateApproval)` if any two participants share the same address.
+- Every participant's `approved`/`approved_at` is reset to `false`/`None` regardless of what the caller passed in.
+- `total_amount` of `token` is pulled from `customer` into the contract via a direct `token::Client::transfer` (not the fee-aware `transfer_if_token_contract` path — multi-party escrows do not apply the platform escrow fee).
+- The release threshold defaults to **10000 bps (unanimous)**; lower it later with `update_approval_threshold_bps`.
+- Emits `MultiPartyEscrowCreated { escrow_id, participant_count }`.
+
+⚠️ **Known quirk — initial voting weight is seeded from `share_bps`, not `weight_bps`.** At creation, the contract stores each participant's per-escrow vote weight as `p.share_bps` (not `p.weight_bps`). `approve_release` and the quorum calculation in `release_multi_party_escrow` both read that stored vote weight (falling back to `weight_bps` only if nothing was ever stored for that participant — which does not happen, since creation always stores one). In practice this means **`share_bps` is what actually determines voting power until an admin calls `set_participant_weight` to overwrite it** with the intended `weight_bps`. If your `share_bps` and `weight_bps` values differ, call `set_participant_weight` for every participant immediately after creation if you need voting power to track the declared `weight_bps` rather than the payout share.
+
+**`approve_release(env, caller: Address, escrow_id: u64) -> Result<(), Error>`**
+
+- `caller` must authorize.
+- Errors: `Escrow(NotFound)` (no such escrow), `Escrow(InvalidStatus)` (escrow not `Locked`), `Basic(DuplicateApproval)` (caller already recorded an approval, or that participant's `approved` flag is already set), `Basic(Unauthorized)` (caller is not one of the escrow's participants, or their current stored vote weight is `0`).
+- On success, records the caller in `approvals`, flips their `approved`/`approved_at`, and emits `ParticipantApproved { escrow_id, approver }`.
+
+**`get_approval_weight(env, escrow_id: u64) -> Result<(u32, u32), Error>`**
+
+Returns `(current_cumulative_approved_weight_bps, required_threshold_bps)`. Errors `Escrow(NotFound)` if the escrow doesn't exist.
+
+**`set_participant_weight(env, admin: Address, escrow_id: u64, participant: Address, weight_bps: u32) -> Result<(), Error>`**
+
+- `admin` must authorize and be a member of the multisig admin set (`Basic(NotAnAdmin)` otherwise).
+- Errors `Escrow(InvalidStatus)` if the escrow is not `Locked`, or if **any** participant has already approved (weights are frozen once voting has started).
+- Errors `Basic(ParticipantNotFound)` if `participant` is not one of the escrow's participants.
+- Errors `Escrow(InvalidStatus)` if the resulting total of all participants' `weight_bps` would not equal exactly `10000`.
+- On success, updates both the participant's `weight_bps` on the stored struct and the per-escrow vote weight actually used by `approve_release`/quorum checks, and emits `WeightUpdated { escrow_id, participant, weight_bps }`.
+
+**`update_approval_threshold_bps(env, admin: Address, escrow_id: u64, threshold_bps: u32) -> Result<(), Error>`**
+
+- `admin` must authorize and be a multisig admin (`Basic(NotAnAdmin)` otherwise).
+- `threshold_bps` must be in `1..=10000`, else `Escrow(InvalidThreshold)`.
+- Errors `Escrow(InvalidStatus)` if the escrow is not `Locked`.
+- Emits `ThresholdUpdated { escrow_id, threshold_bps }`.
+
+**`release_multi_party_escrow(env, escrow_id: u64) -> Result<(), Error>`**
+
+⚠️ **This function takes no caller parameter and performs no authorization check at all — it is callable by anyone, including addresses with no relationship to the escrow**, once the quorum and timing conditions below are met.
+
+- Errors `Action(ApprovalsThresholdNotMet)` if the cumulative approved weight is below the stored threshold.
+- Errors `Escrow(ReleaseNotYetAvailable)` if `now < release_timestamp`.
+- On success, pays each participant `total_amount * share_bps / 10000` directly via `token::Client::transfer`, sets status to `Released`, and emits `MultiPartyEscrowReleased { escrow_id }`.
+
+**`cancel_multi_party_escrow(env, customer: Address, escrow_id: u64) -> Result<(), Error>`**
+
+⚠️ **Despite its doc comment and parameter name, this function performs no ownership check whatsoever.** `MultiPartyEscrow` has no `customer` field — it only has `id, participants, total_amount, token, status, approvals, threshold_bps, created_at, release_timestamp`. The function body only calls `customer.require_auth()`; it never checks that `customer` is a participant, the original funder, or anyone with any prior relationship to the escrow. **In the current implementation, any address that can produce its own valid signature may call this once `release_timestamp` has passed on a `Locked` escrow, and the full `total_amount` is refunded to whatever address was passed in as `customer`** — not necessarily the party that funded it. Treat this as a known gap rather than relying on the parameter name for access control.
+
+- Errors `Escrow(NotFound)` if the escrow doesn't exist, `Escrow(InvalidStatus)` if not `Locked`, `Escrow(ReleaseNotYetAvailable)` if `now < release_timestamp`.
+- On success, sets status to `Cancelled` and transfers the full `total_amount` back via `token::Client::transfer`. No event is emitted.
+
+**`get_multi_party_escrow(env, escrow_id: u64) -> Result<MultiPartyEscrow, Error>`** — read-only getter for the full struct; `Escrow(NotFound)` if missing.
+
+### Multi-Token Escrow
+
+**`TokenEntry`**
+
+```rust
+pub struct TokenEntry {
+    pub token: Address,
+    pub amount: i128,
+}
+```
+
+**`create_multi_token_escrow(env, customer: Address, merchant: Address, tokens: Vec<TokenEntry>, release_timestamp: u64) -> Result<u64, Error>`**
+
+- `customer` must authorize.
+- Requires 1–10 token entries with no duplicate `token` addresses; both violations error `Escrow(InvalidStatus)`.
+- Pulls each entry's `amount` of its `token` from `customer` into the contract, one `token::Client::transfer` per token.
+- Emits `MultiTokenEscrowCreated { escrow_id, customer, merchant, token_count, release_timestamp }`.
+
+**`release_multi_token_escrow(env, escrow_id: u64) -> Result<(), Error>`**
+
+⚠️ Like its multi-party counterpart, this takes no caller parameter and has no authorization check — callable by anyone once the conditions below hold.
+
+- Errors `Escrow(InvalidStatus)` if not `Locked`, `Escrow(ReleaseNotYetAvailable)` if `now < release_timestamp`.
+- **Atomic pre-flight check:** before moving any funds, the contract checks every token's actual contract balance via `try_balance`; if any token's balance is insufficient, or the balance call itself fails, the whole call errors `Escrow(InvalidStatus)` and nothing moves.
+- Only after every balance check passes does it transfer each token's full `amount` to `merchant` via `try_transfer`; if any individual transfer fails at this point, the call still errors `Escrow(InvalidStatus)` (a transfer failure after the pre-flight check, though not expected in normal operation, is not rolled back for earlier transfers in the same call — see the contract's general atomicity notes elsewhere in this README for how Soroban's own transaction semantics bound this).
+- On full success, sets status to `Released` and emits `MultiTokenEscrowReleased { escrow_id, merchant, token_count }`.
+
+**`cancel_multi_token_escrow(env, customer: Address, escrow_id: u64) -> Result<(), Error>`**
+
+Unlike `cancel_multi_party_escrow`, this one is properly authorized: `MultiTokenEscrow` does store a `customer` field, and the function checks `escrow.customer != customer` → `Basic(Unauthorized)` before proceeding.
+
+- Errors `Escrow(NotFound)` if missing, `Escrow(InvalidStatus)` if not `Locked`, `Escrow(ReleaseNotYetAvailable)` if `now < release_timestamp`.
+- On success, refunds every token entry's full amount back to `customer`. No event is emitted.
+
+**`get_multi_token_escrow(env, escrow_id: u64) -> Result<MultiTokenEscrow, Error>`** — read-only getter; `Escrow(NotFound)` if missing.
+
+---
+
+## Dispute Evidence API
+
+Evidence for a `Disputed` escrow can be submitted three ways: a single unverified item (`submit_evidence`, documented elsewhere in this README), a single item verified against a pre-committed Merkle root (`submit_evidence_with_proof`), or an unverified batch of up to 10 items in one call (`submit_evidence_batch`). All three require the caller to be the escrow's `customer` or `merchant` while it is `Disputed`.
+
+### Committing a Merkle root
+
+**`commit_evidence_root(env, caller: Address, escrow_id: u64, merkle_root: BytesN<32>) -> Result<(), Error>`**
+
+- `caller` must authorize and be the escrow's customer or merchant (`Basic(Unauthorized)` otherwise); the escrow must be `Disputed` (`Action(NotDisputed)` otherwise).
+- Can be called **at most once per escrow** — errors `Basic(RootAlreadyCommitted)` if a root was already committed.
+- Stores `EvidenceCommitment { escrow_id, merkle_root, committed_at, committed_by }`. No event is emitted.
+
+**`get_evidence_commitment(env, escrow_id: u64) -> Result<EvidenceCommitment, Error>`**
+
+Errors `Escrow(NotFound)` if the escrow itself doesn't exist. ⚠️ **If the escrow exists but no root was ever committed, this also errors `Basic(RootAlreadyCommitted)`** — the same variant `commit_evidence_root` uses to mean "a root already exists, you can't commit another." The name is misleading for this case: treat `Err(Basic(RootAlreadyCommitted))` from `get_evidence_commitment` as "no commitment exists yet" rather than literally "already committed."
+
+### Building a Merkle root and proof off-chain
+
+`submit_evidence_with_proof` verifies a standard binary Merkle tree of Keccak-256 hashes:
+
+1. Hash each piece of evidence with Keccak-256 to get its leaf hash: `leaf = keccak256(evidence_bytes)`.
+2. Build the tree bottom-up: pair adjacent leaves left-to-right and hash each pair as `keccak256(left_bytes || right_bytes)` (32 + 32 raw bytes concatenated, not re-encoded) to get the parent level. Repeat until one root remains. Commit that root with `commit_evidence_root`.
+3. For a given leaf at `leaf_index`, the proof is the array of sibling hashes along the path from that leaf to the root, ordered from the leaf's level upward.
+4. On-chain verification (`verify_keccak_merkle_proof`) walks the proof: starting from `computed = leaf_hash` and `idx = leaf_index`, at each proof step it computes `keccak256(computed || sibling)` if `idx` is even (the current node is a left child) or `keccak256(sibling || computed)` if `idx` is odd (the current node is a right child), then halves `idx` and moves to the next proof entry. The final `computed` value must equal the committed root.
+
+**`submit_evidence_with_proof(env, caller: Address, escrow_id: u64, evidence: Bytes, proof: Vec<BytesN<32>>, leaf_index: u32) -> Result<(), Error>`**
+
+- `caller` must authorize and be the escrow's customer or merchant on a `Disputed` escrow (same checks as `commit_evidence_root`).
+- If no root has been committed yet for this escrow, this falls back to the same unverified path as `submit_evidence` (the `proof`/`leaf_index` arguments are ignored in that case).
+- If a root has been committed, the proof is verified as above; an invalid proof errors `Basic(InvalidMerkleProof)` and emits no event.
+- ⚠️ **Unlike `submit_evidence` and `submit_evidence_batch`, this function does not check `escrow.evidence_deadline` at all** — it has no deadline enforcement in either the fallback or proof-verified path. A proof-verified submission is accepted even after the configured evidence deadline has passed.
+- On success (either path), stores an `Evidence { submitter, ipfs_hash, submitted_at }` entry and emits `EvidenceSubmitted { escrow_id, submitter, ipfs_hash }`.
+
+### Reading single-item evidence
+
+**`get_evidence_count(env: &Env, escrow_id: u64) -> u64`** — note the `&Env` parameter (unlike most functions in this contract, which take `Env` by value); it is still exposed through the generated client and callable externally (`client.get_evidence_count(&escrow_id)`). Returns `0` if nothing has been submitted via `submit_evidence`/`submit_evidence_with_proof`.
+
+**`get_evidence(env, escrow_id: u64, limit: u64, offset: u64) -> Vec<Evidence>`** — paginated. Returns an empty vector if `limit == 0` or `offset >= total`; otherwise returns items `offset..min(total, offset + limit)`.
+
+### Batch submission
+
+**`submit_evidence_batch(env, caller: Address, escrow_id: u64, evidence_items: Vec<Bytes>) -> Result<u32, Error>`**
+
+- `caller` must authorize and be the escrow's customer or merchant on a `Disputed` escrow.
+- Capped at **10 items per batch** — errors `Escrow(BatchTooLarge)` if `evidence_items.len() > 10`.
+- If the escrow has an evidence deadline set and `now > deadline`, emits `EvidenceDeadlineExceeded { escrow_id, deadline, submitted_at }` and errors `Action(EvidenceDeadlinePassed)`.
+- Each item is converted to a stored label string using a UTF-8-safe prefix **capped at 160 bytes** (longer evidence blobs are truncated for the on-chain label; store the full content off-chain and reference it by this label/hash).
+- ⚠️ **Batch evidence is stored separately from single-item evidence.** `submit_evidence_batch` writes to its own page-indexed storage (`EvidencePage`/`EvidencePageCount`), distinct from the `Evidence`/`EvidenceCount` keys that back `get_evidence`/`get_evidence_count`. Items submitted via `submit_evidence_batch` do **not** appear in `get_evidence` or count toward `get_evidence_count`, and vice versa.
+- Returns the **1-based** page number just written (the first batch call returns `1`, the second returns `2`, and so on).
+
+**`get_evidence_page(env, escrow_id: u64, page: u32) -> Vec<Evidence>`**
+
+Reads back a batch page. ⚠️ **This is 0-indexed**, while `submit_evidence_batch` returns a 1-based count — to read the page written by a call that returned `N`, pass `page = N - 1` (the first batch you submit is read back with `get_evidence_page(escrow_id, 0)`, not `1`). Returns an empty vector if that page doesn't exist.
+
+### Evidence deadline configuration
+
+**`set_evidence_deadline_config(env, admin: Address, config: EvidenceDeadlineConfig) -> Result<(), Error>`**
+
+- `admin` must authorize and be a multisig admin (`Basic(NotAnAdmin)` otherwise).
+- Sets the **global default** `evidence_deadline_seconds` used for every dispute opened from this point forward. Changing it does not retroactively affect disputes already in progress (their deadline was already computed and stored on the escrow when the dispute opened).
+
+**`get_evidence_deadline_config(env) -> EvidenceDeadlineConfig`**
+
+No auth required. Defaults to `{ evidence_deadline_seconds: 604800 }` (7 days) if never configured.
+
+**When the deadline actually starts counting:** the global `evidence_deadline_seconds` is only read once, at the moment `dispute_escrow` transitions an escrow from `Locked` to `Disputed`. At that point the contract computes `escrow.evidence_deadline = Some(dispute_started_at + evidence_deadline_seconds)` and emits `EvidenceDeadlineSet { escrow_id, deadline, set_at }`. It is **not** a global wall-clock deadline — it is per-escrow, anchored to when that escrow's dispute began. `submit_evidence` and `submit_evidence_batch` both enforce this per-escrow deadline; `submit_evidence_with_proof` does not (see the ⚠️ note above).
+
 ## Contract Upgrades
 
 | Function | Parameters | Returns | Auth |
