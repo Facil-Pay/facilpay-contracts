@@ -3698,16 +3698,11 @@ impl EscrowContract {
             .unwrap_or_else(|| Vec::new(&env));
         if !tokens.contains(&token) {
             tokens.push_back(token.clone());
-            env.storage().instance().set(
-                &DataKey::Config(ConfigKey::EscrowAllowedTokens),
-                &tokens,
-            );
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::EscrowAllowedTokens), &tokens);
         }
-        EscrowTokenAdded {
-            token,
-            admin,
-        }
-        .publish(&env);
+        EscrowTokenAdded { token, admin }.publish(&env);
         Ok(())
     }
 
@@ -3731,16 +3726,11 @@ impl EscrowContract {
                     updated.push_back(existing);
                 }
             }
-            env.storage().instance().set(
-                &DataKey::Config(ConfigKey::EscrowAllowedTokens),
-                &updated,
-            );
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::EscrowAllowedTokens), &updated);
         }
-        EscrowTokenRemoved {
-            token,
-            admin,
-        }
-        .publish(&env);
+        EscrowTokenRemoved { token, admin }.publish(&env);
         Ok(())
     }
 
@@ -3804,7 +3794,11 @@ impl EscrowContract {
     }
 
     /// Returns the configured limit, or `None` when the merchant is unlimited.
-    pub fn get_merchant_exposure_limit(env: Env, merchant: Address, token: Address) -> Option<i128> {
+    pub fn get_merchant_exposure_limit(
+        env: Env,
+        merchant: Address,
+        token: Address,
+    ) -> Option<i128> {
         env.storage()
             .instance()
             .get(&DataKey::Config(ConfigKey::MerchantExposureLimit(
@@ -3822,7 +3816,12 @@ impl EscrowContract {
             .unwrap_or(0)
     }
 
-    fn add_exposure(env: &Env, merchant: &Address, token: &Address, amount: i128) -> Result<(), Error> {
+    fn add_exposure(
+        env: &Env,
+        merchant: &Address,
+        token: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
         let key = DataKey::Config(ConfigKey::MerchantExposure(merchant.clone(), token.clone()));
         let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
         let next = current.saturating_add(amount);
@@ -5296,6 +5295,9 @@ impl EscrowContract {
             a.total_value_released += rel_amount;
         });
 
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
         EscrowReleased {
             escrow_id,
             recipient,
@@ -5303,9 +5305,6 @@ impl EscrowContract {
             token: escrow.token,
         }
         .publish(&env);
-
-        // Issue #879: close out the merchant's open exposure
-        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         // Issue #880: record the transition alongside the status event
         Self::append_status_history(

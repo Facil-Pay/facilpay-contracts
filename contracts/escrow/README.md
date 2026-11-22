@@ -1524,3 +1524,17 @@ as before).
 status, the address that performed the transition, and the ledger timestamp of the change. The
 history is written on release (`release_escrow`) and refund (`refund_escrow_to`), mirroring each
 `EscrowStatusChanged` event.
+
+## Minimum Escrow Amount Per Token (Issue #882)
+
+An unset minimum means no minimum is enforced, preserving existing behaviour.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_min_escrow_amount` | `env: Env`, `admin: Address`, `token: Address`, `min_amount: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MinEscrowAmountUpdated { token, min_amount, admin }` |
+| `get_min_escrow_amount` | `env: Env`, `token: Address` | `Option<i128>` | Read-only; `None` when unset | None |
+
+Any creation with `amount < min_amount` fails with `EscrowError::AmountBelowMinimum` (code `345`).
+The check is applied to every creation path: single escrows and their reference/beneficiary/multisig
+variants, templates and recurring schedules, batch entries (per-entry error code `345`),
+multi-party escrows, every token of a multi-token escrow, and child escrows.
