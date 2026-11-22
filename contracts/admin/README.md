@@ -114,6 +114,11 @@ Each field is a `ChildContractStatus` enum that can be:
 | 18 | `CancellationNotAllowed` | Caller is neither the proposer nor backed by a threshold of current admin approvals. |
 | 19 | `ApprovalNotFound` | `revoke_approval` was called by an admin who had not approved the proposal. |
 | 20 | `InvalidPagination` | A proposal listing was requested with `limit == 0`. |
+| 21 | `NoQueuedUpgrade` | No queued upgrade exists for the child contract. |
+| 22 | `UpgradeTooEarly` | `execute_child_upgrade` was called before `execute_after`. |
+| 23 | `UpgradeVetoed` | The queued upgrade was cancelled by the required number of vetoes. |
+| 24 | `InvalidUpgradeConfig` | Invalid veto threshold, or the queued upgrade timestamp overflowed. |
+| 25 | `AlreadyVetoed` | The same admin tried to veto a queued upgrade twice. |
 
 ## Multisig Admin
 
@@ -477,3 +482,34 @@ pub struct AdminProposal {
 | `ApprovalRevoked` | `proposal_id: u64`, `admin: Address`, `approvals: u32` | `revoke_approval` |
 | `ProposalCancelled` | `proposal_id: u64`, `cancelled_by: Address` | `cancel_proposal` |
 
+## Child Upgrade Veto Window
+
+`queue_child_upgrade` / `execute_child_upgrade` replace a single immediate
+`upgrade_children` call with a two-step flow for one child at a time. The delay
+and number of vetoes needed to cancel are configurable.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `configure_child_upgrade` | `admin: Address`, `delay_seconds: u64`, `veto_threshold: u32` | Sets the window. `veto_threshold` must be `1..=MAX_ADMINS`. Defaults: 24 h delay, 2 vetoes. |
+| `get_child_upgrade_config` | — | Returns `ChildUpgradeConfig { delay_seconds, veto_threshold }`. |
+| `queue_child_upgrade` | `admin: Address`, `child_kind: ChildKind`, `wasm_hash: BytesN<32>` | Queues an upgrade, setting `execute_after = now + delay_seconds`. |
+| `get_queued_child_upgrade` | `child_kind: ChildKind` | Returns the queued upgrade, if any. |
+| `veto_child_upgrade` | `admin: Address`, `child_kind: ChildKind` | Adds the caller's veto; reaching `veto_threshold` marks the upgrade vetoed. |
+| `execute_child_upgrade` | `admin: Address`, `child_kind: ChildKind` | Applies the queued upgrade after the delay. |
+
+Errors: `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` (24),
+`NoQueuedUpgrade` (21), `UpgradeTooEarly` (22), `UpgradeVetoed` (23),
+`AlreadyVetoed` (25). Child errors abort the transaction and leave the queue
+entry intact.
+
+Events:
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `ChildUpgradeQueued` | `child_kind`, `wasm_hash`, `execute_after` | `queue_child_upgrade` |
+| `ChildUpgradeVetoed` | `child_kind`, `admin`, `vetoes`, `threshold` | `veto_child_upgrade` |
+| `ChildUpgradeExecuted` | `child_kind`, `wasm_hash`, `executed_by` | `execute_child_upgrade` |
+
+A successful execution also emits `ChildContractUpgraded` and the child's own
+pause/unpause events. As with `upgrade_children`, the coordinator must be an
+authorized admin on the child contract and the WASM must already be uploaded.

@@ -22,6 +22,12 @@ pub const MAX_INCIDENT_PAGE: u32 = 50;
 /// Maximum number of proposals a listing page returns (#873).
 pub const MAX_PROPOSAL_PAGE: u32 = 50;
 
+/// Default delay, in seconds, before a queued child upgrade may run (#874).
+pub const DEFAULT_CHILD_UPGRADE_DELAY: u64 = 24 * 60 * 60;
+
+/// Default number of vetoes that cancel a queued child upgrade (#874).
+pub const DEFAULT_CHILD_UPGRADE_VETOES: u32 = 2;
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -50,6 +56,12 @@ pub enum Error {
     ApprovalNotFound = 19,
     // #873: bounded proposal pagination
     InvalidPagination = 20,
+    // #874: veto window for child upgrades
+    NoQueuedUpgrade = 21,
+    UpgradeTooEarly = 22,
+    UpgradeVetoed = 23,
+    InvalidUpgradeConfig = 24,
+    AlreadyVetoed = 25,
 }
 
 #[contracttype]
@@ -74,6 +86,9 @@ pub enum DataKey {
     Proposal(u64),
     // #820: timestamp at which the current emergency pause may be expired.
     EmergencyPauseExpiry,
+    // #874: veto-window configuration and queued child upgrades.
+    ChildUpgradeConfig,
+    QueuedChildUpgrade(ChildKind),
     // #818: number of incident log entries and each entry by id (persistent).
     IncidentCount,
     Incident(u64),
@@ -106,6 +121,28 @@ pub struct AdminProposal {
     pub executed: bool,
     /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
     pub cancelled: bool,
+}
+
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
 }
 
 /// Schema versions across the platform (#817). A child is `None` when its
@@ -158,6 +195,34 @@ pub struct ApprovalRevoked {
 pub struct ProposalCancelled {
     pub proposal_id: u64,
     pub cancelled_by: Address,
+}
+
+/// Emitted when a child upgrade enters its veto window (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeQueued {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub execute_after: u64,
+}
+
+/// Emitted on every veto cast against a queued child upgrade (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeVetoed {
+    pub child_kind: ChildKind,
+    pub admin: Address,
+    pub vetoes: u32,
+    pub threshold: u32,
+}
+
+/// Emitted after a queued child upgrade is applied (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeExecuted {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub executed_by: Address,
 }
 
 #[contractevent]
@@ -564,6 +629,96 @@ fn upgrade_children_wasm(
         refund_client.unpause_contract(&coordinator);
     }
     Ok(())
+}
+
+/// Pauses, upgrades and unpauses a single child contract (#874). A child that
+/// was already paused is left paused, matching `upgrade_children_wasm`.
+fn upgrade_single_child_wasm(
+    env: &Env,
+    target: ChildKind,
+    wasm_hash: BytesN<32>,
+    upgraded_by: Address,
+) -> Result<(), Error> {
+    let child = child_contract(env, target)?;
+    let coordinator = env.current_contract_address();
+    let reason = String::from_str(env, "veto-window upgrade");
+    let now = env.ledger().timestamp();
+
+    let was_paused = match target {
+        ChildKind::Payment => {
+            PaymentContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+        ChildKind::Escrow => {
+            EscrowContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+        ChildKind::Refund => {
+            RefundContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+    };
+    if !was_paused {
+        match target {
+            ChildKind::Payment => {
+                PaymentContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+            ChildKind::Escrow => {
+                EscrowContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+            ChildKind::Refund => {
+                RefundContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+        }
+    }
+
+    match target {
+        ChildKind::Payment => {
+            PaymentContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+        ChildKind::Escrow => {
+            EscrowContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+        ChildKind::Refund => {
+            RefundContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+    }
+    ChildContractUpgraded {
+        child_kind: target,
+        contract: child.clone(),
+        new_wasm_hash: wasm_hash.clone(),
+        upgraded_by: upgraded_by.clone(),
+        upgraded_at: now,
+    }
+    .publish(env);
+
+    if !was_paused {
+        match target {
+            ChildKind::Payment => {
+                PaymentContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+            ChildKind::Escrow => {
+                EscrowContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+            ChildKind::Refund => {
+                RefundContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_child_upgrade_config(env: &Env) -> ChildUpgradeConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::ChildUpgradeConfig)
+        .unwrap_or(ChildUpgradeConfig {
+            delay_seconds: DEFAULT_CHILD_UPGRADE_DELAY,
+            veto_threshold: DEFAULT_CHILD_UPGRADE_VETOES,
+        })
 }
 
 /// Validates and bounds a proposal listing page (#873).
@@ -1483,6 +1638,168 @@ impl AdminContract {
         load_admins(&env)?;
         let (offset, limit) = checked_page(offset, limit)?;
         Ok(collect_open_proposals(&env, offset, limit, Some(&admin)))
+    }
+
+    /// Configures the child-upgrade veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` when
+    /// `veto_threshold` is 0 or above `MAX_ADMINS`.
+    pub fn configure_child_upgrade(
+        env: Env,
+        admin: Address,
+        delay_seconds: u64,
+        veto_threshold: u32,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        if veto_threshold == 0 || veto_threshold > MAX_ADMINS {
+            return Err(Error::InvalidUpgradeConfig);
+        }
+        env.storage().instance().set(
+            &DataKey::ChildUpgradeConfig,
+            &ChildUpgradeConfig {
+                delay_seconds,
+                veto_threshold,
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the current child-upgrade veto-window configuration (#874).
+    pub fn get_child_upgrade_config(env: Env) -> ChildUpgradeConfig {
+        load_child_upgrade_config(&env)
+    }
+
+    /// Queues a single child WASM upgrade behind a veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` on overflow.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeQueued` with the target and WASM hash.
+    pub fn queue_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        child_contract(&env, child_kind)?;
+        let config = load_child_upgrade_config(&env);
+        let queued_at = env.ledger().timestamp();
+        let execute_after = queued_at
+            .checked_add(config.delay_seconds)
+            .ok_or(Error::InvalidUpgradeConfig)?;
+        let queued = QueuedChildUpgrade {
+            child_kind: child_kind.clone(),
+            wasm_hash: wasm_hash.clone(),
+            queued_at,
+            execute_after,
+            vetoes: Vec::new(&env),
+            vetoed: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QueuedChildUpgrade(child_kind.clone()), &queued);
+        ChildUpgradeQueued {
+            child_kind,
+            wasm_hash,
+            execute_after,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the queued upgrade for a child, if any (#874).
+    pub fn get_queued_child_upgrade(env: Env, child_kind: ChildKind) -> Option<QueuedChildUpgrade> {
+        env.storage()
+            .instance()
+            .get(&DataKey::QueuedChildUpgrade(child_kind))
+    }
+
+    /// Casts a veto against a queued child upgrade (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `NoQueuedUpgrade`, `UpgradeVetoed`,
+    /// `AlreadyVetoed`.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeVetoed` with the current veto count and threshold.
+    pub fn veto_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let mut queued: QueuedChildUpgrade = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::NoQueuedUpgrade)?;
+        if queued.vetoed {
+            return Err(Error::UpgradeVetoed);
+        }
+        if queued.vetoes.contains(&admin) {
+            return Err(Error::AlreadyVetoed);
+        }
+        queued.vetoes.push_back(admin.clone());
+        let threshold = load_child_upgrade_config(&env).veto_threshold;
+        if queued.vetoes.len() >= threshold {
+            queued.vetoed = true;
+        }
+        env.storage().instance().set(&key, &queued);
+        ChildUpgradeVetoed {
+            child_kind,
+            admin,
+            vetoes: queued.vetoes.len(),
+            threshold,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Executes a queued child upgrade after its veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `NoQueuedUpgrade`, `UpgradeVetoed`,
+    /// `UpgradeTooEarly`; child errors abort the call.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeExecuted` with the WASM hash, plus the child's
+    /// `ChildContractUpgraded`, pause and unpause events.
+    pub fn execute_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let queued: QueuedChildUpgrade = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::NoQueuedUpgrade)?;
+        if queued.vetoed {
+            return Err(Error::UpgradeVetoed);
+        }
+        if env.ledger().timestamp() < queued.execute_after {
+            return Err(Error::UpgradeTooEarly);
+        }
+        upgrade_single_child_wasm(
+            &env,
+            child_kind.clone(),
+            queued.wasm_hash.clone(),
+            admin.clone(),
+        )?;
+        env.storage().instance().remove(&key);
+        ChildUpgradeExecuted {
+            child_kind,
+            wasm_hash: queued.wasm_hash,
+            executed_by: admin,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Returns the admin set (#816).
@@ -2670,5 +2987,55 @@ mod test {
 
         set_time(&env, env.ledger().timestamp() + PROPOSAL_TTL_SECONDS + 1);
         assert_eq!(client.get_pending_proposals(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_child_upgrade_veto_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, _) = setup_multisig(&env);
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.configure_child_upgrade(&admin, &100, &2);
+        let config = client.get_child_upgrade_config();
+        assert_eq!(config.delay_seconds, 100);
+        assert_eq!(config.veto_threshold, 2);
+        assert_eq!(
+            client.try_configure_child_upgrade(&admin, &100, &0),
+            Err(Ok(Error::InvalidUpgradeConfig))
+        );
+
+        client.queue_child_upgrade(&admin, &ChildKind::Payment, &hash);
+        let queued = client
+            .get_queued_child_upgrade(&ChildKind::Payment)
+            .unwrap();
+        assert_eq!(queued.wasm_hash, hash);
+        assert_eq!(queued.execute_after, queued.queued_at + 100);
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Payment),
+            Err(Ok(Error::UpgradeTooEarly))
+        );
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Escrow),
+            Err(Ok(Error::NoQueuedUpgrade))
+        );
+
+        client.veto_child_upgrade(&a2, &ChildKind::Payment);
+        assert_eq!(
+            client.try_veto_child_upgrade(&a2, &ChildKind::Payment),
+            Err(Ok(Error::AlreadyVetoed))
+        );
+        client.veto_child_upgrade(&a3, &ChildKind::Payment);
+        assert!(
+            client
+                .get_queued_child_upgrade(&ChildKind::Payment)
+                .unwrap()
+                .vetoed
+        );
+        set_time(&env, queued.execute_after);
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Payment),
+            Err(Ok(Error::UpgradeVetoed))
+        );
     }
 }
