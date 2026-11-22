@@ -110,6 +110,8 @@ Each field is a `ChildContractStatus` enum that can be:
 | 14 | `PauseNotExpired` | `expire_emergency_pause` was called before the pause expiry. |
 | 15 | `PauseExpired` | `extend_emergency_pause` was called at or after the pause expiry. |
 | 16 | `InvalidPauseDuration` | `max_pause_seconds` is `Some(0)`, `additional_seconds` is 0, or the new expiry overflows `u64`. |
+| 17 | `ProposalCancelled` | The proposal was cancelled by `cancel_proposal`. |
+| 18 | `CancellationNotAllowed` | Caller is neither the proposer nor backed by a threshold of current admin approvals. |
 | 19 | `ApprovalNotFound` | `revoke_approval` was called by an admin who had not approved the proposal. |
 
 ## Multisig Admin
@@ -422,9 +424,42 @@ Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled
 caller never approved). Event: `ApprovalRevoked { proposal_id, admin, approvals }`,
 where `approvals` is the remaining count.
 
+### `cancel_proposal(admin, proposal_id)` (#872)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Current admin member. Must authorize. |
+| `proposal_id` | `u64` | Id of an open proposal. |
+
+The proposer may cancel at any time. Any other current admin may cancel once
+approvals from current admins reach the configured threshold. Cancellation sets
+`AdminProposal.cancelled = true`; `approve_action`, `revoke_approval` and
+`execute_action` then fail with `ProposalCancelled`. Cancelled proposals remain
+readable through `get_proposal`.
+
+Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+`ProposalAlreadyExecuted`, `ProposalExpired`, `CancellationNotAllowed` (18).
+Event: `ProposalCancelled { proposal_id, cancelled_by }`.
+
+### Updated `AdminProposal`
+
+```rust
+pub struct AdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool, // #872
+}
+```
+
 ### Additional lifecycle events
 
 | Event | Fields | Emitted by |
 |---|---|---|
 | `ApprovalRevoked` | `proposal_id: u64`, `admin: Address`, `approvals: u32` | `revoke_approval` |
+| `ProposalCancelled` | `proposal_id: u64`, `cancelled_by: Address` | `cancel_proposal` |
 

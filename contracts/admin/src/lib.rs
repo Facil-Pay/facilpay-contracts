@@ -40,6 +40,9 @@ pub enum Error {
     PauseNotExpired = 14,
     PauseExpired = 15,
     InvalidPauseDuration = 16,
+    // #872: cancelling proposals
+    ProposalCancelled = 17,
+    CancellationNotAllowed = 18,
     // #871: revoking an approval
     ApprovalNotFound = 19,
 }
@@ -96,6 +99,8 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
+    pub cancelled: bool,
 }
 
 /// Schema versions across the platform (#817). A child is `None` when its
@@ -140,6 +145,14 @@ pub struct ApprovalRevoked {
     pub proposal_id: u64,
     pub admin: Address,
     pub approvals: u32,
+}
+
+/// Emitted when a pending proposal is cancelled (#872).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelled {
+    pub proposal_id: u64,
+    pub cancelled_by: Address,
 }
 
 #[contractevent]
@@ -559,6 +572,9 @@ fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
 fn require_open(env: &Env, proposal: &AdminProposal) -> Result<(), Error> {
     if proposal.executed {
         return Err(Error::ProposalAlreadyExecuted);
+    }
+    if proposal.cancelled {
+        return Err(Error::ProposalCancelled);
     }
     if env.ledger().timestamp() > proposal.expires_at {
         return Err(Error::ProposalExpired);
@@ -1215,6 +1231,7 @@ impl AdminContract {
             created_at,
             expires_at,
             executed: false,
+            cancelled: false,
         };
         env.storage().instance().set(&DataKey::ProposalCount, &id);
         env.storage()
@@ -1338,6 +1355,48 @@ impl AdminContract {
             proposal_id,
             admin: admin.clone(),
             approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancels an open proposal (#872).
+    ///
+    /// The proposer may cancel directly. Any other current admin may cancel
+    /// once approvals from current admins reach the threshold.
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired`, `CancellationNotAllowed`.
+    ///
+    /// # Events
+    /// Emits `ProposalCancelled`.
+    pub fn cancel_proposal(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+
+        let mut allowed = proposal.proposer == admin;
+        if !allowed {
+            let admins = load_admins(&env)?;
+            let valid = proposal
+                .approvals
+                .iter()
+                .filter(|a| admins.contains(a))
+                .count() as u32;
+            allowed = valid >= load_threshold(&env);
+        }
+        if !allowed {
+            return Err(Error::CancellationNotAllowed);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        ProposalCancelled {
+            proposal_id,
+            cancelled_by: admin,
         }
         .publish(&env);
         Ok(())
@@ -2451,5 +2510,44 @@ mod test {
             client.try_revoke_approval(&a2, &id),
             Err(Ok(Error::ProposalAlreadyExecuted))
         );
+    }
+
+    #[test]
+    fn test_cancel_proposal_blocks_approval_and_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let id = client.propose_action(
+            &admin,
+            &AdminAction::SetPaymentContract(new_payment.clone()),
+        );
+
+        // A third admin cannot cancel while only one approval is in place.
+        assert_eq!(
+            client.try_cancel_proposal(&a3, &id),
+            Err(Ok(Error::CancellationNotAllowed))
+        );
+        // Two current admins have approved, so any admin may cancel.
+        client.approve_action(&a2, &id);
+        client.cancel_proposal(&a3, &id);
+        let proposal = client.get_proposal(&id);
+        assert!(proposal.cancelled);
+        assert_eq!(
+            client.try_approve_action(&a3, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        assert_eq!(
+            client.try_cancel_proposal(&admin, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        // The proposer may always cancel their own proposal.
+        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(new_payment));
+        client.cancel_proposal(&admin, &id2);
+        assert!(client.get_proposal(&id2).cancelled);
     }
 }
