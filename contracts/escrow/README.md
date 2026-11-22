@@ -1492,3 +1492,16 @@ Parties can move an escrow's release date without cancelling or disputing when d
 **Errors:** `NotFound` (200), `InvalidStatus` (201), `Unauthorized` (100), `ReleaseDateProposalExists` (343), `ReleaseDateProposalNotFound` (344), `InvalidReleaseDate` (345).
 
 **Events:** `ReleaseDateProposed { escrow_id, proposed_by, new_release_timestamp }`, `ReleaseDateAccepted { escrow_id, accepted_by, new_release_timestamp }`, `ReleaseDateRejected { escrow_id, rejected_by, proposed_by }`.
+
+## Partial Disputes (issue #883)
+
+`dispute_escrow_partial(customer: Address, escrow_id: u64, disputed_amount: i128, reason: DisputeReason)` lets a customer freeze only part of a `Locked` escrow.
+
+- The undisputed remainder (`amount - released_amount - disputed_amount`) is transferred to the merchant immediately, after the escrow's fee is deducted. The fee is transferred to the configured recipient and accumulated when that recipient is the contract; `released_amount` is incremented by the released total, so fee and payout accounting stay consistent.
+- The escrow moves to `Disputed`; the `evidence_deadline` is set, the caller is recorded as dispute opener, and dispute analytics/reason counts are updated.
+- `disputed_amount` must be positive and no larger than the unreleased balance (`InvalidDisputedAmount`, code 346). Caller must be the escrow customer (`Unauthorized`), the escrow must exist (`NotFound`) and be `Locked` (`InvalidStatus`).
+- `reason` is one of `NonDelivery`, `NotAsDescribed`, `Damaged`, `Fraud`, `Other`; its numeric code is recorded in analytics.
+
+**Resolution:** `resolve_dispute`, `resolve_dispute_split`, `withdraw_dispute` and `auto_resolve_dispute` operate on the remaining disputed balance (`amount - released_amount`) rather than the original amount. Any amount released before the dispute stays with the merchant.
+
+**Event:** `EscrowPartiallyDisputed { escrow_id, disputed_by, disputed_amount, released_amount, reason }`. The normal `EvidenceDeadlineSet` event is also emitted.

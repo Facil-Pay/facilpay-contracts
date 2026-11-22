@@ -295,6 +295,8 @@ pub enum ActionError {
     ReleaseDateProposalExists = 343,
     ReleaseDateProposalNotFound = 344,
     InvalidReleaseDate = 345,
+    // Issue #883: partial disputes
+    InvalidDisputedAmount = 346,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -794,6 +796,17 @@ pub struct MultiTokenEscrowReleased {
     pub escrow_id: u64,
     pub merchant: Address,
     pub token_count: u32,
+}
+
+/// Issue #883: a customer disputed only part of an escrow.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowPartiallyDisputed {
+    pub escrow_id: u64,
+    pub disputed_by: Address,
+    pub disputed_amount: i128,
+    pub released_amount: i128,
+    pub reason: u32,
 }
 
 #[contractevent]
@@ -2496,6 +2509,13 @@ impl EscrowContract {
     /// The effective EscrowFeeConfig for `token`.
     pub fn get_effective_escrow_fee_config(env: Env, token: Address) -> EscrowFeeConfig {
         Self::effective_fee_config(&env, &token)
+    }
+
+    /// Fee charged for `amount` using the rate snapshotted on the escrow.
+    fn escrow_fee_amount(env: &Env, escrow: &Escrow, amount: i128) -> i128 {
+        let raw = (amount * escrow.fee_bps) / 10000;
+        let _ = env;
+        raw
     }
 
     fn effective_fee_config(env: &Env, token: &Address) -> EscrowFeeConfig {
@@ -5501,6 +5521,112 @@ impl EscrowContract {
         Ok(())
     }
 
+    /// Disputes only part of an escrow, releasing the undisputed balance to
+    /// the merchant immediately (after fees) and freezing the rest.
+    pub fn dispute_escrow_partial(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+        disputed_amount: i128,
+        reason: DisputeReason,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "dispute_escrow_partial")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if customer != escrow.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
+        if disputed_amount <= 0 || disputed_amount > remaining {
+            return Err(Error::Action(ActionError::InvalidDisputedAmount));
+        }
+
+        let undisputed = remaining - disputed_amount;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, undisputed);
+        let merchant_amount = undisputed - fee_amount;
+        if fee_amount > 0 {
+            let fee_config = Self::effective_fee_config(&env, &escrow.token);
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &fee_config.fee_recipient,
+                fee_amount,
+            )?;
+            if fee_config.fee_recipient == env.current_contract_address() {
+                let key = DataKey::Participant(ParticipantKey::AccumulatedFees(
+                    escrow.token.clone(),
+                ));
+                let acc: i128 = env.storage().instance().get(&key).unwrap_or(0);
+                env.storage().instance().set(&key, &(acc + fee_amount));
+            }
+            EscrowFeeCollected {
+                escrow_id,
+                fee_amount,
+                recipient: fee_config.fee_recipient,
+            }
+            .publish(&env);
+        }
+        if merchant_amount > 0 {
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                merchant_amount,
+            )?;
+        }
+
+        escrow.released_amount = escrow.released_amount.saturating_add(undisputed);
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Disputed;
+        escrow.dispute_started_at = env.ledger().timestamp();
+        escrow.last_activity_at = escrow.dispute_started_at;
+        let evidence_deadline_seconds =
+            Self::get_evidence_deadline_config(env.clone()).evidence_deadline_seconds;
+        escrow.evidence_deadline = Some(escrow.dispute_started_at + evidence_deadline_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)),
+            &customer,
+        );
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Disputed);
+
+        let reason_code: u32 = match reason {
+            DisputeReason::NonDelivery => 0,
+            DisputeReason::NotAsDescribed => 1,
+            DisputeReason::Damaged => 2,
+            DisputeReason::Fraud => 3,
+            DisputeReason::Other => 4,
+        };
+        let reason_key = DataKey::Dispute(DisputeKey::DisputeReasonCount(reason_code));
+        let count: u64 = env.storage().instance().get(&reason_key).unwrap_or(0);
+        env.storage().instance().set(&reason_key, &(count + 1));
+
+        EscrowPartiallyDisputed {
+            escrow_id,
+            disputed_by: customer,
+            disputed_amount,
+            released_amount: escrow.released_amount,
+            reason: reason_code,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Disputes an escrow with an explicit reason code and evidence hash.
     ///
     /// Behaves identically to `dispute_escrow` but additionally records the
@@ -6300,7 +6426,7 @@ impl EscrowContract {
         EscrowResolved {
             escrow_id,
             released_to_merchant: release_to_merchant,
-            amount: escrow.amount,
+            amount: escrow.amount.saturating_sub(escrow.released_amount),
         }
         .publish(&env);
         Ok(())
@@ -6635,7 +6761,9 @@ impl EscrowContract {
 
         Self::dequeue_escalation(&env, escrow_id);
 
-        // Charge dispute fee to the losing party
+        // Charge dispute fee to the losing party. Only the still-locked
+        // (disputed) remainder is at stake for partial disputes.
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
         let dispute_config = Self::get_dispute_config(env.clone());
         let loser = if release_to_merchant {
             &escrow.customer
@@ -6644,7 +6772,7 @@ impl EscrowContract {
         };
 
         if dispute_config.dispute_fee_bps > 0 {
-            let dispute_fee = (escrow.amount * dispute_config.dispute_fee_bps as i128) / 10000;
+            let dispute_fee = (remaining * dispute_config.dispute_fee_bps as i128) / 10000;
             if dispute_fee > 0 {
                 let token_client = token::Client::new(&env, &escrow.token);
                 token_client.transfer(loser, env.current_contract_address(), &dispute_fee);
@@ -6675,7 +6803,7 @@ impl EscrowContract {
         } else {
             &escrow.customer
         };
-        Self::transfer_if_token_contract(&env, &escrow.token, recipient, escrow.amount)?;
+        Self::transfer_if_token_contract(&env, &escrow.token, recipient, remaining)?;
 
         // Handle collateral distribution
         if let Some(collateral) = env
@@ -6746,7 +6874,7 @@ impl EscrowContract {
         EscrowResolved {
             escrow_id,
             released_to_merchant: release_to_merchant,
-            amount: escrow.amount,
+            amount: remaining,
         }
         .publish(&env);
 
@@ -15173,10 +15301,10 @@ impl EscrowContract {
         Self::dequeue_escalation(&env, escrow_id);
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
 
-        // Compute amounts: merchant gets merchant_bps/10000 of amount; customer
-        // gets the remainder so the two values sum to exactly escrow.amount.
-        let merchant_amount = (escrow.amount * merchant_bps as i128) / 10000_i128;
-        let customer_amount = escrow.amount - merchant_amount;
+        // Compute amounts from the still-locked disputed remainder.
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
+        let merchant_amount = (remaining * merchant_bps as i128) / 10000_i128;
+        let customer_amount = remaining - merchant_amount;
 
         if merchant_amount > 0 {
             Self::transfer_if_token_contract(
