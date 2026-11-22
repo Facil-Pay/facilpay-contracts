@@ -1473,3 +1473,21 @@ Every state-changing entry point first extends the instance storage TTL, so the 
 | `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
 
 17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.
+
+## Admin Token Allowlist (Issue #881)
+
+By default every token is accepted, preserving existing behaviour. Once an admin adds at least
+one token, new escrows may only use tokens on the allowlist. Removing a token never changes an
+existing escrow — it only affects future creations.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `add_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `EscrowTokenAdded { token, admin }` |
+| `remove_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | Same as above; removing an unlisted token is a no-op | `EscrowTokenRemoved { token, admin }` |
+| `get_escrow_tokens` | `env: Env` | `Vec<Address>` | Read-only; empty vector means unrestricted creation | None |
+
+Creation errors: `EscrowError::TokenNotAllowed` (code `343`) is returned by every creation path —
+`create_escrow`, `create_escrow_with_reference`, `create_escrow_with_beneficiaries`,
+`create_escrow_with_multisig`, `create_escrow_from_template`, `create_escrow_batch` (per-entry
+error code `343`), `create_multi_party_escrow`, `create_multi_token_escrow` (each token) and
+recurring/tiered creation helpers — when a non-empty allowlist does not contain the token.

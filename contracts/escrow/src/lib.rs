@@ -42,6 +42,8 @@ pub enum ConfigKey {
     TrustedBridge(Address),
     EvidenceDeadlineConfig,
     TokenEscrowFeeConfig(Address),
+    // Issue #881: admin-managed escrow token allowlist
+    EscrowAllowedTokens,
 }
 
 #[derive(Clone)]
@@ -239,6 +241,12 @@ pub enum EscrowError {
     RecurringScheduleNotFound = 340,
     RecurringScheduleInactive = 341,
     RecurringScheduleComplete = 342,
+    // Issue #881
+    TokenNotAllowed = 343,
+    // Issue #879
+    ExposureLimitExceeded = 344,
+    // Issue #882
+    AmountBelowMinimum = 345,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -341,7 +349,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=235).contains(&code) || (339..=342).contains(&code) {
+            if (200..=235).contains(&code) || (339..=345).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -441,6 +449,22 @@ pub struct TokenEscrowFeeConfigUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenEscrowFeeConfigRemoved {
     pub token: Address,
+}
+
+// ── Issue #881: escrow token allowlist events ────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTokenAdded {
+    pub token: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTokenRemoved {
+    pub token: Address,
+    pub admin: Address,
 }
 
 #[contracttype]
@@ -3617,6 +3641,97 @@ impl EscrowContract {
         )
     }
 
+    // ── Issue #881: admin escrow token allowlist ─────────────────────────────
+
+    /// Adds `token` to the escrow token allowlist. An empty allowlist means all
+    /// tokens are permitted; adding the first token switches enforcement on.
+    pub fn add_escrow_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "add_escrow_token")?;
+        Self::require_multisig_admin(&env, &admin)?;
+
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tokens.contains(&token) {
+            tokens.push_back(token.clone());
+            env.storage().instance().set(
+                &DataKey::Config(ConfigKey::EscrowAllowedTokens),
+                &tokens,
+            );
+        }
+        EscrowTokenAdded {
+            token,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Removes `token` from the escrow token allowlist. Existing escrows are
+    /// unaffected; only new escrow creation is restricted.
+    pub fn remove_escrow_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "remove_escrow_token")?;
+        Self::require_multisig_admin(&env, &admin)?;
+
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        if tokens.contains(&token) {
+            let mut updated = Vec::new(&env);
+            for existing in tokens.iter() {
+                if existing != token {
+                    updated.push_back(existing);
+                }
+            }
+            env.storage().instance().set(
+                &DataKey::Config(ConfigKey::EscrowAllowedTokens),
+                &updated,
+            );
+        }
+        EscrowTokenRemoved {
+            token,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the current allowlist (empty means all tokens are permitted).
+    pub fn get_escrow_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn require_multisig_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        Ok(())
+    }
+
+    fn require_token_allowed(env: &Env, token: &Address) -> Result<(), Error> {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(env));
+        if !tokens.is_empty() && !tokens.contains(token) {
+            return Err(Error::Escrow(EscrowError::TokenNotAllowed));
+        }
+        Ok(())
+    }
+
     fn internal_create_escrow(
         env: Env,
         customer: Address,
@@ -3630,6 +3745,7 @@ impl EscrowContract {
         multisig: Option<MultisigConfiguration>,
         reference: Option<BytesN<32>>,
     ) -> Result<u64, Error> {
+        Self::require_token_allowed(&env, &token)?;
         // Check if merchant has paused escrow creation
         if let Some(pause_state) =
             env.storage()
@@ -3890,6 +4006,7 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         customer.require_auth();
         Self::require_not_paused(&env, "create_multi_party_escrow")?;
+        Self::require_token_allowed(&env, &token)?;
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
@@ -4350,6 +4467,9 @@ impl EscrowContract {
 
         if tokens.is_empty() {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        for entry in tokens.iter() {
+            Self::require_token_allowed(&env, &entry.token)?;
         }
         if tokens.len() > 10 {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
@@ -13022,6 +13142,9 @@ impl EscrowContract {
         // Validate inputs similar to create_escrow
         if entry.amount <= 0 {
             return Err(2); // InvalidStatus
+        }
+        if Self::require_token_allowed(env, &entry.token).is_err() {
+            return Err(343); // EscrowError::TokenNotAllowed
         }
 
         let current_timestamp = env.ledger().timestamp();
