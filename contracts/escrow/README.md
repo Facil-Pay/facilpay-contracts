@@ -1491,3 +1491,19 @@ Creation errors: `EscrowError::TokenNotAllowed` (code `343`) is returned by ever
 `create_escrow_with_multisig`, `create_escrow_from_template`, `create_escrow_batch` (per-entry
 error code `343`), `create_multi_party_escrow`, `create_multi_token_escrow` (each token) and
 recurring/tiered creation helpers — when a non-empty allowlist does not contain the token.
+
+## Per-Merchant Exposure Limit (Issue #879)
+
+Open exposure is tracked per `(merchant, token)` pair. It increases when an escrow is created and
+is reduced when the escrow is released, refunded, cancelled, or fully released in stages. If no
+limit is configured, creation is unrestricted.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_merchant_exposure_limit` | `env: Env`, `admin: Address`, `merchant: Address`, `token: Address`, `limit: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MerchantExposureLimitUpdated { merchant, token, limit, admin }` |
+| `get_merchant_exposure_limit` | `env: Env`, `merchant: Address`, `token: Address` | `Option<i128>` | Read-only; `None` when no limit is set | None |
+| `get_merchant_exposure` | `env: Env`, `merchant: Address`, `token: Address` | `i128` | Read-only; returns `0` when no escrow was ever created | None |
+
+Creation fails with `EscrowError::ExposureLimitExceeded` (code `344`) when `current exposure +
+amount` would exceed the configured limit. The check applies to `create_escrow` and its variants,
+templates, batch entries (per-entry error code `344`), and child escrows.

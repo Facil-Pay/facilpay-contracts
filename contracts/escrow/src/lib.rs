@@ -44,6 +44,11 @@ pub enum ConfigKey {
     TokenEscrowFeeConfig(Address),
     // Issue #881: admin-managed escrow token allowlist
     EscrowAllowedTokens,
+    // Issue #879: per-merchant exposure limit and current exposure
+    MerchantExposureLimit(Address, Address),
+    MerchantExposure(Address, Address),
+    // Issue #882: minimum escrow amount per token
+    MinEscrowAmount(Address),
 }
 
 #[derive(Clone)]
@@ -464,6 +469,27 @@ pub struct EscrowTokenAdded {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowTokenRemoved {
     pub token: Address,
+    pub admin: Address,
+}
+
+// ── Issue #879: merchant exposure events ─────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantExposureLimitUpdated {
+    pub merchant: Address,
+    pub token: Address,
+    pub limit: i128,
+    pub admin: Address,
+}
+
+// ── Issue #882: minimum escrow amount event ──────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinEscrowAmountUpdated {
+    pub token: Address,
+    pub min_amount: i128,
     pub admin: Address,
 }
 
@@ -3732,6 +3758,130 @@ impl EscrowContract {
         Ok(())
     }
 
+    // ── Issue #879: per-merchant exposure limit ──────────────────────────────
+
+    /// Sets the maximum total open escrow value for `(merchant, token)`.
+    pub fn set_merchant_exposure_limit(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        limit: i128,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_merchant_exposure_limit")?;
+        Self::require_multisig_admin(&env, &admin)?;
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant.clone(),
+                token.clone(),
+            )),
+            &limit,
+        );
+        MerchantExposureLimitUpdated {
+            merchant,
+            token,
+            limit,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the configured limit, or `None` when the merchant is unlimited.
+    pub fn get_merchant_exposure_limit(env: Env, merchant: Address, token: Address) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant, token,
+            )))
+    }
+
+    /// Returns the current open escrow value for `(merchant, token)`.
+    pub fn get_merchant_exposure(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantExposure(
+                merchant, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    fn add_exposure(env: &Env, merchant: &Address, token: &Address, amount: i128) -> Result<(), Error> {
+        let key = DataKey::Config(ConfigKey::MerchantExposure(merchant.clone(), token.clone()));
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let next = current.saturating_add(amount);
+        if let Some(limit) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant.clone(),
+                token.clone(),
+            )))
+        {
+            if next > limit {
+                return Err(Error::Escrow(EscrowError::ExposureLimitExceeded));
+            }
+        }
+        env.storage().instance().set(&key, &next);
+        Ok(())
+    }
+
+    fn reduce_exposure(env: &Env, merchant: &Address, token: &Address, amount: i128) {
+        let key = DataKey::Config(ConfigKey::MerchantExposure(merchant.clone(), token.clone()));
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&key, &current.saturating_sub(amount));
+    }
+
+    // ── Issue #882: minimum escrow amount per token ──────────────────────────
+
+    /// Sets the minimum acceptable escrow amount for `token`.
+    pub fn set_min_escrow_amount(
+        env: Env,
+        admin: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_min_escrow_amount")?;
+        Self::require_multisig_admin(&env, &admin)?;
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MinEscrowAmount(token.clone())),
+            &min_amount,
+        );
+        MinEscrowAmountUpdated {
+            token,
+            min_amount,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the configured minimum, or `None` when unset.
+    pub fn get_min_escrow_amount(env: Env, token: Address) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MinEscrowAmount(token)))
+    }
+
+    fn require_min_amount(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+        if let Some(min) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::Config(ConfigKey::MinEscrowAmount(token.clone())))
+        {
+            if amount < min {
+                return Err(Error::Escrow(EscrowError::AmountBelowMinimum));
+            }
+        }
+        Ok(())
+    }
+
     fn internal_create_escrow(
         env: Env,
         customer: Address,
@@ -3746,6 +3896,8 @@ impl EscrowContract {
         reference: Option<BytesN<32>>,
     ) -> Result<u64, Error> {
         Self::require_token_allowed(&env, &token)?;
+        Self::require_min_amount(&env, &token, amount)?;
+        Self::add_exposure(&env, &merchant, &token, amount)?;
         // Check if merchant has paused escrow creation
         if let Some(pause_state) =
             env.storage()
@@ -4007,6 +4159,7 @@ impl EscrowContract {
         customer.require_auth();
         Self::require_not_paused(&env, "create_multi_party_escrow")?;
         Self::require_token_allowed(&env, &token)?;
+        Self::require_min_amount(&env, &token, total_amount)?;
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
@@ -4470,6 +4623,7 @@ impl EscrowContract {
         }
         for entry in tokens.iter() {
             Self::require_token_allowed(&env, &entry.token)?;
+            Self::require_min_amount(&env, &entry.token, entry.amount)?;
         }
         if tokens.len() > 10 {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
@@ -5078,6 +5232,9 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
         // Emit unified status change event
         EscrowStatusChanged {
             escrow_id,
@@ -5175,6 +5332,8 @@ impl EscrowContract {
 
         if escrow.released_amount >= escrow.amount {
             escrow.status = EscrowStatus::Released;
+            // Issue #879: close out the merchant's open exposure
+            Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
         }
 
         env.storage()
@@ -5244,6 +5403,9 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(
@@ -13146,6 +13308,12 @@ impl EscrowContract {
         if Self::require_token_allowed(env, &entry.token).is_err() {
             return Err(343); // EscrowError::TokenNotAllowed
         }
+        if Self::require_min_amount(env, &entry.token, entry.amount).is_err() {
+            return Err(345); // EscrowError::AmountBelowMinimum
+        }
+        if Self::add_exposure(env, &entry.merchant, &entry.token, entry.amount).is_err() {
+            return Err(344); // EscrowError::ExposureLimitExceeded
+        }
 
         let current_timestamp = env.ledger().timestamp();
         if entry.release_timestamp <= current_timestamp {
@@ -13426,6 +13594,9 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         // Calculate keeper reward from platform fee
         let expiry_config = env
@@ -15412,6 +15583,9 @@ impl EscrowContract {
 
             Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
 
+            // Issue #879: close out the merchant's open exposure
+            Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
             Self::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, escrow.amount)?;
 
             MutualCancelCompleted {
@@ -15881,6 +16055,9 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(&env, &escrow.token, &recipient, refund_amount)?;
