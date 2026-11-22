@@ -19,6 +19,9 @@ pub const MAX_ADMINS: u32 = 20;
 /// Maximum number of entries `get_incident_log` returns per page (#818).
 pub const MAX_INCIDENT_PAGE: u32 = 50;
 
+/// Maximum number of proposals a listing page returns (#873).
+pub const MAX_PROPOSAL_PAGE: u32 = 50;
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -45,6 +48,8 @@ pub enum Error {
     CancellationNotAllowed = 18,
     // #871: revoking an approval
     ApprovalNotFound = 19,
+    // #873: bounded proposal pagination
+    InvalidPagination = 20,
 }
 
 #[contracttype]
@@ -559,6 +564,55 @@ fn upgrade_children_wasm(
         refund_client.unpause_contract(&coordinator);
     }
     Ok(())
+}
+
+/// Validates and bounds a proposal listing page (#873).
+fn checked_page(offset: u64, limit: u32) -> Result<(u64, u32), Error> {
+    if limit == 0 {
+        return Err(Error::InvalidPagination);
+    }
+    Ok((offset, limit.min(MAX_PROPOSAL_PAGE)))
+}
+
+/// Collects open proposals newest-first, optionally hiding ones `awaiting` has
+/// already approved (#873).
+fn collect_open_proposals(
+    env: &Env,
+    offset: u64,
+    limit: u32,
+    awaiting: Option<&Address>,
+) -> Vec<AdminProposal> {
+    let mut page = Vec::new(env);
+    let total: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::ProposalCount)
+        .unwrap_or(0);
+    let now = env.ledger().timestamp();
+    let mut skipped = 0u64;
+    let mut id = total;
+    while id > 0 {
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, AdminProposal>(&DataKey::Proposal(id))
+        {
+            let open = !proposal.executed && !proposal.cancelled && now <= proposal.expires_at;
+            let not_approved = match awaiting {
+                Some(admin) => !proposal.approvals.contains(admin),
+                None => true,
+            };
+            if open && not_approved {
+                if skipped < offset {
+                    skipped += 1;
+                } else if page.len() < limit {
+                    page.push_back(proposal);
+                }
+            }
+        }
+        id -= 1;
+    }
+    page
 }
 
 fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
@@ -1400,6 +1454,35 @@ impl AdminContract {
         }
         .publish(&env);
         Ok(())
+    }
+
+    /// Returns open proposals, newest first (#873).
+    ///
+    /// `limit` is capped at `MAX_PROPOSAL_PAGE` (50); `offset` skips that many
+    /// open proposals. Expired, executed and cancelled proposals are excluded.
+    pub fn get_pending_proposals(
+        env: Env,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AdminProposal>, Error> {
+        load_admins(&env)?;
+        let (offset, limit) = checked_page(offset, limit)?;
+        Ok(collect_open_proposals(&env, offset, limit, None))
+    }
+
+    /// Returns open proposals the given admin has not approved, newest first (#873).
+    ///
+    /// `limit` is capped at `MAX_PROPOSAL_PAGE` (50). Expired, executed and
+    /// cancelled proposals are excluded.
+    pub fn get_proposals_awaiting(
+        env: Env,
+        admin: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AdminProposal>, Error> {
+        load_admins(&env)?;
+        let (offset, limit) = checked_page(offset, limit)?;
+        Ok(collect_open_proposals(&env, offset, limit, Some(&admin)))
     }
 
     /// Returns the admin set (#816).
@@ -2549,5 +2632,43 @@ mod test {
         let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(new_payment));
         client.cancel_proposal(&admin, &id2);
         assert!(client.get_proposal(&id2).cancelled);
+    }
+
+    #[test]
+    fn test_proposal_listings_are_bounded_and_filtered() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, _, pauser) = setup_multisig(&env);
+        let p1 = setup_payment(&env, &pauser);
+        let p2 = setup_payment(&env, &pauser);
+        let p3 = setup_payment(&env, &pauser);
+
+        let id1 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p1));
+        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p2));
+        let id3 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p3));
+        client.approve_action(&a2, &id2);
+        client.cancel_proposal(&admin, &id1);
+
+        let pending = client.get_pending_proposals(&0, &10);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(0).unwrap().id, id3);
+        assert_eq!(pending.get(1).unwrap().id, id2);
+
+        let awaiting = client.get_proposals_awaiting(&a2, &0, &10);
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(awaiting.get(0).unwrap().id, id3);
+        assert_eq!(client.get_pending_proposals(&1, &10).len(), 1);
+        assert_eq!(client.get_pending_proposals(&0, &1000).len(), 2);
+        assert_eq!(
+            client.try_get_pending_proposals(&0, &0),
+            Err(Ok(Error::InvalidPagination))
+        );
+
+        client.approve_action(&a2, &id3);
+        client.execute_action(&admin, &id3);
+        assert_eq!(client.get_pending_proposals(&0, &10).len(), 1);
+
+        set_time(&env, env.ledger().timestamp() + PROPOSAL_TTL_SECONDS + 1);
+        assert_eq!(client.get_pending_proposals(&0, &10).len(), 0);
     }
 }

@@ -113,6 +113,7 @@ Each field is a `ChildContractStatus` enum that can be:
 | 17 | `ProposalCancelled` | The proposal was cancelled by `cancel_proposal`. |
 | 18 | `CancellationNotAllowed` | Caller is neither the proposer nor backed by a threshold of current admin approvals. |
 | 19 | `ApprovalNotFound` | `revoke_approval` was called by an admin who had not approved the proposal. |
+| 20 | `InvalidPagination` | A proposal listing was requested with `limit == 0`. |
 
 ## Multisig Admin
 
@@ -440,6 +441,19 @@ readable through `get_proposal`.
 Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
 `ProposalAlreadyExecuted`, `ProposalExpired`, `CancellationNotAllowed` (18).
 Event: `ProposalCancelled { proposal_id, cancelled_by }`.
+
+### Proposal listings (#873)
+
+Both functions return open proposals (not executed, not expired, not cancelled)
+newest first. `limit` must be greater than zero and is capped at
+`MAX_PROPOSAL_PAGE` (50); `offset` skips that many matching proposals.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `get_pending_proposals` | `offset: u64`, `limit: u32` | All open proposals. |
+| `get_proposals_awaiting` | `admin: Address`, `offset: u64`, `limit: u32` | Open proposals the given admin has not approved. |
+
+Errors: `NotInitialized`, `InvalidPagination` (20). No events are emitted.
 
 ### Updated `AdminProposal`
 
