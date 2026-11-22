@@ -1473,3 +1473,22 @@ Every state-changing entry point first extends the instance storage TTL, so the 
 | `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
 
 17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.
+
+## Mutually Agreed Release Date Changes (issue #886)
+
+Parties can move an escrow's release date without cancelling or disputing when delivery is delayed.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `propose_release_date` | `caller: Address`, `escrow_id: u64`, `new_release_timestamp: u64` | Customer or merchant proposes a new release date for a `Locked` escrow. Only one pending proposal per escrow is allowed. |
+| `accept_release_date` | `counterparty: Address`, `escrow_id: u64` | The party who did not propose the date accepts it; the escrow's `release_timestamp` is updated and the proposal is cleared. |
+| `reject_release_date` | `counterparty: Address`, `escrow_id: u64` | The counterparty rejects and clears the pending proposal. |
+| `get_release_date_proposal` | `escrow_id: u64` | Returns the pending `ReleaseDateProposal` or `None`. |
+
+`ReleaseDateProposal` contains `escrow_id`, `proposed_by`, `new_release_timestamp` and `proposed_at`.
+
+**Validation:** the caller must authorize and be the customer or merchant; the escrow must be `Locked`; the new timestamp must be at least `created_at + min_hold_period` and, when `expiry_timestamp` is set (non-zero), strictly before it.
+
+**Errors:** `NotFound` (200), `InvalidStatus` (201), `Unauthorized` (100), `ReleaseDateProposalExists` (343), `ReleaseDateProposalNotFound` (344), `InvalidReleaseDate` (345).
+
+**Events:** `ReleaseDateProposed { escrow_id, proposed_by, new_release_timestamp }`, `ReleaseDateAccepted { escrow_id, accepted_by, new_release_timestamp }`, `ReleaseDateRejected { escrow_id, rejected_by, proposed_by }`.

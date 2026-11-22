@@ -146,6 +146,7 @@ pub enum DisputeKey {
     // Settlement offer feature
     SettlementOffer(u64), // keyed by escrow_id
     SettlementOfferCounter,
+    ReleaseDateProposal(u64),
 }
 
 // Issue #686: storage keys for escrow lifecycle notification hooks
@@ -290,6 +291,10 @@ pub enum ActionError {
     MilestoneAmendmentAlreadyExists = 336,
     MilestoneAmendmentNotFound = 337,
     MilestoneAmendmentAlreadyAccepted = 338,
+    // Issue #886: mutually agreed release date changes
+    ReleaseDateProposalExists = 343,
+    ReleaseDateProposalNotFound = 344,
+    InvalidReleaseDate = 345,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1404,6 +1409,40 @@ pub struct SettlementOffer {
     pub expires_at: u64,
     pub accepted: bool,
     pub rejected: bool,
+}
+
+/// Issue #886: a pending proposal to move an escrow's release date.
+#[derive(Clone)]
+#[contracttype]
+pub struct ReleaseDateProposal {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub new_release_timestamp: u64,
+    pub proposed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateProposed {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub new_release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateAccepted {
+    pub escrow_id: u64,
+    pub accepted_by: Address,
+    pub new_release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateRejected {
+    pub escrow_id: u64,
+    pub rejected_by: Address,
+    pub proposed_by: Address,
 }
 
 #[derive(Clone)]
@@ -15826,6 +15865,158 @@ impl EscrowContract {
                 }
             }
         }
+    }
+
+    // ── Issue #886: mutually agreed release date changes ─────────────────────
+
+    /// Proposes a new release timestamp for a locked escrow. At most one
+    /// proposal may be pending per escrow.
+    pub fn propose_release_date(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        new_release_timestamp: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "propose_release_date")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        if env.storage().instance().has(&key) {
+            return Err(Error::Action(ActionError::ReleaseDateProposalExists));
+        }
+        if new_release_timestamp < escrow.created_at.saturating_add(escrow.min_hold_period)
+            || (escrow.expiry_timestamp != 0 && new_release_timestamp >= escrow.expiry_timestamp)
+        {
+            return Err(Error::Action(ActionError::InvalidReleaseDate));
+        }
+
+        env.storage().instance().set(
+            &key,
+            &ReleaseDateProposal {
+                escrow_id,
+                proposed_by: caller.clone(),
+                new_release_timestamp,
+                proposed_at: env.ledger().timestamp(),
+            },
+        );
+        ReleaseDateProposed {
+            escrow_id,
+            proposed_by: caller,
+            new_release_timestamp,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accepts a pending release date proposal. Only the proposing party's
+    /// counterparty may accept it.
+    pub fn accept_release_date(
+        env: Env,
+        counterparty: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        counterparty.require_auth();
+        Self::require_not_paused(&env, "accept_release_date")?;
+
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        let proposal: ReleaseDateProposal = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::Action(ActionError::ReleaseDateProposalNotFound))?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if counterparty == proposal.proposed_by
+            || (counterparty != escrow.customer && counterparty != escrow.merchant)
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        escrow.release_timestamp = proposal.new_release_timestamp;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().remove(&key);
+        ReleaseDateAccepted {
+            escrow_id,
+            accepted_by: counterparty,
+            new_release_timestamp: proposal.new_release_timestamp,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Rejects a pending release date proposal. Only the proposing party's
+    /// counterparty may reject it.
+    pub fn reject_release_date(
+        env: Env,
+        counterparty: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        counterparty.require_auth();
+        Self::require_not_paused(&env, "reject_release_date")?;
+
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        let proposal: ReleaseDateProposal = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::Action(ActionError::ReleaseDateProposalNotFound))?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if counterparty == proposal.proposed_by
+            || (counterparty != escrow.customer && counterparty != escrow.merchant)
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        env.storage().instance().remove(&key);
+        ReleaseDateRejected {
+            escrow_id,
+            rejected_by: counterparty,
+            proposed_by: proposal.proposed_by,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the pending release date proposal for an escrow, if any.
+    pub fn get_release_date_proposal(env: Env, escrow_id: u64) -> Option<ReleaseDateProposal> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id)))
     }
 }
 
