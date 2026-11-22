@@ -98,6 +98,9 @@ pub enum EscrowKey {
     TermsAmendmentCount(u64),
     // Merchant pause state
     MerchantPauseState(Address),
+    // Issue #884: shared escrow note log
+    Note(u64, u64),
+    NoteCount(u64),
 }
 
 #[derive(Clone)]
@@ -297,6 +300,8 @@ pub enum ActionError {
     InvalidReleaseDate = 345,
     // Issue #883: partial disputes
     InvalidDisputedAmount = 346,
+    // Issue #884: escrow note log
+    MaxNotesPerEscrowReached = 347,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1424,6 +1429,24 @@ pub struct SettlementOffer {
     pub rejected: bool,
 }
 
+/// Issue #884: a note attached to an escrow by a party or observer.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowNote {
+    pub escrow_id: u64,
+    pub author: Address,
+    pub content_hash: BytesN<32>,
+    pub recorded_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowNoteAdded {
+    pub escrow_id: u64,
+    pub author: Address,
+    pub content_hash: BytesN<32>,
+}
+
 /// Issue #886: a pending proposal to move an escrow's release date.
 #[derive(Clone)]
 #[contracttype]
@@ -2222,6 +2245,7 @@ pub struct MerchantEscrowCreationUnpaused {
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
+const MAX_NOTES_PER_ESCROW: u64 = 50;
 
 /// Ledgers closed per day at ~5s per ledger.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -15993,6 +16017,93 @@ impl EscrowContract {
                 }
             }
         }
+    }
+
+    // ── Issue #884: shared escrow note log ───────────────────────────────────
+
+    /// Appends a note to an escrow's shared log. Callable by the customer,
+    /// merchant, or an observer with currently valid access.
+    pub fn add_escrow_note(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        content_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "add_escrow_note")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if caller != escrow.customer
+            && caller != escrow.merchant
+            && !Self::verify_observer_access(env.clone(), escrow_id, caller.clone())
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let count_key = DataKey::Escrow(EscrowKey::NoteCount(escrow_id));
+        let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        if count >= MAX_NOTES_PER_ESCROW {
+            return Err(Error::Action(ActionError::MaxNotesPerEscrowReached));
+        }
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::Note(escrow_id, count)),
+            &EscrowNote {
+                escrow_id,
+                author: caller.clone(),
+                content_hash: content_hash.clone(),
+                recorded_at: env.ledger().timestamp(),
+            },
+        );
+        env.storage().instance().set(&count_key, &(count + 1));
+        EscrowNoteAdded {
+            escrow_id,
+            author: caller,
+            content_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns notes for an escrow in insertion order, paginated by
+    /// `offset` and `limit`.
+    pub fn get_escrow_notes(
+        env: Env,
+        escrow_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<EscrowNote> {
+        let mut notes = Vec::new(&env);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::NoteCount(escrow_id)))
+            .unwrap_or(0);
+        let start = offset as u64;
+        if start >= count || limit == 0 {
+            return notes;
+        }
+        let end = core::cmp::min(
+            count,
+            start.saturating_add(limit as u64).min(MAX_NOTES_PER_ESCROW),
+        );
+        for i in start..end {
+            if let Some(note) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowNote>(&DataKey::Escrow(EscrowKey::Note(escrow_id, i)))
+            {
+                notes.push_back(note);
+            }
+        }
+        notes
     }
 
     // ── Issue #886: mutually agreed release date changes ─────────────────────

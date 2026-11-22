@@ -1505,3 +1505,16 @@ Parties can move an escrow's release date without cancelling or disputing when d
 **Resolution:** `resolve_dispute`, `resolve_dispute_split`, `withdraw_dispute` and `auto_resolve_dispute` operate on the remaining disputed balance (`amount - released_amount`) rather than the original amount. Any amount released before the dispute stays with the merchant.
 
 **Event:** `EscrowPartiallyDisputed { escrow_id, disputed_by, disputed_amount, released_amount, reason }`. The normal `EvidenceDeadlineSet` event is also emitted.
+
+## Shared Escrow Notes (issue #884)
+
+| Function | Parameters | Returns | Description |
+|---|---|---|---|
+| `add_escrow_note` | `caller: Address`, `escrow_id: u64`, `content_hash: BytesN<32>` | `Result<(), Error>` | Appends a note to the escrow's on-chain log. |
+| `get_escrow_notes` | `escrow_id: u64`, `offset: u32`, `limit: u32` | `Vec<EscrowNote>` | Returns notes in insertion order using zero-based pagination. |
+
+`content_hash` is a 32-byte hash of the note content (typically an IPFS/CID digest); the content itself is not stored. `EscrowNote` contains `escrow_id`, `author`, `content_hash` and `recorded_at`.
+
+**Authorization:** `caller` must authorize and be the escrow customer, the merchant, or an observer whose `expires_at` is still in the future (`Unauthorized`, code 100). The escrow must exist (`NotFound`, 200). Notes are capped at 50 per escrow (`MaxNotesPerEscrowReached`, 347).
+
+**Event:** `EscrowNoteAdded { escrow_id, author, content_hash }` is emitted for each note and includes the author.
