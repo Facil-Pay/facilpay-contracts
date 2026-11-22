@@ -188,6 +188,9 @@ pub enum SystemKey {
     RefundProcessingDeadlineConfig,
     // Tracks when refund was approved for deadline enforcement
     RefundApprovedTimestamp(u64),
+    // Issue #804: per-merchant refund-ratio threshold alerts
+    RefundRatioAlertConfigKey,
+    MerchantRatioWindow(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1475,6 +1478,42 @@ pub struct CircuitBreakerTrippedEvent {
 pub struct CircuitBreakerResetEvent {
     pub reset_by: Address,
     pub reset_at: u64,
+}
+
+// Issue #804: per-merchant refund-ratio threshold alerts
+#[derive(Clone)]
+#[contracttype]
+pub struct RefundRatioAlertConfig {
+    pub threshold_bps: u32,
+    pub window_seconds: u64,
+    pub enabled: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRatioWindowState {
+    pub window_start: u64,
+    pub refund_volume: i128,
+    pub payment_volume: i128,
+    pub alert_fired: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantRefundRatioExceeded {
+    pub merchant: Address,
+    pub ratio_bps: u32,
+    pub threshold_bps: u32,
+    pub window_start: u64,
+    pub triggered_at: u64,
+}
+
+// Issue #803: customer trust score for auto-approval
+#[derive(Clone)]
+#[contracttype]
+pub struct TrustBoostConfig {
+    pub min_trust_score_bps: u32,
+    pub boosted_threshold: i128,
 }
 
 // Fraud detection structures (#137)
@@ -7093,7 +7132,20 @@ impl RefundContract {
                 let merchant_threshold =
                     Self::get_auto_approve_below_inner(&env, &effective_merchant);
                 let platform_ceiling = Self::get_auto_approve_below_ceiling_inner(&env);
-                core::cmp::min(merchant_threshold, platform_ceiling)
+                let mut below = core::cmp::min(merchant_threshold, platform_ceiling);
+                // Issue #803: trust-score-based boost to the merchant's own threshold.
+                if let Some(boost) = env.storage().instance().get::<_, TrustBoostConfig>(
+                    &RefundExtKey::TrustBoostConfig(effective_merchant.clone()),
+                ) {
+                    let score = Self::get_customer_trust_score(env.clone(), customer.clone());
+                    if score >= boost.min_trust_score_bps {
+                        below = core::cmp::min(
+                            core::cmp::max(below, boost.boosted_threshold),
+                            platform_ceiling,
+                        );
+                    }
+                }
+                below
             };
             if !requires_approval && amount <= auto_below {
                 RefundStatus::Approved
@@ -7265,6 +7317,14 @@ impl RefundContract {
 
         // Issue #144: Invoke notification hooks
         Self::invoke_hooks(env, RefundEventType::Approved, refund_id);
+
+        // Issue #804: pure alerting, never affects the approval outcome above.
+        Self::check_merchant_refund_ratio_alert(
+            env,
+            &refund.merchant,
+            refund.amount,
+            refund.original_payment_amount,
+        );
 
         Ok(())
     }
@@ -8059,6 +8119,123 @@ impl RefundContract {
         Ok(())
     }
 
+    // ── Issue #804: per-merchant refund-ratio threshold alerts ───────────
+
+    /// Set the admin-configured refund-ratio alert threshold.
+    ///
+    /// When a merchant's rolling refund-to-payment ratio (see
+    /// `get_merchant_refund_ratio_window`) exceeds `config.threshold_bps` at
+    /// the moment a refund is approved, `MerchantRefundRatioExceeded` is
+    /// emitted. This is pure alerting: it never blocks `approve_refund`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin setting the configuration.
+    /// * `config` - The `RefundRatioAlertConfig` with the threshold, rolling
+    ///   window length, and enabled flag.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn set_refund_ratio_alert_config(
+        env: Env,
+        admin: Address,
+        config: RefundRatioAlertConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundRatioAlertConfigKey, &config);
+        Ok(())
+    }
+
+    /// Get the current refund-ratio alert configuration, if one has been set.
+    pub fn get_refund_ratio_alert_config(env: Env) -> Option<RefundRatioAlertConfig> {
+        env.storage()
+            .instance()
+            .get(&SystemKey::RefundRatioAlertConfigKey)
+    }
+
+    /// Get a merchant's current rolling refund-ratio window state, if any
+    /// refund has been approved for them since the configuration was set.
+    pub fn get_merchant_refund_ratio_window(
+        env: Env,
+        merchant: Address,
+    ) -> Option<MerchantRatioWindowState> {
+        env.storage()
+            .instance()
+            .get(&SystemKey::MerchantRatioWindow(merchant))
+    }
+
+    /// Infallible: checks and updates the merchant's rolling refund-ratio
+    /// window on refund approval, emitting `MerchantRefundRatioExceeded` at
+    /// most once per window. Never blocks the approval that triggered it.
+    fn check_merchant_refund_ratio_alert(
+        env: &Env,
+        merchant: &Address,
+        refund_amount: i128,
+        payment_amount: i128,
+    ) {
+        let config: RefundRatioAlertConfig = match env
+            .storage()
+            .instance()
+            .get(&SystemKey::RefundRatioAlertConfigKey)
+        {
+            Some(c) => c,
+            None => return,
+        };
+        if !config.enabled {
+            return;
+        }
+
+        let now = env.ledger().timestamp();
+        let mut window: MerchantRatioWindowState = env
+            .storage()
+            .instance()
+            .get(&SystemKey::MerchantRatioWindow(merchant.clone()))
+            .unwrap_or(MerchantRatioWindowState {
+                window_start: now,
+                refund_volume: 0,
+                payment_volume: 0,
+                alert_fired: false,
+            });
+
+        if now >= window.window_start + config.window_seconds {
+            window.window_start = now;
+            window.refund_volume = 0;
+            window.payment_volume = 0;
+            window.alert_fired = false;
+        }
+
+        window.refund_volume += refund_amount;
+        window.payment_volume += payment_amount;
+
+        if window.payment_volume > 0 {
+            let ratio_bps = ((window.refund_volume * 10000) / window.payment_volume) as u32;
+            if ratio_bps > config.threshold_bps && !window.alert_fired {
+                window.alert_fired = true;
+                MerchantRefundRatioExceeded {
+                    merchant: merchant.clone(),
+                    ratio_bps,
+                    threshold_bps: config.threshold_bps,
+                    window_start: window.window_start,
+                    triggered_at: now,
+                }
+                .publish(env);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&SystemKey::MerchantRatioWindow(merchant.clone()), &window);
+    }
+
     /// Check whether the circuit breaker is currently active (tripped and not yet reset).
     ///
     /// # Returns
@@ -8788,6 +8965,120 @@ impl RefundContract {
             total_amount_refunded,
             avg_processing_time,
         }
+    }
+
+    /// Compute a customer's trust score for auto-approval, in basis points
+    /// (0 to 10000). Deterministic: a pure function of on-chain refund
+    /// history and fraud-flag state at the time of the call.
+    ///
+    /// Formula:
+    /// * If the customer has an active fraud signal (`check_fraud_signals`
+    ///   returns `Some`), the score is `0`, unconditionally — a flagged
+    ///   customer can never qualify for a trust-based auto-approve boost,
+    ///   even if `mark_fraud_reviewed` was later called (reviewing a signal
+    ///   does not clear it).
+    /// * If the customer has never requested a refund (`total_requested ==
+    ///   0`), the score is `0`.
+    /// * Otherwise the score is a weighted average of three components,
+    ///   each in basis points (0 to 10000):
+    ///   - `approval_bps = total_approved * 10000 / total_requested` (50%
+    ///     weight) — the customer's historical approval rate.
+    ///   - `volume_bps = min(total_requested, 10) * 1000` (20% weight) —
+    ///     each of the customer's first 10 refund requests contributes
+    ///     1000bps; 10 or more requests maxes this component at 10000.
+    ///   - `tenure_bps = min(tenure_days, 365) * 10000 / 365` (30% weight),
+    ///     where `tenure_days` is the number of days since the customer's
+    ///     earliest refund request; capped at one year.
+    ///   `trust_score = (approval_bps * 50 + volume_bps * 20 + tenure_bps *
+    ///   30) / 100`, clamped to `0..=10000`.
+    pub fn get_customer_trust_score(env: Env, customer: Address) -> u32 {
+        if Self::check_fraud_signals(env.clone(), customer.clone()).is_some() {
+            return 0;
+        }
+
+        let summary = Self::get_customer_refund_summary(env.clone(), customer.clone());
+        if summary.total_requested == 0 {
+            return 0;
+        }
+
+        let approval_bps = (summary.total_approved * 10000 / summary.total_requested).min(10000);
+        let volume_bps = summary.total_requested.min(10) * 1000;
+
+        let tenure_bps: u64 = match Self::get_customer_refund_id_at(&env, &customer, 0) {
+            Some(earliest_id) => {
+                match env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(earliest_id))
+                {
+                    Some(earliest_refund) => {
+                        let now = env.ledger().timestamp();
+                        let tenure_days = now.saturating_sub(earliest_refund.requested_at) / 86400;
+                        tenure_days.min(365) * 10000 / 365
+                    }
+                    None => 0,
+                }
+            }
+            None => 0,
+        };
+
+        let trust_score = (approval_bps * 50 + volume_bps * 20 + tenure_bps * 30) / 100;
+        trust_score.min(10000) as u32
+    }
+
+    /// Set a per-merchant trust-based boost to the merchant's own
+    /// auto-approve-below threshold (see `set_auto_approve_below`).
+    ///
+    /// Once set, a refund request from a customer whose
+    /// `get_customer_trust_score` is at or above `min_trust_score_bps` is
+    /// evaluated against `max(merchant_threshold, boosted_threshold)`
+    /// instead of `merchant_threshold` alone — still capped by the
+    /// platform-wide ceiling (`get_auto_approve_below_ceiling`).
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant configuring their own boost. Must authorize.
+    /// * `min_trust_score_bps` - Minimum trust score (0 to 10000) required to receive the boost.
+    /// * `boosted_threshold` - The elevated auto-approve-below amount for qualifying customers.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `min_trust_score_bps` is above `10000` or `boosted_threshold` is negative.
+    pub fn set_trust_boost_config(
+        env: Env,
+        merchant: Address,
+        min_trust_score_bps: u32,
+        boosted_threshold: i128,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if min_trust_score_bps > 10000 || boosted_threshold < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage().instance().set(
+            &RefundExtKey::TrustBoostConfig(merchant),
+            &TrustBoostConfig {
+                min_trust_score_bps,
+                boosted_threshold,
+            },
+        );
+        Ok(())
+    }
+
+    /// Get a merchant's trust-boost configuration, if one has been set.
+    pub fn get_trust_boost_config(env: Env, merchant: Address) -> Option<TrustBoostConfig> {
+        env.storage()
+            .instance()
+            .get(&RefundExtKey::TrustBoostConfig(merchant))
+    }
+
+    /// Remove a merchant's trust-boost configuration, turning the boost off.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant removing their own boost. Must authorize.
+    pub fn remove_trust_boost_config(env: Env, merchant: Address) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage()
+            .instance()
+            .remove(&RefundExtKey::TrustBoostConfig(merchant));
+        Ok(())
     }
 
     fn get_merchant_refund_count(env: &Env, merchant: &Address) -> u64 {
