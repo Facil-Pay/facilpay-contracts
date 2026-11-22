@@ -110,6 +110,7 @@ Each field is a `ChildContractStatus` enum that can be:
 | 14 | `PauseNotExpired` | `expire_emergency_pause` was called before the pause expiry. |
 | 15 | `PauseExpired` | `extend_emergency_pause` was called at or after the pause expiry. |
 | 16 | `InvalidPauseDuration` | `max_pause_seconds` is `Some(0)`, `additional_seconds` is 0, or the new expiry overflows `u64`. |
+| 19 | `ApprovalNotFound` | `revoke_approval` was called by an admin who had not approved the proposal. |
 
 ## Multisig Admin
 
@@ -402,3 +403,28 @@ A child that was already globally paused before the call (for example, during an
 | `ChildContractUpgraded` | `child_kind: ChildKind`, `contract: Address`, `new_wasm_hash: BytesN<32>`, `upgraded_by: Address`, `upgraded_at: u64` | `upgrade_children` and executed `UpgradeChildren` proposals, once per child |
 
 The children also emit their own pause, `ContractUpgraded` and unpause events.
+
+## Proposal Lifecycle Extensions
+
+### `revoke_approval(admin, proposal_id)` (#871)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Current admin member whose approval is removed. Must authorize. |
+| `proposal_id` | `u64` | Id of an open, unexecuted, unexpired, uncancelled proposal. |
+
+Removes the caller's approval from the proposal. `execute_action` always
+re-counts approvals from the current admin set, so a revoked approval
+immediately reduces the count used for the threshold check.
+
+Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+`ProposalAlreadyExecuted`, `ProposalExpired`, `ApprovalNotFound` (19, when the
+caller never approved). Event: `ApprovalRevoked { proposal_id, admin, approvals }`,
+where `approvals` is the remaining count.
+
+### Additional lifecycle events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `ApprovalRevoked` | `proposal_id: u64`, `admin: Address`, `approvals: u32` | `revoke_approval` |
+

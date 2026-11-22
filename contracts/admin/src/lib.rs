@@ -40,6 +40,8 @@ pub enum Error {
     PauseNotExpired = 14,
     PauseExpired = 15,
     InvalidPauseDuration = 16,
+    // #871: revoking an approval
+    ApprovalNotFound = 19,
 }
 
 #[contracttype]
@@ -129,6 +131,15 @@ pub struct AdminProposalApproved {
 pub struct AdminProposalExecuted {
     pub proposal_id: u64,
     pub executed_by: Address,
+}
+
+/// Emitted when an admin takes back an approval (#871).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRevoked {
+    pub proposal_id: u64,
+    pub admin: Address,
+    pub approvals: u32,
 }
 
 #[contractevent]
@@ -1302,6 +1313,36 @@ impl AdminContract {
         load_proposal(&env, proposal_id)
     }
 
+    /// Removes the caller's approval from an open proposal (#871).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired`, `ApprovalNotFound`.
+    ///
+    /// # Events
+    /// Emits `ApprovalRevoked` with the remaining approval count.
+    pub fn revoke_approval(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+        let index = proposal
+            .approvals
+            .iter()
+            .position(|a| a == admin)
+            .ok_or(Error::ApprovalNotFound)?;
+        proposal.approvals.remove(index as u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        ApprovalRevoked {
+            proposal_id,
+            admin: admin.clone(),
+            approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Returns the admin set (#816).
     ///
     /// # Errors
@@ -2378,5 +2419,37 @@ mod test {
         assert!(client.try_expire_emergency_pause().is_err());
         assert_eq!(client.get_incident_count(), 0);
         assert_eq!(client.get_incident_log(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_revoke_approval_reduces_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let id = client.propose_action(
+            &admin,
+            &AdminAction::SetPaymentContract(new_payment.clone()),
+        );
+        client.approve_action(&a2, &id);
+
+        assert_eq!(
+            client.try_revoke_approval(&a3, &id),
+            Err(Ok(Error::ApprovalNotFound))
+        );
+        client.revoke_approval(&a2, &id);
+        assert_eq!(client.get_proposal(&id).approvals.len(), 1);
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ThresholdNotMet))
+        );
+
+        client.approve_action(&a2, &id);
+        client.execute_action(&admin, &id);
+        assert_eq!(client.get_contracts().payment, new_payment);
+        assert_eq!(
+            client.try_revoke_approval(&a2, &id),
+            Err(Ok(Error::ProposalAlreadyExecuted))
+        );
     }
 }
