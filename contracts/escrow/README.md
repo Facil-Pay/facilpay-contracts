@@ -93,6 +93,9 @@ The private `weighted_auto_resolve` function sums evidence weights separately fo
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
 - create_escrow_with_reference: Same as create_escrow, but links the escrow to an off-chain order reference that is unique per merchant. See [Order References](#order-references).
+- create_hashlock_escrow: Creates an escrow released by revealing a SHA-256 preimage; see [Hashlock Escrows](#hashlock-escrows-issue-877).
+- claim_hashlock_escrow: Merchant reveals the preimage to release a hashlock escrow.
+- refund_hashlock_escrow: Customer reclaims funds from an unclaimed hashlock escrow after its timeout.
 - get_escrow_by_reference: Looks up an escrow by merchant and order reference.
 - get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
@@ -1217,6 +1220,18 @@ Renewal records persist for the lifetime of the contract's instance storage (see
 [⬅ Back to Main README](../../README.md)
 
 ---
+
+## Hashlock Escrows (issue #877)
+
+Hashlock escrows support atomic cross-chain or off-chain-delivery flows: funds are released only when a secret is revealed.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `create_hashlock_escrow(customer, merchant, amount, token, hash, timeout)` | `hash: BytesN<32>` = expected `sha256(preimage)`; `timeout: u64` = absolute ledger timestamp after which the customer may reclaim. | Customer must authorize. Funds are locked in a standard `Locked` escrow, with `timeout` used as the expiry. Emits `HashlockEscrowCreated { escrow_id, hash, timeout }`. |
+| `claim_hashlock_escrow(merchant, escrow_id, preimage)` | `preimage: Bytes` | Merchant must authorize and the escrow must be `Locked`. Verifies `sha256(preimage) == hash`, marks the escrow `Released`, transfers the full amount to the merchant and emits `HashlockEscrowClaimed { escrow_id, merchant, preimage }` — the revealed preimage is included in the event. |
+| `refund_hashlock_escrow(customer, escrow_id)` | — | Customer must authorize. Allowed only at/after `timeout` while the escrow is still `Locked`; marks it `Cancelled`, refunds the customer in full and emits `HashlockEscrowRefunded { escrow_id, customer, amount }`. |
+
+**Errors:** `InvalidPreimage` (236) for a wrong preimage — no state or funds change; `NotFound` (200) when no hashlock parameters exist; `InvalidStatus` (201) if the escrow is not Locked or the caller is not the expected party; `TimeoutNotReached` (204) for a claim after the timeout or a refund before it. Creation also uses the standard `create_escrow` validation errors. **Events:** `HashlockEscrowCreated`, `HashlockEscrowClaimed` (includes the preimage), `HashlockEscrowRefunded`, plus the normal escrow status-index update.
 
 ## Partial release (issue #687)
 
