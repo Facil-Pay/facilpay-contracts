@@ -96,6 +96,8 @@ The private `weighted_auto_resolve` function sums evidence weights separately fo
 - create_hashlock_escrow: Creates an escrow released by revealing a SHA-256 preimage; see [Hashlock Escrows](#hashlock-escrows-issue-877).
 - claim_hashlock_escrow: Merchant reveals the preimage to release a hashlock escrow.
 - refund_hashlock_escrow: Customer reclaims funds from an unclaimed hashlock escrow after its timeout.
+- set_merchant_cooling_off: Admin-only. Sets a per-merchant customer cooling-off window; see [Merchant Cooling-Off](#merchant-cooling-off-issue-878).
+- cancel_within_cooling_off: Customer cancels an unaccepted escrow during the cooling-off window for a full refund.
 - get_escrow_by_reference: Looks up an escrow by merchant and order reference.
 - get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
@@ -1232,6 +1234,17 @@ Hashlock escrows support atomic cross-chain or off-chain-delivery flows: funds a
 | `refund_hashlock_escrow(customer, escrow_id)` | — | Customer must authorize. Allowed only at/after `timeout` while the escrow is still `Locked`; marks it `Cancelled`, refunds the customer in full and emits `HashlockEscrowRefunded { escrow_id, customer, amount }`. |
 
 **Errors:** `InvalidPreimage` (236) for a wrong preimage — no state or funds change; `NotFound` (200) when no hashlock parameters exist; `InvalidStatus` (201) if the escrow is not Locked or the caller is not the expected party; `TimeoutNotReached` (204) for a claim after the timeout or a refund before it. Creation also uses the standard `create_escrow` validation errors. **Events:** `HashlockEscrowCreated`, `HashlockEscrowClaimed` (includes the preimage), `HashlockEscrowRefunded`, plus the normal escrow status-index update.
+
+## Merchant Cooling-Off (issue #878)
+
+An admin can give customers a window to undo a mistaken payment before the merchant accepts it.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `set_merchant_cooling_off(admin, merchant, cooling_off_seconds)` | `cooling_off_seconds: u64` | Admin-only (must be in the multisig admin set). Stores the window for `merchant` and emits `CoolingOffConfigUpdated { merchant, cooling_off_seconds }`. |
+| `cancel_within_cooling_off(customer, escrow_id)` | — | Customer must authorize. Refunds the full amount and marks the escrow `Cancelled` only while `now < created_at + cooling_off_seconds` and the merchant has not accepted the escrow. Emits `CancelledWithinCoolingOff { escrow_id, customer, amount }`. |
+
+**Errors:** `CoolingOffNotConfigured` (237) when the merchant has no configured window, `CoolingOffWindowEnded` (238) at/after the deadline, `CoolingOffMerchantAccepted` (239) once the merchant has accepted, plus `NotFound`/`InvalidStatus` for unknown or non-Locked escrows and `NotAnAdmin` for a non-admin setter. **Events:** `CoolingOffConfigUpdated`, `CancelledWithinCoolingOff`.
 
 ## Partial release (issue #687)
 

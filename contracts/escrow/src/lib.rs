@@ -13,6 +13,8 @@ use soroban_sdk::{
 #[derive(Clone)]
 #[contracttype]
 pub enum ConfigKey {
+    // Issue #878: per-merchant customer cooling-off window in seconds.
+    MerchantCoolingOff(Address),
     AdminMultiSig,
     AdminProposal(String),
     AdminProposalCounter,
@@ -238,6 +240,10 @@ pub enum EscrowError {
     DisputeCooldownActive = 235,
     // Issue #877: hashlock escrows
     InvalidPreimage = 236,
+    // Issue #878: cooling-off cancellation
+    CoolingOffNotConfigured = 237,
+    CoolingOffWindowEnded = 238,
+    CoolingOffMerchantAccepted = 239,
     // Issue #787: recurring escrow schedules
     InvalidRecurringScheduleParams = 339,
     RecurringScheduleNotFound = 340,
@@ -345,7 +351,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=236).contains(&code) || (339..=342).contains(&code) {
+            if (200..=239).contains(&code) || (339..=342).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -1897,6 +1903,22 @@ pub struct HashlockEscrowRefunded {
     pub escrow_id: u64,
     pub customer: Address,
     pub amount: i128,
+}
+
+/// Issue #878: distinct event for a customer cancellation inside the cooling-off window.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelledWithinCoolingOff {
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoolingOffConfigUpdated {
+    pub merchant: Address,
+    pub cooling_off_seconds: u64,
 }
 
 #[contractevent]
@@ -3592,6 +3614,82 @@ impl EscrowContract {
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
         Self::transfer_if_token_contract(&env, &escrow.token, &customer, amount)?;
         HashlockEscrowRefunded {
+            escrow_id,
+            customer,
+            amount,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Issue #878: admin sets the optional per-merchant cooling-off window.
+    pub fn set_merchant_cooling_off(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        cooling_off_seconds: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_merchant_cooling_off")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MerchantCoolingOff(merchant.clone())),
+            &cooling_off_seconds,
+        );
+        CoolingOffConfigUpdated {
+            merchant,
+            cooling_off_seconds,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Issue #878: customer cancels an unaccepted escrow during the merchant's
+    /// cooling-off window and receives a full refund.
+    pub fn cancel_within_cooling_off(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "cancel_within_cooling_off")?;
+        let mut escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if escrow.customer != customer || escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        let cooling_off_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantCoolingOff(
+                escrow.merchant.clone(),
+            )))
+            .ok_or(Error::Escrow(EscrowError::CoolingOffNotConfigured))?;
+        if env.ledger().timestamp() >= escrow.created_at.saturating_add(cooling_off_seconds) {
+            return Err(Error::Escrow(EscrowError::CoolingOffWindowEnded));
+        }
+        if let Some(acceptance) = Self::get_merchant_acceptance(env.clone(), escrow_id) {
+            if acceptance.accepted {
+                return Err(Error::Escrow(EscrowError::CoolingOffMerchantAccepted));
+            }
+        }
+        let amount = escrow.amount;
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
+        Self::transfer_if_token_contract(&env, &escrow.token, &customer, amount)?;
+        CancelledWithinCoolingOff {
             escrow_id,
             customer,
             amount,
