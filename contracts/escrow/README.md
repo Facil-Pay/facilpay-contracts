@@ -119,6 +119,75 @@ These are distinct timers rather than one combined timeout. Escalation timeout i
 
 ---
 
+## Escrow Fees
+
+The contract can charge a fee on released escrow funds, configured either platform-wide (the "global" config) or per token (an "override" that replaces the global config entirely for that token).
+
+### `EscrowFeeConfig`
+
+```rust
+pub struct EscrowFeeConfig {
+    pub fee_bps: i128,
+    pub fee_recipient: Address,
+    pub enabled: bool,
+}
+```
+
+### Function reference
+
+| Function | Parameters | Returns | Auth | Errors |
+|---|---|---|---|---|
+| `set_escrow_fee_config` | `env: Env`, `admin: Address`, `config: EscrowFeeConfig` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)` if `admin` is not in the multisig admin set. Unlike `set_token_escrow_fee_config` below, this function does **not** validate `config.fee_bps` against `0..=10000` — any `i128` value is accepted and stored as-is. |
+| `get_escrow_fee_config` | `env: Env` | `EscrowFeeConfig` | None | None. Defaults to `{ fee_bps: 0, fee_recipient: <contract address>, enabled: false }` if never set. |
+| `set_token_escrow_fee_config` | `env: Env`, `admin: Address`, `token: Address`, `config: EscrowFeeConfig` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`; `Error::Basic(BasicError::InvalidBps)` if `config.fee_bps` is outside `0..=10000`. |
+| `get_token_escrow_fee_config` | `env: Env`, `token: Address` | `Option<EscrowFeeConfig>` | None | None. `None` if no override is set for `token`. |
+| `remove_token_escrow_fee_config` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`. |
+| `get_effective_escrow_fee_config` | `env: Env`, `token: Address` | `EscrowFeeConfig` | None | None. |
+| `get_accumulated_escrow_fees` | `env: Env`, `token: Address` | `i128` | None | None. Defaults to `0`. |
+| `withdraw_escrow_fees` | `env: Env`, `admin: Address`, `token: Address`, `to: Address` | `Result<i128, Error>` | `admin` must authorize and be a multisig admin | `Error::Basic(BasicError::NotAnAdmin)`. Returns `Ok(0)` with no transfer and no event if the accumulated balance for `token` is already `0`. |
+
+All of the above also require the contract not be paused for that specific function name (`require_not_paused`), which can return the usual pause-related errors independent of the ones listed above.
+
+### How the effective fee is chosen (global vs. per-token)
+
+`get_effective_escrow_fee_config(token)` is the single source of truth for "what fee applies to this token right now":
+
+1. If a token-specific override exists for `token` (set via `set_token_escrow_fee_config`), that override is returned in full — including its own `fee_bps`, `fee_recipient`, and `enabled` flag. The override is a complete replacement, not a partial patch over the global config.
+2. Otherwise, the global config from `get_escrow_fee_config()` is returned.
+
+`remove_token_escrow_fee_config(token)` deletes the override, so a subsequent `get_effective_escrow_fee_config(token)` call falls back to the global config again.
+
+### When fees are charged
+
+Fees are **not** charged when `get_effective_escrow_fee_config` is called — that function only reports the config. The actual fee lifecycle has two distinct moments:
+
+1. **Rate snapshot, at escrow creation.** `create_escrow` calls `get_effective_escrow_fee_config` for the escrow's token once, at creation time, and snapshots the resulting rate onto the escrow record itself: `fee_bps = if fee_config.enabled { fee_config.fee_bps } else { 0 }`. A later call to `set_escrow_fee_config` or `set_token_escrow_fee_config` never retroactively changes the rate on an escrow that already exists — only escrows created after the change see the new rate.
+2. **Fee computation and transfer, at release.** When an escrow is released, the fee amount is computed from the escrow's own snapshotted rate — `fee_amount = (escrow.amount * escrow.fee_bps) / 10000` — not from a freshly re-read config. If `fee_amount > 0`, the effective fee config for the escrow's token is looked up again at this point, but only to resolve where the fee goes:
+   - If the resolved `fee_recipient` is the contract's own address, the fee amount is added to that token's running balance in `get_accumulated_escrow_fees(token)` (no external transfer yet).
+   - Otherwise, the fee amount is transferred directly to `fee_recipient` and is never reflected in `get_accumulated_escrow_fees`.
+   Either way, `EscrowFeeCollected { escrow_id, fee_amount, recipient }` is emitted, and the remaining `escrow.amount - fee_amount` goes to the recipient of the release (normally the merchant).
+
+### Events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `EscrowFeeConfigUpdated` | `fee_bps: i128` | `set_escrow_fee_config` |
+| `TokenEscrowFeeConfigUpdated` | `token: Address`, `fee_bps: i128`, `enabled: bool` | `set_token_escrow_fee_config` |
+| `TokenEscrowFeeConfigRemoved` | `token: Address` | `remove_token_escrow_fee_config` |
+| `EscrowFeeCollected` | `escrow_id: u64`, `fee_amount: i128`, `recipient: Address` | Any escrow release path that charges a non-zero fee |
+| `EscrowFeesWithdrawn` | `amount: i128`, `withdrawn_by: Address` | `withdraw_escrow_fees` (only when the accumulated balance was non-zero) |
+
+### Worked example
+
+1. An admin calls `set_escrow_fee_config(env, admin, EscrowFeeConfig { fee_bps: 250, fee_recipient: <contract address>, enabled: true })` — a global 2.5% fee, collected by the contract itself. No token-specific override exists for USDC.
+2. A customer calls `create_escrow(..., token: <USDC address>, amount: 1_000_0000000, ...)` (1,000 USDC, 7 decimals omitted for readability). Since there's no override for USDC, `get_effective_escrow_fee_config` returns the global config, and the new escrow snapshots `fee_bps = 250`.
+3. Three months later, the admin calls `set_escrow_fee_config` again with `fee_bps: 500`. This escrow is unaffected — its snapshotted `fee_bps` is still `250`. Only escrows created after this point would see `500`.
+4. The escrow is released via `release_escrow`. The fee is computed from the escrow's own snapshot: `fee_amount = 1_000 * 250 / 10_000 = 25` USDC. The merchant receives `1_000 - 25 = 975` USDC. `EscrowFeeCollected { escrow_id, fee_amount: 25_0000000, recipient: <contract address> }` is emitted.
+5. Because `fee_recipient` resolved to the contract's own address, the 25 USDC is not transferred anywhere yet — it is added to the running total returned by `get_accumulated_escrow_fees(env, <USDC address>)`.
+6. Later, an admin calls `withdraw_escrow_fees(env, admin, <USDC address>, <treasury address>)`, which transfers the full accumulated balance (25 USDC, plus whatever else has accumulated from other released escrows since the last withdrawal) to the treasury address, zeroes the accumulated balance, and emits `EscrowFeesWithdrawn { amount: 25_0000000, withdrawn_by: admin }`.
+
+---
+
 ## Order References
 
 An escrow can be linked to an off-chain order in a verifiable way by creating it with a 32-byte reference, typically a hash of the merchant's order ID. Each reference is unique per merchant and stays bound to its escrow for the escrow's whole lifetime, including after it is released, refunded or cancelled. Two different merchants may use the same reference.
@@ -664,6 +733,58 @@ Returns the full `ClawbackRequest` record including `escrow_id`, `initiated_by`,
 | `EscrowError::InvalidStatus`         | Request was already cancelled (on execute)                                                       |
 | `ActionError::NotReady`              | Execution attempted before `execute_after` timestamp                                             |
 | `BasicError::Unauthorized`           | `request_id` not found in storage                                                                |
+
+---
+
+## Recurring Escrows (Templates)
+
+`create_escrow_from_template(customer, template_id) -> escrow_id` creates one escrow from a reusable `EscrowTemplate` (`template_id, owner, token, amount, release_delay_seconds, description, created_at, active`, set up via `create_template` and turned off via `deactivate_template`). Retainer-style agreements that need a fresh escrow every period build on top of this with a recurring schedule.
+
+### Creating a schedule
+
+```
+create_recurring_escrow_schedule(customer, template_id, interval, count) -> schedule_id
+```
+
+- `customer` must authorize; they fund every escrow the schedule goes on to create.
+- `template_id` must reference an existing, active template (`EscrowError::TemplateNotFound` / `TemplateInactive` otherwise).
+- `interval` (seconds between escrows) and `count` (total number of escrows the schedule will create) must both be non-zero (`EscrowError::InvalidRecurringScheduleParams` otherwise).
+- Stores a `RecurringEscrowSchedule { schedule_id, customer, template_id, interval, total_count, created_count: 0, next_due_at, active: true }` with `next_due_at = now + interval` — the schedule governs escrows *after* this call, it does not create one itself.
+- Emits `RecurringEscrowScheduleCreated { schedule_id, customer, template_id, next_due_at }` (topic `recurring_escrow_created`).
+
+### Triggering the next escrow
+
+```
+trigger_next_recurring_escrow(schedule_id) -> escrow_id
+```
+
+Permissionless — anyone may call this once the next escrow is due; the customer's own authorization still has to be present in the submitted transaction for the underlying token transfer, so a non-customer caller needs a pre-signed authorization entry from the customer (the same non-root-authorization pattern used elsewhere in this codebase for permissionless keeper calls).
+
+- `EscrowError::RecurringScheduleNotFound` — no schedule with this id.
+- `EscrowError::RecurringScheduleInactive` — the schedule was cancelled via `cancel_recurring_escrow_schedule`.
+- `EscrowError::RecurringScheduleComplete` — `created_count` already reached `total_count`.
+- `EscrowError::TemplateNotFound` / `TemplateInactive` — the underlying template has since been removed or deactivated. This is re-checked fresh on every call rather than cached on the schedule (returning an error rolls back any storage writes made during the call, so a flag can't be persisted on this path) — since there is no way to reactivate a template once deactivated, re-checking it has the same effect: the schedule is permanently stopped from here on.
+- `ActionError::NotReady` — called before `next_due_at`.
+- On success: creates an escrow from the template exactly like `create_escrow_from_template` does, increments `created_count`, and advances `next_due_at` by `interval`. Emits `RecurringEscrowTriggered { schedule_id, escrow_id, created_count, next_due_at }`.
+
+### Cancelling a schedule
+
+```
+cancel_recurring_escrow_schedule(customer, schedule_id) -> ()
+```
+
+- `customer` must authorize and must match the schedule's `customer` (`BasicError::Unauthorized` otherwise).
+- `EscrowError::RecurringScheduleNotFound` if the schedule does not exist.
+- Marks the schedule inactive; a subsequent `trigger_next_recurring_escrow` call fails with `RecurringScheduleInactive`. Calling it again on an already-inactive schedule succeeds as a no-op.
+- Emits `RecurringEscrowScheduleCancelled { schedule_id }` (topic `recurring_escrow_cancelled`).
+
+### Querying a schedule
+
+```
+get_recurring_escrow_schedule(schedule_id) -> Option<RecurringEscrowSchedule>
+```
+
+Returns the full schedule record, or `None` if it does not exist.
 
 ---
 

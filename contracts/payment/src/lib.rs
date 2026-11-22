@@ -545,6 +545,10 @@ pub enum StateDataKey {
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
     SettlementFinalized(u64),
     ScheduledPaymentCounter,
+    // Issue #775: index of subscriptions by `next_payment_at` so keepers can
+    // query due subscriptions without scanning every one.
+    SubscriptionDueIndex,
+    SubscriptionDueBucket(u64), // next_payment_at -> Vec<subscription_id>
 }
 
 // Issue #648: storage tier routing.
@@ -7334,6 +7338,131 @@ impl PaymentContract {
         );
     }
 
+    // ── Issue #775: due-date index ──────────────────────────────────────
+    //
+    // Keeps a sorted `Vec<u64>` of distinct `next_payment_at` values that
+    // currently have at least one subscription (the "index"), plus a
+    // `Vec<u64>` of subscription ids per value (the "bucket"), mirroring the
+    // escalation-timeout queue in the escrow contract. This lets
+    // `get_subscriptions_due_before` walk only the due buckets instead of
+    // scanning every subscription.
+
+    /// Adds `sub_id` to the due-bucket for `next_payment_at`, inserting the
+    /// timestamp into the sorted index if this is its first entry.
+    fn index_due_subscription(env: &Env, next_payment_at: u64, sub_id: u64) {
+        let bucket_key = DataKey::State(StateDataKey::SubscriptionDueBucket(next_payment_at));
+        let mut bucket: Vec<u64> = env.store().get(&bucket_key).unwrap_or(Vec::new(env));
+        let is_new_bucket = bucket.is_empty();
+        bucket.push_back(sub_id);
+        env.store().set(&bucket_key, &bucket);
+
+        if is_new_bucket {
+            let index_key = DataKey::State(StateDataKey::SubscriptionDueIndex);
+            let mut index: Vec<u64> = env.store().get(&index_key).unwrap_or(Vec::new(env));
+            let mut pos = index.len();
+            for i in 0..index.len() {
+                if index.get(i).unwrap() > next_payment_at {
+                    pos = i;
+                    break;
+                }
+            }
+            index.insert(pos, next_payment_at);
+            env.store().set(&index_key, &index);
+        }
+    }
+
+    /// Removes `sub_id` from the due-bucket for `next_payment_at`, removing
+    /// the timestamp from the sorted index if the bucket becomes empty.
+    fn deindex_due_subscription(env: &Env, next_payment_at: u64, sub_id: u64) {
+        let bucket_key = DataKey::State(StateDataKey::SubscriptionDueBucket(next_payment_at));
+        let bucket: Vec<u64> = match env.store().get(&bucket_key) {
+            Some(b) => b,
+            None => return,
+        };
+
+        let mut remaining = Vec::new(env);
+        for id in bucket.iter() {
+            if id != sub_id {
+                remaining.push_back(id);
+            }
+        }
+
+        if remaining.is_empty() {
+            env.store().remove(&bucket_key);
+            let index_key = DataKey::State(StateDataKey::SubscriptionDueIndex);
+            let index: Vec<u64> = env.store().get(&index_key).unwrap_or(Vec::new(env));
+            let mut new_index = Vec::new(env);
+            for value in index.iter() {
+                if value != next_payment_at {
+                    new_index.push_back(value);
+                }
+            }
+            env.store().set(&index_key, &new_index);
+        } else {
+            env.store().set(&bucket_key, &remaining);
+        }
+    }
+
+    /// Returns active subscriptions whose `next_payment_at` is at or before
+    /// `timestamp`, using the due-date index rather than scanning every
+    /// subscription. Only `SubscriptionStatus::Active` subscriptions are
+    /// returned; paused, cancelled, expired, in-dunning and suspended
+    /// subscriptions are excluded.
+    ///
+    /// # Arguments
+    /// * `timestamp` - Upper bound (inclusive) on `next_payment_at`.
+    /// * `offset` - Number of matching (active, due) subscriptions to skip.
+    /// * `limit` - Maximum number of subscriptions to return.
+    pub fn get_subscriptions_due_before(
+        env: Env,
+        timestamp: u64,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<Subscription> {
+        let index: Vec<u64> = env
+            .store()
+            .get(&DataKey::State(StateDataKey::SubscriptionDueIndex))
+            .unwrap_or(Vec::new(&env));
+
+        let mut result = Vec::new(&env);
+        let mut skipped = 0u64;
+
+        for due_at in index.iter() {
+            if due_at > timestamp {
+                break;
+            }
+            if result.len() as u64 >= limit {
+                break;
+            }
+
+            let bucket: Vec<u64> = env
+                .store()
+                .get(&DataKey::State(StateDataKey::SubscriptionDueBucket(due_at)))
+                .unwrap_or(Vec::new(&env));
+
+            for sub_id in bucket.iter() {
+                if result.len() as u64 >= limit {
+                    break;
+                }
+                let sub: Option<Subscription> = env
+                    .store()
+                    .get(&DataKey::Subscription(SubscriptionKey::Data(sub_id)));
+                if let Some(sub) = sub {
+                    if sub.status != SubscriptionStatus::Active {
+                        continue;
+                    }
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    result.push_back(sub);
+                }
+            }
+        }
+
+        result
+    }
+
     /// Returns active subscription IDs for a merchant (100 per page).
     pub fn get_merchant_subscriptions(env: Env, merchant: Address, page: u64) -> Vec<u64> {
         env.store()
@@ -7680,6 +7809,8 @@ impl PaymentContract {
 
         Self::add_to_merchant_active_subscriptions(&env, &merchant, sub_id);
 
+        Self::index_due_subscription(&env, sub.next_payment_at, sub_id);
+
         (SubscriptionCreated {
             subscription_id: sub_id,
             customer: sub.customer.clone(),
@@ -7790,12 +7921,15 @@ impl PaymentContract {
             && now >= sub.pause_data.last_paused_at + sub.pause_data.max_pause_seconds
         {
             let pause_duration = now - sub.pause_data.last_paused_at;
+            let old_next_payment_at = sub.next_payment_at;
             sub.pause_data.total_pause_duration += pause_duration;
             sub.next_payment_at += pause_duration;
             if sub.ends_at > 0 {
                 sub.ends_at += pause_duration;
             }
             sub.status = SubscriptionStatus::Active;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -7873,12 +8007,16 @@ impl PaymentContract {
                 );
                 sub.payment_count += 1;
                 sub.retry_count = 0;
+                let old_next_payment_at = sub.next_payment_at;
                 sub.next_payment_at += sub.interval;
                 sub.status = SubscriptionStatus::Active;
 
                 if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                     sub.status = SubscriptionStatus::Expired;
                 }
+
+                Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+                Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
                 env.store().set(
                     &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -7977,7 +8115,10 @@ impl PaymentContract {
 
         // Skip charge if still within trial period
         if sub.trial_data.ends_at > 0 && now < sub.trial_data.ends_at {
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at += sub.interval;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
                 &sub,
@@ -8041,7 +8182,10 @@ impl PaymentContract {
 
             sub.payment_count += 1;
             sub.retry_count = 0;
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at += sub.interval;
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
             // issue #664: honour scheduled cancellation — mark Cancelled after this final charge
             if sub.cancel_at_period_end {
@@ -8936,7 +9080,10 @@ impl PaymentContract {
         sub.pause_data.total_pause_duration += pause_duration;
 
         // Shift next billing date by pause duration
+        let old_next_payment_at = sub.next_payment_at;
         sub.next_payment_at += pause_duration;
+        Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         // Shift ends_at if it's a fixed-duration subscription
         if sub.ends_at > 0 {
@@ -9099,6 +9246,8 @@ impl PaymentContract {
 
         let skipped_payment_at = sub.next_payment_at;
         sub.next_payment_at += sub.interval;
+        Self::deindex_due_subscription(&env, skipped_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -9331,12 +9480,16 @@ impl PaymentContract {
         if transfer_ok {
             sub.payment_count += 1;
             sub.retry_count = 0;
+            let old_next_payment_at = sub.next_payment_at;
             sub.next_payment_at = now + sub.interval;
             sub.status = SubscriptionStatus::Active;
 
             if sub.ends_at > 0 && sub.next_payment_at >= sub.ends_at {
                 sub.status = SubscriptionStatus::Expired;
             }
+
+            Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+            Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
             env.store().set(
                 &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -9444,7 +9597,10 @@ impl PaymentContract {
         // Reset to active state
         sub.status = SubscriptionStatus::Active;
         sub.retry_count = 0;
+        let old_next_payment_at = sub.next_payment_at;
         sub.next_payment_at = env.ledger().timestamp() + sub.interval;
+        Self::deindex_due_subscription(&env, old_next_payment_at, subscription_id);
+        Self::index_due_subscription(&env, sub.next_payment_at, subscription_id);
 
         env.store().set(
             &DataKey::Subscription(SubscriptionKey::Data(subscription_id)),
@@ -17265,6 +17421,9 @@ mod test_metered_billing;
 #[cfg(test)]
 mod test_installment_refund;
 
+#[cfg(test)]
+mod test_installment_schedule;
+
 mod test_fee_sweep;
 #[cfg(test)]
 mod test_split_payment;
@@ -17274,6 +17433,9 @@ mod test_spend_limits;
 
 #[cfg(test)]
 mod test_subscription_groups;
+
+#[cfg(test)]
+mod test_subscriptions_due;
 
 #[cfg(test)]
 mod test_finality_delay;
@@ -17315,4 +17477,4 @@ mod test_mandates;
 mod test_refund_sync;
 
 #[cfg(test)]
-mod test_payment_hooks;
+mod test_dunning;
