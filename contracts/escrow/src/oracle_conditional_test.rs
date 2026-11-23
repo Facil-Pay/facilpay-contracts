@@ -408,6 +408,7 @@ fn test_evaluate_met_condition_deducts_fee() {
             fee_bps: 250,
             fee_recipient: s.contract_id.clone(),
             enabled: true,
+            max_fee: None,
         },
     );
     let source = register_state_source(&s, &expected_value(&s.env));

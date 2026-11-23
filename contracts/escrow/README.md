@@ -93,6 +93,11 @@ The private `weighted_auto_resolve` function sums evidence weights separately fo
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
 - create_escrow_with_reference: Same as create_escrow, but links the escrow to an off-chain order reference that is unique per merchant. See [Order References](#order-references).
+- create_hashlock_escrow: Creates an escrow released by revealing a SHA-256 preimage; see [Hashlock Escrows](#hashlock-escrows-issue-877).
+- claim_hashlock_escrow: Merchant reveals the preimage to release a hashlock escrow.
+- refund_hashlock_escrow: Customer reclaims funds from an unclaimed hashlock escrow after its timeout.
+- set_merchant_cooling_off: Admin-only. Sets a per-merchant customer cooling-off window; see [Merchant Cooling-Off](#merchant-cooling-off-issue-878).
+- cancel_within_cooling_off: Customer cancels an unaccepted escrow during the cooling-off window for a full refund.
 - get_escrow_by_reference: Looks up an escrow by merchant and order reference.
 - get_escrow_reference: Returns the order reference an escrow was created with, if any.
 - release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
@@ -1218,6 +1223,29 @@ Renewal records persist for the lifetime of the contract's instance storage (see
 
 ---
 
+## Hashlock Escrows (issue #877)
+
+Hashlock escrows support atomic cross-chain or off-chain-delivery flows: funds are released only when a secret is revealed.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `create_hashlock_escrow(customer, merchant, amount, token, hash, timeout)` | `hash: BytesN<32>` = expected `sha256(preimage)`; `timeout: u64` = absolute ledger timestamp after which the customer may reclaim. | Customer must authorize. Funds are locked in a standard `Locked` escrow, with `timeout` used as the expiry. Emits `HashlockEscrowCreated { escrow_id, hash, timeout }`. |
+| `claim_hashlock_escrow(merchant, escrow_id, preimage)` | `preimage: Bytes` | Merchant must authorize and the escrow must be `Locked`. Verifies `sha256(preimage) == hash`, marks the escrow `Released`, transfers the full amount to the merchant and emits `HashlockEscrowClaimed { escrow_id, merchant, preimage }` — the revealed preimage is included in the event. |
+| `refund_hashlock_escrow(customer, escrow_id)` | — | Customer must authorize. Allowed only at/after `timeout` while the escrow is still `Locked`; marks it `Cancelled`, refunds the customer in full and emits `HashlockEscrowRefunded { escrow_id, customer, amount }`. |
+
+**Errors:** `InvalidPreimage` (236) for a wrong preimage — no state or funds change; `NotFound` (200) when no hashlock parameters exist; `InvalidStatus` (201) if the escrow is not Locked or the caller is not the expected party; `TimeoutNotReached` (204) for a claim after the timeout or a refund before it. Creation also uses the standard `create_escrow` validation errors. **Events:** `HashlockEscrowCreated`, `HashlockEscrowClaimed` (includes the preimage), `HashlockEscrowRefunded`, plus the normal escrow status-index update.
+
+## Merchant Cooling-Off (issue #878)
+
+An admin can give customers a window to undo a mistaken payment before the merchant accepts it.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `set_merchant_cooling_off(admin, merchant, cooling_off_seconds)` | `cooling_off_seconds: u64` | Admin-only (must be in the multisig admin set). Stores the window for `merchant` and emits `CoolingOffConfigUpdated { merchant, cooling_off_seconds }`. |
+| `cancel_within_cooling_off(customer, escrow_id)` | — | Customer must authorize. Refunds the full amount and marks the escrow `Cancelled` only while `now < created_at + cooling_off_seconds` and the merchant has not accepted the escrow. Emits `CancelledWithinCoolingOff { escrow_id, customer, amount }`. |
+
+**Errors:** `CoolingOffNotConfigured` (237) when the merchant has no configured window, `CoolingOffWindowEnded` (238) at/after the deadline, `CoolingOffMerchantAccepted` (239) once the merchant has accepted, plus `NotFound`/`InvalidStatus` for unknown or non-Locked escrows and `NotAnAdmin` for a non-admin setter. **Events:** `CoolingOffConfigUpdated`, `CancelledWithinCoolingOff`.
+
 ## Partial release (issue #687)
 
 `release_partial(admin, escrow_id, amount)` releases part of a standard escrow's locked funds to the merchant.
@@ -1473,3 +1501,68 @@ Every state-changing entry point first extends the instance storage TTL, so the 
 | `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
 
 17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.
+
+## Admin Token Allowlist (Issue #881)
+
+By default every token is accepted, preserving existing behaviour. Once an admin adds at least
+one token, new escrows may only use tokens on the allowlist. Removing a token never changes an
+existing escrow — it only affects future creations.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `add_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `EscrowTokenAdded { token, admin }` |
+| `remove_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | Same as above; removing an unlisted token is a no-op | `EscrowTokenRemoved { token, admin }` |
+| `get_escrow_tokens` | `env: Env` | `Vec<Address>` | Read-only; empty vector means unrestricted creation | None |
+
+Creation errors: `EscrowError::TokenNotAllowed` (code `343`) is returned by every creation path —
+`create_escrow`, `create_escrow_with_reference`, `create_escrow_with_beneficiaries`,
+`create_escrow_with_multisig`, `create_escrow_from_template`, `create_escrow_batch` (per-entry
+error code `343`), `create_multi_party_escrow`, `create_multi_token_escrow` (each token) and
+recurring/tiered creation helpers — when a non-empty allowlist does not contain the token.
+
+## Per-Merchant Exposure Limit (Issue #879)
+
+Open exposure is tracked per `(merchant, token)` pair. It increases when an escrow is created and
+is reduced when the escrow is released, refunded, cancelled, or fully released in stages. If no
+limit is configured, creation is unrestricted.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_merchant_exposure_limit` | `env: Env`, `admin: Address`, `merchant: Address`, `token: Address`, `limit: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MerchantExposureLimitUpdated { merchant, token, limit, admin }` |
+| `get_merchant_exposure_limit` | `env: Env`, `merchant: Address`, `token: Address` | `Option<i128>` | Read-only; `None` when no limit is set | None |
+| `get_merchant_exposure` | `env: Env`, `merchant: Address`, `token: Address` | `i128` | Read-only; returns `0` when no escrow was ever created | None |
+
+Creation fails with `EscrowError::ExposureLimitExceeded` (code `344`) when `current exposure +
+amount` would exceed the configured limit. The check applies to `create_escrow` and its variants,
+templates, batch entries (per-entry error code `344`), and child escrows.
+
+## Escrow Status History (Issue #880)
+
+Every transition that publishes `EscrowStatusChanged` also appends an entry to a per-escrow bounded
+history. When `MAX_STATUS_HISTORY` (10) is reached, the oldest entry is dropped. History is
+read-only through the getter; no additional errors or events are introduced (the existing
+`EscrowStatusChanged { escrow_id, old_status, new_status, changed_by, timestamp }` event is emitted
+as before).
+
+| Function | Parameters | Returns | Notes |
+|---|---|---|---|
+| `get_escrow_status_history` | `env: Env`, `escrow_id: u64` | `Vec<EscrowStatusEntry>` | Read-only; empty for unknown ids. Entries are chronological (oldest first). |
+
+`EscrowStatusEntry { status: EscrowStatus, changed_by: Address, timestamp: u64 }` records the new
+status, the address that performed the transition, and the ledger timestamp of the change. The
+history is written on release (`release_escrow`) and refund (`refund_escrow_to`), mirroring each
+`EscrowStatusChanged` event.
+
+## Minimum Escrow Amount Per Token (Issue #882)
+
+An unset minimum means no minimum is enforced, preserving existing behaviour.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_min_escrow_amount` | `env: Env`, `admin: Address`, `token: Address`, `min_amount: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MinEscrowAmountUpdated { token, min_amount, admin }` |
+| `get_min_escrow_amount` | `env: Env`, `token: Address` | `Option<i128>` | Read-only; `None` when unset | None |
+
+Any creation with `amount < min_amount` fails with `EscrowError::AmountBelowMinimum` (code `345`).
+The check is applied to every creation path: single escrows and their reference/beneficiary/multisig
+variants, templates and recurring schedules, batch entries (per-entry error code `345`),
+multi-party escrows, every token of a multi-token escrow, and child escrows.

@@ -92,6 +92,8 @@ pub enum DataKey {
     // #818: number of incident log entries and each entry by id (persistent).
     IncidentCount,
     Incident(u64),
+    // #876: number of incident entries per structured reason code.
+    IncidentReasonCount(u32),
 }
 
 /// A privileged coordinator action that goes through propose/approve/execute (#816).
@@ -119,30 +121,21 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
-    /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
-    pub cancelled: bool,
+    /// Optional hash of the off-chain rationale for this proposal (#875).
+    pub description_hash: Option<BytesN<32>>,
 }
 
-/// Configuration for the child-upgrade veto window (#874).
+/// Proposal shape used before #875, kept so existing stored proposals stay readable.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChildUpgradeConfig {
-    /// Seconds that must elapse between queueing and execution.
-    pub delay_seconds: u64,
-    /// Number of distinct admin vetoes that cancel a queued upgrade.
-    pub veto_threshold: u32,
-}
-
-/// A queued, not-yet-executed child upgrade (#874).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueuedChildUpgrade {
-    pub child_kind: ChildKind,
-    pub wasm_hash: BytesN<32>,
-    pub queued_at: u64,
-    pub execute_after: u64,
-    pub vetoes: Vec<Address>,
-    pub vetoed: bool,
+struct LegacyAdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
 }
 
 /// Schema versions across the platform (#817). A child is `None` when its
@@ -163,6 +156,7 @@ pub struct AdminProposalCreated {
     pub proposer: Address,
     pub action: AdminAction,
     pub expires_at: u64,
+    pub description_hash: Option<BytesN<32>>,
 }
 
 #[contractevent]
@@ -279,6 +273,7 @@ pub struct EmergencyFunctionPausedEvent {
     pub paused_by: Address,
     pub reason: String,
     pub paused_at: u64,
+    pub reason_code: IncidentReason,
 }
 
 /// Emitted when the pauser unpauses a single function on one child contract.
@@ -321,6 +316,29 @@ pub enum IncidentAction {
     UnpauseFunction,
 }
 
+/// Structured reason code for an emergency action, stored alongside the
+/// free-form reason text (#876).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncidentReason {
+    SecurityExploit,
+    OracleFailure,
+    ChildUpgrade,
+    Maintenance,
+    Other,
+}
+
+/// Stable numeric code used to aggregate incident counts by reason (#876).
+fn incident_reason_code(reason: &IncidentReason) -> u32 {
+    match reason {
+        IncidentReason::SecurityExploit => 0,
+        IncidentReason::OracleFailure => 1,
+        IncidentReason::ChildUpgrade => 2,
+        IncidentReason::Maintenance => 3,
+        IncidentReason::Other => 4,
+    }
+}
+
 /// What an incident log entry acted on (#818).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -347,6 +365,22 @@ pub struct IncidentEntry {
     pub actor: Option<Address>,
     /// Ledger timestamp of the action.
     pub at: u64,
+    /// Structured reason code (#876): 0 SecurityExploit, 1 OracleFailure,
+    /// 2 ChildUpgrade, 3 Maintenance, 4 Other. `None` for pre-#876 entries.
+    pub reason_code: Option<u32>,
+}
+
+/// Incident entry shape used before #876, kept for backwards-compatible reads.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LegacyIncidentEntry {
+    pub id: u64,
+    pub action: IncidentAction,
+    pub target: IncidentTarget,
+    pub function: Option<String>,
+    pub reason: String,
+    pub actor: Option<Address>,
+    pub at: u64,
 }
 
 /// Emitted whenever an entry is appended to the incident log (#818).
@@ -356,6 +390,7 @@ pub struct IncidentLogged {
     pub incident_id: u64,
     pub action: IncidentAction,
     pub at: u64,
+    pub reason_code: IncidentReason,
 }
 
 /// Appends an entry to the persistent incident log and emits `IncidentLogged`.
@@ -366,6 +401,7 @@ fn log_incident(
     function: Option<String>,
     reason: String,
     actor: Option<Address>,
+    reason_code: IncidentReason,
 ) {
     let id = incident_count(env) + 1;
     let at = env.ledger().timestamp();
@@ -377,15 +413,26 @@ fn log_incident(
         reason,
         actor,
         at,
+        reason_code: Some(incident_reason_code(&reason_code)),
     };
     env.storage()
         .persistent()
         .set(&DataKey::Incident(id), &entry);
     env.storage().persistent().set(&DataKey::IncidentCount, &id);
+    let code = incident_reason_code(&reason_code);
+    let reason_count: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::IncidentReasonCount(code))
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&DataKey::IncidentReasonCount(code), &(reason_count + 1));
     IncidentLogged {
         incident_id: id,
         action,
         at,
+        reason_code,
     }
     .publish(env);
 }
@@ -771,10 +818,29 @@ fn collect_open_proposals(
 }
 
 fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
-    env.storage()
+    if let Some(proposal) = env
+        .storage()
         .persistent()
         .get(&DataKey::Proposal(proposal_id))
-        .ok_or(Error::ProposalNotFound)
+    {
+        return Ok(proposal);
+    }
+    // Proposals stored before #875 have no description hash.
+    let legacy: LegacyAdminProposal = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Proposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)?;
+    Ok(AdminProposal {
+        id: legacy.id,
+        action: legacy.action,
+        proposer: legacy.proposer,
+        approvals: legacy.approvals,
+        created_at: legacy.created_at,
+        expires_at: legacy.expires_at,
+        executed: legacy.executed,
+        description_hash: None,
+    })
 }
 
 /// Rejects proposals that already ran or whose approval window has closed.
@@ -946,6 +1012,7 @@ impl AdminContract {
         pauser: Address,
         reason: String,
         max_pause_seconds: Option<u64>,
+        reason_code: IncidentReason,
     ) -> Result<(), Error> {
         require_pauser(&env, &pauser)?;
 
@@ -984,6 +1051,7 @@ impl AdminContract {
             None,
             reason,
             Some(pauser),
+            reason_code,
         );
 
         Ok(())
@@ -1014,6 +1082,7 @@ impl AdminContract {
             None,
             String::from_str(&env, ""),
             Some(pauser),
+            IncidentReason::Other,
         );
         Ok(())
     }
@@ -1070,6 +1139,7 @@ impl AdminContract {
             None,
             String::from_str(&env, ""),
             Some(admin),
+            IncidentReason::Other,
         );
 
         Ok(new_expires_at)
@@ -1117,6 +1187,7 @@ impl AdminContract {
             None,
             String::from_str(&env, ""),
             None,
+            IncidentReason::Other,
         );
 
         Ok(())
@@ -1145,6 +1216,19 @@ impl AdminContract {
         while id <= end {
             if let Some(entry) = env.storage().persistent().get(&DataKey::Incident(id)) {
                 page.push_back(entry);
+            } else if let Some(legacy) = env.storage().persistent().get(&DataKey::Incident(id)).map(
+                |entry: LegacyIncidentEntry| IncidentEntry {
+                    id: entry.id,
+                    action: entry.action,
+                    target: entry.target,
+                    function: entry.function,
+                    reason: entry.reason,
+                    actor: entry.actor,
+                    at: entry.at,
+                    reason_code: None,
+                },
+            ) {
+                page.push_back(legacy);
             }
             id += 1;
         }
@@ -1154,6 +1238,14 @@ impl AdminContract {
     /// Returns the total number of entries in the incident log (#818).
     pub fn get_incident_count(env: Env) -> u64 {
         incident_count(&env)
+    }
+
+    /// Returns the number of incident log entries with the given reason code (#876).
+    pub fn get_incident_count_by_reason(env: Env, reason: IncidentReason) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::IncidentReasonCount(incident_reason_code(&reason)))
+            .unwrap_or(0)
     }
 
     /// Pauses a single function on one child contract, leaving every other
@@ -1181,6 +1273,7 @@ impl AdminContract {
         target: ChildKind,
         function_name: String,
         reason: String,
+        reason_code: IncidentReason,
     ) -> Result<(), Error> {
         require_pauser(&env, &pauser)?;
         if function_name.is_empty() {
@@ -1212,6 +1305,7 @@ impl AdminContract {
             paused_by: pauser.clone(),
             reason: reason.clone(),
             paused_at: env.ledger().timestamp(),
+            reason_code,
         }
         .publish(&env);
         log_incident(
@@ -1221,6 +1315,7 @@ impl AdminContract {
             Some(function_name),
             reason,
             Some(pauser),
+            reason_code,
         );
 
         Ok(())
@@ -1281,6 +1376,7 @@ impl AdminContract {
             Some(function_name),
             String::from_str(&env, ""),
             Some(pauser),
+            IncidentReason::Other,
         );
 
         Ok(())
@@ -1418,7 +1514,12 @@ impl AdminContract {
     ///
     /// # Events
     /// Emits `AdminProposalCreated`.
-    pub fn propose_action(env: Env, proposer: Address, action: AdminAction) -> Result<u64, Error> {
+    pub fn propose_action(
+        env: Env,
+        proposer: Address,
+        action: AdminAction,
+        description_hash: Option<BytesN<32>>,
+    ) -> Result<u64, Error> {
         require_admin_member(&env, &proposer)?;
         if let AdminAction::SetAdmins(admins, threshold) = &action {
             validate_admin_set(admins, *threshold)?;
@@ -1440,7 +1541,7 @@ impl AdminContract {
             created_at,
             expires_at,
             executed: false,
-            cancelled: false,
+            description_hash: description_hash.clone(),
         };
         env.storage().instance().set(&DataKey::ProposalCount, &id);
         env.storage()
@@ -1452,6 +1553,7 @@ impl AdminContract {
             proposer,
             action,
             expires_at,
+            description_hash: description_hash.clone(),
         }
         .publish(&env);
 
@@ -1946,7 +2048,7 @@ mod test {
         );
 
         let reason = String::from_str(&env, "security incident");
-        client.emergency_pause_all(&pauser, &reason, &None);
+        client.emergency_pause_all(&pauser, &reason, &None, &IncidentReason::Other);
         client.emergency_unpause_all(&pauser);
     }
 
@@ -2020,7 +2122,7 @@ mod test {
         let refund = RefundContractClient::new(&env, &refund_contract);
 
         let reason = String::from_str(&env, "security incident");
-        client.emergency_pause_all(&pauser, &reason, &None);
+        client.emergency_pause_all(&pauser, &reason, &None, &IncidentReason::Other);
 
         assert!(payment.get_pause_state().globally_paused);
         assert!(escrow.get_pause_state().globally_paused);
@@ -2045,7 +2147,7 @@ mod test {
         let someone = Address::generate(&env);
         let reason = String::from_str(&env, "incident");
         assert_eq!(
-            fresh.try_emergency_pause_all(&someone, &reason, &None),
+            fresh.try_emergency_pause_all(&someone, &reason, &None, &IncidentReason::Other),
             Err(Ok(Error::NotInitialized))
         );
         assert_eq!(
@@ -2056,7 +2158,7 @@ mod test {
         // Initialized contract rejects anyone but the stored pauser, including the admin.
         let (client, admin, _pauser, payment_contract, _, _) = setup_initialized(&env);
         assert_eq!(
-            client.try_emergency_pause_all(&admin, &reason, &None),
+            client.try_emergency_pause_all(&admin, &reason, &None, &IncidentReason::Other),
             Err(Ok(Error::Unauthorized))
         );
         assert_eq!(
@@ -2108,7 +2210,12 @@ mod test {
         client.set_refund_contract(&admin, &new_refund);
 
         // Pausing now targets the new contracts and leaves the old ones untouched.
-        client.emergency_pause_all(&pauser, &String::from_str(&env, "rotation"), &None);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "rotation"),
+            &None,
+            &IncidentReason::Other,
+        );
 
         assert!(
             PaymentContractClient::new(&env, &new_payment)
@@ -2325,6 +2432,7 @@ mod test {
         let id = client.propose_action(
             &admin,
             &AdminAction::SetPaymentContract(new_payment.clone()),
+            &None,
         );
         assert_eq!(
             client.try_execute_action(&admin, &id),
@@ -2356,10 +2464,10 @@ mod test {
         let action = AdminAction::SetRefundContract(stranger.clone());
 
         assert_eq!(
-            client.try_propose_action(&pauser, &action),
+            client.try_propose_action(&pauser, &action, &None),
             Err(Ok(Error::Unauthorized))
         );
-        let id = client.propose_action(&admin, &action);
+        let id = client.propose_action(&admin, &action, &None);
         assert_eq!(
             client.try_approve_action(&stranger, &id),
             Err(Ok(Error::Unauthorized))
@@ -2381,7 +2489,7 @@ mod test {
         let (client, admin, a2, a3, pauser) = setup_multisig(&env);
         let new_escrow = setup_escrow(&env, &pauser);
 
-        let id = client.propose_action(&admin, &AdminAction::SetEscrowContract(new_escrow));
+        let id = client.propose_action(&admin, &AdminAction::SetEscrowContract(new_escrow), &None);
         client.approve_action(&a2, &id);
 
         let expires_at = client.get_proposal(&id).expires_at;
@@ -2405,10 +2513,11 @@ mod test {
         let new_refund = setup_refund(&env, &pauser);
 
         // a3 approves a pending action, then is removed from the set.
-        let pending = client.propose_action(&a3, &AdminAction::SetRefundContract(new_refund));
+        let pending =
+            client.propose_action(&a3, &AdminAction::SetRefundContract(new_refund), &None);
 
         let new_set = Vec::from_array(&env, [admin.clone(), a2.clone()]);
-        let id = client.propose_action(&admin, &AdminAction::SetAdmins(new_set.clone(), 2));
+        let id = client.propose_action(&admin, &AdminAction::SetAdmins(new_set.clone(), 2), &None);
         client.approve_action(&a2, &id);
         client.execute_action(&admin, &id);
         assert_eq!(client.get_admins(), new_set);
@@ -2422,7 +2531,7 @@ mod test {
 
         // Invalid SetAdmins proposals are rejected up front.
         assert_eq!(
-            client.try_propose_action(&admin, &AdminAction::SetAdmins(new_set, 5)),
+            client.try_propose_action(&admin, &AdminAction::SetAdmins(new_set, 5), &None),
             Err(Ok(Error::InvalidThreshold))
         );
     }
@@ -2432,7 +2541,12 @@ mod test {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _, _, _, pauser) = setup_multisig(&env);
-        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &None);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &None,
+            &IncidentReason::Other,
+        );
         let payment = PaymentContractClient::new(&env, &client.get_contracts().payment);
         assert!(payment.get_pause_state().globally_paused);
     }
@@ -2525,6 +2639,7 @@ mod test {
             &pauser,
             &String::from_str(&env, "incident"),
             &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
         );
         let expires_at = 1_000 + PAUSE_SECONDS;
         assert_eq!(client.get_emergency_pause_expiry(), Some(expires_at));
@@ -2562,6 +2677,7 @@ mod test {
             &pauser,
             &String::from_str(&env, "incident"),
             &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
         );
         set_time(&env, env.ledger().timestamp() + PAUSE_SECONDS);
 
@@ -2601,7 +2717,12 @@ mod test {
         env.mock_all_auths();
         let (client, admin, pauser, _, _, _) = setup_initialized(&env);
 
-        client.emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &None);
+        client.emergency_pause_all(
+            &pauser,
+            &String::from_str(&env, "incident"),
+            &None,
+            &IncidentReason::Other,
+        );
         assert_eq!(client.get_emergency_pause_expiry(), None);
 
         set_time(&env, env.ledger().timestamp() + 365 * 24 * 60 * 60);
@@ -2623,7 +2744,12 @@ mod test {
         let (client, _, pauser, _, _, _) = setup_initialized(&env);
 
         assert_eq!(
-            client.try_emergency_pause_all(&pauser, &String::from_str(&env, "incident"), &Some(0)),
+            client.try_emergency_pause_all(
+                &pauser,
+                &String::from_str(&env, "incident"),
+                &Some(0),
+                &IncidentReason::Other
+            ),
             Err(Ok(Error::InvalidPauseDuration))
         );
         assert_eq!(all_paused(&env, &client), [false; 3]);
@@ -2641,6 +2767,7 @@ mod test {
             &pauser,
             &String::from_str(&env, "incident"),
             &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
         );
         let expires_at = 1_000 + PAUSE_SECONDS;
 
@@ -2674,6 +2801,7 @@ mod test {
             &pauser,
             &String::from_str(&env, "incident"),
             &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
         );
         let expires_at = 1_000 + PAUSE_SECONDS;
 
@@ -2710,6 +2838,7 @@ mod test {
             &pauser,
             &String::from_str(&env, "incident"),
             &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
         );
         let expires_at = client.get_emergency_pause_expiry().unwrap();
 
@@ -2726,7 +2855,12 @@ mod test {
         let (client, _, pauser, _, _, _) = setup_initialized(&env);
         let reason = String::from_str(&env, "incident");
 
-        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        client.emergency_pause_all(
+            &pauser,
+            &reason,
+            &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
+        );
         client.emergency_unpause_all(&pauser);
         assert_eq!(client.get_emergency_pause_expiry(), None);
         assert_eq!(
@@ -2734,9 +2868,14 @@ mod test {
             Err(Ok(Error::NoPauseExpiry))
         );
 
-        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        client.emergency_pause_all(
+            &pauser,
+            &reason,
+            &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
+        );
         client.emergency_unpause_all(&pauser);
-        client.emergency_pause_all(&pauser, &reason, &None);
+        client.emergency_pause_all(&pauser, &reason, &None, &IncidentReason::Other);
         assert_eq!(client.get_emergency_pause_expiry(), None);
     }
 
@@ -2755,14 +2894,25 @@ mod test {
         assert_eq!(client.get_incident_count(), 0);
         assert_eq!(client.get_incident_log(&0, &10).len(), 0);
 
-        client.emergency_pause_function(&pauser, &ChildKind::Refund, &function, &reason);
+        client.emergency_pause_function(
+            &pauser,
+            &ChildKind::Refund,
+            &function,
+            &reason,
+            &IncidentReason::Other,
+        );
         client.emergency_unpause_function(&pauser, &ChildKind::Refund, &function);
-        client.emergency_pause_all(&pauser, &reason, &Some(PAUSE_SECONDS));
+        client.emergency_pause_all(
+            &pauser,
+            &reason,
+            &Some(PAUSE_SECONDS),
+            &IncidentReason::Other,
+        );
         set_time(&env, 1_100);
         client.extend_emergency_pause(&admin, &PAUSE_SECONDS);
         set_time(&env, 1_000 + 2 * PAUSE_SECONDS);
         client.expire_emergency_pause();
-        client.emergency_pause_all(&pauser, &reason, &None);
+        client.emergency_pause_all(&pauser, &reason, &None, &IncidentReason::Other);
         client.emergency_unpause_all(&pauser);
         assert!(has_event(&env, "incident_logged"));
 
@@ -2780,6 +2930,7 @@ mod test {
                 reason: reason.clone(),
                 actor: Some(pauser.clone()),
                 at: 1_000,
+                reason_code: Some(4),
             }
         );
         let unpause_fn = log.get(1).unwrap();
@@ -2818,7 +2969,7 @@ mod test {
         let reason = String::from_str(&env, "incident");
 
         for _ in 0..30 {
-            client.emergency_pause_all(&pauser, &reason, &None);
+            client.emergency_pause_all(&pauser, &reason, &None, &IncidentReason::Other);
             client.emergency_unpause_all(&pauser);
         }
         assert_eq!(client.get_incident_count(), 60);
@@ -2862,17 +3013,18 @@ mod test {
         let reason = String::from_str(&env, "incident");
 
         assert!(client
-            .try_emergency_pause_all(&admin, &reason, &None)
+            .try_emergency_pause_all(&admin, &reason, &None, &IncidentReason::Other)
             .is_err());
         assert!(client
-            .try_emergency_pause_all(&pauser, &reason, &Some(0))
+            .try_emergency_pause_all(&pauser, &reason, &Some(0), &IncidentReason::Other)
             .is_err());
         assert!(client
             .try_emergency_pause_function(
                 &pauser,
                 &ChildKind::Payment,
                 &String::from_str(&env, ""),
-                &reason
+                &reason,
+                &IncidentReason::Other
             )
             .is_err());
         assert!(client.try_expire_emergency_pause().is_err());

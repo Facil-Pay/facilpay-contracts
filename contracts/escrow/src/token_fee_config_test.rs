@@ -53,6 +53,7 @@ fn fee_config(fee_bps: i128, fee_recipient: &Address, enabled: bool) -> EscrowFe
         fee_bps,
         fee_recipient: fee_recipient.clone(),
         enabled,
+        max_fee: None,
     }
 }
 

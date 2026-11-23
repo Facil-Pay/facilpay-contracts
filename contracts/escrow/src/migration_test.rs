@@ -95,6 +95,7 @@ fn test_sub_account_fee_bps_override() {
             fee_bps: 500,
             fee_recipient: admin.clone(),
             enabled: true,
+            max_fee: None,
         },
     );
 
