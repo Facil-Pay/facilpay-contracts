@@ -646,6 +646,7 @@ No new error variants — this feature can never fail or revert a call. Event: `
 ### Customer History
 
 - `get_customer_refund_history()` — Paginated refund history for a customer.
+- `get_customer_refunds_by_status(customer: Address, status: RefundStatus, offset: u64, limit: u64) -> Vec<Refund>` — **(Issue #913)** A customer's refunds in one `status`, newest-first. Pagination matches `get_customer_refund_history`: `offset` skips that many *matching* refunds and at most `limit` are returned; `limit = 0` or an offset past the last match returns an empty list. Note the argument order is `offset, limit`. Read-only: no auth, no errors, no events. A rejected refund sits in `PendingAppeal` until its appeal window closes and `finalize_denial` moves it to `Rejected`.
 - `get_customer_refund_count_public()` — Total count of refunds for a customer.
 - `get_customer_refund_summary()` — Summary stats for a customer's refunds.
 
@@ -1057,6 +1058,25 @@ The same logic applies in every code path that processes a refund: `process_refu
 | `CoreError::InvalidAmount` | `1` | `amount` ≤ 0 for deposit/withdraw, or `min_amount` < 0 for `set_min_refund_reserve` |
 | `ExtError::InsufficientRefundReserve` | `67` | Withdrawal or refund payout exceeds the current balance |
 | `ExtError::ReserveBelowMinimum` | `68` | Withdrawal would leave the balance below the admin-set minimum |
+| `CoreError::ThirdPartyReserveLocked` | `87` | Withdrawal would dip into unreleased third-party contributions |
+| `CoreError::ContributionExceeded` | `88` | `release_reserve_contribution` amount exceeds the funder's outstanding contribution |
+
+#### Third-party deposits (Issue #920)
+
+Platforms and parent merchants can fund a merchant's reserve on its behalf. Platform-funded amounts are tracked per funder and stay locked: the merchant cannot withdraw them until the admin releases them. Refund payouts may still draw on locked funds.
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `deposit_refund_reserve_for` | `funder: Address`, `merchant: Address`, `token: Address`, `amount: i128` | `Result<i128, Error>` (new balance) | `funder` |
+| `release_reserve_contribution` | `admin: Address`, `merchant: Address`, `token: Address`, `funder: Address`, `amount: i128` | `Result<i128, Error>` (funder's remaining locked contribution) | `admin` |
+| `get_reserve_contribution` | `merchant: Address`, `token: Address`, `funder: Address` | `i128` — funder's outstanding (unreleased) contribution | — |
+| `get_locked_refund_reserve` | `merchant: Address`, `token: Address` | `i128` — `min(unreleased third-party total, balance)` | — |
+
+- **Depositing for a merchant** transfers `amount` of `token` from `funder` (not the merchant) into the contract, adds it to the merchant's reserve, and adds it to `funder`'s contribution. `amount` must be positive (`InvalidAmount`, 1). Honours the global pause and the `deposit_refund_reserve_for` function pause. A first third-party deposit opts the merchant into the reserve for that token, exactly like `deposit_refund_reserve`.
+- **Withdrawal lock.** `withdraw_refund_reserve` fails with `ThirdPartyReserveLocked` (87) if the balance left behind would fall below `get_locked_refund_reserve`. Only the merchant's own deposits (and released contributions) are withdrawable.
+- **Releasing.** `release_reserve_contribution` reduces the funder's contribution and the locked total by `amount`, making that much withdrawable by the merchant. Fails with `Unauthorized` (3) for non-admins, `InvalidAmount` (1) for `amount <= 0`, and `ContributionExceeded` (88) if `amount` is more than the funder's outstanding contribution.
+- **Refunds and the lock.** Payouts draw the whole reserve, including locked funds. The locked amount is capped at the current balance, so once refunds have consumed the reserve below the locked total the merchant has nothing withdrawable until the reserve is topped up or the admin releases contributions.
+- **Low-reserve alert.** Third-party deposits go through the same balance update as merchant deposits, so a top-up that lifts the reserve back to or above its warning level re-arms `RefundReserveLow`; the next drop below fires it again.
 
 ### Payment Refund Caps
 
@@ -1152,6 +1172,8 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundReserveWithdrawn` | `refund_reserve_withdrawn` | `merchant`, `token`, `amount`, `new_balance` | `withdraw_refund_reserve()` removes funds from the merchant's reserve |
 | `RefundReserveDebited` | `refund_reserve_debited` | `merchant`, `token`, `refund_id`, `amount`, `new_balance` | `process_refund()` (and batch/auto/appeal paths) debits the merchant's reserve to fund a payout |
 | `MinRefundReserveSet` | `min_refund_reserve_set` | `merchant`, `token`, `min_amount` | `set_min_refund_reserve()` establishes or updates the withdrawal floor |
+| `RefundReserveDepositedFor` | `refund_reserve_deposited_for` | `funder`, `merchant`, `token`, `amount`, `new_balance` | `deposit_refund_reserve_for()` adds third-party funds to the merchant's reserve (#920) |
+| `ReserveContributionReleased` | `reserve_contribution_released` | `funder`, `merchant`, `token`, `amount`, `remaining_contribution` | `release_reserve_contribution()` unlocks part of a funder's contribution (#920) |
 
 ### Voucher Events
 

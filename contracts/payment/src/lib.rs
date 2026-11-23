@@ -90,6 +90,12 @@ pub enum PaymentKey {
     // Reusable merchant payment links
     PaymentLinkCounter,
     PaymentLink(u64),
+    // Issue #900: partial payments on payment requests
+    RequestAllowPartial(u64),
+    RequestPaidAmount(u64),
+    RequestContributions(u64),
+    // Issue #900: payment whose funds are already held by the contract
+    Prefunded(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -123,6 +129,8 @@ pub enum SubscriptionKey {
     // Issue #753: seat-based subscriptions
     Seats(u64),
     SeatCredit(u64),
+    // Issue #902: merchant-set min/max seat bounds
+    SeatBounds(u64),
     // Issue #770: churn reason recorded on cancellation
     CancellationReason(u64),
 }
@@ -299,6 +307,9 @@ pub enum SubscriptionError {
     // Subscription transfers
     SubscriptionNotTransferable = 329,
     InvalidTransferRecipient = 330,
+    // Issue #902: seat bounds on seat-based subscriptions
+    SeatsOutOfBounds = 331,
+    InvalidSeatBounds = 332,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -370,6 +381,9 @@ pub enum FeatureError {
     // Issue #767: auto-complete escrowed payment after confirmation timeout
     NoConfirmationTimeout = 546,
     ConfirmationTimeoutNotExpired = 547,
+    // Issue #900: partial payments on payment requests
+    RequestOverpayment = 548,
+    PartialPaymentNotAllowed = 549,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -415,7 +429,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=547).contains(&code) {
+            if (500..=549).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -425,7 +439,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=330).contains(&code) {
+            if (300..=332).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
@@ -775,6 +789,14 @@ pub struct SubscriptionPriceProposal {
 pub struct SubscriptionSeats {
     pub quantity: u32,
     pub unit_amount: i128,
+}
+
+// Issue #902: optional seat bounds on a seat-based subscription.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SeatBounds {
+    pub min_seats: Option<u32>,
+    pub max_seats: Option<u32>,
 }
 
 /// Reason a subscription was cancelled (#770).
@@ -1188,6 +1210,34 @@ pub struct PaymentRequestPaid {
 pub struct PaymentRequestCancelled {
     pub request_id: u64,
     pub merchant: Address,
+}
+
+// Issue #900: merchant toggled partial payments on a payment request
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartialSet {
+    pub request_id: u64,
+    pub merchant: Address,
+    pub allow_partial: bool,
+}
+
+// Issue #900: a customer paid part of a payment request
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartiallyPaid {
+    pub request_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+    pub paid_amount: i128,
+}
+
+// Issue #900: a partial contribution was returned when a request was cancelled
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartialRefunded {
+    pub request_id: u64,
+    pub payer: Address,
+    pub amount: i128,
 }
 
 // Issue #669: merchant registry
@@ -1671,6 +1721,16 @@ pub struct SubscriptionCancelScheduled {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCancelUndone {
     pub subscription_id: u64,
+}
+
+// Issue #902: merchant set seat bounds on a subscription
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionSeatBoundsSet {
+    pub subscription_id: u64,
+    pub merchant: Address,
+    pub min_seats: Option<u32>,
+    pub max_seats: Option<u32>,
 }
 
 // issue #753: seat count changed mid-cycle
@@ -3566,6 +3626,16 @@ impl PaymentContract {
             }
         }
 
+        // Issue #900: a partially paid request is settled by paying the remainder.
+        let paid_amount = Self::get_payment_request_paid_amount(env.clone(), request_id);
+        if paid_amount > 0 {
+            let remaining = request.amount - paid_amount;
+            Self::do_pay_payment_request_partial(&env, customer, request_id, remaining)?;
+            return Self::get_payment_request(env, request_id)?
+                .payment_id
+                .ok_or(Error::Payment(PaymentError::RequestNotFound));
+        }
+
         let payment_id = PaymentContract::do_create_payment(
             &env,
             customer.clone(),
@@ -3629,6 +3699,27 @@ impl PaymentContract {
         request.status = PaymentRequestStatus::Cancelled;
         env.store().set(&key, &request);
 
+        // Issue #900: return any partial payments to the payers that made them.
+        let contributions_key = DataKey::Payment(PaymentKey::RequestContributions(request_id));
+        if let Some(contributions) = env.store().get::<Map<Address, i128>>(&contributions_key) {
+            let token_client = token::Client::new(&env, &request.token);
+            let contract_address = env.current_contract_address();
+            for (payer, amount) in contributions.iter() {
+                if amount > 0 {
+                    token_client.transfer(&contract_address, &payer, &amount);
+                    (PaymentRequestPartialRefunded {
+                        request_id,
+                        payer,
+                        amount,
+                    })
+                    .publish(&env);
+                }
+            }
+            env.store().remove(&contributions_key);
+            env.store()
+                .remove(&DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)));
+        }
+
         (PaymentRequestCancelled {
             request_id,
             merchant,
@@ -3636,6 +3727,204 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Lets customers pay a payment request in several transfers (#900).
+    ///
+    /// Only the issuing merchant may change this, only while the request is
+    /// `Open`, and partial payments cannot be disabled once any have been made.
+    ///
+    /// # Errors
+    /// `RequestNotFound`, `Unauthorized` (not the request's merchant),
+    /// `RequestAlreadyPaid` / `RequestCancelled`, or `InvalidStatus` when
+    /// disabling a request that already has partial payments.
+    pub fn set_payment_request_partial(
+        env: Env,
+        merchant: Address,
+        request_id: u64,
+        allow_partial: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let request = Self::get_payment_request(env.clone(), request_id)?;
+        if request.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+        if !allow_partial && Self::get_payment_request_paid_amount(env.clone(), request_id) > 0 {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        let key = DataKey::Payment(PaymentKey::RequestAllowPartial(request_id));
+        if allow_partial {
+            env.store().set(&key, &true);
+        } else {
+            env.store().remove(&key);
+        }
+        (PaymentRequestPartialSet {
+            request_id,
+            merchant,
+            allow_partial,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Whether partial payments are enabled on a request (#900).
+    pub fn get_request_allows_partial(env: Env, request_id: u64) -> bool {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::RequestAllowPartial(
+                request_id,
+            )))
+            .unwrap_or(false)
+    }
+
+    /// Total paid so far towards a payment request through partial payments (#900).
+    pub fn get_payment_request_paid_amount(env: Env, request_id: u64) -> i128 {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)))
+            .unwrap_or(0)
+    }
+
+    /// Pays part of an open payment request that allows partial payments (#900).
+    ///
+    /// `amount` is transferred from `customer` into the contract and added to
+    /// the request's `paid_amount`. When `paid_amount` reaches the request's
+    /// `amount`, the request becomes `Paid` and a payment record is created
+    /// for the full amount with `customer` (the final payer) as its customer,
+    /// exactly as `pay_payment_request` does.
+    ///
+    /// # Returns
+    /// The request's `paid_amount` after this payment.
+    ///
+    /// # Errors
+    /// `RequestNotFound`, `RequestAlreadyPaid`, `RequestCancelled`,
+    /// `RequestExpired`, `RequestCustomerMismatch`, `InvalidAmount`
+    /// (`amount <= 0`), `PartialPaymentNotAllowed` (merchant has not opted in),
+    /// `RequestOverpayment` (`paid_amount + amount > request.amount`), or any
+    /// `create_payment` check when the final payment completes the request.
+    pub fn pay_payment_request_partial(
+        env: Env,
+        customer: Address,
+        request_id: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "pay_payment_request")?;
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+        Self::do_pay_payment_request_partial(&env, customer, request_id, amount)
+    }
+
+    fn do_pay_payment_request_partial(
+        env: &Env,
+        customer: Address,
+        request_id: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let env = env.clone();
+        let key = DataKey::Payment(PaymentKey::Request(request_id));
+        let mut request: PaymentRequest = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::RequestNotFound))?;
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+        if request.expires_at != 0 && env.ledger().timestamp() >= request.expires_at {
+            return Err(Error::Payment(PaymentError::RequestExpired));
+        }
+        if let Some(allowed) = &request.customer {
+            if *allowed != customer {
+                return Err(Error::Payment(PaymentError::RequestCustomerMismatch));
+            }
+        }
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if !Self::get_request_allows_partial(env.clone(), request_id) {
+            return Err(Error::Feature(FeatureError::PartialPaymentNotAllowed));
+        }
+        let paid_amount = Self::get_payment_request_paid_amount(env.clone(), request_id)
+            .checked_add(amount)
+            .ok_or(Error::Feature(FeatureError::RequestOverpayment))?;
+        if paid_amount > request.amount {
+            return Err(Error::Feature(FeatureError::RequestOverpayment));
+        }
+
+        token::Client::new(&env, &request.token).transfer(
+            &customer,
+            env.current_contract_address(),
+            &amount,
+        );
+
+        let contributions_key = DataKey::Payment(PaymentKey::RequestContributions(request_id));
+        let mut contributions: Map<Address, i128> = env
+            .store()
+            .get(&contributions_key)
+            .unwrap_or_else(|| Map::new(&env));
+        let previous = contributions.get(customer.clone()).unwrap_or(0);
+        contributions.set(customer.clone(), previous + amount);
+
+        (PaymentRequestPartiallyPaid {
+            request_id,
+            customer: customer.clone(),
+            amount,
+            paid_amount,
+        })
+        .publish(&env);
+
+        if paid_amount < request.amount {
+            env.store().set(&contributions_key, &contributions);
+            env.store().set(
+                &DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)),
+                &paid_amount,
+            );
+            return Ok(paid_amount);
+        }
+
+        // Fully paid: create the payment record now.
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer.clone(),
+            customer.clone(),
+            request.merchant.clone(),
+            request.amount,
+            request.token.clone(),
+            request.currency.clone(),
+            0,
+            request.metadata.clone(),
+        )?;
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Prefunded(payment_id)), &true);
+        env.store().remove(&contributions_key);
+        env.store().set(
+            &DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)),
+            &paid_amount,
+        );
+        request.status = PaymentRequestStatus::Paid;
+        request.payment_id = Some(payment_id);
+        env.store().set(&key, &request);
+
+        (PaymentRequestPaid {
+            request_id,
+            payment_id,
+            customer,
+        })
+        .publish(&env);
+
+        Ok(paid_amount)
     }
 
     /// Returns a payment request by id (#662).
@@ -5657,12 +5946,20 @@ impl PaymentContract {
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
 
-        token_client.transfer_from(
-            &contract_address,
-            &payment.payer,
-            &contract_address,
-            &merchant_amount,
-        );
+        // Issue #900: payments created from partially paid requests are already
+        // funded by the payers' transfers into the contract.
+        let prefunded = env
+            .store()
+            .get::<bool>(&DataKey::Payment(PaymentKey::Prefunded(payment_id)))
+            .unwrap_or(false);
+        if !prefunded {
+            token_client.transfer_from(
+                &contract_address,
+                &payment.payer,
+                &contract_address,
+                &merchant_amount,
+            );
+        }
 
         PaymentContract::settle_or_accumulate(
             env,
@@ -14139,6 +14436,14 @@ impl PaymentContract {
         if sub.status != SubscriptionStatus::Active {
             return Err(Error::Subscription(SubscriptionError::NotActive));
         }
+        // Issue #902: enforce merchant-set seat bounds.
+        if let Some(bounds) = Self::get_subscription_seat_bounds(env.clone(), subscription_id) {
+            let below = bounds.min_seats.is_some_and(|min| new_quantity < min);
+            let above = bounds.max_seats.is_some_and(|max| new_quantity > max);
+            if below || above {
+                return Err(Error::Subscription(SubscriptionError::SeatsOutOfBounds));
+            }
+        }
 
         let mut seats = Self::load_subscription_seats(&env, &sub);
         let old_quantity = seats.quantity;
@@ -14222,6 +14527,72 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Set or update the min/max seat bounds on a seat-based subscription (#902).
+    ///
+    /// Called by the subscription's merchant, typically right after the
+    /// subscription is created, and again whenever the plan changes. Passing
+    /// `None` for both bounds clears them. Bounds only constrain later
+    /// `update_subscription_quantity` calls; the current quantity is unchanged.
+    ///
+    /// # Errors
+    /// `NotFound` if the subscription does not exist, `Unauthorized` if the
+    /// caller is not its merchant, `InvalidSeatBounds` if a bound is 0 or
+    /// `min_seats > max_seats`.
+    pub fn set_subscription_seat_bounds(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        min_seats: Option<u32>,
+        max_seats: Option<u32>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if min_seats == Some(0) || max_seats == Some(0) {
+            return Err(Error::Subscription(SubscriptionError::InvalidSeatBounds));
+        }
+        if let (Some(min), Some(max)) = (min_seats, max_seats) {
+            if min > max {
+                return Err(Error::Subscription(SubscriptionError::InvalidSeatBounds));
+            }
+        }
+        let key = DataKey::Subscription(SubscriptionKey::SeatBounds(subscription_id));
+        if min_seats.is_none() && max_seats.is_none() {
+            env.store().remove(&key);
+        } else {
+            env.store().set(
+                &key,
+                &SeatBounds {
+                    min_seats,
+                    max_seats,
+                },
+            );
+        }
+        (SubscriptionSeatBoundsSet {
+            subscription_id,
+            merchant,
+            min_seats,
+            max_seats,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Seat bounds on a subscription, or `None` if unbounded (#902).
+    pub fn get_subscription_seat_bounds(env: Env, subscription_id: u64) -> Option<SeatBounds> {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::SeatBounds(
+                subscription_id,
+            )))
     }
 
     /// Seat record for a subscription, defaulting to one seat at the full
@@ -17466,6 +17837,12 @@ mod test_storage_tiers;
 
 #[cfg(test)]
 mod test_payment_request;
+
+#[cfg(test)]
+mod test_partial_payment_request;
+
+#[cfg(test)]
+mod test_seat_bounds;
 
 #[cfg(test)]
 mod test_merchant_registry;

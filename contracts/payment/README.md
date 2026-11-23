@@ -133,6 +133,42 @@ Merchants can issue a payable request (an invoice link) that a customer accepts 
 
 Emits `PaymentRequestCreated`, `PaymentRequestPaid` (after the payment's own `PaymentCreated`) and `PaymentRequestCancelled`.
 
+#### Partial Payments on Payment Requests (Issue #900)
+
+A merchant can let customers pay a large request in several transfers.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `set_payment_request_partial` | `merchant: Address`, `request_id: u64`, `allow_partial: bool` | `Result<(), Error>` | `merchant` (must be the request's merchant) |
+| `pay_payment_request_partial` | `customer: Address`, `request_id: u64`, `amount: i128` | `Result<i128, Error>` — the request's `paid_amount` after this payment | `customer` |
+| `get_request_allows_partial` | `request_id: u64` | `bool` (`false` by default) | — |
+| `get_payment_request_paid_amount` | `request_id: u64` | `i128` — total paid so far (`0` if none) | — |
+
+- **Opt-in.** Partial payments are off by default. The merchant enables them with `set_payment_request_partial(merchant, id, true)` while the request is `Open`. They cannot be switched off once any partial payment has been made.
+- **Paying part.** The request must be `Open`, unexpired and, if restricted, paid by the named customer. `amount` must be `> 0`, and `paid_amount + amount` must not exceed the request's `amount` (overpayment is rejected). Unlike a full `pay_payment_request`, each partial payment **transfers `amount` from the customer into the contract immediately**, where it is held. Several customers may contribute to an unrestricted request; each payer's contribution is tracked.
+- **Becoming Paid.** When `paid_amount` reaches `amount`, the request becomes `Paid` and the payment record is created then, for the full `amount`, with the final payer as `customer`/`payer`; all `create_payment` checks run at that point. That payment is marked as prefunded, so `complete_payment` settles it from the held funds and does not pull the amount from the payer's allowance a second time.
+- **Full pay on a partially paid request.** `pay_payment_request` on a request with `paid_amount > 0` pays the remaining `amount - paid_amount` as a final partial payment and returns the created `payment_id`.
+- **Cancelling.** `cancel_payment_request` on a partially paid request returns each payer's contribution to them and resets `paid_amount` to `0`.
+- **Pausing.** `pay_payment_request_partial` honours the `pay_payment_request` and `create_payment` function pauses.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `set_payment_request_partial`: caller is not the request's merchant |
+| `BasicError::InvalidAmount` | `121` | `pay_payment_request_partial`: `amount <= 0` |
+| `PaymentError::InvalidStatus` | `201` | `set_payment_request_partial`: disabling partial payments after money has been taken |
+| `PaymentError::RequestNotFound` / `RequestAlreadyPaid` / `RequestCancelled` / `RequestExpired` / `RequestCustomerMismatch` | `235`–`239` | As for `pay_payment_request` |
+| `FeatureError::RequestOverpayment` | `548` | `paid_amount + amount` would exceed the request's `amount` |
+| `FeatureError::PartialPaymentNotAllowed` | `549` | The merchant has not enabled partial payments on the request |
+
+Events:
+
+| Event | Fields | When |
+| --- | --- | --- |
+| `PaymentRequestPartialSet` | `request_id`, `merchant`, `allow_partial` | `set_payment_request_partial` |
+| `PaymentRequestPartiallyPaid` | `request_id`, `customer`, `amount`, `paid_amount` | Every partial payment, including the final one |
+| `PaymentRequestPaid` | `request_id`, `payment_id`, `customer` | The final payment brings `paid_amount` to `amount` |
+| `PaymentRequestPartialRefunded` | `request_id`, `payer`, `amount` | Once per payer when a partially paid request is cancelled |
+
 ### Tips
 
 | Function                                   | Description                                                                                                                         |
@@ -554,6 +590,8 @@ A subscription bills `unit_amount * quantity` per cycle, so merchants can bill p
 | `update_subscription_quantity(customer, subscription_id, new_quantity)` | Customer (must authorize) changes the seat count. Charges or credits the prorated difference for the rest of the cycle. |
 | `get_subscription_seats(subscription_id)` | Returns `SubscriptionSeats { quantity, unit_amount }`. Panics if the subscription does not exist. |
 | `get_subscription_seat_credit(subscription_id)` | Returns the unused proration credit (`0` if none) that will be deducted from the next recurring charges. |
+| `set_subscription_seat_bounds(merchant, subscription_id, min_seats, max_seats)` | **(Issue #902)** Merchant (must authorize) sets or updates optional seat bounds. See [Seat Bounds](#seat-bounds-issue-902). |
+| `get_subscription_seat_bounds(subscription_id)` | **(Issue #902)** Returns `Option<SeatBounds { min_seats: Option<u32>, max_seats: Option<u32> }>`; `None` if unbounded. |
 
 | Parameter | Type | Rule |
 | --- | --- | --- |
@@ -581,9 +619,32 @@ Example: a 30-day subscription at 10 per seat, 5 seats (`amount = 50`), with pro
 | `SubscriptionError::NotActive` | `301` | The subscription is not `Active` (paused, in dunning, cancelled, …) |
 | `SubscriptionError::MerchantPaused` | `317` | A prorated charge is due but the merchant is paused |
 | `SubscriptionError::InvalidQuantity` | `328` | `new_quantity` is `0` |
+| `SubscriptionError::SeatsOutOfBounds` | `331` | `new_quantity` is below `min_seats` or above `max_seats` (#902) |
 | `FeatureError::SpendLimitExceeded` | `527` | The prorated charge would exceed the customer's spend limit |
 
 Emits `SubscriptionQuantityChanged { subscription_id, old_quantity, new_quantity, unit_amount, new_amount, proration_amount }`. `proration_amount` is positive when charged, negative when credited, and `0` when nothing was prorated.
+
+##### Seat Bounds (Issue #902)
+
+Merchants selling team plans can enforce a minimum and/or maximum seat count. The merchant calls `set_subscription_seat_bounds` when the subscription is created (it takes effect from then on) and may call it again at any time to change or clear the bounds.
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `merchant` | `Address` | Must be the subscription's merchant and must authorize |
+| `subscription_id` | `u64` | An existing subscription |
+| `min_seats` | `Option<u32>` | `None` for no lower bound; otherwise `>= 1` |
+| `max_seats` | `Option<u32>` | `None` for no upper bound; otherwise `>= 1` and `>= min_seats` |
+
+- Passing `None` for both clears the bounds.
+- Bounds only constrain later `update_subscription_quantity` calls, which fail with `SeatsOutOfBounds` (331) outside them; the current quantity is not changed when bounds are set.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not the subscription's merchant |
+| `SubscriptionError::NotFound` | `300` | No subscription with this ID |
+| `SubscriptionError::InvalidSeatBounds` | `332` | A bound is `0`, or `min_seats > max_seats` |
+
+Emits `SubscriptionSeatBoundsSet { subscription_id, merchant, min_seats, max_seats }`.
 
 ### Metered Billing
 

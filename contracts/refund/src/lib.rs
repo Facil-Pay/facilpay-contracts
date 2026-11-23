@@ -310,6 +310,9 @@ pub enum CoreError {
     VoucherMinPurchaseNotMet = 85,
     // Issue #802: message thread on refund requests — per-refund cap reached
     RefundMessageLimitReached = 86,
+    // Issue #920: third-party refund reserve contributions
+    ThirdPartyReserveLocked = 87,
+    ContributionExceeded = 88,
 }
 
 #[contracterror]
@@ -1581,6 +1584,12 @@ pub enum RefundExtKey {
     PaymentSynced(u64),
     // Issue #801: per-merchant minimum purchase amount required to redeem a voucher.
     MerchantVoucherMinPurchase(Address),
+    // Issue #803: per-merchant trust-score auto-approve boost.
+    TrustBoostConfig(Address),
+    // Issue #920: outstanding third-party contribution per (merchant, token, funder)
+    // and the locked total across all funders per (merchant, token).
+    ReserveFunderContribution(Address, Address, Address),
+    ReserveThirdPartyTotal(Address, Address),
 }
 
 // Issue #807: emitted when a merchant sets a category refund percentage cap.
@@ -1819,6 +1828,29 @@ pub struct RefundReserveDeposited {
     pub token: Address,
     pub amount: i128,
     pub new_balance: i128,
+}
+
+/// Event emitted when a third party tops up a merchant's refund reserve (#920).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveDepositedFor {
+    pub funder: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when the admin releases a third-party reserve contribution
+/// so the merchant may withdraw it (#920).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveContributionReleased {
+    pub funder: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub remaining_contribution: i128,
 }
 
 /// Event emitted when a merchant withdraws from its refund reserve.
@@ -2994,6 +3026,177 @@ impl RefundContract {
         Ok(new_balance)
     }
 
+    /// Deposit tokens into `merchant`'s refund reserve on its behalf (#920).
+    ///
+    /// Tokens are transferred from `funder`, who must authenticate. The amount
+    /// is recorded as `funder`'s contribution and stays locked in the reserve:
+    /// the merchant cannot withdraw it until the admin releases it with
+    /// `release_reserve_contribution`. Refunds may still draw on it.
+    ///
+    /// # Returns
+    /// The reserve balance after the deposit.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `amount` is not positive or a total overflows.
+    pub fn deposit_refund_reserve_for(
+        env: Env,
+        funder: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "deposit_refund_reserve_for")?;
+        funder.require_auth();
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        token::Client::new(&env, &token).transfer(&funder, env.current_contract_address(), &amount);
+
+        let new_balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone())
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+
+        let contribution_key = RefundExtKey::ReserveFunderContribution(
+            merchant.clone(),
+            token.clone(),
+            funder.clone(),
+        );
+        let contribution: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+        let contribution = contribution
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        let total_key = RefundExtKey::ReserveThirdPartyTotal(merchant.clone(), token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let total = total
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+
+        env.storage()
+            .persistent()
+            .set(&contribution_key, &contribution);
+        Self::extend_refund_ext_ttl(&env, &contribution_key);
+        env.storage().persistent().set(&total_key, &total);
+        Self::extend_refund_ext_ttl(&env, &total_key);
+
+        // Goes through set_refund_reserve so the low-reserve alert re-arms.
+        Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+
+        (RefundReserveDepositedFor {
+            funder,
+            merchant,
+            token,
+            amount,
+            new_balance,
+        })
+        .publish(&env);
+
+        Ok(new_balance)
+    }
+
+    /// Release up to `amount` of `funder`'s contribution to `merchant`'s
+    /// reserve so the merchant may withdraw it (#920). Admin-only.
+    ///
+    /// # Returns
+    /// The funder's remaining locked contribution.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    /// Returns `InvalidAmount` if `amount` is not positive.
+    /// Returns `ContributionExceeded` if `amount` exceeds the contribution.
+    pub fn release_reserve_contribution(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        funder: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        let contribution_key = RefundExtKey::ReserveFunderContribution(
+            merchant.clone(),
+            token.clone(),
+            funder.clone(),
+        );
+        let contribution: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+        if amount > contribution {
+            return Err(Error::Core(CoreError::ContributionExceeded));
+        }
+        let remaining = contribution - amount;
+        let total_key = RefundExtKey::ReserveThirdPartyTotal(merchant.clone(), token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let new_total = total.saturating_sub(amount).max(0);
+
+        if remaining == 0 {
+            env.storage().persistent().remove(&contribution_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&contribution_key, &remaining);
+            Self::extend_refund_ext_ttl(&env, &contribution_key);
+        }
+        if new_total == 0 {
+            env.storage().persistent().remove(&total_key);
+        } else {
+            env.storage().persistent().set(&total_key, &new_total);
+            Self::extend_refund_ext_ttl(&env, &total_key);
+        }
+
+        (ReserveContributionReleased {
+            funder,
+            merchant,
+            token,
+            amount,
+            remaining_contribution: remaining,
+        })
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
+    /// Outstanding (unreleased) contribution `funder` has made to
+    /// `merchant`'s reserve for `token` (0 if none) (#920).
+    pub fn get_reserve_contribution(
+        env: Env,
+        merchant: Address,
+        token: Address,
+        funder: Address,
+    ) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::ReserveFunderContribution(
+                merchant, token, funder,
+            ))
+            .unwrap_or(0)
+    }
+
+    /// Portion of `merchant`'s reserve for `token` the merchant cannot
+    /// withdraw: the unreleased third-party total, capped at the current
+    /// balance since refunds may draw it down (#920).
+    pub fn get_locked_refund_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        let total: i128 = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ReserveThirdPartyTotal(
+                merchant.clone(),
+                token.clone(),
+            ))
+            .unwrap_or(0);
+        let balance = Self::get_refund_reserve(env, merchant, token);
+        core::cmp::min(total, balance).max(0)
+    }
+
     /// Withdraw tokens from the merchant's refund reserve. The balance left
     /// behind may not drop below the admin-set minimum for that token.
     ///
@@ -3004,6 +3207,8 @@ impl RefundContract {
     /// Returns `InvalidAmount` if `amount` is not positive.
     /// Returns `InsufficientRefundReserve` if `amount` exceeds the balance.
     /// Returns `ReserveBelowMinimum` if the withdrawal breaches the minimum.
+    /// Returns `ThirdPartyReserveLocked` if the withdrawal would dip into
+    /// unreleased third-party contributions (#920).
     pub fn withdraw_refund_reserve(
         env: Env,
         merchant: Address,
@@ -3024,6 +3229,11 @@ impl RefundContract {
         let min_amount = Self::get_min_refund_reserve(env.clone(), merchant.clone(), token.clone());
         if new_balance < min_amount {
             return Err(Error::Ext(ExtError::ReserveBelowMinimum));
+        }
+        // Issue #920: platform-funded amounts stay locked until the admin releases them.
+        let locked = Self::get_locked_refund_reserve(env.clone(), merchant.clone(), token.clone());
+        if new_balance < locked {
+            return Err(Error::Core(CoreError::ThirdPartyReserveLocked));
         }
 
         // Issue #647: Extend TTL on persistent entry reads (if they exist)
@@ -8911,6 +9121,48 @@ impl RefundContract {
         results
     }
 
+    /// Get a customer's refunds in `status`, newest-first (#913).
+    ///
+    /// Pagination matches `get_customer_refund_history`: `offset` skips that
+    /// many matching refunds and at most `limit` are returned. A `limit` of 0
+    /// returns an empty list.
+    pub fn get_customer_refunds_by_status(
+        env: Env,
+        customer: Address,
+        status: RefundStatus,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(&env);
+        if limit == 0 {
+            return results;
+        }
+        let mut index = Self::get_customer_refund_count(&env, &customer);
+        let mut skipped = 0u64;
+        while index > 0 && (results.len() as u64) < limit {
+            index -= 1;
+            let Some(refund_id) = Self::get_customer_refund_id_at(&env, &customer, index) else {
+                continue;
+            };
+            let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+            else {
+                continue;
+            };
+            if refund.status != status {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            results.push_back(refund);
+        }
+        results
+    }
+
     /// Get the total count of refunds for a customer (public version)
     pub fn get_customer_refund_count_public(env: Env, customer: Address) -> u64 {
         Self::get_customer_refund_count(&env, &customer)
@@ -12480,6 +12732,12 @@ mod test_upgrade;
 
 #[cfg(test)]
 mod test_refund_reserve;
+
+#[cfg(test)]
+mod test_third_party_reserve;
+
+#[cfg(test)]
+mod test_customer_refunds_by_status;
 
 #[cfg(test)]
 mod test_multi_token_arbitrator;
