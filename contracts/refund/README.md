@@ -863,6 +863,11 @@ Emits `RefundMessagePosted { refund_id, message_id, sender, posted_at }` from `p
 - `issue_promotional_vouchers()` — Merchant issues goodwill credit vouchers to many customers at once, funded from its refund reserve.
 - `set_voucher_min_purchase()` — Admin sets (or clears) the minimum purchase amount required to redeem a merchant's vouchers.
 - `get_voucher_min_purchase()` — Gets the minimum purchase amount configured for a merchant's vouchers.
+- `extend_voucher_expiry()` — Issuing merchant moves an unredeemed voucher's expiry later.
+- `revoke_voucher()` — Issuing merchant revokes a voucher's remaining balance (admin co-approval above a threshold).
+- `approve_voucher_revocation()` — Admin co-approves revoking a voucher above the revocation threshold.
+- `set_voucher_revoke_threshold()` / `get_voucher_revoke_threshold()` — Admin sets / reads the remaining balance above which revocation needs co-approval.
+- `is_voucher_revoked()` — Whether a voucher has been revoked.
 
 #### Minimum purchase for voucher redemption
 
@@ -958,6 +963,57 @@ Each voucher expires `expiry_seconds` after the ledger time of the call. Promoti
 | `PromotionalVoucherIssued` | `voucher_id`, `merchant`, `customer`, `token`, `amount`, `expires_at` | Once per voucher issued |
 | `PromotionalVouchersIssued` | `merchant`, `token`, `count`, `total_amount`, `new_reserve_balance` | Once per batch, after the vouchers |
 
+#### Extending voucher expiry
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `extend_voucher_expiry` | `merchant: Address` (must authorize), `voucher_id: u64`, `new_expires_at: u64` | `Result<(), Error>` |
+
+Lets the merchant that issued a voucher give the customer more time to use it. Only the issuing merchant (the voucher's `merchant` field) can extend it. `new_expires_at` must be later than the voucher's current `expires_at`: expiry can only move later, never earlier. The voucher must not be fully redeemed or revoked. A partially redeemed voucher can be extended, and its remaining balance gets the new expiry. An already-expired voucher can also be extended, which makes it redeemable again. The function can be paused on its own with `pause_function("extend_voucher_expiry")`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | `merchant` did not issue the voucher |
+| `CoreError::VoucherRevoked` | `87` | The voucher was revoked |
+| `CoreError::InvalidVoucherExpiry` | `88` | `new_expires_at` is not later than the current `expires_at` |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been fully redeemed |
+
+| Event | Fields | Emitted |
+| --- | --- | --- |
+| `VoucherExpiryExtended` | `voucher_id`, `merchant`, `old_expires_at`, `new_expires_at` | On every successful extension |
+
+#### Revoking vouchers
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `revoke_voucher` | `merchant: Address` (must authorize), `voucher_id: u64`, `reason_hash: BytesN<32>` | `Result<i128, Error>` (the revoked amount) |
+| `approve_voucher_revocation` | `admin: Address` (must authorize), `voucher_id: u64` | `Result<(), Error>` |
+| `set_voucher_revoke_threshold` | `admin: Address` (must authorize), `threshold: i128` | `Result<(), Error>` |
+| `get_voucher_revoke_threshold` | — | `i128` |
+| `is_voucher_revoked` | `voucher_id: u64` | `bool` |
+
+`revoke_voucher` pulls back a voucher that was issued by mistake or obtained by fraud. Only the issuing merchant can revoke it, and `reason_hash` records the hash of the off-chain reason. Only the remaining balance is revoked: if 400 of a 1000 voucher was already redeemed, the revocation covers the other 600, and the call returns that amount. After revocation the voucher is marked `redeemed`, its balance is `0`, and redeeming, transferring or extending it fails with `VoucherRevoked`.
+
+Promotional vouchers (`refund_id == 0`) are funded from the merchant's refund reserve, so their remaining balance is credited back to the merchant's reserve for the voucher's token. Refund vouchers were not funded from a reserve, so nothing is credited; the tokens stay with the contract.
+
+The admin can set a co-approval threshold with `set_voucher_revoke_threshold`. When the threshold is non-zero and the voucher's remaining balance is above it, the admin must first call `approve_voucher_revocation(admin, voucher_id)`; otherwise `revoke_voucher` fails with `VoucherRevocationNeedsApproval`. The default threshold is `0`, which means no revocation needs co-approval. `revoke_voucher` can be paused on its own with `pause_function("revoke_voucher")`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::InvalidAmount` | `1` | `set_voucher_revoke_threshold` was given a negative threshold |
+| `CoreError::Unauthorized` | `3` | `merchant` did not issue the voucher, or the caller is not the contract admin (admin functions) |
+| `CoreError::VoucherRevoked` | `87` | The voucher was already revoked |
+| `CoreError::VoucherRevocationNeedsApproval` | `89` | The remaining balance is above the threshold and the admin has not co-approved |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been fully redeemed, so there is nothing to revoke |
+
+| Event | Fields | Emitted |
+| --- | --- | --- |
+| `VoucherRevoked` | `voucher_id`, `merchant`, `customer`, `revoked_amount`, `returned_to_reserve`, `reason_hash` | On every successful revocation |
+| `VoucherRevocationApproved` | `voucher_id`, `admin` | When the admin co-approves a revocation |
+| `VoucherRevokeThresholdSet` | `threshold`, `admin` | When the admin sets the threshold |
+
 #### Voucher expiry and value handling
 
 A voucher is created with a concrete TTL at issue time:
@@ -977,7 +1033,7 @@ The contract treats the expiry check as `now > expires_at`:
 - redemption fails once the timestamp moves past the stored expiry
 - equality is still valid, so the voucher remains usable at the exact `expires_at` boundary
 
-This is enforced in `redeem_refund_voucher()` by rejecting with `VoucherExpired` when the ledger time is past the voucher's expiry. The value itself is not automatically reclaimed or reissued once a voucher expires; the voucher simply stops being redeemable. There is no on-chain “refund the expired amount back to merchant/treasury” flow in the contract; the unredeemed value is effectively dead credit unless a new voucher is created or a different manual process handles it.
+This is enforced in `redeem_refund_voucher()` by rejecting with `VoucherExpired` when the ledger time is past the voucher's expiry. The issuing merchant can push the expiry later with `extend_voucher_expiry()`. The value itself is not automatically reclaimed or reissued once a voucher expires; the voucher simply stops being redeemable. There is no on-chain “refund the expired amount back to merchant/treasury” flow in the contract; the unredeemed value is effectively dead credit unless a new voucher is created or a different manual process handles it.
 
 #### Policy inheritance and merchant ancestry
 

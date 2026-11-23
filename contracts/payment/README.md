@@ -106,17 +106,21 @@ Merchants can issue a payable request (an invoice link) that a customer accepts 
 | `pay_payment_request` | `customer: Address`, `request_id: u64` | `Result<u64, Error>` — the created `payment_id` | `customer` |
 | `cancel_payment_request` | `merchant: Address`, `request_id: u64` | `Result<(), Error>` | `merchant` (must be the request's merchant) |
 | `get_payment_request` | `request_id: u64` | `Result<PaymentRequest, Error>` | — |
+| `set_max_open_requests` | `admin: Address`, `max_open_requests: u32` | `Result<(), Error>` | `admin` (must be the contract admin) |
+| `get_max_open_requests` | — | `u32` — the cap, `0` when none is set | — |
+| `get_open_request_count` | `merchant: Address`, `customer: Address` | `u32` — open requests `merchant` has issued to `customer` | — |
 
 - **Creating.** `amount` must be `> 0`; the token, currency and metadata are validated exactly as in `create_payment`. `expires_at` is an absolute ledger timestamp after which the request can no longer be paid; `0` means it never expires. Pass `customer: Some(address)` to restrict the request to one payer, or `None` to let anyone pay it. Request ids start at `1`.
 - **Paying.** The request must be `Open`, not expired (`now < expires_at`), and — if restricted — paid by the named customer. The contract then runs the same logic as `create_payment(customer, merchant, amount, token, currency, 0, metadata)`: all `create_payment` checks (token allowlist, flagged addresses, rate and spend limits, merchant pause) apply, and the merchant's default payment expiry is used. As with `create_payment`, no tokens move at this point; the customer's approved allowance is drawn when the payment is completed. The request becomes `Paid` and records the `payment_id`, so it can be paid exactly once.
 - **Cancelling.** Only the issuing merchant can cancel, and only while the request is `Open` (an expired but unpaid request can still be cancelled).
+- **Open request cap (Issue #903).** The admin can cap how many open requests a merchant may have outstanding for one customer with `set_max_open_requests(admin, n)`; `0` (the default) means no cap. A request counts as open while it is unpaid, uncancelled and unexpired, so paying it, cancelling it, or letting it pass `expires_at` frees its slot. Only requests restricted to a customer (`customer: Some(address)`) are counted; open requests (`customer: None`) are not. Once the merchant has `n` open requests for the customer, `create_payment_request` fails with `OpenRequestLimitReached`. Lowering the cap does not affect requests that already exist; it only blocks new ones until the count drops below the cap.
 - **Pausing.** `create_payment_request` honours the `create_payment_request` function pause; `pay_payment_request` honours both the `pay_payment_request` and `create_payment` function pauses.
 
 `PaymentRequest` fields: `id`, `merchant`, `customer: Option<Address>`, `amount`, `token`, `currency`, `expires_at`, `metadata`, `status` (`PaymentRequestStatus::Open | Paid | Cancelled`), `created_at`, `payment_id: Option<u64>`.
 
 | Error | Code | When |
 | --- | --- | --- |
-| `BasicError::Unauthorized` | `100` | `cancel_payment_request`: caller is not the request's merchant |
+| `BasicError::Unauthorized` | `100` | `cancel_payment_request`: caller is not the request's merchant. `set_max_open_requests`: caller is not the contract admin |
 | `BasicError::MetadataTooLarge` | `101` | `create_payment_request`: metadata exceeds 512 bytes |
 | `BasicError::InvalidCurrency` | `103` | `create_payment_request`: unsupported currency |
 | `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | The contract or the relevant function is paused |
@@ -128,10 +132,75 @@ Merchants can issue a payable request (an invoice link) that a customer accepts 
 | `PaymentError::RequestExpired` | `238` | `create_payment_request`: `expires_at` is non-zero and not in the future. `pay_payment_request`: the request has expired |
 | `PaymentError::RequestCustomerMismatch` | `239` | `pay_payment_request`: the request is restricted to a different customer |
 | `SubscriptionError::MerchantPaused` | `317` | The merchant is paused |
+| `FeatureError::OpenRequestLimitReached` | `548` | `create_payment_request`: the merchant already has `get_max_open_requests()` open requests for this customer |
 
 `pay_payment_request` can also return any error `create_payment` returns (for example `AddressFlagged`, `RateLimitExceeded`, `SpendLimitExceeded`).
 
-Emits `PaymentRequestCreated`, `PaymentRequestPaid` (after the payment's own `PaymentCreated`) and `PaymentRequestCancelled`.
+Emits `PaymentRequestCreated`, `PaymentRequestPaid` (after the payment's own `PaymentCreated`), `PaymentRequestCancelled`, and `MaxOpenRequestsSet` (`max_open_requests`, `set_by`) from `set_max_open_requests`.
+
+### Payment Links
+
+A payment link is a reusable, fixed-price checkout that a merchant shares once and many customers can pay. Each use creates a normal `Payment`, which then follows the usual lifecycle (`complete_payment`, `cancel_payment`, refunds, …).
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `create_payment_link` | `merchant: Address`, `amount: i128`, `token: Address`, `currency: Currency`, `usage_cap: u32`, `expiry_seconds: u64`, `metadata: String`, `description: String` | `Result<u64, Error>` — the new `link_id` | `merchant` |
+| `use_payment_link` | `customer: Address`, `link_id: u64` | `Result<u64, Error>` — the created `payment_id` | `customer` |
+| `deactivate_payment_link` | `merchant: Address`, `link_id: u64` | `Result<(), Error>` | `merchant` (must be the link's merchant) |
+| `reactivate_payment_link` | `merchant: Address`, `link_id: u64` | `Result<(), Error>` | `merchant` (must be the link's merchant) |
+| `get_payment_link` | `link_id: u64` | `Result<PaymentLink, Error>` | — |
+
+`PaymentLink` fields: `id`, `merchant`, `amount`, `token`, `currency`, `usage_cap`, `usage_count`, `expires_at`, `metadata`, `description`, `status` (`PaymentLinkStatus::Active | Inactive | Expired`), `created_at`, `last_used_at: Option<u64>`.
+
+- **Creating.** `amount` must be `> 0`. `usage_cap` is the maximum number of uses; `0` means unlimited. `expiry_seconds` is relative to the ledger time of the call: the link stores `expires_at = now + expiry_seconds`, and `expiry_seconds = 0` means the link never expires (`expires_at = 0`). Link ids start at `1`. A new link is `Active`.
+- **Lifecycle.**
+  - `Active` — the link can be used.
+  - `Inactive` — the merchant called `deactivate_payment_link`. Uses fail with `PaymentLinkInactive`. The merchant can call `reactivate_payment_link` to make it `Active` again, as long as it has not expired.
+  - `Expired` — ledger time has reached `expires_at`. Uses fail with `PaymentLinkExpired` and the link can't be reactivated. Expiry is checked against `expires_at` on every call. A failed call rolls back its writes, so the stored `status` can still read `Active` after expiry; check `expires_at` to tell whether a link has expired.
+- **Usage cap.** Each successful use increments `usage_count` and sets `last_used_at`. Once `usage_count` reaches a non-zero `usage_cap`, further uses fail with `PaymentLinkUsageCapReached`. Reactivating a link does not reset `usage_count`.
+- **Using.** `use_payment_link` checks, in order: status is `Active`, the link has not expired, and the usage cap is not reached. It then calls `create_payment(customer, merchant, amount, token, currency, 0, metadata)` with the link's terms, so all `create_payment` checks apply (token allowlist, currency, flagged addresses, rate and spend limits, registered merchant, merchant pause). The payment gets the merchant's default payment expiry. As with `create_payment`, no tokens move at this point; the customer's approved allowance is drawn when the payment is completed. Every use creates a separate payment.
+- **Pausing.** `create_payment_link` honours the `create_payment_link` function pause. `use_payment_link` honours both the `use_payment_link` and `create_payment` function pauses.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `deactivate_payment_link` / `reactivate_payment_link`: caller is not the link's merchant |
+| `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | The contract or the relevant function is paused |
+| `PaymentError::InvalidPaymentLinkAmount` | `245` | `create_payment_link`: `amount <= 0` |
+| `PaymentError::PaymentLinkNotFound` | `246` | No link with this id |
+| `PaymentError::PaymentLinkInactive` | `247` | `use_payment_link`: the link is not `Active` |
+| `PaymentError::PaymentLinkExpired` | `248` | `use_payment_link` / `reactivate_payment_link`: ledger time has reached `expires_at` |
+| `PaymentError::PaymentLinkUsageCapReached` | `249` | `use_payment_link`: `usage_count` has reached `usage_cap` |
+
+`use_payment_link` can also return any error `create_payment` returns (for example `TokenNotAllowed`, `AddressFlagged`, `RateLimitExceeded`, `SpendLimitExceeded`, `MerchantPaused`).
+
+| Event | Payload Fields | Fires When |
+| --- | --- | --- |
+| `PaymentLinkCreated` | `link_id`, `merchant`, `amount`, `usage_cap` | `create_payment_link()` creates a link |
+| `PaymentLinkUsed` | `link_id`, `payment_id`, `customer`, `usage_count` | `use_payment_link()` creates a payment (after the payment's own `PaymentCreated`) |
+| `PaymentLinkDeactivated` | `link_id`, `merchant` | `deactivate_payment_link()` |
+| `PaymentLinkReactivated` | `link_id`, `merchant` | `reactivate_payment_link()` |
+
+```bash
+# Merchant creates a link: 10 USDC, at most 100 uses, valid for 30 days
+stellar contract invoke --id $CONTRACT_ID --source $MERCHANT_KEY \
+  -- create_payment_link \
+  --merchant $MERCHANT_ADDRESS \
+  --amount 10000000 \
+  --token $USDC_TOKEN_ADDRESS \
+  --currency USDC \
+  --usage_cap 100 \
+  --expiry_seconds 2592000 \
+  --metadata '"sku-42"' \
+  --description '"Monthly box"'
+# → Returns link_id, e.g. 1
+
+# A customer pays through the link
+stellar contract invoke --id $CONTRACT_ID --source $CUSTOMER_KEY \
+  -- use_payment_link \
+  --customer $CUSTOMER_ADDRESS \
+  --link_id 1
+# → Returns payment_id
+```
 
 ### Tips
 
@@ -300,13 +369,55 @@ Merchants can optionally attach a **schedule** to a `Pending` payment, specifyin
 
 | Function                                                                                          | Description                                                          |
 | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `create_escrowed_payment(customer, merchant, amount, token, currency, metadata, escrow_contract)` | Create a payment whose funds are locked in a linked escrow contract. |
+| `create_escrowed_payment(customer, merchant, amount, token, currency, escrow_contract, release_timestamp, min_hold_period, metadata, auto_release_on_complete)` | Create a payment whose funds are locked in a linked escrow contract. Returns `(payment_id, escrow_id)`. |
 | `complete_escrowed_payment(admin, payment_id)`                                                    | Release funds from escrow to the merchant after a successful trade.  |
 | `cancel_escrowed_payment(admin, payment_id)`                                                      | Cancel the escrow and return funds to the customer.                  |
 | `dispute_escrowed_payment(caller, payment_id)`                                                    | Raise a dispute on an escrowed payment.                              |
 | `resolve_escrowed_payment_dispute(admin, payment_id, favor_customer)`                             | Resolve a dispute in favour of the customer or merchant.             |
 | `get_escrowed_payment(payment_id)`                                                                | Retrieve the `EscrowedPayment` record.                               |
 | `get_escrowed_payment_dispute(payment_id)`                                                        | Retrieve the active dispute record for an escrowed payment.          |
+| `set_escrow_confirm_timeout(customer, payment_id, timeout_seconds)`                               | Customer sets how long after escrow creation the payment may be auto-completed. |
+| `auto_complete_escrowed_payment(caller, payment_id)`                                              | Anyone releases the escrow once the confirmation timeout has passed. |
+
+#### Confirmation Timeout and Auto-Completion
+
+An escrowed payment normally waits for the admin to call `complete_escrowed_payment`. The customer can instead give the payment a confirmation timeout, after which anyone can complete it, so the merchant is paid even if nobody confirms.
+
+| Function | Parameters | Returns | Must authorize |
+| --- | --- | --- | --- |
+| `set_escrow_confirm_timeout` | `customer: Address`, `payment_id: u64`, `timeout_seconds: u64` | `Result<(), Error>` | `customer` (must be the payment's customer) |
+| `auto_complete_escrowed_payment` | `caller: Address`, `payment_id: u64` | `Result<(), Error>` | `caller` (any address) |
+
+- **Setting the timeout.** After `create_escrowed_payment`, the payment's customer calls `set_escrow_confirm_timeout`. The payment must still be `Pending`. `timeout_seconds` is counted from the escrowed payment's `created_at`, not from the time of this call, so the deadline is `created_at + timeout_seconds`. Calling it again replaces the timeout. It is stored as `EscrowedPayment.confirmation_timeout_seconds`. No event is emitted.
+- **Auto-completing.** Once ledger time reaches the deadline, any address can call `auto_complete_escrowed_payment`. The payment must be `Pending`, the merchant must not be paused, and there must be no unresolved dispute on the payment. The contract releases the escrow as the trusted bridge (honouring `auto_release_on_complete`), marks the payment `Completed`, records the status change with `caller` as the actor, and emits `EscrowedPaymentCompleted` (`payment_id`, `escrow_id`). Raising a dispute with `dispute_escrowed_payment` before the deadline blocks auto-completion until the dispute is resolved.
+- **Pausing.** `auto_complete_escrowed_payment` honours the `auto_complete_escrowed_payment` function pause.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `set_escrow_confirm_timeout`: caller is not the payment's customer |
+| `BasicError::ContractPaused` / `FunctionPaused` | `116` / `117` | `auto_complete_escrowed_payment`: the contract or function is paused |
+| `PaymentError::NotFound` | `200` | No payment with this id |
+| `PaymentError::InvalidStatus` | `201` | The payment is not `Pending`, or (`auto_complete_escrowed_payment`) it has an unresolved dispute |
+| `SubscriptionError::MerchantPaused` | `317` | `auto_complete_escrowed_payment`: the merchant is paused |
+| `FeatureError::EscrowMappingNotFound` | `500` | The payment is not an escrowed payment |
+| `FeatureError::EscrowBridgeFailed` | `501` | `auto_complete_escrowed_payment`: the escrow contract refused the release |
+| `FeatureError::NoConfirmationTimeout` | `546` | `auto_complete_escrowed_payment`: no timeout was set with `set_escrow_confirm_timeout` |
+| `FeatureError::ConfirmationTimeoutNotExpired` | `547` | `auto_complete_escrowed_payment`: ledger time is before `created_at + timeout_seconds` |
+
+```bash
+# Customer allows auto-completion 7 days after the escrowed payment was created
+stellar contract invoke --id $CONTRACT_ID --source $CUSTOMER_KEY \
+  -- set_escrow_confirm_timeout \
+  --customer $CUSTOMER_ADDRESS \
+  --payment_id 1 \
+  --timeout_seconds 604800
+
+# After the deadline, anyone completes it
+stellar contract invoke --id $CONTRACT_ID --source $ANY_KEY \
+  -- auto_complete_escrowed_payment \
+  --caller $ANY_ADDRESS \
+  --payment_id 1
+```
 
 ### Cross-Contract Escrow Verification
 
@@ -1493,6 +1604,11 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `PaymentRequestCreated`       | `payment_request_created`     | `request_id`, `merchant`, `customer`, `amount`, `token`, `expires_at` | `create_payment_request()` issues a request                               |
 | `PaymentRequestPaid`          | `payment_request_paid`        | `request_id`, `payment_id`, `customer`                    | `pay_payment_request()` creates the payment                                           |
 | `PaymentRequestCancelled`     | `payment_request_cancelled`   | `request_id`, `merchant`                                  | `cancel_payment_request()` cancels an open request                                    |
+| `MaxOpenRequestsSet`          | `max_open_requests_set`       | `max_open_requests`, `set_by`                             | `set_max_open_requests()` sets the open payment request cap                           |
+| `PaymentLinkCreated`          | `payment_link_created`        | `link_id`, `merchant`, `amount`, `usage_cap`              | `create_payment_link()` creates a link                                                |
+| `PaymentLinkUsed`             | `payment_link_used`           | `link_id`, `payment_id`, `customer`, `usage_count`        | `use_payment_link()` creates a payment                                                |
+| `PaymentLinkDeactivated`      | `payment_link_deactivated`    | `link_id`, `merchant`                                     | `deactivate_payment_link()`                                                           |
+| `PaymentLinkReactivated`      | `payment_link_reactivated`    | `link_id`, `merchant`                                     | `reactivate_payment_link()`                                                           |
 
 ### Tip Events
 
@@ -1516,7 +1632,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | Event                      | Topic Name                 | Payload Fields                               | Fires When                                                                 |
 | -------------------------- | -------------------------- | -------------------------------------------- | -------------------------------------------------------------------------- |
 | `EscrowedPaymentCreated`   | `EscrowedPaymentCreated`   | `payment_id`, `escrow_id`, `escrow_contract` | `create_escrowed_payment()` succeeds, escrow contract address recorded     |
-| `EscrowedPaymentCompleted` | `EscrowedPaymentCompleted` | `payment_id`, `escrow_id`                    | `complete_escrowed_payment()` releases funds from escrow                   |
+| `EscrowedPaymentCompleted` | `EscrowedPaymentCompleted` | `payment_id`, `escrow_id`                    | `complete_escrowed_payment()` or `auto_complete_escrowed_payment()` releases funds from escrow |
 | `EscrowedPaymentCancelled` | `EscrowedPaymentCancelled` | `payment_id`, `escrow_id`                    | `cancel_escrowed_payment()` returns funds to customer                      |
 | `EscrowedPaymentDisputed`  | `EscrowedPaymentDisputed`  | `payment_id`, `raised_by`                    | `dispute_escrowed_payment()` opens a dispute on escrowed payment           |
 | `PaymentDisputeResolved`   | `PaymentDisputeResolved`   | `payment_id`, `favor_customer`               | `resolve_escrowed_payment_dispute()` settles dispute in favor of one party |
@@ -1671,10 +1787,10 @@ Errors are grouped into five ranges:
 | Range   | Category                                                       |
 | ------- | -------------------------------------------------------------- |
 | 100–126 | `BasicError` — auth, metadata, rate limits, multi-sig setup    |
-| 200–244 | `PaymentError` — payment lifecycle, payment-request, merchant-registry and refund-sync violations |
+| 200–249 | `PaymentError` — payment lifecycle, payment-request, payment-link, merchant-registry and refund-sync violations |
 | 300–320 | `SubscriptionError` — subscription, dunning, skip-cap and pause-limit violations |
 | 400–406 | `ProposalError` — multi-sig proposal violations                |
-| 500–545 | `FeatureError` — channels, splits, loyalty, escrow, forwarding |
+| 500–548 | `FeatureError` — channels, splits, loyalty, escrow, escrow auto-completion, forwarding, open payment request cap |
 
 See [`ERRORS.md`](./ERRORS.md) for the full list.
 

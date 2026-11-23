@@ -55,6 +55,8 @@ pub enum ConfigKey {
     RefundContract,
     // Issue #772: configurable batch size limit for recurring payments
     RecurringPaymentBatchLimit,
+    // Issue #903: cap on open payment requests per (merchant, customer)
+    MaxOpenRequests,
 }
 
 #[derive(Clone)]
@@ -85,6 +87,8 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Issue #903: ids of open payment requests per (merchant, customer)
+    OpenRequests(Address, Address),
     // Issue #809: refund-contract refund ids already applied to a payment
     RefundSynced(u64),
     // Reusable merchant payment links
@@ -370,6 +374,8 @@ pub enum FeatureError {
     // Issue #767: auto-complete escrowed payment after confirmation timeout
     NoConfirmationTimeout = 546,
     ConfirmationTimeoutNotExpired = 547,
+    // Issue #903: merchant reached the open payment request cap for a customer
+    OpenRequestLimitReached = 548,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -415,7 +421,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, Self::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if (500..=547).contains(&code) {
+            if (500..=548).contains(&code) {
                 return Ok(Error::Feature(unsafe {
                     core::mem::transmute::<u32, FeatureError>(code)
                 }));
@@ -1188,6 +1194,14 @@ pub struct PaymentRequestPaid {
 pub struct PaymentRequestCancelled {
     pub request_id: u64,
     pub merchant: Address,
+}
+
+/// Emitted when the admin sets the open payment request cap (#903).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxOpenRequestsSet {
+    pub max_open_requests: u32,
+    pub set_by: Address,
 }
 
 // Issue #669: merchant registry
@@ -3455,7 +3469,9 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(request_id)` on success, or an error if the amount is not positive, the
     /// token is not allowed, the currency is invalid, the metadata is too large,
-    /// `expires_at` is not in the future, or the contract or merchant is paused.
+    /// `expires_at` is not in the future, the contract or merchant is paused, or
+    /// the merchant already has `get_max_open_requests` open requests for
+    /// `customer` (`OpenRequestLimitReached`, #903).
     pub fn create_payment_request(
         env: Env,
         merchant: Address,
@@ -3488,6 +3504,16 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::RequestExpired));
         }
 
+        // Issue #903: cap open requests per (merchant, customer).
+        let mut open_requests = Vec::new(&env);
+        if let Some(c) = &customer {
+            open_requests = Self::live_open_requests(&env, &merchant, c);
+            let max_open = Self::get_max_open_requests(env.clone());
+            if max_open > 0 && open_requests.len() >= max_open {
+                return Err(Error::Feature(FeatureError::OpenRequestLimitReached));
+            }
+        }
+
         let request_id = env
             .store()
             .get::<u64>(&DataKey::Payment(PaymentKey::RequestCounter))
@@ -3510,6 +3536,13 @@ impl PaymentContract {
             .set(&DataKey::Payment(PaymentKey::Request(request_id)), &request);
         env.store()
             .set(&DataKey::Payment(PaymentKey::RequestCounter), &request_id);
+        if let Some(c) = &customer {
+            open_requests.push_back(request_id);
+            env.store().set(
+                &DataKey::Payment(PaymentKey::OpenRequests(merchant.clone(), c.clone())),
+                &open_requests,
+            );
+        }
 
         (PaymentRequestCreated {
             request_id,
@@ -3581,6 +3614,7 @@ impl PaymentContract {
         request.status = PaymentRequestStatus::Paid;
         request.payment_id = Some(payment_id);
         env.store().set(&key, &request);
+        Self::release_open_request(&env, &request);
 
         (PaymentRequestPaid {
             request_id,
@@ -3628,6 +3662,7 @@ impl PaymentContract {
 
         request.status = PaymentRequestStatus::Cancelled;
         env.store().set(&key, &request);
+        Self::release_open_request(&env, &request);
 
         (PaymentRequestCancelled {
             request_id,
@@ -3636,6 +3671,62 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Sets the maximum number of open payment requests a merchant may have
+    /// outstanding for a single customer (#903).
+    ///
+    /// A request is open while it is unpaid, uncancelled and unexpired, so paying,
+    /// cancelling or letting a request expire frees its slot. Requests created with
+    /// `customer = None` are not counted.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authorize)
+    /// * `max_open_requests` - The cap per (merchant, customer), or `0` for no cap
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or `BasicError::Unauthorized` if `admin` is not the
+    /// contract admin.
+    ///
+    /// # Events
+    /// Emits `MaxOpenRequestsSet`.
+    pub fn set_max_open_requests(
+        env: Env,
+        admin: Address,
+        max_open_requests: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::Admin))
+            .ok_or(Error::Basic(BasicError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.store().set(
+            &DataKey::Config(ConfigKey::MaxOpenRequests),
+            &max_open_requests,
+        );
+        (MaxOpenRequestsSet {
+            max_open_requests,
+            set_by: admin,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the open payment request cap per (merchant, customer), or `0` when
+    /// no cap is set (#903).
+    pub fn get_max_open_requests(env: Env) -> u32 {
+        env.store()
+            .get(&DataKey::Config(ConfigKey::MaxOpenRequests))
+            .unwrap_or(0)
+    }
+
+    /// Returns the number of open (unpaid, uncancelled, unexpired) payment
+    /// requests `merchant` has issued to `customer` (#903).
+    pub fn get_open_request_count(env: Env, merchant: Address, customer: Address) -> u32 {
+        Self::live_open_requests(&env, &merchant, &customer).len()
     }
 
     /// Returns a payment request by id (#662).
@@ -13268,6 +13359,50 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::MerchantInactive));
         }
         Ok(())
+    }
+
+    /// Returns the ids of `merchant`'s requests to `customer` that are still open:
+    /// unpaid, uncancelled and unexpired (#903). Expired entries drop out here,
+    /// which is how expiry frees a slot.
+    fn live_open_requests(env: &Env, merchant: &Address, customer: &Address) -> Vec<u64> {
+        let tracked: Vec<u64> = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::OpenRequests(
+                merchant.clone(),
+                customer.clone(),
+            )))
+            .unwrap_or(Vec::new(env));
+        let now = env.ledger().timestamp();
+        let mut live = Vec::new(env);
+        for id in tracked.iter() {
+            let request: Option<PaymentRequest> =
+                env.store().get(&DataKey::Payment(PaymentKey::Request(id)));
+            if let Some(r) = request {
+                let expired = r.expires_at != 0 && now >= r.expires_at;
+                if r.status == PaymentRequestStatus::Open && !expired {
+                    live.push_back(id);
+                }
+            }
+        }
+        live
+    }
+
+    /// Removes a paid or cancelled request from its (merchant, customer) open
+    /// request list, freeing its slot (#903).
+    fn release_open_request(env: &Env, request: &PaymentRequest) {
+        if let Some(customer) = &request.customer {
+            let key = DataKey::Payment(PaymentKey::OpenRequests(
+                request.merchant.clone(),
+                customer.clone(),
+            ));
+            let tracked: Option<Vec<u64>> = env.store().get(&key);
+            if let Some(mut ids) = tracked {
+                if let Some(pos) = ids.first_index_of(request.id) {
+                    ids.remove(pos);
+                    env.store().set(&key, &ids);
+                }
+            }
+        }
     }
 
     fn require_registry_admin(env: &Env, admin: &Address) -> Result<(), Error> {
