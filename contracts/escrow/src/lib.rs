@@ -13,6 +13,8 @@ use soroban_sdk::{
 #[derive(Clone)]
 #[contracttype]
 pub enum ConfigKey {
+    // Issue #878: per-merchant customer cooling-off window in seconds.
+    MerchantCoolingOff(Address),
     AdminMultiSig,
     AdminProposal(String),
     AdminProposalCounter,
@@ -42,6 +44,13 @@ pub enum ConfigKey {
     TrustedBridge(Address),
     EvidenceDeadlineConfig,
     TokenEscrowFeeConfig(Address),
+    // Issue #881: admin-managed escrow token allowlist
+    EscrowAllowedTokens,
+    // Issue #879: per-merchant exposure limit and current exposure
+    MerchantExposureLimit(Address, Address),
+    MerchantExposure(Address, Address),
+    // Issue #882: minimum escrow amount per token
+    MinEscrowAmount(Address),
 }
 
 #[derive(Clone)]
@@ -98,9 +107,9 @@ pub enum EscrowKey {
     TermsAmendmentCount(u64),
     // Merchant pause state
     MerchantPauseState(Address),
-    // Issue #884: shared escrow note log
-    Note(u64, u64),
-    NoteCount(u64),
+    // Issue #880: bounded status history (escrow_id, index)
+    StatusHistory(u64, u32),
+    StatusHistoryCount(u64),
 }
 
 #[derive(Clone)]
@@ -238,11 +247,23 @@ pub enum EscrowError {
     InvalidBeneficiaryShares = 233,
     DuplicateBeneficiary = 234,
     DisputeCooldownActive = 235,
+    // Issue #877: hashlock escrows
+    InvalidPreimage = 236,
+    // Issue #878: cooling-off cancellation
+    CoolingOffNotConfigured = 237,
+    CoolingOffWindowEnded = 238,
+    CoolingOffMerchantAccepted = 239,
     // Issue #787: recurring escrow schedules
     InvalidRecurringScheduleParams = 339,
     RecurringScheduleNotFound = 340,
     RecurringScheduleInactive = 341,
     RecurringScheduleComplete = 342,
+    // Issue #881
+    TokenNotAllowed = 343,
+    // Issue #879
+    ExposureLimitExceeded = 344,
+    // Issue #882
+    AmountBelowMinimum = 345,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,7 +376,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ActionError>(code)
                 }));
             }
-            if (200..=235).contains(&code) || (339..=342).contains(&code) {
+            if (200..=235).contains(&code) || (339..=345).contains(&code) {
                 return Ok(Error::Escrow(unsafe {
                     core::mem::transmute::<u32, EscrowError>(code)
                 }));
@@ -397,6 +418,15 @@ pub enum EscrowStatus {
     Disputed,
     Resolved,
     Cancelled,
+}
+
+/// Issue #880: one bounded status-transition record per escrow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct EscrowStatusEntry {
+    pub status: EscrowStatus,
+    pub changed_by: Address,
+    pub timestamp: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -459,6 +489,43 @@ pub struct TokenEscrowFeeConfigUpdated {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TokenEscrowFeeConfigRemoved {
     pub token: Address,
+}
+
+// ── Issue #881: escrow token allowlist events ────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTokenAdded {
+    pub token: Address,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowTokenRemoved {
+    pub token: Address,
+    pub admin: Address,
+}
+
+// ── Issue #879: merchant exposure events ─────────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantExposureLimitUpdated {
+    pub merchant: Address,
+    pub token: Address,
+    pub limit: i128,
+    pub admin: Address,
+}
+
+// ── Issue #882: minimum escrow amount event ──────────────────────────────────
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MinEscrowAmountUpdated {
+    pub token: Address,
+    pub min_amount: i128,
+    pub admin: Address,
 }
 
 #[contracttype]
@@ -1942,6 +2009,56 @@ pub struct ConditionEvaluated {
     pub met: bool,
 }
 
+/// Issue #877: hash/preimage parameters for a hashlock escrow.
+#[derive(Clone)]
+#[contracttype]
+pub struct HashlockEscrow {
+    pub escrow_id: u64,
+    pub hash: BytesN<32>,
+    pub timeout: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashlockEscrowCreated {
+    pub escrow_id: u64,
+    pub hash: BytesN<32>,
+    pub timeout: u64,
+}
+
+/// Issue #877: emitted on a successful claim; contains the revealed preimage.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashlockEscrowClaimed {
+    pub escrow_id: u64,
+    pub merchant: Address,
+    pub preimage: Bytes,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HashlockEscrowRefunded {
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+/// Issue #878: distinct event for a customer cancellation inside the cooling-off window.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelledWithinCoolingOff {
+    pub escrow_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoolingOffConfigUpdated {
+    pub merchant: Address,
+    pub cooling_off_seconds: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowExpired {
@@ -2261,6 +2378,8 @@ pub const INSTANCE_BUMP_THRESHOLD: u32 = 30 * LEDGERS_PER_DAY;
 /// Instance TTL is extended to this many ledgers (~90 days) so the contract
 /// survives long quiet periods without being archived (#646).
 pub const INSTANCE_BUMP_AMOUNT: u32 = 90 * LEDGERS_PER_DAY;
+/// Issue #880: maximum number of status-history entries kept per escrow.
+pub const MAX_STATUS_HISTORY: u32 = 10;
 
 // Issue #649: Persistent storage TTL constants for per-record and per-user data
 #[allow(dead_code)]
@@ -3522,6 +3641,222 @@ impl EscrowContract {
         )
     }
 
+    /// Issue #877: creates an escrow releasable by a SHA-256 preimage.
+    ///
+    /// `hash` is the expected `sha256(preimage)`. `timeout` is an absolute
+    /// ledger timestamp after which the customer can reclaim the funds.
+    pub fn create_hashlock_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        hash: BytesN<32>,
+        timeout: u64,
+    ) -> Result<u64, Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "create_escrow")?;
+        if timeout <= env.ledger().timestamp() {
+            return Err(Error::Escrow(EscrowError::EscrowAlreadyExpired));
+        }
+
+        let escrow_id = Self::internal_create_escrow(
+            env.clone(),
+            customer,
+            merchant,
+            amount,
+            token,
+            0,
+            0,
+            timeout,
+            true,
+            None,
+            None,
+        )?;
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::Hashlock(escrow_id)),
+            &HashlockEscrow {
+                escrow_id,
+                hash: hash.clone(),
+                timeout,
+            },
+        );
+        HashlockEscrowCreated {
+            escrow_id,
+            hash,
+            timeout,
+        }
+        .publish(&env);
+        Ok(escrow_id)
+    }
+
+    /// Issue #877: releases a hashlock escrow to the merchant by revealing the
+    /// preimage. A wrong preimage fails with `InvalidPreimage` and moves no funds.
+    pub fn claim_hashlock_escrow(
+        env: Env,
+        merchant: Address,
+        escrow_id: u64,
+        preimage: Bytes,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        merchant.require_auth();
+        Self::require_not_paused(&env, "release_escrow")?;
+        let lock: HashlockEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Hashlock(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        let mut escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if escrow.status != EscrowStatus::Locked || escrow.merchant != merchant {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        let digest: BytesN<32> = env.crypto().sha256(&preimage).into();
+        if digest != lock.hash {
+            return Err(Error::Escrow(EscrowError::InvalidPreimage));
+        }
+        if env.ledger().timestamp() >= lock.timeout {
+            return Err(Error::Escrow(EscrowError::TimeoutNotReached));
+        }
+
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Released;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Released);
+        Self::transfer_if_token_contract(&env, &escrow.token, &merchant, escrow.amount)?;
+        HashlockEscrowClaimed {
+            escrow_id,
+            merchant,
+            preimage,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Issue #877: customer reclaims an unclaimed hashlock escrow after timeout.
+    pub fn refund_hashlock_escrow(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "refund_escrow")?;
+        let lock: HashlockEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Hashlock(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        let mut escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if escrow.customer != customer || escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if env.ledger().timestamp() < lock.timeout {
+            return Err(Error::Escrow(EscrowError::TimeoutNotReached));
+        }
+        let amount = escrow.amount;
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
+        Self::transfer_if_token_contract(&env, &escrow.token, &customer, amount)?;
+        HashlockEscrowRefunded {
+            escrow_id,
+            customer,
+            amount,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Issue #878: admin sets the optional per-merchant cooling-off window.
+    pub fn set_merchant_cooling_off(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        cooling_off_seconds: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_merchant_cooling_off")?;
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MerchantCoolingOff(merchant.clone())),
+            &cooling_off_seconds,
+        );
+        CoolingOffConfigUpdated {
+            merchant,
+            cooling_off_seconds,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Issue #878: customer cancels an unaccepted escrow during the merchant's
+    /// cooling-off window and receives a full refund.
+    pub fn cancel_within_cooling_off(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "cancel_within_cooling_off")?;
+        let mut escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+        if escrow.customer != customer || escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        let cooling_off_seconds: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantCoolingOff(
+                escrow.merchant.clone(),
+            )))
+            .ok_or(Error::Escrow(EscrowError::CoolingOffNotConfigured))?;
+        if env.ledger().timestamp() >= escrow.created_at.saturating_add(cooling_off_seconds) {
+            return Err(Error::Escrow(EscrowError::CoolingOffWindowEnded));
+        }
+        if let Some(acceptance) = Self::get_merchant_acceptance(env.clone(), escrow_id) {
+            if acceptance.accepted {
+                return Err(Error::Escrow(EscrowError::CoolingOffMerchantAccepted));
+            }
+        }
+        let amount = escrow.amount;
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
+        Self::transfer_if_token_contract(&env, &escrow.token, &customer, amount)?;
+        CancelledWithinCoolingOff {
+            escrow_id,
+            customer,
+            amount,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
     /// Creates an escrow linked to an off-chain order reference (Issue #694).
     ///
     /// Behaves exactly like [`Self::create_escrow`], and additionally records
@@ -3717,6 +4052,278 @@ impl EscrowContract {
         )
     }
 
+    // ── Issue #881: admin escrow token allowlist ─────────────────────────────
+
+    /// Adds `token` to the escrow token allowlist. An empty allowlist means all
+    /// tokens are permitted; adding the first token switches enforcement on.
+    pub fn add_escrow_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "add_escrow_token")?;
+        Self::require_multisig_admin(&env, &admin)?;
+
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tokens.contains(&token) {
+            tokens.push_back(token.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::EscrowAllowedTokens), &tokens);
+        }
+        EscrowTokenAdded { token, admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Removes `token` from the escrow token allowlist. Existing escrows are
+    /// unaffected; only new escrow creation is restricted.
+    pub fn remove_escrow_token(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "remove_escrow_token")?;
+        Self::require_multisig_admin(&env, &admin)?;
+
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env));
+        if tokens.contains(&token) {
+            let mut updated = Vec::new(&env);
+            for existing in tokens.iter() {
+                if existing != token {
+                    updated.push_back(existing);
+                }
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::Config(ConfigKey::EscrowAllowedTokens), &updated);
+        }
+        EscrowTokenRemoved { token, admin }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the current allowlist (empty means all tokens are permitted).
+    pub fn get_escrow_tokens(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn require_multisig_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        Ok(())
+    }
+
+    fn require_token_allowed(env: &Env, token: &Address) -> Result<(), Error> {
+        let tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EscrowAllowedTokens))
+            .unwrap_or_else(|| Vec::new(env));
+        if !tokens.is_empty() && !tokens.contains(token) {
+            return Err(Error::Escrow(EscrowError::TokenNotAllowed));
+        }
+        Ok(())
+    }
+
+    // ── Issue #879: per-merchant exposure limit ──────────────────────────────
+
+    /// Sets the maximum total open escrow value for `(merchant, token)`.
+    pub fn set_merchant_exposure_limit(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        limit: i128,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_merchant_exposure_limit")?;
+        Self::require_multisig_admin(&env, &admin)?;
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant.clone(),
+                token.clone(),
+            )),
+            &limit,
+        );
+        MerchantExposureLimitUpdated {
+            merchant,
+            token,
+            limit,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the configured limit, or `None` when the merchant is unlimited.
+    pub fn get_merchant_exposure_limit(
+        env: Env,
+        merchant: Address,
+        token: Address,
+    ) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant, token,
+            )))
+    }
+
+    /// Returns the current open escrow value for `(merchant, token)`.
+    pub fn get_merchant_exposure(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MerchantExposure(
+                merchant, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    fn add_exposure(
+        env: &Env,
+        merchant: &Address,
+        token: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let key = DataKey::Config(ConfigKey::MerchantExposure(merchant.clone(), token.clone()));
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let next = current.saturating_add(amount);
+        if let Some(limit) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::Config(ConfigKey::MerchantExposureLimit(
+                merchant.clone(),
+                token.clone(),
+            )))
+        {
+            if next > limit {
+                return Err(Error::Escrow(EscrowError::ExposureLimitExceeded));
+            }
+        }
+        env.storage().instance().set(&key, &next);
+        Ok(())
+    }
+
+    fn reduce_exposure(env: &Env, merchant: &Address, token: &Address, amount: i128) {
+        let key = DataKey::Config(ConfigKey::MerchantExposure(merchant.clone(), token.clone()));
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&key, &current.saturating_sub(amount));
+    }
+
+    // ── Issue #882: minimum escrow amount per token ──────────────────────────
+
+    /// Sets the minimum acceptable escrow amount for `token`.
+    pub fn set_min_escrow_amount(
+        env: Env,
+        admin: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        admin.require_auth();
+        Self::require_not_paused(&env, "set_min_escrow_amount")?;
+        Self::require_multisig_admin(&env, &admin)?;
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::MinEscrowAmount(token.clone())),
+            &min_amount,
+        );
+        MinEscrowAmountUpdated {
+            token,
+            min_amount,
+            admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the configured minimum, or `None` when unset.
+    pub fn get_min_escrow_amount(env: Env, token: Address) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MinEscrowAmount(token)))
+    }
+
+    fn require_min_amount(env: &Env, token: &Address, amount: i128) -> Result<(), Error> {
+        if let Some(min) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::Config(ConfigKey::MinEscrowAmount(token.clone())))
+        {
+            if amount < min {
+                return Err(Error::Escrow(EscrowError::AmountBelowMinimum));
+            }
+        }
+        Ok(())
+    }
+
+    // ── Issue #880: bounded escrow status history ────────────────────────────
+
+    /// Returns status transitions in chronological order (empty for unknown ids).
+    pub fn get_escrow_status_history(env: Env, escrow_id: u64) -> Vec<EscrowStatusEntry> {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)))
+            .unwrap_or(0);
+        let mut history = Vec::new(&env);
+        for i in 0..count {
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get(&DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i)))
+            {
+                history.push_back(entry);
+            }
+        }
+        history
+    }
+
+    /// Appends one entry, dropping the oldest once `MAX_STATUS_HISTORY` is reached.
+    fn append_status_history(env: &Env, escrow_id: u64, entry: &EscrowStatusEntry) {
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)))
+            .unwrap_or(0);
+        if count < MAX_STATUS_HISTORY {
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, count)),
+                entry,
+            );
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistoryCount(escrow_id)),
+                &(count + 1),
+            );
+        } else {
+            // Shift left: index 0 is the oldest entry.
+            for i in 1..MAX_STATUS_HISTORY {
+                let next: EscrowStatusEntry = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i)))
+                    .expect("status history entry");
+                env.storage().instance().set(
+                    &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, i - 1)),
+                    &next,
+                );
+            }
+            env.storage().instance().set(
+                &DataKey::Escrow(EscrowKey::StatusHistory(escrow_id, MAX_STATUS_HISTORY - 1)),
+                entry,
+            );
+        }
+    }
+
     fn internal_create_escrow(
         env: Env,
         customer: Address,
@@ -3730,6 +4337,9 @@ impl EscrowContract {
         multisig: Option<MultisigConfiguration>,
         reference: Option<BytesN<32>>,
     ) -> Result<u64, Error> {
+        Self::require_token_allowed(&env, &token)?;
+        Self::require_min_amount(&env, &token, amount)?;
+        Self::add_exposure(&env, &merchant, &token, amount)?;
         // Check if merchant has paused escrow creation
         if let Some(pause_state) =
             env.storage()
@@ -3990,6 +4600,8 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         customer.require_auth();
         Self::require_not_paused(&env, "create_multi_party_escrow")?;
+        Self::require_token_allowed(&env, &token)?;
+        Self::require_min_amount(&env, &token, total_amount)?;
 
         // Minimum 2, maximum 10 participants
         if participants.len() < 2 || participants.len() > 10 {
@@ -4450,6 +5062,10 @@ impl EscrowContract {
 
         if tokens.is_empty() {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        for entry in tokens.iter() {
+            Self::require_token_allowed(&env, &entry.token)?;
+            Self::require_min_amount(&env, &entry.token, entry.amount)?;
         }
         if tokens.len() > 10 {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
@@ -5050,6 +5666,9 @@ impl EscrowContract {
             a.total_value_released += rel_amount;
         });
 
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
         EscrowReleased {
             escrow_id,
             recipient,
@@ -5057,6 +5676,17 @@ impl EscrowContract {
             token: escrow.token,
         }
         .publish(&env);
+
+        // Issue #880: record the transition alongside the status event
+        Self::append_status_history(
+            &env,
+            escrow_id,
+            &EscrowStatusEntry {
+                status: EscrowStatus::Released,
+                changed_by: _admin.clone(),
+                timestamp: current_time,
+            },
+        );
 
         // Emit unified status change event
         EscrowStatusChanged {
@@ -5155,6 +5785,8 @@ impl EscrowContract {
 
         if escrow.released_amount >= escrow.amount {
             escrow.status = EscrowStatus::Released;
+            // Issue #879: close out the merchant's open exposure
+            Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
         }
 
         env.storage()
@@ -5224,6 +5856,9 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
+
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(
@@ -13230,6 +13865,15 @@ impl EscrowContract {
         if entry.amount <= 0 {
             return Err(2); // InvalidStatus
         }
+        if Self::require_token_allowed(env, &entry.token).is_err() {
+            return Err(343); // EscrowError::TokenNotAllowed
+        }
+        if Self::require_min_amount(env, &entry.token, entry.amount).is_err() {
+            return Err(345); // EscrowError::AmountBelowMinimum
+        }
+        if Self::add_exposure(env, &entry.merchant, &entry.token, entry.amount).is_err() {
+            return Err(344); // EscrowError::ExposureLimitExceeded
+        }
 
         let current_timestamp = env.ledger().timestamp();
         if entry.release_timestamp <= current_timestamp {
@@ -13510,6 +14154,9 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
 
         // Calculate keeper reward from platform fee
         let expiry_config = env
@@ -15499,6 +16146,9 @@ impl EscrowContract {
 
             Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Cancelled);
 
+            // Issue #879: close out the merchant's open exposure
+            Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
             Self::transfer_if_token_contract(&env, &escrow.token, &escrow.customer, escrow.amount)?;
 
             MutualCancelCompleted {
@@ -15969,6 +16619,9 @@ impl EscrowContract {
 
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
 
+        // Issue #879: close out the merchant's open exposure
+        Self::reduce_exposure(&env, &escrow.merchant, &escrow.token, escrow.amount);
+
         let refund_amount = escrow.amount.saturating_sub(escrow.released_amount);
         EscrowContract::transfer_if_token_contract(&env, &escrow.token, &recipient, refund_amount)?;
 
@@ -15978,6 +16631,17 @@ impl EscrowContract {
             amount: refund_amount,
         }
         .publish(&env);
+
+        // Issue #880: record the transition alongside the status event
+        Self::append_status_history(
+            &env,
+            escrow_id,
+            &EscrowStatusEntry {
+                status: EscrowStatus::Resolved,
+                changed_by: caller.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
 
         // Emit unified status change event
         EscrowStatusChanged {
