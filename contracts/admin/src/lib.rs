@@ -121,8 +121,32 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
+    pub cancelled: bool,
     /// Optional hash of the off-chain rationale for this proposal (#875).
     pub description_hash: Option<BytesN<32>>,
+}
+
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
 }
 
 /// Proposal shape used before #875, kept so existing stored proposals stay readable.
@@ -839,6 +863,7 @@ fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
         created_at: legacy.created_at,
         expires_at: legacy.expires_at,
         executed: legacy.executed,
+        cancelled: false,
         description_hash: None,
     })
 }
@@ -1541,6 +1566,7 @@ impl AdminContract {
             created_at,
             expires_at,
             executed: false,
+            cancelled: false,
             description_hash: description_hash.clone(),
         };
         env.storage().instance().set(&DataKey::ProposalCount, &id);
@@ -1793,7 +1819,7 @@ impl AdminContract {
             .checked_add(config.delay_seconds)
             .ok_or(Error::InvalidUpgradeConfig)?;
         let queued = QueuedChildUpgrade {
-            child_kind: child_kind.clone(),
+            child_kind,
             wasm_hash: wasm_hash.clone(),
             queued_at,
             execute_after,
@@ -1802,7 +1828,7 @@ impl AdminContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::QueuedChildUpgrade(child_kind.clone()), &queued);
+            .set(&DataKey::QueuedChildUpgrade(child_kind), &queued);
         ChildUpgradeQueued {
             child_kind,
             wasm_hash,
@@ -1833,7 +1859,7 @@ impl AdminContract {
         child_kind: ChildKind,
     ) -> Result<(), Error> {
         require_admin_member(&env, &admin)?;
-        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let key = DataKey::QueuedChildUpgrade(child_kind);
         let mut queued: QueuedChildUpgrade = env
             .storage()
             .instance()
@@ -1876,7 +1902,7 @@ impl AdminContract {
         child_kind: ChildKind,
     ) -> Result<(), Error> {
         require_admin_member(&env, &admin)?;
-        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let key = DataKey::QueuedChildUpgrade(child_kind);
         let queued: QueuedChildUpgrade = env
             .storage()
             .instance()
@@ -1888,12 +1914,7 @@ impl AdminContract {
         if env.ledger().timestamp() < queued.execute_after {
             return Err(Error::UpgradeTooEarly);
         }
-        upgrade_single_child_wasm(
-            &env,
-            child_kind.clone(),
-            queued.wasm_hash.clone(),
-            admin.clone(),
-        )?;
+        upgrade_single_child_wasm(&env, child_kind, queued.wasm_hash.clone(), admin.clone())?;
         env.storage().instance().remove(&key);
         ChildUpgradeExecuted {
             child_kind,
@@ -3041,6 +3062,7 @@ mod test {
         let id = client.propose_action(
             &admin,
             &AdminAction::SetPaymentContract(new_payment.clone()),
+            &None,
         );
         client.approve_action(&a2, &id);
 
@@ -3073,6 +3095,7 @@ mod test {
         let id = client.propose_action(
             &admin,
             &AdminAction::SetPaymentContract(new_payment.clone()),
+            &None,
         );
 
         // A third admin cannot cancel while only one approval is in place.
@@ -3098,7 +3121,8 @@ mod test {
             Err(Ok(Error::ProposalCancelled))
         );
         // The proposer may always cancel their own proposal.
-        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(new_payment));
+        let id2 =
+            client.propose_action(&admin, &AdminAction::SetPaymentContract(new_payment), &None);
         client.cancel_proposal(&admin, &id2);
         assert!(client.get_proposal(&id2).cancelled);
     }
@@ -3112,9 +3136,9 @@ mod test {
         let p2 = setup_payment(&env, &pauser);
         let p3 = setup_payment(&env, &pauser);
 
-        let id1 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p1));
-        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p2));
-        let id3 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p3));
+        let id1 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p1), &None);
+        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p2), &None);
+        let id3 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p3), &None);
         client.approve_action(&a2, &id2);
         client.cancel_proposal(&admin, &id1);
 
