@@ -39,11 +39,11 @@ Every privileged function performs two authorization checks:
 | Function | Description | Role Required |
 |---|---|---|
 | `initialize(admin, pauser, payment_contract, escrow_contract, refund_contract)` | Configures the contract with the admin, pauser, and child contract addresses. | Admin (sets both roles) |
-| `emergency_pause_all(pauser, reason, max_pause_seconds)` | Pauses the payment, escrow, and refund contracts in one call, optionally with an expiry. See [Bounded Emergency Pause](#bounded-emergency-pause). | Pauser |
+| `emergency_pause_all(pauser, reason, max_pause_seconds, reason_code)` | Pauses the payment, escrow, and refund contracts in one call, optionally with an expiry. See [Bounded Emergency Pause](#bounded-emergency-pause). | Pauser |
 | `emergency_unpause_all(pauser)` | Unpauses the payment, escrow, and refund contracts in one call and clears any pause expiry. | Pauser |
 | `extend_emergency_pause(admin, additional_seconds)` | Pushes back the expiry of a bounded pause before it is reached. | Admin member (any threshold) |
 | `expire_emergency_pause()` | Unpauses all children once a bounded pause has reached its expiry. | Anyone (children still check the pauser, see below) |
-| `emergency_pause_function(pauser, target, function_name, reason)` | Pauses one function on the targeted child contract only. | Pauser |
+| `emergency_pause_function(pauser, target, function_name, reason, reason_code)` | Pauses one function on the targeted child contract only. | Pauser |
 | `emergency_unpause_function(pauser, target, function_name)` | Unpauses one function on the targeted child contract only. | Pauser |
 | `set_payment_contract(admin, payment_contract)` | Updates the stored payment contract address. | Admin member, threshold 1 only |
 | `set_escrow_contract(admin, escrow_contract)` | Updates the stored escrow contract address. | Admin member, threshold 1 only |
@@ -51,7 +51,7 @@ Every privileged function performs two authorization checks:
 | `upgrade(admin, new_wasm_hash)` | Replaces the coordinator WASM. | Admin member, threshold 1 only |
 | `upgrade_children(admin, payment_hash, escrow_hash, refund_hash)` | Pauses, upgrades and unpauses all three child contracts in one call. See [Coordinated Child Upgrades](#coordinated-child-upgrades). | Admin member, threshold 1 only |
 | `set_admins(admin, admins, threshold)` | Replaces the admin set and threshold. | Admin member, threshold 1 only |
-| `propose_action(proposer, action)` | Proposes a privileged action. | Admin member |
+| `propose_action(proposer, action, description_hash)` | Proposes a privileged action with an optional hash of its off-chain rationale. | Admin member |
 | `approve_action(approver, proposal_id)` | Approves an open proposal. | Admin member |
 | `execute_action(executor, proposal_id)` | Runs a proposal that has reached the threshold. | Admin member |
 
@@ -67,6 +67,7 @@ Every privileged function performs two authorization checks:
 | `get_emergency_pause_expiry()` | When the current bounded pause may be expired, or `None` if no bounded pause is in effect. | `Option<u64>` |
 | `get_incident_log(offset, limit)` | A page of the emergency-action incident log, oldest first. See [Incident Log](#incident-log). | `Vec<IncidentEntry>` |
 | `get_incident_count()` | Total number of incident log entries. | `u64` |
+| `get_incident_count_by_reason(reason)` | Number of incident log entries with the given reason code. | `u64` |
 | `get_schema_version()` | The coordinator's own schema version (`ADMIN_SCHEMA_VERSION`). | `u32` |
 | `get_platform_versions()` | The coordinator's version and each child's `get_schema_version`. See [Platform Versions](#platform-versions). | `PlatformVersions` |
 | `get_platform_status()` | Returns the current pause state of all three child contracts. If a child contract is unreachable, it is reported as `Unknown` rather than causing a panic. | `PlatformStatus` containing the address and pause status of each child. |
@@ -141,11 +142,17 @@ Privileged coordinator calls (child contract setters, `upgrade`, and changing th
 
 Errors: `NotInitialized`, `Unauthorized`, `MultisigRequired`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminSetUpdated`.
 
-### `propose_action(proposer, action) -> u64`
+### `propose_action(proposer, action, description_hash) -> u64`
 
 Creates a proposal and records the proposer's approval. The proposal expires `PROPOSAL_TTL_SECONDS` (7 days) after creation. `SetAdmins` proposals are validated up front.
 
-Errors: `NotInitialized`, `Unauthorized`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminProposalCreated`.
+| Parameter | Type | Description |
+|---|---|---|
+| `proposer` | `Address` | Admin member creating the proposal; must authorize. |
+| `action` | `AdminAction` | Privileged action to execute after approval. |
+| `description_hash` | `Option<BytesN<32>>` | Optional SHA-256 hash of the off-chain rationale/review for the proposal. Stored on the proposal and emitted in the event; `None` when no rationale is linked. |
+
+Errors: `NotInitialized`, `Unauthorized`, `InvalidAdminSet`, `InvalidThreshold`. Event: `AdminProposalCreated`. Proposals stored before this parameter was added remain readable and report `description_hash: None`.
 
 ### `approve_action(approver, proposal_id)`
 
@@ -168,6 +175,7 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64, // created_at + PROPOSAL_TTL_SECONDS; open while now <= expires_at
     pub executed: bool,
+    pub description_hash: Option<BytesN<32>>, // off-chain rationale hash (#875)
 }
 ```
 
@@ -175,7 +183,7 @@ pub struct AdminProposal {
 
 | Event | Fields | Emitted by |
 |---|---|---|
-| `AdminProposalCreated` | `proposal_id: u64`, `proposer: Address`, `action: AdminAction`, `expires_at: u64` | `propose_action` |
+| `AdminProposalCreated` | `proposal_id: u64`, `proposer: Address`, `action: AdminAction`, `expires_at: u64`, `description_hash: Option<BytesN<32>>` | `propose_action` |
 | `AdminProposalApproved` | `proposal_id: u64`, `approver: Address`, `approvals: u32` | `approve_action` |
 | `AdminProposalExecuted` | `proposal_id: u64`, `executed_by: Address` | `execute_action` |
 | `AdminSetUpdated` | `admins: Vec<Address>`, `threshold: u32` | `set_admins`, executed `SetAdmins` proposals |
@@ -205,13 +213,14 @@ pub struct PlatformVersions {
 
 A forgotten emergency pause could otherwise freeze the platform indefinitely. `emergency_pause_all` can be given a maximum duration, after which anyone may lift the pause.
 
-### `emergency_pause_all(pauser, reason, max_pause_seconds)`
+### `emergency_pause_all(pauser, reason, max_pause_seconds, reason_code)`
 
 | Parameter | Type | Description |
 |---|---|---|
 | `pauser` | `Address` | Must authorize the call and match the stored pauser. |
 | `reason` | `String` | Human-readable reason, passed to each child's `pause_contract`. |
 | `max_pause_seconds` | `Option<u64>` | `Some(n)`: the pause may be expired once the ledger timestamp reaches `now + n`. `None`: no expiry; any expiry left by an earlier pause is cleared. |
+| `reason_code` | `IncidentReason` | Structured reason for aggregation/alerts: `SecurityExploit`, `OracleFailure`, `ChildUpgrade`, `Maintenance` or `Other`. Stored on the incident entry and emitted in the pause events. |
 
 Errors: `NotInitialized`, `Unauthorized`, `InvalidPauseDuration` (`Some(0)` or overflow). Calling it again while paused replaces the expiry.
 
@@ -257,7 +266,7 @@ Incident response sometimes needs to disable a single operation (for example ref
 | `Escrow` | The stored escrow contract |
 | `Refund` | The stored refund contract |
 
-### `emergency_pause_function(pauser, target, function_name, reason)`
+### `emergency_pause_function(pauser, target, function_name, reason, reason_code)`
 
 Calls `pause_function(pauser, function_name, reason)` on the child selected by `target`. Other functions on that child, and all other child contracts, are left untouched; nothing is globally paused.
 
@@ -267,6 +276,7 @@ Calls `pause_function(pauser, function_name, reason)` on the child selected by `
 | `target` | `ChildKind` | Which child contract to act on. |
 | `function_name` | `String` | Name of the child function to pause, e.g. `"process_refund"`. Must be non-empty. |
 | `reason` | `String` | Human-readable reason, recorded in the child's pause history. The escrow contract rejects an empty reason. |
+| `reason_code` | `IncidentReason` | Structured reason code (`SecurityExploit`, `OracleFailure`, `ChildUpgrade`, `Maintenance`, `Other`), stored on the incident entry and included in `EmergencyFunctionPausedEvent` and `IncidentLogged`. |
 
 Errors: `NotInitialized`, `Unauthorized`, `InvalidFunctionName`. If the child contract rejects the call (for example because the pauser is not one of its admins), the whole transaction fails.
 
@@ -288,12 +298,26 @@ In addition to the child contract's own `FunctionPausedEvent` / `FunctionUnpause
 
 | Event | Fields | Emitted by |
 |---|---|---|
-| `EmergencyFunctionPausedEvent` | `target: ChildKind`, `function_name: String`, `paused_by: Address`, `reason: String`, `paused_at: u64` | `emergency_pause_function` |
+| `EmergencyFunctionPausedEvent` | `target: ChildKind`, `function_name: String`, `paused_by: Address`, `reason: String`, `paused_at: u64`, `reason_code: IncidentReason` | `emergency_pause_function` |
 | `EmergencyFunctionUnpausedEvent` | `target: ChildKind`, `function_name: String`, `unpaused_by: Address`, `unpaused_at: u64` | `emergency_unpause_function` |
 
 `EmergencyFunctionUnpausedEvent` is published under the topic `emergency_fn_unpaused`.
 
 ## Incident Log
+
+`IncidentReason` is the structured reason code introduced with these pause calls (#876):
+
+```rust
+pub enum IncidentReason {
+    SecurityExploit, // code 0
+    OracleFailure,   // code 1
+    ChildUpgrade,    // code 2
+    Maintenance,     // code 3
+    Other,           // code 4
+}
+```
+
+`emergency_pause_all` and `emergency_pause_function` accept a free-form `reason: String` (still passed to child contracts) plus a `reason_code: IncidentReason`. The code is included in `EmergencyFunctionPausedEvent` and `IncidentLogged`, stored as a numeric code on the incident entry, and counted by `get_incident_count_by_reason`. Other incident-producing functions record `Other`.
 
 Post-incident reviews need a lasting record of every emergency action. The coordinator appends an `IncidentEntry` to a log in **persistent storage** each time one of these succeeds:
 
@@ -319,6 +343,7 @@ Calls that fail (wrong caller, invalid arguments, a child rejecting the call) re
 | `reason` | `String` | The reason supplied with the action, or empty if the action takes none. |
 | `actor` | `Option<Address>` | Who performed the action. `None` for a permissionless auto-expiry. |
 | `at` | `u64` | Ledger timestamp of the action. |
+| `reason_code` | `Option<u32>` | Structured reason code (0–4, see `IncidentReason` above). `None` for entries created before reason codes existed; those entries remain readable. |
 
 ### `get_incident_log(offset, limit) -> Vec<IncidentEntry>`
 
@@ -333,11 +358,15 @@ Returns entries in ID order. Returns an empty vector when `offset >= get_inciden
 
 The number of entries in the log. Read-only, no errors.
 
+### `get_incident_count_by_reason(reason: IncidentReason) -> u64`
+
+Returns the number of entries recorded with the given structured reason code. Read-only, no errors.
+
 ### Events
 
 | Event | Fields | Emitted by |
 |---|---|---|
-| `IncidentLogged` | `incident_id: u64`, `action: IncidentAction`, `at: u64` | Every function that appends an entry, after its own event |
+| `IncidentLogged` | `incident_id: u64`, `action: IncidentAction`, `at: u64`, `reason_code: IncidentReason` | Every function that appends an entry, after its own event |
 
 ## Security Considerations
 
