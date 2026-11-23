@@ -158,6 +158,7 @@ pub enum DisputeKey {
     // Settlement offer feature
     SettlementOffer(u64), // keyed by escrow_id
     SettlementOfferCounter,
+    ReleaseDateProposal(u64),
 }
 
 // Issue #686: storage keys for escrow lifecycle notification hooks
@@ -314,6 +315,16 @@ pub enum ActionError {
     MilestoneAmendmentAlreadyExists = 336,
     MilestoneAmendmentNotFound = 337,
     MilestoneAmendmentAlreadyAccepted = 338,
+    // Issue #886: mutually agreed release date changes
+    ReleaseDateProposalExists = 343,
+    ReleaseDateProposalNotFound = 344,
+    InvalidReleaseDate = 345,
+    // Issue #883: partial disputes
+    InvalidDisputedAmount = 346,
+    // Issue #884: escrow note log
+    MaxNotesPerEscrowReached = 347,
+    // Issue #885: absolute fee cap
+    InvalidMaxFee = 348,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -439,6 +450,8 @@ pub struct EscrowFeeConfig {
     pub fee_bps: i128,
     pub fee_recipient: Address,
     pub enabled: bool,
+    /// Optional absolute cap in token units; `None` means uncapped.
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -460,6 +473,7 @@ pub struct EscrowFeesWithdrawn {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EscrowFeeConfigUpdated {
     pub fee_bps: i128,
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -468,6 +482,7 @@ pub struct TokenEscrowFeeConfigUpdated {
     pub token: Address,
     pub fee_bps: i128,
     pub enabled: bool,
+    pub max_fee: Option<i128>,
 }
 
 #[contractevent]
@@ -859,6 +874,17 @@ pub struct MultiTokenEscrowReleased {
     pub escrow_id: u64,
     pub merchant: Address,
     pub token_count: u32,
+}
+
+/// Issue #883: a customer disputed only part of an escrow.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowPartiallyDisputed {
+    pub escrow_id: u64,
+    pub disputed_by: Address,
+    pub disputed_amount: i128,
+    pub released_amount: i128,
+    pub reason: u32,
 }
 
 #[contractevent]
@@ -1474,6 +1500,58 @@ pub struct SettlementOffer {
     pub expires_at: u64,
     pub accepted: bool,
     pub rejected: bool,
+}
+
+/// Issue #884: a note attached to an escrow by a party or observer.
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowNote {
+    pub escrow_id: u64,
+    pub author: Address,
+    pub content_hash: BytesN<32>,
+    pub recorded_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowNoteAdded {
+    pub escrow_id: u64,
+    pub author: Address,
+    pub content_hash: BytesN<32>,
+}
+
+/// Issue #886: a pending proposal to move an escrow's release date.
+#[derive(Clone)]
+#[contracttype]
+pub struct ReleaseDateProposal {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub new_release_timestamp: u64,
+    pub proposed_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateProposed {
+    pub escrow_id: u64,
+    pub proposed_by: Address,
+    pub new_release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateAccepted {
+    pub escrow_id: u64,
+    pub accepted_by: Address,
+    pub new_release_timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseDateRejected {
+    pub escrow_id: u64,
+    pub rejected_by: Address,
+    pub proposed_by: Address,
 }
 
 #[derive(Clone)]
@@ -2290,6 +2368,7 @@ pub struct MerchantEscrowCreationUnpaused {
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const MIGRATION_TARGET_SCHEMA_VERSION: u32 = 2;
 const MIN_CLAWBACK_DELAY: u64 = 86_400;
+const MAX_NOTES_PER_ESCROW: u64 = 50;
 
 /// Ledgers closed per day at ~5s per ledger.
 const LEDGERS_PER_DAY: u32 = 17_280;
@@ -2438,6 +2517,9 @@ impl EscrowContract {
         Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_not_paused(&env, "set_escrow_fee_config")?;
+        if config.max_fee.is_some_and(|cap| cap < 0) {
+            return Err(Error::Action(ActionError::InvalidMaxFee));
+        }
         let multisig = Self::get_multisig_config(env.clone());
         if !multisig.admins.contains(&admin) {
             return Err(Error::Basic(BasicError::NotAnAdmin));
@@ -2447,6 +2529,7 @@ impl EscrowContract {
             .set(&DataKey::Config(ConfigKey::EscrowFeeConfig), &config);
         EscrowFeeConfigUpdated {
             fee_bps: config.fee_bps,
+            max_fee: config.max_fee,
         }
         .publish(&env);
         Ok(())
@@ -2470,6 +2553,7 @@ impl EscrowContract {
                 fee_bps: 0,
                 fee_recipient: env.current_contract_address(),
                 enabled: false,
+                max_fee: None,
             })
     }
 
@@ -2507,6 +2591,9 @@ impl EscrowContract {
         if !(0..=10000).contains(&config.fee_bps) {
             return Err(Error::Basic(BasicError::InvalidBps));
         }
+        if config.max_fee.is_some_and(|cap| cap < 0) {
+            return Err(Error::Action(ActionError::InvalidMaxFee));
+        }
         env.storage().instance().set(
             &DataKey::Config(ConfigKey::TokenEscrowFeeConfig(token.clone())),
             &config,
@@ -2515,6 +2602,7 @@ impl EscrowContract {
             token,
             fee_bps: config.fee_bps,
             enabled: config.enabled,
+            max_fee: config.max_fee,
         }
         .publish(&env);
         Ok(())
@@ -2579,6 +2667,15 @@ impl EscrowContract {
     /// The effective EscrowFeeConfig for `token`.
     pub fn get_effective_escrow_fee_config(env: Env, token: Address) -> EscrowFeeConfig {
         Self::effective_fee_config(&env, &token)
+    }
+
+    /// Fee charged for `amount` using the rate snapshotted on the escrow.
+    fn escrow_fee_amount(env: &Env, escrow: &Escrow, amount: i128) -> i128 {
+        let raw = (amount * escrow.fee_bps) / 10000;
+        match Self::effective_fee_config(env, &escrow.token).max_fee {
+            Some(cap) => core::cmp::min(raw, cap),
+            None => raw,
+        }
     }
 
     fn effective_fee_config(env: &Env, token: &Address) -> EscrowFeeConfig {
@@ -5449,7 +5546,7 @@ impl EscrowContract {
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
         }
 
-        let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let merchant_amount = escrow.amount - fee_amount;
 
         if fee_amount > 0 {
@@ -5641,7 +5738,7 @@ impl EscrowContract {
             return Err(Error::Action(ActionError::PartialReleaseExceedsBalance));
         }
 
-        let fee_amount = (amount * escrow.fee_bps) / 10000;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, amount);
         let merchant_amount = amount - fee_amount;
 
         if fee_amount > 0 {
@@ -6097,6 +6194,111 @@ impl EscrowContract {
         }
         .publish(&env);
 
+        Ok(())
+    }
+
+    /// Disputes only part of an escrow, releasing the undisputed balance to
+    /// the merchant immediately (after fees) and freezing the rest.
+    pub fn dispute_escrow_partial(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+        disputed_amount: i128,
+        reason: DisputeReason,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        customer.require_auth();
+        Self::require_not_paused(&env, "dispute_escrow_partial")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if customer != escrow.customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
+        if disputed_amount <= 0 || disputed_amount > remaining {
+            return Err(Error::Action(ActionError::InvalidDisputedAmount));
+        }
+
+        let undisputed = remaining - disputed_amount;
+        let fee_amount = Self::escrow_fee_amount(&env, &escrow, undisputed);
+        let merchant_amount = undisputed - fee_amount;
+        if fee_amount > 0 {
+            let fee_config = Self::effective_fee_config(&env, &escrow.token);
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &fee_config.fee_recipient,
+                fee_amount,
+            )?;
+            if fee_config.fee_recipient == env.current_contract_address() {
+                let key =
+                    DataKey::Participant(ParticipantKey::AccumulatedFees(escrow.token.clone()));
+                let acc: i128 = env.storage().instance().get(&key).unwrap_or(0);
+                env.storage().instance().set(&key, &(acc + fee_amount));
+            }
+            EscrowFeeCollected {
+                escrow_id,
+                fee_amount,
+                recipient: fee_config.fee_recipient,
+            }
+            .publish(&env);
+        }
+        if merchant_amount > 0 {
+            Self::transfer_if_token_contract(
+                &env,
+                &escrow.token,
+                &escrow.merchant,
+                merchant_amount,
+            )?;
+        }
+
+        escrow.released_amount = escrow.released_amount.saturating_add(undisputed);
+        let old_status = escrow.status.clone();
+        escrow.status = EscrowStatus::Disputed;
+        escrow.dispute_started_at = env.ledger().timestamp();
+        escrow.last_activity_at = escrow.dispute_started_at;
+        let evidence_deadline_seconds =
+            Self::get_evidence_deadline_config(env.clone()).evidence_deadline_seconds;
+        escrow.evidence_deadline = Some(escrow.dispute_started_at + evidence_deadline_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::DisputeOpener(escrow_id)),
+            &customer,
+        );
+        Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Disputed);
+
+        let reason_code: u32 = match reason {
+            DisputeReason::NonDelivery => 0,
+            DisputeReason::NotAsDescribed => 1,
+            DisputeReason::Damaged => 2,
+            DisputeReason::Fraud => 3,
+            DisputeReason::Other => 4,
+        };
+        let reason_key = DataKey::Dispute(DisputeKey::DisputeReasonCount(reason_code));
+        let count: u64 = env.storage().instance().get(&reason_key).unwrap_or(0);
+        env.storage().instance().set(&reason_key, &(count + 1));
+
+        EscrowPartiallyDisputed {
+            escrow_id,
+            disputed_by: customer,
+            disputed_amount,
+            released_amount: escrow.released_amount,
+            reason: reason_code,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -6899,7 +7101,7 @@ impl EscrowContract {
         EscrowResolved {
             escrow_id,
             released_to_merchant: release_to_merchant,
-            amount: escrow.amount,
+            amount: escrow.amount.saturating_sub(escrow.released_amount),
         }
         .publish(&env);
         Ok(())
@@ -7234,7 +7436,9 @@ impl EscrowContract {
 
         Self::dequeue_escalation(&env, escrow_id);
 
-        // Charge dispute fee to the losing party
+        // Charge dispute fee to the losing party. Only the still-locked
+        // (disputed) remainder is at stake for partial disputes.
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
         let dispute_config = Self::get_dispute_config(env.clone());
         let loser = if release_to_merchant {
             &escrow.customer
@@ -7243,7 +7447,7 @@ impl EscrowContract {
         };
 
         if dispute_config.dispute_fee_bps > 0 {
-            let dispute_fee = (escrow.amount * dispute_config.dispute_fee_bps as i128) / 10000;
+            let dispute_fee = (remaining * dispute_config.dispute_fee_bps as i128) / 10000;
             if dispute_fee > 0 {
                 let token_client = token::Client::new(&env, &escrow.token);
                 token_client.transfer(loser, env.current_contract_address(), &dispute_fee);
@@ -7274,7 +7478,7 @@ impl EscrowContract {
         } else {
             &escrow.customer
         };
-        Self::transfer_if_token_contract(&env, &escrow.token, recipient, escrow.amount)?;
+        Self::transfer_if_token_contract(&env, &escrow.token, recipient, remaining)?;
 
         // Handle collateral distribution
         if let Some(collateral) = env
@@ -7345,7 +7549,7 @@ impl EscrowContract {
         EscrowResolved {
             escrow_id,
             released_to_merchant: release_to_merchant,
-            amount: escrow.amount,
+            amount: remaining,
         }
         .publish(&env);
 
@@ -10057,7 +10261,7 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-                let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+                let fee_amount = EscrowContract::escrow_fee_amount(env, &escrow, escrow.amount);
                 let merchant_amount = escrow.amount - fee_amount;
 
                 if fee_amount > 0 {
@@ -12450,7 +12654,7 @@ impl EscrowContract {
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
         // Calculate keeper reward from platform fee
-        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let platform_fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let keeper_reward = if config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
             (platform_fee_amount * config.keeper_reward_bps as i128) / 10000
         } else {
@@ -13019,7 +13223,7 @@ impl EscrowContract {
                 .instance()
                 .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-            let fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+            let fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
             let merchant_amount = escrow.amount - fee_amount;
 
             if fee_amount > 0 {
@@ -13964,7 +14168,7 @@ impl EscrowContract {
                 keeper_reward_bps: 0,
             });
 
-        let platform_fee_amount = (escrow.amount * escrow.fee_bps) / 10000;
+        let platform_fee_amount = Self::escrow_fee_amount(&env, &escrow, escrow.amount);
         let keeper_reward = if expiry_config.keeper_reward_bps > 0 && platform_fee_amount > 0 {
             (platform_fee_amount * expiry_config.keeper_reward_bps as i128) / 10000
         } else {
@@ -15041,7 +15245,10 @@ impl EscrowContract {
         }
 
         let fee_bps = Self::effective_sub_account_fee_bps(&sub, escrow.fee_bps);
-        let fee_amount = (sub.amount * fee_bps) / 10000;
+        let fee_cap = Self::effective_fee_config(&env, &escrow.token)
+            .max_fee
+            .unwrap_or(i128::MAX);
+        let fee_amount = core::cmp::min((sub.amount * fee_bps) / 10000, fee_cap);
         let merchant_amount = sub.amount - fee_amount;
 
         if fee_amount > 0 {
@@ -15784,10 +15991,10 @@ impl EscrowContract {
         Self::dequeue_escalation(&env, escrow_id);
         Self::update_status_index(&env, escrow_id, &old_status, &EscrowStatus::Resolved);
 
-        // Compute amounts: merchant gets merchant_bps/10000 of amount; customer
-        // gets the remainder so the two values sum to exactly escrow.amount.
-        let merchant_amount = (escrow.amount * merchant_bps as i128) / 10000_i128;
-        let customer_amount = escrow.amount - merchant_amount;
+        // Compute amounts from the still-locked disputed remainder.
+        let remaining = escrow.amount.saturating_sub(escrow.released_amount);
+        let merchant_amount = (remaining * merchant_bps as i128) / 10000_i128;
+        let customer_amount = remaining - merchant_amount;
 
         if merchant_amount > 0 {
             Self::transfer_if_token_contract(
@@ -16493,6 +16700,242 @@ impl EscrowContract {
                 }
             }
         }
+    }
+
+    // ── Issue #884: shared escrow note log ───────────────────────────────────
+
+    /// Appends a note to an escrow's shared log. Callable by the customer,
+    /// merchant, or an observer with currently valid access.
+    pub fn add_escrow_note(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        content_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "add_escrow_note")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if caller != escrow.customer
+            && caller != escrow.merchant
+            && !Self::verify_observer_access(env.clone(), escrow_id, caller.clone())
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        let count_key = DataKey::Escrow(EscrowKey::NoteCount(escrow_id));
+        let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
+        if count >= MAX_NOTES_PER_ESCROW {
+            return Err(Error::Action(ActionError::MaxNotesPerEscrowReached));
+        }
+        env.storage().instance().set(
+            &DataKey::Escrow(EscrowKey::Note(escrow_id, count)),
+            &EscrowNote {
+                escrow_id,
+                author: caller.clone(),
+                content_hash: content_hash.clone(),
+                recorded_at: env.ledger().timestamp(),
+            },
+        );
+        env.storage().instance().set(&count_key, &(count + 1));
+        EscrowNoteAdded {
+            escrow_id,
+            author: caller,
+            content_hash,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns notes for an escrow in insertion order, paginated by
+    /// `offset` and `limit`.
+    pub fn get_escrow_notes(env: Env, escrow_id: u64, offset: u32, limit: u32) -> Vec<EscrowNote> {
+        let mut notes = Vec::new(&env);
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::NoteCount(escrow_id)))
+            .unwrap_or(0);
+        let start = offset as u64;
+        if start >= count || limit == 0 {
+            return notes;
+        }
+        let end = core::cmp::min(
+            count,
+            start.saturating_add(limit as u64).min(MAX_NOTES_PER_ESCROW),
+        );
+        for i in start..end {
+            if let Some(note) = env
+                .storage()
+                .instance()
+                .get::<DataKey, EscrowNote>(&DataKey::Escrow(EscrowKey::Note(escrow_id, i)))
+            {
+                notes.push_back(note);
+            }
+        }
+        notes
+    }
+
+    // ── Issue #886: mutually agreed release date changes ─────────────────────
+
+    /// Proposes a new release timestamp for a locked escrow. At most one
+    /// proposal may be pending per escrow.
+    pub fn propose_release_date(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        new_release_timestamp: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        caller.require_auth();
+        Self::require_not_paused(&env, "propose_release_date")?;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if caller != escrow.customer && caller != escrow.merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        if env.storage().instance().has(&key) {
+            return Err(Error::Action(ActionError::ReleaseDateProposalExists));
+        }
+        if new_release_timestamp < escrow.created_at.saturating_add(escrow.min_hold_period)
+            || (escrow.expiry_timestamp != 0 && new_release_timestamp >= escrow.expiry_timestamp)
+        {
+            return Err(Error::Action(ActionError::InvalidReleaseDate));
+        }
+
+        env.storage().instance().set(
+            &key,
+            &ReleaseDateProposal {
+                escrow_id,
+                proposed_by: caller.clone(),
+                new_release_timestamp,
+                proposed_at: env.ledger().timestamp(),
+            },
+        );
+        ReleaseDateProposed {
+            escrow_id,
+            proposed_by: caller,
+            new_release_timestamp,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Accepts a pending release date proposal. Only the proposing party's
+    /// counterparty may accept it.
+    pub fn accept_release_date(
+        env: Env,
+        counterparty: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        counterparty.require_auth();
+        Self::require_not_paused(&env, "accept_release_date")?;
+
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        let proposal: ReleaseDateProposal = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::Action(ActionError::ReleaseDateProposalNotFound))?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+        if counterparty == proposal.proposed_by
+            || (counterparty != escrow.customer && counterparty != escrow.merchant)
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        escrow.release_timestamp = proposal.new_release_timestamp;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+        env.storage().instance().remove(&key);
+        ReleaseDateAccepted {
+            escrow_id,
+            accepted_by: counterparty,
+            new_release_timestamp: proposal.new_release_timestamp,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Rejects a pending release date proposal. Only the proposing party's
+    /// counterparty may reject it.
+    pub fn reject_release_date(
+        env: Env,
+        counterparty: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        Self::bump_instance_ttl(&env);
+        counterparty.require_auth();
+        Self::require_not_paused(&env, "reject_release_date")?;
+
+        let key = DataKey::Dispute(DisputeKey::ReleaseDateProposal(escrow_id));
+        let proposal: ReleaseDateProposal = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::Action(ActionError::ReleaseDateProposalNotFound))?;
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if counterparty == proposal.proposed_by
+            || (counterparty != escrow.customer && counterparty != escrow.merchant)
+        {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        env.storage().instance().remove(&key);
+        ReleaseDateRejected {
+            escrow_id,
+            rejected_by: counterparty,
+            proposed_by: proposal.proposed_by,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the pending release date proposal for an escrow, if any.
+    pub fn get_release_date_proposal(env: Env, escrow_id: u64) -> Option<ReleaseDateProposal> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Dispute(DisputeKey::ReleaseDateProposal(
+                escrow_id,
+            )))
     }
 }
 

@@ -5,7 +5,9 @@ use soroban_sdk::{token, Address, BytesN, Env};
 
 fn setup_token(env: &Env) -> (Address, token::StellarAssetClient<'_>, token::Client<'_>) {
     let token_admin = Address::generate(env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let asset_client = token::StellarAssetClient::new(env, &token_id);
     let token_client = token::Client::new(env, &token_id);
     (token_id, asset_client, token_client)
@@ -27,14 +29,7 @@ fn test_initiate_clawback_success() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -68,14 +63,7 @@ fn test_initiate_clawback_too_short_delay() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -104,14 +92,7 @@ fn test_initiate_clawback_already_pending() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -120,7 +101,10 @@ fn test_initiate_clawback_already_pending() {
     client.initiate_clawback(&admin, &escrow_id, &reason_hash, &delay);
 
     let result = client.try_initiate_clawback(&admin, &escrow_id, &reason_hash, &delay);
-    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::AlreadyProcessed))));
+    assert_eq!(
+        result,
+        Err(Ok(Error::Escrow(EscrowError::AlreadyProcessed)))
+    );
 }
 
 #[test]
@@ -139,14 +123,7 @@ fn test_initiate_clawback_rejected_for_released_escrow() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     // Release the escrow before the timelock window even exists.
@@ -179,14 +156,7 @@ fn test_execute_clawback_success() {
 
     asset_client.mint(&customer, &1000);
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -194,7 +164,8 @@ fn test_execute_clawback_success() {
     let request_id = client.initiate_clawback(&admin, &escrow_id, &reason_hash, &delay);
 
     // Fast forward time
-    env.ledger().set_timestamp(env.ledger().timestamp() + delay + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + delay + 1);
 
     client.execute_clawback(&admin, &request_id);
 
@@ -223,14 +194,7 @@ fn test_execute_clawback_before_delay_fails() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -260,14 +224,7 @@ fn test_execute_clawback_exactly_at_timelock_boundary() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -301,14 +258,7 @@ fn test_cancel_clawback_success() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -337,14 +287,7 @@ fn test_execute_cancelled_clawback_fails() {
     asset_client.mint(&customer, &1000);
 
     let escrow_id = client.create_escrow(
-        &customer,
-        &merchant,
-        &1000_i128,
-        &token_id,
-        &1000_u64,
-        &0_u64,
-        &0_u64,
-        &false,
+        &customer, &merchant, &1000_i128, &token_id, &1000_u64, &0_u64, &0_u64, &false,
     );
 
     let reason_hash = BytesN::from_array(&env, &[1_u8; 32]);
@@ -353,7 +296,8 @@ fn test_execute_cancelled_clawback_fails() {
 
     client.cancel_clawback(&admin, &request_id);
 
-    env.ledger().set_timestamp(env.ledger().timestamp() + delay + 1);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + delay + 1);
     let result = client.try_execute_clawback(&admin, &request_id);
     assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
 }
