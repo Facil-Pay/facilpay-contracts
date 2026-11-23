@@ -111,6 +111,15 @@ Each field is a `ChildContractStatus` enum that can be:
 | 14 | `PauseNotExpired` | `expire_emergency_pause` was called before the pause expiry. |
 | 15 | `PauseExpired` | `extend_emergency_pause` was called at or after the pause expiry. |
 | 16 | `InvalidPauseDuration` | `max_pause_seconds` is `Some(0)`, `additional_seconds` is 0, or the new expiry overflows `u64`. |
+| 17 | `ProposalCancelled` | The proposal was cancelled by `cancel_proposal`. |
+| 18 | `CancellationNotAllowed` | Caller is neither the proposer nor backed by a threshold of current admin approvals. |
+| 19 | `ApprovalNotFound` | `revoke_approval` was called by an admin who had not approved the proposal. |
+| 20 | `InvalidPagination` | A proposal listing was requested with `limit == 0`. |
+| 21 | `NoQueuedUpgrade` | No queued upgrade exists for the child contract. |
+| 22 | `UpgradeTooEarly` | `execute_child_upgrade` was called before `execute_after`. |
+| 23 | `UpgradeVetoed` | The queued upgrade was cancelled by the required number of vetoes. |
+| 24 | `InvalidUpgradeConfig` | Invalid veto threshold, or the queued upgrade timestamp overflowed. |
+| 25 | `AlreadyVetoed` | The same admin tried to veto a queued upgrade twice. |
 
 ## Multisig Admin
 
@@ -431,3 +440,105 @@ A child that was already globally paused before the call (for example, during an
 | `ChildContractUpgraded` | `child_kind: ChildKind`, `contract: Address`, `new_wasm_hash: BytesN<32>`, `upgraded_by: Address`, `upgraded_at: u64` | `upgrade_children` and executed `UpgradeChildren` proposals, once per child |
 
 The children also emit their own pause, `ContractUpgraded` and unpause events.
+
+## Proposal Lifecycle Extensions
+
+### `revoke_approval(admin, proposal_id)` (#871)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Current admin member whose approval is removed. Must authorize. |
+| `proposal_id` | `u64` | Id of an open, unexecuted, unexpired, uncancelled proposal. |
+
+Removes the caller's approval from the proposal. `execute_action` always
+re-counts approvals from the current admin set, so a revoked approval
+immediately reduces the count used for the threshold check.
+
+Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+`ProposalAlreadyExecuted`, `ProposalExpired`, `ApprovalNotFound` (19, when the
+caller never approved). Event: `ApprovalRevoked { proposal_id, admin, approvals }`,
+where `approvals` is the remaining count.
+
+### `cancel_proposal(admin, proposal_id)` (#872)
+
+| Parameter | Type | Description |
+|---|---|---|
+| `admin` | `Address` | Current admin member. Must authorize. |
+| `proposal_id` | `u64` | Id of an open proposal. |
+
+The proposer may cancel at any time. Any other current admin may cancel once
+approvals from current admins reach the configured threshold. Cancellation sets
+`AdminProposal.cancelled = true`; `approve_action`, `revoke_approval` and
+`execute_action` then fail with `ProposalCancelled`. Cancelled proposals remain
+readable through `get_proposal`.
+
+Errors: `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+`ProposalAlreadyExecuted`, `ProposalExpired`, `CancellationNotAllowed` (18).
+Event: `ProposalCancelled { proposal_id, cancelled_by }`.
+
+### Proposal listings (#873)
+
+Both functions return open proposals (not executed, not expired, not cancelled)
+newest first. `limit` must be greater than zero and is capped at
+`MAX_PROPOSAL_PAGE` (50); `offset` skips that many matching proposals.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `get_pending_proposals` | `offset: u64`, `limit: u32` | All open proposals. |
+| `get_proposals_awaiting` | `admin: Address`, `offset: u64`, `limit: u32` | Open proposals the given admin has not approved. |
+
+Errors: `NotInitialized`, `InvalidPagination` (20). No events are emitted.
+
+### Updated `AdminProposal`
+
+```rust
+pub struct AdminProposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool, // #872
+}
+```
+
+### Additional lifecycle events
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `ApprovalRevoked` | `proposal_id: u64`, `admin: Address`, `approvals: u32` | `revoke_approval` |
+| `ProposalCancelled` | `proposal_id: u64`, `cancelled_by: Address` | `cancel_proposal` |
+
+## Child Upgrade Veto Window
+
+`queue_child_upgrade` / `execute_child_upgrade` replace a single immediate
+`upgrade_children` call with a two-step flow for one child at a time. The delay
+and number of vetoes needed to cancel are configurable.
+
+| Function | Parameters | Description |
+|---|---|---|
+| `configure_child_upgrade` | `admin: Address`, `delay_seconds: u64`, `veto_threshold: u32` | Sets the window. `veto_threshold` must be `1..=MAX_ADMINS`. Defaults: 24 h delay, 2 vetoes. |
+| `get_child_upgrade_config` | — | Returns `ChildUpgradeConfig { delay_seconds, veto_threshold }`. |
+| `queue_child_upgrade` | `admin: Address`, `child_kind: ChildKind`, `wasm_hash: BytesN<32>` | Queues an upgrade, setting `execute_after = now + delay_seconds`. |
+| `get_queued_child_upgrade` | `child_kind: ChildKind` | Returns the queued upgrade, if any. |
+| `veto_child_upgrade` | `admin: Address`, `child_kind: ChildKind` | Adds the caller's veto; reaching `veto_threshold` marks the upgrade vetoed. |
+| `execute_child_upgrade` | `admin: Address`, `child_kind: ChildKind` | Applies the queued upgrade after the delay. |
+
+Errors: `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` (24),
+`NoQueuedUpgrade` (21), `UpgradeTooEarly` (22), `UpgradeVetoed` (23),
+`AlreadyVetoed` (25). Child errors abort the transaction and leave the queue
+entry intact.
+
+Events:
+
+| Event | Fields | Emitted by |
+|---|---|---|
+| `ChildUpgradeQueued` | `child_kind`, `wasm_hash`, `execute_after` | `queue_child_upgrade` |
+| `ChildUpgradeVetoed` | `child_kind`, `admin`, `vetoes`, `threshold` | `veto_child_upgrade` |
+| `ChildUpgradeExecuted` | `child_kind`, `wasm_hash`, `executed_by` | `execute_child_upgrade` |
+
+A successful execution also emits `ChildContractUpgraded` and the child's own
+pause/unpause events. As with `upgrade_children`, the coordinator must be an
+authorized admin on the child contract and the WASM must already be uploaded.

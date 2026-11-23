@@ -19,6 +19,15 @@ pub const MAX_ADMINS: u32 = 20;
 /// Maximum number of entries `get_incident_log` returns per page (#818).
 pub const MAX_INCIDENT_PAGE: u32 = 50;
 
+/// Maximum number of proposals a listing page returns (#873).
+pub const MAX_PROPOSAL_PAGE: u32 = 50;
+
+/// Default delay, in seconds, before a queued child upgrade may run (#874).
+pub const DEFAULT_CHILD_UPGRADE_DELAY: u64 = 24 * 60 * 60;
+
+/// Default number of vetoes that cancel a queued child upgrade (#874).
+pub const DEFAULT_CHILD_UPGRADE_VETOES: u32 = 2;
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -40,6 +49,19 @@ pub enum Error {
     PauseNotExpired = 14,
     PauseExpired = 15,
     InvalidPauseDuration = 16,
+    // #872: cancelling proposals
+    ProposalCancelled = 17,
+    CancellationNotAllowed = 18,
+    // #871: revoking an approval
+    ApprovalNotFound = 19,
+    // #873: bounded proposal pagination
+    InvalidPagination = 20,
+    // #874: veto window for child upgrades
+    NoQueuedUpgrade = 21,
+    UpgradeTooEarly = 22,
+    UpgradeVetoed = 23,
+    InvalidUpgradeConfig = 24,
+    AlreadyVetoed = 25,
 }
 
 #[contracttype]
@@ -64,6 +86,9 @@ pub enum DataKey {
     Proposal(u64),
     // #820: timestamp at which the current emergency pause may be expired.
     EmergencyPauseExpiry,
+    // #874: veto-window configuration and queued child upgrades.
+    ChildUpgradeConfig,
+    QueuedChildUpgrade(ChildKind),
     // #818: number of incident log entries and each entry by id (persistent).
     IncidentCount,
     Incident(u64),
@@ -146,6 +171,51 @@ pub struct AdminProposalApproved {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdminProposalExecuted {
     pub proposal_id: u64,
+    pub executed_by: Address,
+}
+
+/// Emitted when an admin takes back an approval (#871).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovalRevoked {
+    pub proposal_id: u64,
+    pub admin: Address,
+    pub approvals: u32,
+}
+
+/// Emitted when a pending proposal is cancelled (#872).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalCancelled {
+    pub proposal_id: u64,
+    pub cancelled_by: Address,
+}
+
+/// Emitted when a child upgrade enters its veto window (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeQueued {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub execute_after: u64,
+}
+
+/// Emitted on every veto cast against a queued child upgrade (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeVetoed {
+    pub child_kind: ChildKind,
+    pub admin: Address,
+    pub vetoes: u32,
+    pub threshold: u32,
+}
+
+/// Emitted after a queued child upgrade is applied (#874).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeExecuted {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
     pub executed_by: Address,
 }
 
@@ -608,6 +678,145 @@ fn upgrade_children_wasm(
     Ok(())
 }
 
+/// Pauses, upgrades and unpauses a single child contract (#874). A child that
+/// was already paused is left paused, matching `upgrade_children_wasm`.
+fn upgrade_single_child_wasm(
+    env: &Env,
+    target: ChildKind,
+    wasm_hash: BytesN<32>,
+    upgraded_by: Address,
+) -> Result<(), Error> {
+    let child = child_contract(env, target)?;
+    let coordinator = env.current_contract_address();
+    let reason = String::from_str(env, "veto-window upgrade");
+    let now = env.ledger().timestamp();
+
+    let was_paused = match target {
+        ChildKind::Payment => {
+            PaymentContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+        ChildKind::Escrow => {
+            EscrowContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+        ChildKind::Refund => {
+            RefundContractClient::new(env, &child)
+                .get_pause_state()
+                .globally_paused
+        }
+    };
+    if !was_paused {
+        match target {
+            ChildKind::Payment => {
+                PaymentContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+            ChildKind::Escrow => {
+                EscrowContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+            ChildKind::Refund => {
+                RefundContractClient::new(env, &child).pause_contract(&coordinator, &reason)
+            }
+        }
+    }
+
+    match target {
+        ChildKind::Payment => {
+            PaymentContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+        ChildKind::Escrow => {
+            EscrowContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+        ChildKind::Refund => {
+            RefundContractClient::new(env, &child).upgrade(&coordinator, &wasm_hash)
+        }
+    }
+    ChildContractUpgraded {
+        child_kind: target,
+        contract: child.clone(),
+        new_wasm_hash: wasm_hash.clone(),
+        upgraded_by: upgraded_by.clone(),
+        upgraded_at: now,
+    }
+    .publish(env);
+
+    if !was_paused {
+        match target {
+            ChildKind::Payment => {
+                PaymentContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+            ChildKind::Escrow => {
+                EscrowContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+            ChildKind::Refund => {
+                RefundContractClient::new(env, &child).unpause_contract(&coordinator)
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_child_upgrade_config(env: &Env) -> ChildUpgradeConfig {
+    env.storage()
+        .instance()
+        .get(&DataKey::ChildUpgradeConfig)
+        .unwrap_or(ChildUpgradeConfig {
+            delay_seconds: DEFAULT_CHILD_UPGRADE_DELAY,
+            veto_threshold: DEFAULT_CHILD_UPGRADE_VETOES,
+        })
+}
+
+/// Validates and bounds a proposal listing page (#873).
+fn checked_page(offset: u64, limit: u32) -> Result<(u64, u32), Error> {
+    if limit == 0 {
+        return Err(Error::InvalidPagination);
+    }
+    Ok((offset, limit.min(MAX_PROPOSAL_PAGE)))
+}
+
+/// Collects open proposals newest-first, optionally hiding ones `awaiting` has
+/// already approved (#873).
+fn collect_open_proposals(
+    env: &Env,
+    offset: u64,
+    limit: u32,
+    awaiting: Option<&Address>,
+) -> Vec<AdminProposal> {
+    let mut page = Vec::new(env);
+    let total: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::ProposalCount)
+        .unwrap_or(0);
+    let now = env.ledger().timestamp();
+    let mut skipped = 0u64;
+    let mut id = total;
+    while id > 0 {
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, AdminProposal>(&DataKey::Proposal(id))
+        {
+            let open = !proposal.executed && !proposal.cancelled && now <= proposal.expires_at;
+            let not_approved = match awaiting {
+                Some(admin) => !proposal.approvals.contains(admin),
+                None => true,
+            };
+            if open && not_approved {
+                if skipped < offset {
+                    skipped += 1;
+                } else if page.len() < limit {
+                    page.push_back(proposal);
+                }
+            }
+        }
+        id -= 1;
+    }
+    page
+}
+
 fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
     if let Some(proposal) = env
         .storage()
@@ -638,6 +847,9 @@ fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
 fn require_open(env: &Env, proposal: &AdminProposal) -> Result<(), Error> {
     if proposal.executed {
         return Err(Error::ProposalAlreadyExecuted);
+    }
+    if proposal.cancelled {
+        return Err(Error::ProposalCancelled);
     }
     if env.ledger().timestamp() > proposal.expires_at {
         return Err(Error::ProposalExpired);
@@ -1427,6 +1639,269 @@ impl AdminContract {
     /// `ProposalNotFound` if no proposal has that id.
     pub fn get_proposal(env: Env, proposal_id: u64) -> Result<AdminProposal, Error> {
         load_proposal(&env, proposal_id)
+    }
+
+    /// Removes the caller's approval from an open proposal (#871).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired`, `ApprovalNotFound`.
+    ///
+    /// # Events
+    /// Emits `ApprovalRevoked` with the remaining approval count.
+    pub fn revoke_approval(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+        let index = proposal
+            .approvals
+            .iter()
+            .position(|a| a == admin)
+            .ok_or(Error::ApprovalNotFound)?;
+        proposal.approvals.remove(index as u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        ApprovalRevoked {
+            proposal_id,
+            admin: admin.clone(),
+            approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Cancels an open proposal (#872).
+    ///
+    /// The proposer may cancel directly. Any other current admin may cancel
+    /// once approvals from current admins reach the threshold.
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `ProposalNotFound`, `ProposalCancelled`,
+    /// `ProposalAlreadyExecuted`, `ProposalExpired`, `CancellationNotAllowed`.
+    ///
+    /// # Events
+    /// Emits `ProposalCancelled`.
+    pub fn cancel_proposal(env: Env, admin: Address, proposal_id: u64) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let mut proposal = load_proposal(&env, proposal_id)?;
+        require_open(&env, &proposal)?;
+
+        let mut allowed = proposal.proposer == admin;
+        if !allowed {
+            let admins = load_admins(&env)?;
+            let valid = proposal
+                .approvals
+                .iter()
+                .filter(|a| admins.contains(a))
+                .count() as u32;
+            allowed = valid >= load_threshold(&env);
+        }
+        if !allowed {
+            return Err(Error::CancellationNotAllowed);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Proposal(proposal_id), &proposal);
+        ProposalCancelled {
+            proposal_id,
+            cancelled_by: admin,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns open proposals, newest first (#873).
+    ///
+    /// `limit` is capped at `MAX_PROPOSAL_PAGE` (50); `offset` skips that many
+    /// open proposals. Expired, executed and cancelled proposals are excluded.
+    pub fn get_pending_proposals(
+        env: Env,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AdminProposal>, Error> {
+        load_admins(&env)?;
+        let (offset, limit) = checked_page(offset, limit)?;
+        Ok(collect_open_proposals(&env, offset, limit, None))
+    }
+
+    /// Returns open proposals the given admin has not approved, newest first (#873).
+    ///
+    /// `limit` is capped at `MAX_PROPOSAL_PAGE` (50). Expired, executed and
+    /// cancelled proposals are excluded.
+    pub fn get_proposals_awaiting(
+        env: Env,
+        admin: Address,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<AdminProposal>, Error> {
+        load_admins(&env)?;
+        let (offset, limit) = checked_page(offset, limit)?;
+        Ok(collect_open_proposals(&env, offset, limit, Some(&admin)))
+    }
+
+    /// Configures the child-upgrade veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` when
+    /// `veto_threshold` is 0 or above `MAX_ADMINS`.
+    pub fn configure_child_upgrade(
+        env: Env,
+        admin: Address,
+        delay_seconds: u64,
+        veto_threshold: u32,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        if veto_threshold == 0 || veto_threshold > MAX_ADMINS {
+            return Err(Error::InvalidUpgradeConfig);
+        }
+        env.storage().instance().set(
+            &DataKey::ChildUpgradeConfig,
+            &ChildUpgradeConfig {
+                delay_seconds,
+                veto_threshold,
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns the current child-upgrade veto-window configuration (#874).
+    pub fn get_child_upgrade_config(env: Env) -> ChildUpgradeConfig {
+        load_child_upgrade_config(&env)
+    }
+
+    /// Queues a single child WASM upgrade behind a veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `InvalidUpgradeConfig` on overflow.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeQueued` with the target and WASM hash.
+    pub fn queue_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+        wasm_hash: BytesN<32>,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        child_contract(&env, child_kind)?;
+        let config = load_child_upgrade_config(&env);
+        let queued_at = env.ledger().timestamp();
+        let execute_after = queued_at
+            .checked_add(config.delay_seconds)
+            .ok_or(Error::InvalidUpgradeConfig)?;
+        let queued = QueuedChildUpgrade {
+            child_kind: child_kind.clone(),
+            wasm_hash: wasm_hash.clone(),
+            queued_at,
+            execute_after,
+            vetoes: Vec::new(&env),
+            vetoed: false,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::QueuedChildUpgrade(child_kind.clone()), &queued);
+        ChildUpgradeQueued {
+            child_kind,
+            wasm_hash,
+            execute_after,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the queued upgrade for a child, if any (#874).
+    pub fn get_queued_child_upgrade(env: Env, child_kind: ChildKind) -> Option<QueuedChildUpgrade> {
+        env.storage()
+            .instance()
+            .get(&DataKey::QueuedChildUpgrade(child_kind))
+    }
+
+    /// Casts a veto against a queued child upgrade (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `NoQueuedUpgrade`, `UpgradeVetoed`,
+    /// `AlreadyVetoed`.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeVetoed` with the current veto count and threshold.
+    pub fn veto_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let mut queued: QueuedChildUpgrade = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::NoQueuedUpgrade)?;
+        if queued.vetoed {
+            return Err(Error::UpgradeVetoed);
+        }
+        if queued.vetoes.contains(&admin) {
+            return Err(Error::AlreadyVetoed);
+        }
+        queued.vetoes.push_back(admin.clone());
+        let threshold = load_child_upgrade_config(&env).veto_threshold;
+        if queued.vetoes.len() >= threshold {
+            queued.vetoed = true;
+        }
+        env.storage().instance().set(&key, &queued);
+        ChildUpgradeVetoed {
+            child_kind,
+            admin,
+            vetoes: queued.vetoes.len(),
+            threshold,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Executes a queued child upgrade after its veto window (#874).
+    ///
+    /// # Errors
+    /// `NotInitialized`, `Unauthorized`, `NoQueuedUpgrade`, `UpgradeVetoed`,
+    /// `UpgradeTooEarly`; child errors abort the call.
+    ///
+    /// # Events
+    /// Emits `ChildUpgradeExecuted` with the WASM hash, plus the child's
+    /// `ChildContractUpgraded`, pause and unpause events.
+    pub fn execute_child_upgrade(
+        env: Env,
+        admin: Address,
+        child_kind: ChildKind,
+    ) -> Result<(), Error> {
+        require_admin_member(&env, &admin)?;
+        let key = DataKey::QueuedChildUpgrade(child_kind.clone());
+        let queued: QueuedChildUpgrade = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::NoQueuedUpgrade)?;
+        if queued.vetoed {
+            return Err(Error::UpgradeVetoed);
+        }
+        if env.ledger().timestamp() < queued.execute_after {
+            return Err(Error::UpgradeTooEarly);
+        }
+        upgrade_single_child_wasm(
+            &env,
+            child_kind.clone(),
+            queued.wasm_hash.clone(),
+            admin.clone(),
+        )?;
+        env.storage().instance().remove(&key);
+        ChildUpgradeExecuted {
+            child_kind,
+            wasm_hash: queued.wasm_hash,
+            executed_by: admin,
+        }
+        .publish(&env);
+        Ok(())
     }
 
     /// Returns the admin set (#816).
@@ -2555,5 +3030,164 @@ mod test {
         assert!(client.try_expire_emergency_pause().is_err());
         assert_eq!(client.get_incident_count(), 0);
         assert_eq!(client.get_incident_log(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_revoke_approval_reduces_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let id = client.propose_action(
+            &admin,
+            &AdminAction::SetPaymentContract(new_payment.clone()),
+        );
+        client.approve_action(&a2, &id);
+
+        assert_eq!(
+            client.try_revoke_approval(&a3, &id),
+            Err(Ok(Error::ApprovalNotFound))
+        );
+        client.revoke_approval(&a2, &id);
+        assert_eq!(client.get_proposal(&id).approvals.len(), 1);
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ThresholdNotMet))
+        );
+
+        client.approve_action(&a2, &id);
+        client.execute_action(&admin, &id);
+        assert_eq!(client.get_contracts().payment, new_payment);
+        assert_eq!(
+            client.try_revoke_approval(&a2, &id),
+            Err(Ok(Error::ProposalAlreadyExecuted))
+        );
+    }
+
+    #[test]
+    fn test_cancel_proposal_blocks_approval_and_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, pauser) = setup_multisig(&env);
+        let new_payment = setup_payment(&env, &pauser);
+        let id = client.propose_action(
+            &admin,
+            &AdminAction::SetPaymentContract(new_payment.clone()),
+        );
+
+        // A third admin cannot cancel while only one approval is in place.
+        assert_eq!(
+            client.try_cancel_proposal(&a3, &id),
+            Err(Ok(Error::CancellationNotAllowed))
+        );
+        // Two current admins have approved, so any admin may cancel.
+        client.approve_action(&a2, &id);
+        client.cancel_proposal(&a3, &id);
+        let proposal = client.get_proposal(&id);
+        assert!(proposal.cancelled);
+        assert_eq!(
+            client.try_approve_action(&a3, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        assert_eq!(
+            client.try_execute_action(&admin, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        assert_eq!(
+            client.try_cancel_proposal(&admin, &id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+        // The proposer may always cancel their own proposal.
+        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(new_payment));
+        client.cancel_proposal(&admin, &id2);
+        assert!(client.get_proposal(&id2).cancelled);
+    }
+
+    #[test]
+    fn test_proposal_listings_are_bounded_and_filtered() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, _, pauser) = setup_multisig(&env);
+        let p1 = setup_payment(&env, &pauser);
+        let p2 = setup_payment(&env, &pauser);
+        let p3 = setup_payment(&env, &pauser);
+
+        let id1 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p1));
+        let id2 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p2));
+        let id3 = client.propose_action(&admin, &AdminAction::SetPaymentContract(p3));
+        client.approve_action(&a2, &id2);
+        client.cancel_proposal(&admin, &id1);
+
+        let pending = client.get_pending_proposals(&0, &10);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.get(0).unwrap().id, id3);
+        assert_eq!(pending.get(1).unwrap().id, id2);
+
+        let awaiting = client.get_proposals_awaiting(&a2, &0, &10);
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(awaiting.get(0).unwrap().id, id3);
+        assert_eq!(client.get_pending_proposals(&1, &10).len(), 1);
+        assert_eq!(client.get_pending_proposals(&0, &1000).len(), 2);
+        assert_eq!(
+            client.try_get_pending_proposals(&0, &0),
+            Err(Ok(Error::InvalidPagination))
+        );
+
+        client.approve_action(&a2, &id3);
+        client.execute_action(&admin, &id3);
+        assert_eq!(client.get_pending_proposals(&0, &10).len(), 1);
+
+        set_time(&env, env.ledger().timestamp() + PROPOSAL_TTL_SECONDS + 1);
+        assert_eq!(client.get_pending_proposals(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_child_upgrade_veto_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, a2, a3, _) = setup_multisig(&env);
+        let hash = BytesN::from_array(&env, &[7u8; 32]);
+
+        client.configure_child_upgrade(&admin, &100, &2);
+        let config = client.get_child_upgrade_config();
+        assert_eq!(config.delay_seconds, 100);
+        assert_eq!(config.veto_threshold, 2);
+        assert_eq!(
+            client.try_configure_child_upgrade(&admin, &100, &0),
+            Err(Ok(Error::InvalidUpgradeConfig))
+        );
+
+        client.queue_child_upgrade(&admin, &ChildKind::Payment, &hash);
+        let queued = client
+            .get_queued_child_upgrade(&ChildKind::Payment)
+            .unwrap();
+        assert_eq!(queued.wasm_hash, hash);
+        assert_eq!(queued.execute_after, queued.queued_at + 100);
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Payment),
+            Err(Ok(Error::UpgradeTooEarly))
+        );
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Escrow),
+            Err(Ok(Error::NoQueuedUpgrade))
+        );
+
+        client.veto_child_upgrade(&a2, &ChildKind::Payment);
+        assert_eq!(
+            client.try_veto_child_upgrade(&a2, &ChildKind::Payment),
+            Err(Ok(Error::AlreadyVetoed))
+        );
+        client.veto_child_upgrade(&a3, &ChildKind::Payment);
+        assert!(
+            client
+                .get_queued_child_upgrade(&ChildKind::Payment)
+                .unwrap()
+                .vetoed
+        );
+        set_time(&env, queued.execute_after);
+        assert_eq!(
+            client.try_execute_child_upgrade(&admin, &ChildKind::Payment),
+            Err(Ok(Error::UpgradeVetoed))
+        );
     }
 }
