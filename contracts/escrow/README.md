@@ -1501,3 +1501,68 @@ Every state-changing entry point first extends the instance storage TTL, so the 
 | `INSTANCE_BUMP_AMOUNT` | `90 * 17_280` ledgers (~90 days) | TTL the instance is extended to |
 
 17,280 ledgers ≈ one day at ~5s per ledger. If the contract sits idle for more than ~90 days its state must be restored before use.
+
+## Admin Token Allowlist (Issue #881)
+
+By default every token is accepted, preserving existing behaviour. Once an admin adds at least
+one token, new escrows may only use tokens on the allowlist. Removing a token never changes an
+existing escrow — it only affects future creations.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `add_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `EscrowTokenAdded { token, admin }` |
+| `remove_escrow_token` | `env: Env`, `admin: Address`, `token: Address` | `Result<(), Error>` | Same as above; removing an unlisted token is a no-op | `EscrowTokenRemoved { token, admin }` |
+| `get_escrow_tokens` | `env: Env` | `Vec<Address>` | Read-only; empty vector means unrestricted creation | None |
+
+Creation errors: `EscrowError::TokenNotAllowed` (code `343`) is returned by every creation path —
+`create_escrow`, `create_escrow_with_reference`, `create_escrow_with_beneficiaries`,
+`create_escrow_with_multisig`, `create_escrow_from_template`, `create_escrow_batch` (per-entry
+error code `343`), `create_multi_party_escrow`, `create_multi_token_escrow` (each token) and
+recurring/tiered creation helpers — when a non-empty allowlist does not contain the token.
+
+## Per-Merchant Exposure Limit (Issue #879)
+
+Open exposure is tracked per `(merchant, token)` pair. It increases when an escrow is created and
+is reduced when the escrow is released, refunded, cancelled, or fully released in stages. If no
+limit is configured, creation is unrestricted.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_merchant_exposure_limit` | `env: Env`, `admin: Address`, `merchant: Address`, `token: Address`, `limit: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MerchantExposureLimitUpdated { merchant, token, limit, admin }` |
+| `get_merchant_exposure_limit` | `env: Env`, `merchant: Address`, `token: Address` | `Option<i128>` | Read-only; `None` when no limit is set | None |
+| `get_merchant_exposure` | `env: Env`, `merchant: Address`, `token: Address` | `i128` | Read-only; returns `0` when no escrow was ever created | None |
+
+Creation fails with `EscrowError::ExposureLimitExceeded` (code `344`) when `current exposure +
+amount` would exceed the configured limit. The check applies to `create_escrow` and its variants,
+templates, batch entries (per-entry error code `344`), and child escrows.
+
+## Escrow Status History (Issue #880)
+
+Every transition that publishes `EscrowStatusChanged` also appends an entry to a per-escrow bounded
+history. When `MAX_STATUS_HISTORY` (10) is reached, the oldest entry is dropped. History is
+read-only through the getter; no additional errors or events are introduced (the existing
+`EscrowStatusChanged { escrow_id, old_status, new_status, changed_by, timestamp }` event is emitted
+as before).
+
+| Function | Parameters | Returns | Notes |
+|---|---|---|---|
+| `get_escrow_status_history` | `env: Env`, `escrow_id: u64` | `Vec<EscrowStatusEntry>` | Read-only; empty for unknown ids. Entries are chronological (oldest first). |
+
+`EscrowStatusEntry { status: EscrowStatus, changed_by: Address, timestamp: u64 }` records the new
+status, the address that performed the transition, and the ledger timestamp of the change. The
+history is written on release (`release_escrow`) and refund (`refund_escrow_to`), mirroring each
+`EscrowStatusChanged` event.
+
+## Minimum Escrow Amount Per Token (Issue #882)
+
+An unset minimum means no minimum is enforced, preserving existing behaviour.
+
+| Function | Parameters | Returns | Authorization / errors | Event |
+|---|---|---|---|---|
+| `set_min_escrow_amount` | `env: Env`, `admin: Address`, `token: Address`, `min_amount: i128` | `Result<(), Error>` | `admin.require_auth()`, multisig admin required (`BasicError::NotAnAdmin`); `BasicError::ContractPaused` when paused | `MinEscrowAmountUpdated { token, min_amount, admin }` |
+| `get_min_escrow_amount` | `env: Env`, `token: Address` | `Option<i128>` | Read-only; `None` when unset | None |
+
+Any creation with `amount < min_amount` fails with `EscrowError::AmountBelowMinimum` (code `345`).
+The check is applied to every creation path: single escrows and their reference/beneficiary/multisig
+variants, templates and recurring schedules, batch entries (per-entry error code `345`),
+multi-party escrows, every token of a multi-token escrow, and child escrows.
