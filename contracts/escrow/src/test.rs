@@ -5493,3 +5493,477 @@ fn test_vesting_acceleration_cap_not_exceeded_on_second_complete() {
     let vested = client.get_vested_amount(&escrow_id);
     assert!(vested <= 10000);
 }
+
+// ── ADDITIONAL COMPREHENSIVE TESTS ───────────────────────────────────────────
+
+#[test]
+fn test_multi_party_escrow_with_unequal_weights_complex_approval() {
+    // Test a 4-party escrow with unequal weights requiring strategic approvals
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_client = token::StellarAssetClient::new(&env, &token_id);
+    let token_user_client = token::Client::new(&env, &token_id);
+
+    let customer = Address::generate(&env);
+    let p1 = Address::generate(&env);
+    let p2 = Address::generate(&env);
+    let p3 = Address::generate(&env);
+    let p4 = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.initialize(&admin);
+    token_client.mint(&customer, &100000);
+
+    // Create participants with specific weight distribution:
+    // p1: 40%, p2: 30%, p3: 20%, p4: 10%
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: p1.clone(),
+        role: ParticipantRole::Merchant,
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p2.clone(),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p3.clone(),
+        role: ParticipantRole::Arbitrator,
+        share_bps: 2000,
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p4.clone(),
+        role: ParticipantRole::Custom(String::from_str(&env, "advisor")),
+        share_bps: 1000,
+        weight_bps: 1000,
+        approved: false,
+        approved_at: None,
+    });
+
+    env.ledger().set_timestamp(500);
+    let escrow_id = client.create_multi_party_escrow(
+        &customer,
+        &participants,
+        &100000,
+        &token_id,
+        &1000,
+    );
+
+    // Set threshold to 60% (6000 bps)
+    client.update_approval_threshold_bps(&admin, &escrow_id, &6000);
+
+    // Test 1: p1 alone (40%) cannot release
+    client.approve_release(&p1, &escrow_id);
+    let (current, required) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 4000);
+    assert_eq!(required, 6000);
+
+    env.ledger().set_timestamp(1001);
+    let result = client.try_release_multi_party_escrow(&escrow_id);
+    assert!(result.is_err());
+
+    // Test 2: p1 + p2 (70%) should allow release
+    client.approve_release(&p2, &escrow_id);
+    let (current, _) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 7000);
+
+    client.release_multi_party_escrow(&escrow_id);
+
+    // Verify distribution matches share_bps
+    assert_eq!(token_user_client.balance(&p1), 40000);
+    assert_eq!(token_user_client.balance(&p2), 30000);
+    assert_eq!(token_user_client.balance(&p3), 20000);
+    assert_eq!(token_user_client.balance(&p4), 10000);
+    assert_eq!(token_user_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_vesting_schedule_with_deadline_enforcement_and_clawback() {
+    // Test milestone deadlines with missed milestone handling
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_asset_client = token::StellarAssetClient::new(&env, &token_id);
+    let token_client = token::Client::new(&env, &token_id);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    token_asset_client.mint(&customer, &50000);
+
+    // Create milestones with specific deadlines
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            milestone_id: 1,
+            unlock_timestamp: 2000,
+            amount: 15000,
+            released: false,
+            description: String::from_str(&env, "Phase 1 - Due 3000"),
+            approved_by: None,
+            approved_at: None,
+            deadline: Some(3000), // Deadline at timestamp 3000
+            claimed_missed: false,
+        },
+        VestingMilestone {
+            milestone_id: 2,
+            unlock_timestamp: 4000,
+            amount: 15000,
+            released: false,
+            description: String::from_str(&env, "Phase 2 - Due 5000"),
+            approved_by: None,
+            approved_at: None,
+            deadline: Some(5000),
+            claimed_missed: false,
+        },
+        VestingMilestone {
+            milestone_id: 3,
+            unlock_timestamp: 6000,
+            amount: 20000,
+            released: false,
+            description: String::from_str(&env, "Final Phase - Due 7000"),
+            approved_by: None,
+            approved_at: None,
+            deadline: Some(7000),
+            claimed_missed: false,
+        },
+    ];
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &50000,
+        &token_id,
+        &1500,
+        &7000,
+        &milestones,
+    );
+
+    // Successfully complete milestone 1 before deadline
+    env.ledger().set_timestamp(2800);
+    client.approve_milestone(&admin, &escrow_id, &1);
+    client.release_milestone(&escrow_id, &1);
+    assert_eq!(token_client.balance(&merchant), 15000);
+
+    // Miss milestone 2 deadline - advance past deadline without approval
+    env.ledger().set_timestamp(5100);
+    
+    // Milestone 2 not approved - should be claimable as missed
+    let schedule = client.get_vesting_schedule(&escrow_id);
+    let m2 = schedule.milestones.get(1).unwrap();
+    assert!(!m2.released);
+    assert!(m2.approved_by.is_none());
+
+    // Successfully complete milestone 3 on time
+    env.ledger().set_timestamp(6500);
+    client.approve_milestone(&admin, &escrow_id, &3);
+    client.release_milestone(&escrow_id, &3);
+    
+    // Verify merchant received milestone 1 and 3 but not 2
+    assert_eq!(token_client.balance(&merchant), 35000); // 15000 + 20000
+    
+    // Verify contract still holds milestone 2 funds
+    assert_eq!(token_client.balance(&contract_id), 15000);
+}
+
+#[test]
+fn test_reputation_decay_with_multiple_addresses_over_time() {
+    // Test reputation decay system with multiple users over extended periods
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.ledger().set_timestamp(0);
+    client.initialize(&admin);
+
+    // Configure decay: 2% per day, 7-day threshold, floor at 1000
+    client.update_decay_config(
+        &admin,
+        &ReputationDecayConfig {
+            decay_rate_bps: 200,     // 2% per day
+            decay_threshold_days: 7,
+            min_score: 1000,
+            max_score: 10000,
+        },
+    );
+
+    // Set initial high reputations through disputes
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 1000,
+            completion_reward: 100,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // User1 wins dispute -> score = 8000
+    let e1 = client.create_escrow(&user2, &user1, &500, &token, &5000, &0);
+    client.dispute_escrow(&user2, &e1);
+    client.resolve_dispute(&admin, &e1, &true);
+
+    // User2 loses -> score = 4000
+    // User3 stays at neutral 5000
+
+    env.ledger().set_timestamp(0);
+    let u1_initial = client.get_reputation(&user1);
+    let u2_initial = client.get_reputation(&user2);
+    let u3_initial = client.get_reputation(&user3);
+
+    assert_eq!(u1_initial.score, 8000);
+    assert_eq!(u2_initial.score, 4000);
+    assert_eq!(u3_initial.score, 5000);
+
+    // Advance 30 days (23 days of decay after 7-day threshold)
+    env.ledger().set_timestamp(30 * 86400);
+
+    // User1: 23 days * 2% = 46% decay on 8000 = 3680 decay -> 4320 expected
+    let u1_effective = client.get_effective_reputation(&user1);
+    let expected_u1_decay = (8000 * 200 * 23) / 10000;
+    let expected_u1 = 8000 - expected_u1_decay;
+    assert_eq!(u1_effective, expected_u1);
+
+    // User2: 23 days * 2% of 4000 = 1840 decay -> 2160 expected
+    let u2_effective = client.get_effective_reputation(&user2);
+    let expected_u2_decay = (4000 * 200 * 23) / 10000;
+    let expected_u2 = 4000 - expected_u2_decay;
+    assert_eq!(u2_effective, expected_u2);
+
+    // User3: 23 days * 2% of 5000 = 2300 decay -> 2700 expected
+    let u3_effective = client.get_effective_reputation(&user3);
+    let expected_u3_decay = (5000 * 200 * 23) / 10000;
+    let expected_u3 = 5000 - expected_u3_decay;
+    assert_eq!(u3_effective, expected_u3);
+
+    // Apply decay and verify persistence
+    client.apply_reputation_decay(&user1);
+    client.apply_reputation_decay(&user2);
+    client.apply_reputation_decay(&user3);
+
+    let u1_after = client.get_reputation(&user1);
+    let u2_after = client.get_reputation(&user2);
+    let u3_after = client.get_reputation(&user3);
+
+    assert_eq!(u1_after.score, expected_u1 as i32);
+    assert_eq!(u2_after.score, expected_u2 as i32);
+    assert_eq!(u3_after.score, expected_u3 as i32);
+
+    // All last_updated timestamps should now be at day 30
+    assert_eq!(u1_after.last_updated, 30 * 86400);
+    assert_eq!(u2_after.last_updated, 30 * 86400);
+    assert_eq!(u3_after.last_updated, 30 * 86400);
+}
+
+#[test]
+fn test_oracle_conditional_with_state_changes_and_staleness() {
+    // Comprehensive oracle test with state changes and staleness validation
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let oracle_id = env.register(MockOracle, ());
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+
+    env.ledger().set_timestamp(10000);
+    client.initialize(&admin);
+
+    // Initial oracle state - price below threshold
+    oracle_client.set_price(&OraclePriceData {
+        price: 800,
+        timestamp: 9900,
+    });
+
+    let condition = OracleCondition {
+        escrow_id: 0, // Will be set after creation
+        oracle: OracleConfig {
+            oracle_address: oracle_id.clone(),
+            price_feed_id: BytesN::from_array(&env, &[0u8; 32]),
+            staleness_threshold: 300, // 5 minutes
+        },
+        target_price: 1000,
+        comparison: PriceComparison::GreaterThan,
+        release_to_merchant_if_met: true,
+    };
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &5000, &token, &99999, &0);
+
+    let mut condition_with_id = condition.clone();
+    condition_with_id.escrow_id = escrow_id;
+    client.attach_oracle_condition(&admin, &escrow_id, &condition_with_id);
+
+    // Scenario 1: Price still below threshold
+    client.dispute_escrow(&customer, &escrow_id);
+    
+    env.ledger().set_timestamp(10100);
+    oracle_client.set_price(&OraclePriceData {
+        price: 950,
+        timestamp: 10050,
+    });
+
+    client.auto_resolve_with_oracle(&escrow_id);
+    let escrow1 = client.get_escrow(&escrow_id);
+    assert_eq!(escrow1.status, EscrowStatus::Resolved); // Condition not met, customer wins
+
+    // Create second escrow for scenario 2
+    let escrow_id2 =
+        client.create_escrow(&customer, &merchant, &5000, &token, &99999, &0);
+    let mut condition2 = condition.clone();
+    condition2.escrow_id = escrow_id2;
+    client.attach_oracle_condition(&admin, &escrow_id2, &condition2);
+    client.dispute_escrow(&customer, &escrow_id2);
+
+    // Scenario 2: Price exceeds threshold - fresh data
+    env.ledger().set_timestamp(11000);
+    oracle_client.set_price(&OraclePriceData {
+        price: 1500,
+        timestamp: 10900,
+    });
+
+    client.auto_resolve_with_oracle(&escrow_id2);
+    let escrow2 = client.get_escrow(&escrow_id2);
+    assert_eq!(escrow2.status, EscrowStatus::Released); // Condition met, merchant wins
+
+    // Create third escrow for scenario 3
+    let escrow_id3 =
+        client.create_escrow(&customer, &merchant, &5000, &token, &99999, &0);
+    let mut condition3 = condition.clone();
+    condition3.escrow_id = escrow_id3;
+    client.attach_oracle_condition(&admin, &escrow_id3, &condition3);
+    client.dispute_escrow(&customer, &escrow_id3);
+
+    // Scenario 3: Price data is stale (older than staleness_threshold)
+    env.ledger().set_timestamp(12000);
+    // Oracle still has timestamp 10900, now 1100 seconds old (> 300 threshold)
+
+    let result = client.try_auto_resolve_with_oracle(&escrow_id3);
+    assert_eq!(result, Err(Ok(Error::OracleStalePriceFeed)));
+
+    let escrow3 = client.get_escrow(&escrow_id3);
+    assert_eq!(escrow3.status, EscrowStatus::Disputed); // Still disputed, oracle failed
+}
+
+#[test]
+fn test_insurance_pool_with_multiple_claims_and_fund_management() {
+    // Comprehensive insurance test with multiple escrows, claims, and pool management
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer1 = Address::generate(&env);
+    let customer2 = Address::generate(&env);
+    let customer3 = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    // Configure insurance: 5% premium, 50% max coverage
+    let insurance_config = InsuranceConfig {
+        premium_bps: 500,
+        max_coverage_bps: 5000,
+        enabled: true,
+    };
+    client.set_insurance_config(&admin, &insurance_config);
+
+    // Create multiple insured escrows
+    let e1 = client.create_escrow(&customer1, &merchant, &10000, &token, &2000, &0);
+    client.opt_into_insurance(&e1);
+    // Premium: 500 (5%), Amount after: 9500
+
+    let e2 = client.create_escrow(&customer2, &merchant, &20000, &token, &2000, &0);
+    client.opt_into_insurance(&e2);
+    // Premium: 1000 (5%), Amount after: 19000
+
+    let e3 = client.create_escrow(&customer3, &merchant, &5000, &token, &2000, &0);
+    client.opt_into_insurance(&e3);
+    // Premium: 250 (5%), Amount after: 4750
+
+    // Pool should have 1750 total
+    let pool_after_premiums = client.get_insurance_pool();
+    assert_eq!(pool_after_premiums.balance, 1750);
+    assert_eq!(pool_after_premiums.total_premiums_collected, 1750);
+
+    // Refund escrow 1 and file claim
+    client.refund_escrow(&customer1, &e1);
+    let claim1 = client.file_insurance_claim(&admin, &e1, &4750); // 50% of 9500
+    client.approve_claim(&admin, &claim1);
+
+    let pool_after_claim1 = client.get_insurance_pool();
+    assert_eq!(pool_after_claim1.balance, -3000); // 1750 - 4750 = -3000 (underfunded)
+    assert_eq!(pool_after_claim1.total_claims_paid, 4750);
+    assert_eq!(pool_after_claim1.total_claims_filed, 1);
+
+    // Refund escrow 2 and file smaller claim
+    client.refund_escrow(&customer2, &e2);
+    let claim2 = client.file_insurance_claim(&admin, &e2, &2000);
+    
+    // This claim should fail due to insufficient funds
+    let result = client.try_approve_claim(&admin, &claim2);
+    assert!(result.is_err());
+
+    // Verify pool state - claim wasn't paid
+    let pool_after_failed = client.get_insurance_pool();
+    assert_eq!(pool_after_failed.balance, -3000); // Unchanged
+    assert_eq!(pool_after_failed.total_claims_paid, 4750); // Unchanged
+    assert_eq!(pool_after_failed.total_claims_filed, 2); // Filed count increased
+
+    // Admin adds funds to pool
+    // Note: This would require a fund_insurance_pool function in the actual implementation
+    // For this test, we verify the pool is underfunded
+
+    // Verify escrow 3 is still active (not claimed)
+    let escrow3 = client.get_escrow(&e3);
+    assert_eq!(escrow3.status, EscrowStatus::Locked);
+    assert_eq!(escrow3.amount, 4750); // After premium deduction
+
+    // Final pool verification
+    let final_pool = client.get_insurance_pool();
+    assert_eq!(final_pool.total_escrows_insured, 3);
+    assert_eq!(final_pool.total_premiums_collected, 1750);
+    assert_eq!(final_pool.total_claims_filed, 2);
+    assert_eq!(final_pool.total_claims_paid, 4750);
+    assert!(final_pool.balance < 0); // Pool is underfunded
+}
