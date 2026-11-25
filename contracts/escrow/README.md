@@ -114,6 +114,7 @@ The private `weighted_auto_resolve` function sums evidence weights separately fo
 - get_escrow_amount: Queries the locked token amount held in an escrow.
 - verify_escrow_participant: Verifies if a given address is a valid participant (customer or merchant) of an escrow.
 - verify_observer_access: Verifies whether an observer has active, non-expired read-only access.
+- Negotiation (milestone amendments, settlement offers, terms amendments, release delegates, merchant acceptance): see [Negotiation](#negotiation).
 
 The escrow dispute flow has two separate timeout paths, and they apply in different dispute rounds.
 
@@ -1472,6 +1473,215 @@ Reads back a batch page. ⚠️ **This is 0-indexed**, while `submit_evidence_ba
 No auth required. Defaults to `{ evidence_deadline_seconds: 604800 }` (7 days) if never configured.
 
 **When the deadline actually starts counting:** the global `evidence_deadline_seconds` is only read once, at the moment `dispute_escrow` transitions an escrow from `Locked` to `Disputed`. At that point the contract computes `escrow.evidence_deadline = Some(dispute_started_at + evidence_deadline_seconds)` and emits `EvidenceDeadlineSet { escrow_id, deadline, set_at }`. It is **not** a global wall-clock deadline — it is per-escrow, anchored to when that escrow's dispute began. `submit_evidence` and `submit_evidence_batch` both enforce this per-escrow deadline; `submit_evidence_with_proof` does not (see the ⚠️ note above).
+
+## Negotiation
+
+After an escrow is created, its customer and merchant can still change what they agreed to without the admin's help. Each feature below is a propose/respond flow between the two parties, or a single-party action that the other party can see on-chain.
+
+Rules that apply to every function in this section:
+
+- The caller must authorize the call (`require_auth`).
+- Every state-changing function fails with `BasicError::ContractPaused` (`103`) while the contract, or that particular function, is paused.
+- "Party" means the escrow's `customer` or `merchant`. Anyone else gets `BasicError::Unauthorized` (`100`).
+- The milestone-amendment and settlement-offer functions load the escrow with `get_escrow`, which **panics** ("Escrow not found") for an unknown `escrow_id` instead of returning `EscrowError::NotFound`. The other functions return `EscrowError::NotFound` (`200`).
+
+### Milestone Amendments
+
+Either party can propose new terms for one milestone of the escrow's vesting schedule. The **other** party accepts or rejects it. Only one amendment can be pending per milestone.
+
+| Function | Parameters | Returns | Who may call | Required state |
+| --- | --- | --- | --- | --- |
+| `propose_milestone_amendment` | `caller: Address`, `escrow_id: u64`, `milestone_id: u64`, `new_amount: i128`, `new_unlock_timestamp: u64`, `new_deadline: Option<u64>`, `new_description: String` | `Result<(), Error>` | Either party | The escrow has a vesting schedule containing `milestone_id`, and no amendment is stored for that milestone |
+| `accept_milestone_amendment` | `caller: Address`, `escrow_id: u64`, `milestone_id: u64` | `Result<(), Error>` | The party that did **not** propose | A pending, not yet accepted amendment exists |
+| `reject_milestone_amendment` | `caller: Address`, `escrow_id: u64`, `milestone_id: u64` | `Result<(), Error>` | The party that did **not** propose | A pending amendment exists |
+
+- Proposing stores a `MilestoneAmendment` record. The escrow status is not checked.
+- Accepting overwrites the milestone's `amount`, `unlock_timestamp`, `deadline` and `description` in the vesting schedule. The amendment record is kept with `accepted: true`, so a later proposal for the **same milestone** fails with `MilestoneAmendmentAlreadyExists`.
+- Rejecting deletes the amendment record, so a new proposal can be made for that milestone.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not a party, or the proposer tries to accept/reject their own amendment |
+| `EscrowError::NotFound` | `200` | The escrow has no vesting schedule |
+| `ActionError::MilestoneNotFound` | `335` | `propose_milestone_amendment`: no milestone with `milestone_id` in the schedule |
+| `ActionError::MilestoneAmendmentAlreadyExists` | `336` | `propose_milestone_amendment`: an amendment (pending or accepted) is already stored for this milestone |
+| `ActionError::MilestoneAmendmentNotFound` | `337` | `accept_*` / `reject_*`: no amendment stored for this milestone |
+| `ActionError::MilestoneAmendmentAlreadyAccepted` | `338` | `accept_milestone_amendment`: the amendment was already accepted |
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `MilestoneAmendmentProposed` | `milestone_amendment_proposed` | `escrow_id`, `milestone_id`, `proposed_by`, `new_amount`, `new_deadline`, `proposed_at` | `propose_milestone_amendment` succeeds |
+| `MilestoneAmendmentAccepted` | `milestone_amendment_accepted` | `escrow_id`, `milestone_id`, `accepted_by`, `new_amount`, `new_deadline`, `accepted_at` | `accept_milestone_amendment` applies the amendment |
+| `MilestoneAmendmentRejected` | `milestone_amendment_rejected` | `escrow_id`, `milestone_id`, `rejected_by`, `rejected_at` | `reject_milestone_amendment` discards the amendment |
+
+### Settlement Offers
+
+While an escrow is `Disputed`, either party can offer to split the funds instead of waiting for the dispute to be resolved. If the other party accepts before the offer expires, the split is paid out and the escrow becomes `Resolved`.
+
+| Function | Parameters | Returns | Who may call | Required state |
+| --- | --- | --- | --- | --- |
+| `propose_settlement_offer` | `caller: Address`, `escrow_id: u64`, `customer_amount: i128`, `merchant_amount: i128`, `expiry_seconds: u64` | `Result<(), Error>` | Either party | Escrow is `Disputed`; no live offer (an existing offer must have expired) |
+| `accept_settlement_offer` | `caller: Address`, `escrow_id: u64` | `Result<(), Error>` | The party that did **not** propose | Escrow is `Disputed`; offer exists and `now < expires_at` |
+| `reject_settlement_offer` | `caller: Address`, `escrow_id: u64` | `Result<(), Error>` | The party that did **not** propose | An offer exists (status and expiry are not checked) |
+
+- `customer_amount + merchant_amount` must equal `escrow.amount` exactly. No escrow fee is taken from a settlement. The two amounts are not checked individually, and a share of `0` or less is simply not transferred.
+- The offer expires at `proposed_at + expiry_seconds`. Once it has expired, a new `propose_settlement_offer` replaces it.
+- Accepting sets the escrow status to `Resolved`, transfers `customer_amount` to the customer and `merchant_amount` to the merchant, and keeps the offer with `accepted: true`.
+- Rejecting deletes the offer, so either party can propose again straight away.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not a party, or the proposer tries to accept/reject their own offer |
+| `EscrowError::InvalidStatus` | `201` | `accept_settlement_offer`: a token transfer failed |
+| `ActionError::NotDisputed` | `301` | `propose_*` / `accept_*`: the escrow is not `Disputed` |
+| `ActionError::SettlementOfferAlreadyExists` | `329` | `propose_settlement_offer`: an unexpired offer is already pending |
+| `ActionError::SettlementOfferNotFound` | `330` | `accept_*` / `reject_*`: no offer stored for this escrow |
+| `ActionError::SettlementOfferExpired` | `331` | `accept_settlement_offer`: `now >= expires_at` |
+| `ActionError::SettlementOfferAlreadyAccepted` | `332` | `accept_settlement_offer`: the offer was already accepted (in practice the escrow is then `Resolved`, so `NotDisputed` is returned first) |
+| `ActionError::InvalidSettlementAmount` | `333` | `propose_settlement_offer`: the amounts do not sum to `escrow.amount` |
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `SettlementOfferProposed` | `settlement_offer_proposed` | `escrow_id`, `proposed_by`, `customer_amount`, `merchant_amount`, `proposed_at`, `expires_at` | `propose_settlement_offer` succeeds |
+| `SettlementOfferAccepted` | `settlement_offer_accepted` | `escrow_id`, `accepted_by`, `customer_amount`, `merchant_amount`, `accepted_at` | `accept_settlement_offer` pays out the split |
+| `EscrowResolved` | `escrow_resolved` | `escrow_id`, `released_to_merchant` (`true` if `merchant_amount > customer_amount`), `amount` (the full escrow amount) | Emitted right after `SettlementOfferAccepted` |
+| `SettlementOfferRejected` | `settlement_offer_rejected` | `escrow_id`, `rejected_by`, `rejected_at` | `reject_settlement_offer` discards the offer |
+
+#### Example: settling a dispute
+
+A 1,000-unit escrow is disputed. The customer offers to take 400 back and let the merchant keep 600. The merchant first rejects a lower offer, then accepts a better one.
+
+```rust
+// 1. The customer disputes the escrow. Status: Locked -> Disputed.
+client.dispute_escrow(&customer, &escrow_id);
+
+// 2. Customer proposes 700 / 300, valid for 24 hours.
+client.propose_settlement_offer(&customer, &escrow_id, &700, &300, &86_400);
+//    -> SettlementOfferProposed
+
+// 3. Merchant rejects it. The offer is deleted.
+client.reject_settlement_offer(&merchant, &escrow_id);
+//    -> SettlementOfferRejected
+
+// 4. Customer proposes 400 / 600. Amounts must sum to the escrow amount (1,000).
+client.propose_settlement_offer(&customer, &escrow_id, &400, &600, &86_400);
+
+// 5. Before expiry, the merchant accepts. 400 goes to the customer, 600 to the merchant.
+client.accept_settlement_offer(&merchant, &escrow_id);
+//    -> SettlementOfferAccepted, EscrowResolved; status: Disputed -> Resolved
+```
+
+If the merchant waits past `expires_at`, step 5 fails with `SettlementOfferExpired` (331), and either party may call `propose_settlement_offer` again.
+
+### Terms Hash and Terms Amendments
+
+An escrow can carry a 32-byte hash of its off-chain terms (for example a hash of the contract PDF). Changing it after the fact through an amendment needs both parties' approval.
+
+| Function | Parameters | Returns | Who may call | Required state |
+| --- | --- | --- | --- | --- |
+| `set_terms_hash` | `caller: Address`, `escrow_id: u64`, `hash: BytesN<32>` | `Result<(), Error>` | Either party | Escrow exists |
+| `propose_terms_amendment` | `proposer: Address`, `escrow_id: u64`, `new_hash: BytesN<32>` | `Result<u64, Error>`: the new amendment index | Either party | Escrow exists |
+| `approve_terms_amendment` | `approver: Address`, `escrow_id: u64`, `amendment_index: u64` | `Result<(), Error>` | Either party | The amendment exists and is not finalized |
+| `get_terms_hash` | `escrow_id: u64` | `Option<TermsHash>` | Anyone | — |
+| `get_terms_amendment` | `escrow_id: u64`, `amendment_index: u64` | `Option<TermsAmendment>` | Anyone | — |
+| `get_all_terms_amendments` | `escrow_id: u64` | `Vec<TermsAmendment>` (oldest first; empty if none) | Anyone | — |
+
+- `set_terms_hash` writes the hash directly, replacing any previous one, without the other party's approval. Use it to record the initial terms; use amendments to change them.
+- `propose_terms_amendment` stores a `TermsAmendment` at the next index (starting at `0`) and counts as the proposer's approval. Several amendments can be pending at once; each is approved on its own.
+- `approve_terms_amendment` records the approver's side. When both `customer_approved` and `merchant_approved` are `true`, the amendment is finalized and `new_hash` becomes the escrow's terms hash. Approving again from the side that already approved changes nothing but the timestamp.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not a party |
+| `EscrowError::NotFound` | `200` | No escrow with this ID |
+| `EscrowError::AlreadyProcessed` | `202` | `approve_terms_amendment`: the amendment is already finalized |
+| `ActionError::InvalidTermsHash` | `325` | `approve_terms_amendment`: no amendment at `amendment_index` |
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `TermsHashSet` | `terms_hash_set` | `escrow_id`, `hash` | `set_terms_hash` succeeds |
+| `TermsAmendmentProposed` | `terms_amendment_proposed` | `escrow_id`, `amendment_index`, `new_hash`, `proposed_by` | `propose_terms_amendment` succeeds |
+| `TermsAmendmentApproved` | `terms_amendment_approved` | `escrow_id`, `amendment_index`, `approved_by` | Every successful `approve_terms_amendment` |
+| `TermsAmendmentFinalized` | `terms_amendment_finalized` | `escrow_id`, `amendment_index`, `new_hash` | The approval that completes both sides (emitted before `TermsAmendmentApproved`) |
+
+### Release Delegates
+
+A merchant can name one delegate (for example an agent or fulfilment service) who may release the escrow on their behalf.
+
+| Function | Parameters | Returns | Who may call | Required state |
+| --- | --- | --- | --- | --- |
+| `set_release_delegate` | `caller: Address`, `escrow_id: u64`, `delegate: Address` | `Result<(), Error>` | The merchant | Escrow is `Locked` or `Disputed` |
+| `remove_release_delegate` | `caller: Address`, `escrow_id: u64` | `Result<(), Error>` | The merchant | Escrow exists (any status) |
+| `approve_release_as_delegate` | `caller: Address`, `escrow_id: u64` | `Result<(), Error>` | The current delegate | Escrow is `Locked` |
+
+- Setting a delegate replaces any existing one. The delegate is stored in `Escrow.release_delegate`.
+- `approve_release_as_delegate` runs the normal release path: the release checks (release time, hold period, multisig approvals and so on) apply, the escrow fee is charged, and the funds go to the merchant (or the configured beneficiaries). The escrow becomes `Released`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `set_*` / `remove_*`: caller is not the merchant. `approve_release_as_delegate`: caller is not the delegate |
+| `EscrowError::NotFound` | `200` | No escrow with this ID |
+| `EscrowError::InvalidStatus` | `201` | `set_release_delegate`: escrow is not `Locked`/`Disputed`. `approve_release_as_delegate`: escrow is not `Locked` |
+| `ActionError::ReleaseDelegateNotSet` | `334` | `approve_release_as_delegate`: no delegate is set |
+| `ActionError::ApprovalsThresholdNotMet` | `314` | `approve_release_as_delegate`: a release multisig is configured and has too few approvals |
+
+`approve_release_as_delegate` can also return every error the release checks return.
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `ReleaseDelegateSet` | `release_delegate_set` | `escrow_id`, `delegate`, `set_by` | `set_release_delegate` succeeds |
+| `ReleaseDelegateRemoved` | `release_delegate_removed` | `escrow_id`, `removed_by` | `remove_release_delegate` succeeds (even if no delegate was set) |
+| `DelegatedReleaseApproved` | `delegated_release_approved` | `escrow_id`, `approved_by` | `approve_release_as_delegate`, before the release; followed by the usual release events (`EscrowFeeCollected` when a fee applies, `EscrowReleased`, `EscrowStatusChanged`) |
+
+### Merchant Acceptance
+
+The merchant can record on-chain that they accept an escrow. Acceptance is one-way: it cannot be withdrawn.
+
+| Function | Parameters | Returns | Who may call | Required state |
+| --- | --- | --- | --- | --- |
+| `merchant_accept_escrow` | `merchant: Address`, `escrow_id: u64` | `Result<(), Error>` | The escrow's merchant | Escrow exists and has not been accepted yet (status is not checked) |
+| `get_merchant_acceptance` | `escrow_id: u64` | `Option<MerchantAcceptance>` (`None` until accepted) | Anyone | — |
+
+`MerchantAcceptance { escrow_id, accepted, accepted_at: Option<u64> }` is stored on acceptance. Once accepted, the customer can no longer use `cancel_within_cooling_off` (it fails with `CoolingOffMerchantAccepted`, 239; see [Merchant Cooling-Off](#merchant-cooling-off-issue-878)). `ActionError::MerchantAcceptanceRequired` (323) is reserved for flows that require acceptance first; no public function returns it at the moment.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not the escrow's merchant |
+| `EscrowError::NotFound` | `200` | No escrow with this ID |
+| `ActionError::MerchantAlreadyAccepted` | `324` | The merchant has already accepted this escrow |
+
+| Event | Topic | Payload fields | Fires when |
+| --- | --- | --- | --- |
+| `MerchantAccepted` | `merchant_accepted` | `escrow_id`, `merchant`, `accepted_at` | `merchant_accept_escrow` succeeds |
+
+### `ActionError` codes 317–338
+
+| Code | Variant | Returned by | Meaning |
+| --- | --- | --- | --- |
+| `317` | `MutualCancelAlreadyRequested` | `request_mutual_cancel` | The caller already requested a mutual cancel for this escrow |
+| `318` | `MutualCancelNotRequested` | `withdraw_mutual_cancel` | The caller has no mutual-cancel request to withdraw |
+| `319` | `HookNotFound` | `deregister_escrow_hook` | No hook with this ID |
+| `320` | `HookNotOwnedBySubscriber` | `deregister_escrow_hook` | The hook belongs to a different subscriber |
+| `321` | `MaxHooksPerEventReached` | `register_escrow_hook` | The event type already has the maximum number of hooks |
+| `322` | `InvalidHookAddress` | `register_escrow_hook` | The subscriber contract did not answer the `ping` check |
+| `323` | `MerchantAcceptanceRequired` | — (reserved) | The merchant must accept the escrow first; not returned by any public function yet |
+| `324` | `MerchantAlreadyAccepted` | `merchant_accept_escrow` | The merchant already accepted this escrow |
+| `325` | `InvalidTermsHash` | `approve_terms_amendment` | No terms amendment at the given index |
+| `326` | `AmendmentRequiresBothParties` | — (reserved) | Defined but not returned by any function |
+| `327` | `MerchantCreationPaused` | escrow creation functions | The merchant has paused new escrows |
+| `328` | `ResolverMustBeDifferent` | `assign_third_party_resolver` | The resolver is the escrow's customer or merchant |
+| `329` | `SettlementOfferAlreadyExists` | `propose_settlement_offer` | An unexpired settlement offer is already pending |
+| `330` | `SettlementOfferNotFound` | `accept_settlement_offer`, `reject_settlement_offer` | No settlement offer for this escrow |
+| `331` | `SettlementOfferExpired` | `accept_settlement_offer` | The offer's `expires_at` has passed |
+| `332` | `SettlementOfferAlreadyAccepted` | `accept_settlement_offer` | The offer was already accepted |
+| `333` | `InvalidSettlementAmount` | `propose_settlement_offer` | `customer_amount + merchant_amount != escrow.amount` |
+| `334` | `ReleaseDelegateNotSet` | `approve_release_as_delegate` | The escrow has no release delegate |
+| `335` | `MilestoneNotFound` | `propose_milestone_amendment` | No milestone with this ID in the vesting schedule |
+| `336` | `MilestoneAmendmentAlreadyExists` | `propose_milestone_amendment` | An amendment is already stored for this milestone |
+| `337` | `MilestoneAmendmentNotFound` | `accept_milestone_amendment`, `reject_milestone_amendment` | No amendment for this milestone |
+| `338` | `MilestoneAmendmentAlreadyAccepted` | `accept_milestone_amendment` | The amendment was already accepted |
+
+---
 
 ## Contract Upgrades
 

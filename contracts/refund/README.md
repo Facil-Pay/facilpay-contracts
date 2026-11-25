@@ -850,7 +850,69 @@ When an SLA is active, each refund created in `Requested` status records a respo
 - `auto_approve_on_sla_breach()` — Permissionless: auto-approves a refund past its SLA deadline.
 - `get_sla_breached_refunds()` — Lists `Requested` refunds whose SLA has passed.
 
+See also [Processing Deadline for Approved Refunds](#processing-deadline-for-approved-refunds) for refunds that are approved but not paid out.
+
 Errors: `SlaNotConfigured` (62) if the refund has no recorded deadline, `SlaNotBreached` (63) if the deadline hasn't passed.
+
+### Processing Deadline for Approved Refunds
+
+The Merchant Response SLA covers a refund stuck in `Requested`. The processing deadline covers the next step: a refund that was **approved but never paid out**. Once the admin turns it on, an approved refund must be processed within `deadline_seconds` of its approval. After that, the customer can force the payout themselves.
+
+**When the deadline starts.** The clock starts at the refund's `approved_at` timestamp. That timestamp is set whenever a refund moves to `Approved`: `approve_refund`, `approve_refund_batch`, `accept_counter_offer` and `auto_approve_on_sla_breach`. The deadline is `approved_at + deadline_seconds`, using the config **at the time of the check**. Unlike the response SLA, it is not stored per refund, so changing `deadline_seconds` moves the deadline of every refund that is already approved. Disabling the config stops enforcement entirely.
+
+**When it is missed.** The deadline counts as missed once `now >= approved_at + deadline_seconds`. Nothing happens on its own; the customer calls `enforce_processing_deadline`, which pays out the refund just as `process_refund` would (refund reserve debit, platform fee deduction, token transfer to the customer, quota tracking, payment-contract sync and notification hooks), with the customer recorded as `processed_by`. The refund moves to `Processed`.
+
+| Function | Parameters | Returns | Auth |
+| --- | --- | --- | --- |
+| `set_processing_deadline_config` | `admin: Address`, `deadline_seconds: u64`, `enabled: bool` | `Result<(), Error>` | admin |
+| `get_processing_deadline_config` | — | `RefundProcessingDeadlineConfig` | — |
+| `check_processing_deadline` | `refund_id: u64` | `Result<bool, Error>` | none (permissionless) |
+| `enforce_processing_deadline` | `customer: Address`, `refund_id: u64` | `Result<(), Error>` | the refund's customer |
+
+```rust
+pub struct RefundProcessingDeadlineConfig {
+    pub deadline_seconds: u64, // time allowed between approval and processing
+    pub enabled: bool,         // enforcement is off unless this is true
+}
+```
+
+- `set_processing_deadline_config` stores the config, replacing any earlier one. `deadline_seconds` is not validated. Emits no event.
+- `get_processing_deadline_config` returns the stored config. If none has been set, it returns `{ deadline_seconds: 259200 /* 3 days */, enabled: false }`.
+- `check_processing_deadline` returns `true` if the deadline has passed, `false` if not. Anyone may call it. When it returns `true` it also emits `ProcessingDeadlineMissed`, so it is not a pure view: each call after the deadline emits the event again.
+- `enforce_processing_deadline` checks that the caller is the refund's customer, runs `check_processing_deadline`, and processes the refund if the deadline has been missed. Only the refund's customer may call it; the merchant and admin keep using `process_refund`.
+
+**Errors**
+
+| Error | Code | Returned by | When |
+| --- | --- | --- | --- |
+| `CoreError::Unauthorized` | `3` | `set_processing_deadline_config` | Caller is not the contract admin |
+| `CoreError::Unauthorized` | `3` | `enforce_processing_deadline` | Caller is not the refund's customer |
+| `CoreError::RefundNotFound` | `2` | `check_processing_deadline`, `enforce_processing_deadline` | No refund with this ID |
+| `CoreError::InvalidStatus` | `7` | `check_processing_deadline`, `enforce_processing_deadline` | Refund is not `Approved` (or has no `approved_at`) |
+| `ExtError::ProcessingDeadlineNotConfigured` | `83` | `check_processing_deadline`, `enforce_processing_deadline` | The config is missing or `enabled` is `false` |
+| `ExtError::ProcessingDeadlineMissed` | `82` | `enforce_processing_deadline` | The deadline has **not** been reached yet, so there is nothing to enforce. Despite its name, this error means "deadline not missed yet". |
+
+`enforce_processing_deadline` can also return any error from the payout itself, for example a payment refund-cap error, an insufficient refund reserve, or `RefundExceedsPolicy` when the merchant's refund quota would be exceeded.
+
+**Events**
+
+- `ProcessingDeadlineMissed` (`refund_id`, `approved_at`, `deadline`, `current_time`) from `check_processing_deadline` and `enforce_processing_deadline`, whenever the deadline is found to have passed.
+- `enforce_processing_deadline` then emits the events of a normal payout: `RefundProcessed` (with `processed_by` = the customer), `RefundFeeDeducted` when a platform fee applies, and `RefundPaymentSynced` or `RefundPaymentSyncFailed`.
+
+**Example**
+
+```rust
+// Admin: approved refunds must be processed within 3 days.
+client.set_processing_deadline_config(&admin, &259_200u64, &true);
+
+// ...refund `refund_id` is approved at time T and not processed...
+
+// Anyone can check; returns false before T + 259_200, true from then on.
+let missed: bool = client.check_processing_deadline(&refund_id);
+
+// After the deadline, the customer pays out the refund themselves.
+client.enforce_processing_deadline(&customer, &refund_id);
+```
 
 ### Dispute Evidence
 
@@ -1177,6 +1239,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |
 | `RefundPaymentSynced` | `refund_payment_synced` | `refund_id`, `payment_id`, `amount` | A processed refund is recorded on the payment contract (#809) |
 | `RefundPaymentSyncFailed` | `refund_payment_sync_failed` | `refund_id`, `payment_id`, `payment_contract_set` | The payment-contract sync is skipped or rejected; the payout stands (#809) |
+| `ProcessingDeadlineMissed` | `processing_deadline_missed` | `refund_id`, `approved_at`, `deadline`, `current_time` | `check_processing_deadline()` or `enforce_processing_deadline()` finds an approved refund past its processing deadline |
 | `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
 | `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
 | `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |

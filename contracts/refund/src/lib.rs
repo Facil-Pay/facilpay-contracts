@@ -12891,3 +12891,6 @@ mod test_multi_token_arbitrator;
 
 #[cfg(test)]
 mod test_response_sla;
+
+#[cfg(test)]
+mod test_scheduled_policy;

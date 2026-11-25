@@ -109,6 +109,7 @@ Recommended migration path:
 
 - [Storage Versioning Guide](docs/STORAGE_VERSIONING.md)
 - [Audit Summary](docs/AUDIT_SUMMARY.md)
+- [Event Reference for indexers](docs/EVENTS.md): every contract event with its topic, payload and emitting functions
 - Telegram: https://t.me/+afM9uh7GGtVkYmZk
 - [API Repository](https://github.com/facilpay/facilpay-api)
 - [SDK Repository](https://github.com/facilpay/facilpay-sdk)
