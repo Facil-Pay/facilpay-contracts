@@ -17478,3 +17478,6 @@ mod test_refund_sync;
 
 #[cfg(test)]
 mod test_dunning;
+
+#[cfg(test)]
+mod test_scheduled_auto_resume;
