@@ -96,6 +96,28 @@ pub enum DataKey {
     IncidentReasonCount(u32),
 }
 
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
+}
+
 /// A privileged coordinator action that goes through propose/approve/execute (#816).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +147,8 @@ pub struct AdminProposal {
     pub cancelled: bool,
     /// Optional hash of the off-chain rationale for this proposal (#875).
     pub description_hash: Option<BytesN<32>>,
+    /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
+    pub cancelled: bool,
 }
 
 /// Configuration for the child-upgrade veto window (#874).
@@ -160,6 +184,28 @@ struct LegacyAdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+}
+
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
 }
 
 /// Schema versions across the platform (#817). A child is `None` when its
@@ -865,6 +911,7 @@ fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
         executed: legacy.executed,
         cancelled: false,
         description_hash: None,
+        cancelled: false,
     })
 }
 
@@ -1568,6 +1615,7 @@ impl AdminContract {
             executed: false,
             cancelled: false,
             description_hash: description_hash.clone(),
+            cancelled: false,
         };
         env.storage().instance().set(&DataKey::ProposalCount, &id);
         env.storage()

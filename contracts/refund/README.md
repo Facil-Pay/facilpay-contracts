@@ -284,6 +284,44 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `escalate_arbitration_case()` — Escalates a case from junior to senior panel.
 - `get_arbitration_tier()` — Returns Senior or Junior tier for a case.
 
+#### Arbitrator Bonds (Issue #908)
+
+Arbitrators who ignore assigned cases now lose part of a bond. While bonding is configured, only arbitrators holding a full bond can be assigned to cases (manual `assign_arbitrator`, escalation panels and `auto_assign_arbitrators` all use the same check). When `trigger_arbitration_timeout` resolves a case, each assigned arbitrator who did not vote loses `slash_bps` of their bond to the slashed-bond treasury.
+
+| Function | Description |
+| --- | --- |
+| `set_arbitrator_bond(admin, token, amount, slash_bps)` | Admin sets the bond requirement. `amount = 0` disables bonding (existing bonds stay withdrawable). |
+| `get_arbitrator_bond_config()` | Returns `Option<ArbitratorBondConfig { token, amount, slash_bps }>`. |
+| `post_arbitrator_bond(arbitrator)` | A registered arbitrator posts their bond, or tops it up after a slash. Only the shortfall up to `amount` is transferred. Returns the bond total. |
+| `withdraw_arbitrator_bond(arbitrator)` | Returns the arbitrator's full remaining bond. Only allowed when they are not assigned to any open case. |
+| `get_arbitrator_bond(arbitrator)` | Returns `Option<ArbitratorBond { token, amount, posted_at }>`. |
+| `get_slashed_bond_balance(token)` | Slashed funds held for the treasury in `token`. |
+| `withdraw_slashed_bonds(admin, token, to)` | Admin transfers all slashed funds in `token` to `to`. |
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `token` | `Address` | Token the bond is held in |
+| `amount` | `i128` | `>= 0`; `0` disables bonding |
+| `slash_bps` | `u32` | `0..=10000`; share of a non-voter's bond slashed per timed-out case |
+
+Notes:
+
+- An arbitrator whose bond falls below `amount` after a slash is not assignable until they call `post_arbitrator_bond` again.
+- If the admin changes the bond token, bonds held in the old token must be withdrawn before a new one can be posted.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `Unauthorized` | `3` | Caller is not the admin (`set_arbitrator_bond`, `withdraw_slashed_bonds`) |
+| `InvalidAmount` | `1` | `amount < 0` or `slash_bps > 10000` |
+| `NotArbitrator` | `16` | `post_arbitrator_bond` caller is not a registered arbitrator |
+| `InsufficientTreasuryFees` | `31` | No slashed funds to withdraw in `token` |
+| `ArbitratorBondNotConfigured` | `87` | Bonding is disabled |
+| `ArbitratorNotBonded` | `88` | `assign_arbitrator` target has no full bond, or `withdraw_arbitrator_bond` caller has no bond |
+| `ArbitratorHasOpenCases` | `89` | Withdrawal while assigned to an open case |
+| `ArbitratorBondAlreadyPosted` | `90` | Bond already meets the requirement, or is held in a different token |
+
+Events: `ArbitratorBondConfigured { token, amount, slash_bps }`, `ArbitratorBondPosted { arbitrator, token, amount, total }`, `ArbitratorBondSlashed { case_id, arbitrator, token, amount, remaining }`, `ArbitratorBondWithdrawn { arbitrator, token, amount }`.
+
 ### Policy Templates
 
 - `create_policy_template()` — Admin creates a reusable refund policy template.
@@ -671,6 +709,7 @@ No new error variants — this feature can never fail or revert a call. Event: `
 ### Customer History
 
 - `get_customer_refund_history()` — Paginated refund history for a customer.
+- `get_customer_refunds_by_status(customer: Address, status: RefundStatus, offset: u64, limit: u64) -> Vec<Refund>` — **(Issue #913)** A customer's refunds in one `status`, newest-first. Pagination matches `get_customer_refund_history`: `offset` skips that many *matching* refunds and at most `limit` are returned; `limit = 0` or an offset past the last match returns an empty list. Note the argument order is `offset, limit`. Read-only: no auth, no errors, no events. A rejected refund sits in `PendingAppeal` until its appeal window closes and `finalize_denial` moves it to `Rejected`.
 - `get_customer_refund_count_public()` — Total count of refunds for a customer.
 - `get_customer_refund_summary()` — Summary stats for a customer's refunds.
 
@@ -888,13 +927,11 @@ Emits `RefundMessagePosted { refund_id, message_id, sender, posted_at }` from `p
 - `issue_promotional_vouchers()` — Merchant issues goodwill credit vouchers to many customers at once, funded from its refund reserve.
 - `set_voucher_min_purchase()` — Admin sets (or clears) the minimum purchase amount required to redeem a merchant's vouchers.
 - `get_voucher_min_purchase()` — Gets the minimum purchase amount configured for a merchant's vouchers.
-- `merge_vouchers()` — Customer combines same-merchant, same-token vouchers into one. See [Merging vouchers](#merging-vouchers).
-- `get_voucher_merged_into()` — The voucher a consumed source voucher was merged into.
-- `set_voucher_liability_cap()` / `clear_voucher_liability_cap()` — Admin caps (or uncaps) a merchant's outstanding voucher value per token. See [Outstanding voucher liability](#outstanding-voucher-liability).
-- `get_voucher_liability()` / `get_voucher_liability_cap()` — Current outstanding voucher value and its cap.
-- `revoke_voucher()` — Admin revokes a voucher, releasing its balance from the liability.
+- `extend_voucher_expiry()` — Issuing merchant moves an unredeemed voucher's expiry later.
+- `revoke_voucher()` — Issuing merchant revokes a voucher's remaining balance (admin co-approval above a threshold).
+- `approve_voucher_revocation()` — Admin co-approves revoking a voucher above the revocation threshold.
+- `set_voucher_revoke_threshold()` / `get_voucher_revoke_threshold()` — Admin sets / reads the remaining balance above which revocation needs co-approval.
 - `is_voucher_revoked()` — Whether a voucher has been revoked.
-- `expire_voucher()` — Anyone releases an expired voucher's balance from the liability.
 
 #### Minimum purchase for voucher redemption
 
@@ -993,82 +1030,56 @@ Each voucher expires `expiry_seconds` after the ledger time of the call. Promoti
 | `PromotionalVoucherIssued` | `voucher_id`, `merchant`, `customer`, `token`, `amount`, `expires_at` | Once per voucher issued |
 | `PromotionalVouchersIssued` | `merchant`, `token`, `count`, `total_amount`, `new_reserve_balance` | Once per batch, after the vouchers |
 
-#### Merging vouchers
+#### Extending voucher expiry
 
 | Function | Parameters | Returns |
 | --- | --- | --- |
-| `merge_vouchers` | `customer: Address` (must authorize), `voucher_ids: Vec<u64>` | `Result<u64, Error>` (the merged voucher's ID) |
-| `get_voucher_merged_into` | `voucher_id: u64` | `Option<u64>` (the voucher a source was merged into; `None` if never merged) |
+| `extend_voucher_expiry` | `merchant: Address` (must authorize), `voucher_id: u64`, `new_expires_at: u64` | `Result<(), Error>` |
 
-`merge_vouchers` combines several small vouchers from one merchant into a single voucher. It takes 2 to `MAX_VOUCHER_MERGE` (20) distinct IDs. Every source voucher must:
-
-- belong to `customer`,
-- be unredeemed, unrevoked and unexpired,
-- be transferable (vouchers issued while the merchant had transfers disabled cannot be merged), and
-- have the same merchant and the same token as the others.
-
-The merged voucher holds the sum of the sources' **remaining** balances (partial redemptions are taken into account) and takes the **earliest** expiry among the sources. It has `refund_id == 0`, is owned by `customer`, is transferable, and works like any other voucher.
-
-Each source voucher is marked consumed: `redeemed` is set to `true`, its balance becomes `0`, and `get_voucher_merged_into` returns the merged voucher's ID. Sources stay in the customer's `get_customer_vouchers` list as consumed records. The merchant's outstanding voucher liability does not change, because the value moves from the sources to the merged voucher.
-
-The whole call is validated before anything is written, so a failed merge leaves every source untouched. `merge_vouchers` can be paused on its own with `pause_function("merge_vouchers")`.
+Lets the merchant that issued a voucher give the customer more time to use it. Only the issuing merchant (the voucher's `merchant` field) can extend it. `new_expires_at` must be later than the voucher's current `expires_at`: expiry can only move later, never earlier. The voucher must not be fully redeemed or revoked. A partially redeemed voucher can be extended, and its remaining balance gets the new expiry. An already-expired voucher can also be extended, which makes it redeemable again. The function can be paused on its own with `pause_function("extend_voucher_expiry")`.
 
 | Error | Code | When |
 | --- | --- | --- |
-| `CoreError::Unauthorized` | `3` | A voucher is not owned by `customer` |
-| `CoreError::VoucherRevoked` | `89` | A voucher was revoked by the admin |
-| `CoreError::InvalidVoucherMerge` | `91` | Fewer than 2 IDs, more than `MAX_VOUCHER_MERGE` IDs, or an ID is repeated |
-| `CoreError::VoucherMergeMismatch` | `92` | The vouchers belong to different merchants or use different tokens |
-| `ExtError::VoucherNotFound` | `52` | A voucher does not exist |
-| `ExtError::VoucherExpired` | `53` | A voucher has expired |
-| `ExtError::VoucherAlreadyRedeemed` | `54` | A voucher was fully redeemed or already merged |
-| `ExtError::VoucherNotTransferable` | `75` | A voucher was issued non-transferable |
+| `CoreError::Unauthorized` | `3` | `merchant` did not issue the voucher |
+| `CoreError::VoucherRevoked` | `87` | The voucher was revoked |
+| `CoreError::InvalidVoucherExpiry` | `88` | `new_expires_at` is not later than the current `expires_at` |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been fully redeemed |
 
 | Event | Fields | Emitted |
 | --- | --- | --- |
-| `VouchersMerged` | `customer`, `merchant`, `token`, `source_voucher_ids`, `merged_voucher_id`, `amount`, `expires_at` | `merge_vouchers()` creates the merged voucher |
+| `VoucherExpiryExtended` | `voucher_id`, `merchant`, `old_expires_at`, `new_expires_at` | On every successful extension |
 
-#### Outstanding voucher liability
+#### Revoking vouchers
 
-The contract tracks the outstanding voucher value of each `(merchant, token)` pair: the remaining balance of every voucher that has not been redeemed, revoked or released after expiry. The admin can cap it so a merchant cannot issue vouchers far beyond what it can honour.
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `revoke_voucher` | `merchant: Address` (must authorize), `voucher_id: u64`, `reason_hash: BytesN<32>` | `Result<i128, Error>` (the revoked amount) |
+| `approve_voucher_revocation` | `admin: Address` (must authorize), `voucher_id: u64` | `Result<(), Error>` |
+| `set_voucher_revoke_threshold` | `admin: Address` (must authorize), `threshold: i128` | `Result<(), Error>` |
+| `get_voucher_revoke_threshold` | — | `i128` |
+| `is_voucher_revoked` | `voucher_id: u64` | `bool` |
 
-| Function | Parameters | Returns | Auth |
-| --- | --- | --- | --- |
-| `set_voucher_liability_cap` | `admin: Address`, `merchant: Address`, `token: Address`, `cap: i128` | `Result<(), Error>` | `admin` |
-| `clear_voucher_liability_cap` | `admin: Address`, `merchant: Address`, `token: Address` | `Result<(), Error>` | `admin` |
-| `get_voucher_liability_cap` | `merchant: Address`, `token: Address` | `Option<i128>` (`None` when uncapped) | — |
-| `get_voucher_liability` | `merchant: Address`, `token: Address` | `i128` — current outstanding liability (`0` if none) | — |
-| `revoke_voucher` | `admin: Address`, `voucher_id: u64` | `Result<i128, Error>` (amount released from the liability) | `admin` |
-| `is_voucher_revoked` | `voucher_id: u64` | `bool` | — |
-| `expire_voucher` | `voucher_id: u64` | `Result<i128, Error>` (amount released from the liability) | anyone |
+`revoke_voucher` pulls back a voucher that was issued by mistake or obtained by fraud. Only the issuing merchant can revoke it, and `reason_hash` records the hash of the off-chain reason. Only the remaining balance is revoked: if 400 of a 1000 voucher was already redeemed, the revocation covers the other 600, and the call returns that amount. After revocation the voucher is marked `redeemed`, its balance is `0`, and redeeming, transferring or extending it fails with `VoucherRevoked`.
 
-How the liability changes:
+Promotional vouchers (`refund_id == 0`) are funded from the merchant's refund reserve, so their remaining balance is credited back to the merchant's reserve for the voucher's token. Refund vouchers were not funded from a reserve, so nothing is credited; the tokens stay with the contract.
 
-- **Issuance** adds the voucher's value: `issue_refund_voucher` adds the refund amount, and `issue_promotional_vouchers` adds each voucher in the batch.
-- **Redemption** subtracts what is paid out: the remaining balance for `redeem_refund_voucher`, or `amount` for `redeem_voucher_amount`.
-- **Revocation** subtracts the voucher's remaining balance. A revoked voucher can no longer be redeemed, transferred or merged, and its balance reads as `0`. Expired vouchers can be revoked too.
-- **Expiry** subtracts the remaining balance once `expire_voucher` is called for a voucher that is past its `expires_at`. The contract cannot act when time passes on its own, so an expired voucher keeps counting until someone calls `expire_voucher` (anyone may). Calling it again for the same voucher releases nothing and returns `0`.
-- **Transfers and merges** leave the liability unchanged.
-- Vouchers issued before liability tracking existed are not counted, and redeeming them does not reduce the liability.
-
-**The cap.** With a cap set, `issue_refund_voucher` and `issue_promotional_vouchers` reject issuance that would push the liability above the cap. A promotional batch is checked as a whole, before the reserve is touched, so a rejected batch issues nothing and debits nothing. `cap` may be `0` (no new vouchers at all). Lowering the cap below the current liability does not touch existing vouchers; it only blocks new issuance until the liability falls. Caps are per token: a cap on one token does not limit another. `clear_voucher_liability_cap` removes the limit.
+The admin can set a co-approval threshold with `set_voucher_revoke_threshold`. When the threshold is non-zero and the voucher's remaining balance is above it, the admin must first call `approve_voucher_revocation(admin, voucher_id)`; otherwise `revoke_voucher` fails with `VoucherRevocationNeedsApproval`. The default threshold is `0`, which means no revocation needs co-approval. `revoke_voucher` can be paused on its own with `pause_function("revoke_voucher")`.
 
 | Error | Code | When |
 | --- | --- | --- |
-| `CoreError::InvalidAmount` | `1` | `set_voucher_liability_cap`: `cap` is negative |
-| `CoreError::Unauthorized` | `3` | The caller of an admin function is not the admin |
-| `CoreError::VoucherLiabilityCapExceeded` | `88` | Issuance would push the liability above the cap |
-| `CoreError::VoucherRevoked` | `89` | Redeeming, transferring, merging, revoking or expiring a revoked voucher |
-| `CoreError::VoucherNotExpired` | `90` | `expire_voucher`: the voucher has not expired yet |
-| `ExtError::VoucherNotFound` | `52` | `revoke_voucher` / `expire_voucher`: the voucher does not exist |
-| `ExtError::VoucherAlreadyRedeemed` | `54` | `revoke_voucher` / `expire_voucher`: the voucher was fully redeemed or merged |
+| `CoreError::InvalidAmount` | `1` | `set_voucher_revoke_threshold` was given a negative threshold |
+| `CoreError::Unauthorized` | `3` | `merchant` did not issue the voucher, or the caller is not the contract admin (admin functions) |
+| `CoreError::VoucherRevoked` | `87` | The voucher was already revoked |
+| `CoreError::VoucherRevocationNeedsApproval` | `89` | The remaining balance is above the threshold and the admin has not co-approved |
+| `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
+| `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been fully redeemed, so there is nothing to revoke |
 
 | Event | Fields | Emitted |
 | --- | --- | --- |
-| `VoucherLiabilityCapSet` | `merchant`, `token`, `cap` | `set_voucher_liability_cap()` sets or changes a cap |
-| `VoucherLiabilityCapCleared` | `merchant`, `token` | `clear_voucher_liability_cap()` removes a cap |
-| `VoucherRevoked` | `voucher_id`, `revoked_by`, `released_amount` | `revoke_voucher()` revokes a voucher |
-| `ExpiredVoucherReleased` | `voucher_id`, `merchant`, `token`, `released_amount` | `expire_voucher()` releases an expired voucher's balance (not emitted when nothing is released) |
+| `VoucherRevoked` | `voucher_id`, `merchant`, `customer`, `revoked_amount`, `returned_to_reserve`, `reason_hash` | On every successful revocation |
+| `VoucherRevocationApproved` | `voucher_id`, `admin` | When the admin co-approves a revocation |
+| `VoucherRevokeThresholdSet` | `threshold`, `admin` | When the admin sets the threshold |
 
 #### Voucher expiry and value handling
 
@@ -1089,7 +1100,7 @@ The contract treats the expiry check as `now > expires_at`:
 - redemption fails once the timestamp moves past the stored expiry
 - equality is still valid, so the voucher remains usable at the exact `expires_at` boundary
 
-This is enforced in `redeem_refund_voucher()` by rejecting with `VoucherExpired` when the ledger time is past the voucher's expiry. The value itself is not automatically reclaimed or reissued once a voucher expires; the voucher simply stops being redeemable. There is no on-chain “refund the expired amount back to merchant/treasury” flow in the contract; the unredeemed value is effectively dead credit unless a new voucher is created or a different manual process handles it. Calling `expire_voucher()` on an expired voucher removes its remaining balance from the merchant's outstanding voucher liability (see [Outstanding voucher liability](#outstanding-voucher-liability)); it does not move any tokens.
+This is enforced in `redeem_refund_voucher()` by rejecting with `VoucherExpired` when the ledger time is past the voucher's expiry. The issuing merchant can push the expiry later with `extend_voucher_expiry()`. The value itself is not automatically reclaimed or reissued once a voucher expires; the voucher simply stops being redeemable. There is no on-chain “refund the expired amount back to merchant/treasury” flow in the contract; the unredeemed value is effectively dead credit unless a new voucher is created or a different manual process handles it.
 
 #### Policy inheritance and merchant ancestry
 
@@ -1169,6 +1180,25 @@ The same logic applies in every code path that processes a refund: `process_refu
 | `CoreError::InvalidAmount` | `1` | `amount` ≤ 0 for deposit/withdraw, or `min_amount` < 0 for `set_min_refund_reserve` |
 | `ExtError::InsufficientRefundReserve` | `67` | Withdrawal or refund payout exceeds the current balance |
 | `ExtError::ReserveBelowMinimum` | `68` | Withdrawal would leave the balance below the admin-set minimum |
+| `CoreError::ThirdPartyReserveLocked` | `87` | Withdrawal would dip into unreleased third-party contributions |
+| `CoreError::ContributionExceeded` | `88` | `release_reserve_contribution` amount exceeds the funder's outstanding contribution |
+
+#### Third-party deposits (Issue #920)
+
+Platforms and parent merchants can fund a merchant's reserve on its behalf. Platform-funded amounts are tracked per funder and stay locked: the merchant cannot withdraw them until the admin releases them. Refund payouts may still draw on locked funds.
+
+| Function | Parameters | Returns | Auth |
+|---|---|---|---|
+| `deposit_refund_reserve_for` | `funder: Address`, `merchant: Address`, `token: Address`, `amount: i128` | `Result<i128, Error>` (new balance) | `funder` |
+| `release_reserve_contribution` | `admin: Address`, `merchant: Address`, `token: Address`, `funder: Address`, `amount: i128` | `Result<i128, Error>` (funder's remaining locked contribution) | `admin` |
+| `get_reserve_contribution` | `merchant: Address`, `token: Address`, `funder: Address` | `i128` — funder's outstanding (unreleased) contribution | — |
+| `get_locked_refund_reserve` | `merchant: Address`, `token: Address` | `i128` — `min(unreleased third-party total, balance)` | — |
+
+- **Depositing for a merchant** transfers `amount` of `token` from `funder` (not the merchant) into the contract, adds it to the merchant's reserve, and adds it to `funder`'s contribution. `amount` must be positive (`InvalidAmount`, 1). Honours the global pause and the `deposit_refund_reserve_for` function pause. A first third-party deposit opts the merchant into the reserve for that token, exactly like `deposit_refund_reserve`.
+- **Withdrawal lock.** `withdraw_refund_reserve` fails with `ThirdPartyReserveLocked` (87) if the balance left behind would fall below `get_locked_refund_reserve`. Only the merchant's own deposits (and released contributions) are withdrawable.
+- **Releasing.** `release_reserve_contribution` reduces the funder's contribution and the locked total by `amount`, making that much withdrawable by the merchant. Fails with `Unauthorized` (3) for non-admins, `InvalidAmount` (1) for `amount <= 0`, and `ContributionExceeded` (88) if `amount` is more than the funder's outstanding contribution.
+- **Refunds and the lock.** Payouts draw the whole reserve, including locked funds. The locked amount is capped at the current balance, so once refunds have consumed the reserve below the locked total the merchant has nothing withdrawable until the reserve is topped up or the admin releases contributions.
+- **Low-reserve alert.** Third-party deposits go through the same balance update as merchant deposits, so a top-up that lifts the reserve back to or above its warning level re-arms `RefundReserveLow`; the next drop below fires it again.
 
 ### Payment Refund Caps
 
@@ -1265,6 +1295,8 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundReserveWithdrawn` | `refund_reserve_withdrawn` | `merchant`, `token`, `amount`, `new_balance` | `withdraw_refund_reserve()` removes funds from the merchant's reserve |
 | `RefundReserveDebited` | `refund_reserve_debited` | `merchant`, `token`, `refund_id`, `amount`, `new_balance` | `process_refund()` (and batch/auto/appeal paths) debits the merchant's reserve to fund a payout |
 | `MinRefundReserveSet` | `min_refund_reserve_set` | `merchant`, `token`, `min_amount` | `set_min_refund_reserve()` establishes or updates the withdrawal floor |
+| `RefundReserveDepositedFor` | `refund_reserve_deposited_for` | `funder`, `merchant`, `token`, `amount`, `new_balance` | `deposit_refund_reserve_for()` adds third-party funds to the merchant's reserve (#920) |
+| `ReserveContributionReleased` | `reserve_contribution_released` | `funder`, `merchant`, `token`, `amount`, `remaining_contribution` | `release_reserve_contribution()` unlocks part of a funder's contribution (#920) |
 
 ### Voucher Events
 

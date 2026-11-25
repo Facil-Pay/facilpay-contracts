@@ -122,6 +122,10 @@ pub enum ArbitrationKey {
     ArbitratorSpecializations(Address),
     SpecializedArbitrators(RefundReasonCode, u64),
     SpecializedArbitratorCount(RefundReasonCode),
+    // Issue #908: arbitrator bonds slashed for missed votes
+    ArbitratorBondConfig,
+    ArbitratorBond(Address),
+    SlashedBondTreasury(Address),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -226,18 +230,12 @@ pub enum VoucherKey {
     // Absent until the first partial redemption; the voucher's full `amount`
     // is the balance until then.
     RemainingBalance(u64),
-    // Issue #914: present while a voucher's remaining balance is counted in its
-    // (merchant, token) outstanding liability. Vouchers issued before liability
-    // tracking existed never carry it, so releasing them is a no-op.
-    LiabilityTracked(u64),
-    // Issue #914: outstanding (unredeemed, unexpired) voucher value per (merchant, token).
-    OutstandingLiability(Address, Address),
-    // Issue #914: admin-set cap on outstanding voucher value per (merchant, token).
-    LiabilityCap(Address, Address),
-    // Issue #914: present (true) once an admin has revoked the voucher.
+    // Issue #912: present (true) once a voucher has been revoked.
     Revoked(u64),
-    // Issue #910: id of the voucher a consumed source voucher was merged into.
-    MergedInto(u64),
+    // Issue #912: remaining balance above which revocation needs admin co-approval.
+    RevokeApprovalThreshold,
+    // Issue #912: present (true) once the admin co-approved a voucher's revocation.
+    RevocationApproved(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -322,15 +320,11 @@ pub enum CoreError {
     VoucherMinPurchaseNotMet = 85,
     // Issue #802: message thread on refund requests — per-refund cap reached
     RefundMessageLimitReached = 86,
-    // Issue #915: another request for the payment is still open
-    OpenRefundRequestExists = 87,
-    // Issue #914: outstanding voucher liability cap
-    VoucherLiabilityCapExceeded = 88,
-    VoucherRevoked = 89,
-    VoucherNotExpired = 90,
-    // Issue #910: voucher merging
-    InvalidVoucherMerge = 91,
-    VoucherMergeMismatch = 92,
+    // Issue #908: arbitrator bonds
+    ArbitratorBondNotConfigured = 87,
+    ArbitratorNotBonded = 88,
+    ArbitratorHasOpenCases = 89,
+    ArbitratorBondAlreadyPosted = 90,
 }
 
 #[contracterror]
@@ -408,6 +402,13 @@ pub enum ExtError {
     ProcessingDeadlineNotConfigured = 83,
     // Refund sync to payment contract
     RefundAlreadySynced = 84,
+    // Arbitrator case load
+    ArbitratorAtCapacity = 87,
+    // Evidence deadline
+    EvidenceDeadlinePassed = 88,
+    EvidenceDeadlineNotReached = 89,
+    // Appeal withdrawal
+    AppealNotPending = 90,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -779,6 +780,7 @@ pub struct CounterOffer {
     pub refund_id: u64,
     pub merchant: Address,
     pub amount: i128,
+    pub voucher_bps: u32, // Basis points of amount to pay as store credit voucher
     pub offered_at: u64,
     pub expires_at: u64,
 }
@@ -800,6 +802,8 @@ pub struct CounterOfferAccepted {
     pub customer: Address,
     pub requested_amount: i128,
     pub accepted_amount: i128,
+    pub voucher_amount: i128,
+    pub token_amount: i128,
 }
 
 // Issue #813: customer rejection of a counter-offer
@@ -849,6 +853,42 @@ pub struct VoucherAmountRedeemed {
     pub customer: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+// Issue #911: merchant-extended voucher expiry
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherExpiryExtended {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub old_expires_at: u64,
+    pub new_expires_at: u64,
+}
+
+// Issue #912: voucher revocation
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevoked {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub customer: Address,
+    pub revoked_amount: i128,
+    pub returned_to_reserve: bool,
+    pub reason_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevocationApproved {
+    pub voucher_id: u64,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevokeThresholdSet {
+    pub threshold: i128,
+    pub admin: Address,
 }
 
 // Issue #806: bulk promotional voucher issuance
@@ -1047,6 +1087,8 @@ pub struct Refund {
     pub appeal_deadline: Option<u64>,
     // Issue #199: TTL expiry
     pub expires_at: Option<u64>,
+    // Partial refund with voucher: basis points of refund to pay as voucher (0-10000)
+    pub voucher_bps: u32,
 }
 
 #[derive(Clone)]
@@ -1120,6 +1162,65 @@ pub struct ArbitrationCase {
     pub fee_pool: i128,
     pub timeout_at: u64,
     pub default_favor_customer: bool,
+    // Evidence deadline: timestamp after which evidence is rejected
+    pub evidence_deadline: u64,
+    // Tracks whether both parties have waived the evidence deadline
+    pub evidence_waived: bool,
+}
+
+/// Admin-set arbitrator bond requirement (#908). While configured, only
+/// arbitrators holding a bond of at least `amount` in `token` are assignable.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ArbitratorBondConfig {
+    pub token: Address,
+    pub amount: i128,
+    /// Share of a non-voter's bond slashed on arbitration timeout, in bps.
+    pub slash_bps: u32,
+}
+
+/// A bond posted by an arbitrator (#908).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct ArbitratorBond {
+    pub token: Address,
+    pub amount: i128,
+    pub posted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorBondConfigured {
+    pub token: Address,
+    pub amount: i128,
+    pub slash_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorBondPosted {
+    pub arbitrator: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub total: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorBondSlashed {
+    pub case_id: u64,
+    pub arbitrator: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub remaining: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorBondWithdrawn {
+    pub arbitrator: Address,
+    pub token: Address,
+    pub amount: i128,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1658,11 +1759,8 @@ pub enum RefundExtKey {
     PaymentSynced(u64),
     // Issue #801: per-merchant minimum purchase amount required to redeem a voucher.
     MerchantVoucherMinPurchase(Address),
-    // Per-merchant customer trust score boost configuration.
+    // Per-merchant trust-score refund boost configuration.
     TrustBoostConfig(Address),
-    // Issue #915: present (true) while a merchant allows only one open refund
-    // request per payment.
-    SingleOpenRequest(Address),
 }
 
 // Issue #807: emitted when a merchant sets a category refund percentage cap.
@@ -1903,6 +2001,29 @@ pub struct RefundReserveDeposited {
     pub new_balance: i128,
 }
 
+/// Event emitted when a third party tops up a merchant's refund reserve (#920).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundReserveDepositedFor {
+    pub funder: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub new_balance: i128,
+}
+
+/// Event emitted when the admin releases a third-party reserve contribution
+/// so the merchant may withdraw it (#920).
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReserveContributionReleased {
+    pub funder: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub remaining_contribution: i128,
+}
+
 /// Event emitted when a merchant withdraws from its refund reserve.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1942,6 +2063,60 @@ pub struct RefundReserveLow {
     pub token: Address,
     pub balance: i128,
     pub warning_level: i128,
+}
+
+// ── New feature events ─────────────────────────────────────────────────────
+
+/// Event emitted when admin sets max active cases per arbitrator
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxActiveCasesSet {
+    pub admin: Address,
+    pub max_cases: u32,
+}
+
+/// Event emitted when an arbitrator's open case count changes
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorOpenCaseCountUpdated {
+    pub arbitrator: Address,
+    pub case_count: u32,
+}
+
+/// Event emitted when a customer withdraws their appeal
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealWithdrawn {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub customer: Address,
+    pub withdrawn_at: u64,
+}
+
+/// Event emitted when evidence deadline config is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineConfigUpdated {
+    pub admin: Address,
+    pub deadline_seconds: u64,
+}
+
+/// Event emitted when evidence is rejected due to deadline
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRejectedDueToDeadline {
+    pub case_id: u64,
+    pub submitter: Address,
+    pub submitted_at: u64,
+    pub deadline: u64,
+}
+
+/// Event emitted when both parties waive the evidence deadline
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineWaived {
+    pub case_id: u64,
+    pub waived_at: u64,
 }
 
 /// Event emitted when the admin sets a merchant's minimum refund reserve.
@@ -3085,6 +3260,177 @@ impl RefundContract {
         Ok(new_balance)
     }
 
+    /// Deposit tokens into `merchant`'s refund reserve on its behalf (#920).
+    ///
+    /// Tokens are transferred from `funder`, who must authenticate. The amount
+    /// is recorded as `funder`'s contribution and stays locked in the reserve:
+    /// the merchant cannot withdraw it until the admin releases it with
+    /// `release_reserve_contribution`. Refunds may still draw on it.
+    ///
+    /// # Returns
+    /// The reserve balance after the deposit.
+    ///
+    /// # Errors
+    /// Returns `InvalidAmount` if `amount` is not positive or a total overflows.
+    pub fn deposit_refund_reserve_for(
+        env: Env,
+        funder: Address,
+        merchant: Address,
+        token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "deposit_refund_reserve_for")?;
+        funder.require_auth();
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+
+        token::Client::new(&env, &token).transfer(&funder, env.current_contract_address(), &amount);
+
+        let new_balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone())
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+
+        let contribution_key = RefundExtKey::ReserveFunderContribution(
+            merchant.clone(),
+            token.clone(),
+            funder.clone(),
+        );
+        let contribution: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+        let contribution = contribution
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+        let total_key = RefundExtKey::ReserveThirdPartyTotal(merchant.clone(), token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let total = total
+            .checked_add(amount)
+            .ok_or(Error::Core(CoreError::InvalidAmount))?;
+
+        env.storage()
+            .persistent()
+            .set(&contribution_key, &contribution);
+        Self::extend_refund_ext_ttl(&env, &contribution_key);
+        env.storage().persistent().set(&total_key, &total);
+        Self::extend_refund_ext_ttl(&env, &total_key);
+
+        // Goes through set_refund_reserve so the low-reserve alert re-arms.
+        Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+
+        (RefundReserveDepositedFor {
+            funder,
+            merchant,
+            token,
+            amount,
+            new_balance,
+        })
+        .publish(&env);
+
+        Ok(new_balance)
+    }
+
+    /// Release up to `amount` of `funder`'s contribution to `merchant`'s
+    /// reserve so the merchant may withdraw it (#920). Admin-only.
+    ///
+    /// # Returns
+    /// The funder's remaining locked contribution.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the admin.
+    /// Returns `InvalidAmount` if `amount` is not positive.
+    /// Returns `ContributionExceeded` if `amount` exceeds the contribution.
+    pub fn release_reserve_contribution(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        funder: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        let contribution_key = RefundExtKey::ReserveFunderContribution(
+            merchant.clone(),
+            token.clone(),
+            funder.clone(),
+        );
+        let contribution: i128 = env
+            .storage()
+            .persistent()
+            .get(&contribution_key)
+            .unwrap_or(0);
+        if amount > contribution {
+            return Err(Error::Core(CoreError::ContributionExceeded));
+        }
+        let remaining = contribution - amount;
+        let total_key = RefundExtKey::ReserveThirdPartyTotal(merchant.clone(), token.clone());
+        let total: i128 = env.storage().persistent().get(&total_key).unwrap_or(0);
+        let new_total = total.saturating_sub(amount).max(0);
+
+        if remaining == 0 {
+            env.storage().persistent().remove(&contribution_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&contribution_key, &remaining);
+            Self::extend_refund_ext_ttl(&env, &contribution_key);
+        }
+        if new_total == 0 {
+            env.storage().persistent().remove(&total_key);
+        } else {
+            env.storage().persistent().set(&total_key, &new_total);
+            Self::extend_refund_ext_ttl(&env, &total_key);
+        }
+
+        (ReserveContributionReleased {
+            funder,
+            merchant,
+            token,
+            amount,
+            remaining_contribution: remaining,
+        })
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
+    /// Outstanding (unreleased) contribution `funder` has made to
+    /// `merchant`'s reserve for `token` (0 if none) (#920).
+    pub fn get_reserve_contribution(
+        env: Env,
+        merchant: Address,
+        token: Address,
+        funder: Address,
+    ) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&RefundExtKey::ReserveFunderContribution(
+                merchant, token, funder,
+            ))
+            .unwrap_or(0)
+    }
+
+    /// Portion of `merchant`'s reserve for `token` the merchant cannot
+    /// withdraw: the unreleased third-party total, capped at the current
+    /// balance since refunds may draw it down (#920).
+    pub fn get_locked_refund_reserve(env: Env, merchant: Address, token: Address) -> i128 {
+        let total: i128 = env
+            .storage()
+            .persistent()
+            .get(&RefundExtKey::ReserveThirdPartyTotal(
+                merchant.clone(),
+                token.clone(),
+            ))
+            .unwrap_or(0);
+        let balance = Self::get_refund_reserve(env, merchant, token);
+        core::cmp::min(total, balance).max(0)
+    }
+
     /// Withdraw tokens from the merchant's refund reserve. The balance left
     /// behind may not drop below the admin-set minimum for that token.
     ///
@@ -3095,6 +3441,8 @@ impl RefundContract {
     /// Returns `InvalidAmount` if `amount` is not positive.
     /// Returns `InsufficientRefundReserve` if `amount` exceeds the balance.
     /// Returns `ReserveBelowMinimum` if the withdrawal breaches the minimum.
+    /// Returns `ThirdPartyReserveLocked` if the withdrawal would dip into
+    /// unreleased third-party contributions (#920).
     pub fn withdraw_refund_reserve(
         env: Env,
         merchant: Address,
@@ -3115,6 +3463,11 @@ impl RefundContract {
         let min_amount = Self::get_min_refund_reserve(env.clone(), merchant.clone(), token.clone());
         if new_balance < min_amount {
             return Err(Error::Ext(ExtError::ReserveBelowMinimum));
+        }
+        // Issue #920: platform-funded amounts stay locked until the admin releases them.
+        let locked = Self::get_locked_refund_reserve(env.clone(), merchant.clone(), token.clone());
+        if new_balance < locked {
+            return Err(Error::Core(CoreError::ThirdPartyReserveLocked));
         }
 
         // Issue #647: Extend TTL on persistent entry reads (if they exist)
@@ -3609,6 +3962,9 @@ impl RefundContract {
         }
         if !Self::is_arbitrator_available_inner(&env, &arbitrator) {
             return Err(Error::Ext(ExtError::ArbitratorUnavailable));
+        }
+        if !Self::is_arbitrator_bonded(&env, &arbitrator) {
+            return Err(Error::Core(CoreError::ArbitratorNotBonded));
         }
 
         if !case.arbitrators.contains(&arbitrator) {
@@ -4342,6 +4698,9 @@ impl RefundContract {
             .instance()
             .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
 
+        // Issue #908: penalize assigned arbitrators who never voted.
+        Self::slash_non_voting_arbitrators(&env, case_id, &case.arbitrators);
+
         if approved {
             let mut refund: Refund = env
                 .storage()
@@ -4378,6 +4737,175 @@ impl RefundContract {
         ArbitrationCaseDecided { case_id, approved }.publish(&env);
 
         Ok(())
+    }
+
+    /// Configures the arbitrator bond requirement (#908). Pass `amount = 0` to
+    /// disable bonding; existing bonds stay withdrawable.
+    ///
+    /// # Errors
+    /// `Unauthorized` if `admin` is not the contract admin; `InvalidAmount` if
+    /// `amount` is negative or `slash_bps` exceeds 10 000.
+    pub fn set_arbitrator_bond(
+        env: Env,
+        admin: Address,
+        token: Address,
+        amount: i128,
+        slash_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount < 0 || slash_bps > 10_000 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        if amount == 0 {
+            env.storage()
+                .instance()
+                .remove(&ArbitrationKey::ArbitratorBondConfig);
+        } else {
+            env.storage().instance().set(
+                &ArbitrationKey::ArbitratorBondConfig,
+                &ArbitratorBondConfig {
+                    token: token.clone(),
+                    amount,
+                    slash_bps,
+                },
+            );
+        }
+        ArbitratorBondConfigured {
+            token,
+            amount,
+            slash_bps,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the arbitrator bond configuration, or `None` when bonding is disabled.
+    pub fn get_arbitrator_bond_config(env: Env) -> Option<ArbitratorBondConfig> {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorBondConfig)
+    }
+
+    /// Posts (or tops up) the caller's bond up to the configured amount (#908).
+    /// Transfers only the shortfall from `arbitrator` into the contract.
+    ///
+    /// # Errors
+    /// `NotArbitrator` if not registered; `ArbitratorBondNotConfigured` if
+    /// bonding is disabled; `ArbitratorBondAlreadyPosted` if the bond already
+    /// meets the requirement or is held in a different token.
+    pub fn post_arbitrator_bond(env: Env, arbitrator: Address) -> Result<i128, Error> {
+        arbitrator.require_auth();
+        if !Self::is_registered_arbitrator(&env, &arbitrator) {
+            return Err(Error::Core(CoreError::NotArbitrator));
+        }
+        let config: ArbitratorBondConfig = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorBondConfig)
+            .ok_or(Error::Core(CoreError::ArbitratorBondNotConfigured))?;
+        let key = ArbitrationKey::ArbitratorBond(arbitrator.clone());
+        let existing: Option<ArbitratorBond> = env.storage().instance().get(&key);
+        let held = match &existing {
+            Some(b) if b.token != config.token => {
+                return Err(Error::Core(CoreError::ArbitratorBondAlreadyPosted))
+            }
+            Some(b) => b.amount,
+            None => 0,
+        };
+        let shortfall = config.amount - held;
+        if shortfall <= 0 {
+            return Err(Error::Core(CoreError::ArbitratorBondAlreadyPosted));
+        }
+        token::Client::new(&env, &config.token).transfer(
+            &arbitrator,
+            env.current_contract_address(),
+            &shortfall,
+        );
+        let bond = ArbitratorBond {
+            token: config.token.clone(),
+            amount: config.amount,
+            posted_at: env.ledger().timestamp(),
+        };
+        env.storage().instance().set(&key, &bond);
+        ArbitratorBondPosted {
+            arbitrator,
+            token: config.token,
+            amount: shortfall,
+            total: bond.amount,
+        }
+        .publish(&env);
+        Ok(bond.amount)
+    }
+
+    /// Withdraws the caller's full remaining bond (#908). Only allowed while
+    /// the arbitrator is not assigned to any open arbitration case.
+    ///
+    /// # Errors
+    /// `ArbitratorNotBonded` if no bond is held; `ArbitratorHasOpenCases` if the
+    /// arbitrator is assigned to an open case.
+    pub fn withdraw_arbitrator_bond(env: Env, arbitrator: Address) -> Result<i128, Error> {
+        arbitrator.require_auth();
+        let key = ArbitrationKey::ArbitratorBond(arbitrator.clone());
+        let bond: ArbitratorBond = env
+            .storage()
+            .instance()
+            .get(&key)
+            .ok_or(Error::Core(CoreError::ArbitratorNotBonded))?;
+        if Self::arbitrator_has_open_cases(&env, &arbitrator) {
+            return Err(Error::Core(CoreError::ArbitratorHasOpenCases));
+        }
+        env.storage().instance().remove(&key);
+        if bond.amount > 0 {
+            token::Client::new(&env, &bond.token).transfer(
+                &env.current_contract_address(),
+                &arbitrator,
+                &bond.amount,
+            );
+        }
+        ArbitratorBondWithdrawn {
+            arbitrator,
+            token: bond.token,
+            amount: bond.amount,
+        }
+        .publish(&env);
+        Ok(bond.amount)
+    }
+
+    /// Returns an arbitrator's bond, if any (#908).
+    pub fn get_arbitrator_bond(env: Env, arbitrator: Address) -> Option<ArbitratorBond> {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorBond(arbitrator))
+    }
+
+    /// Returns slashed bond funds held for the treasury in `token` (#908).
+    pub fn get_slashed_bond_balance(env: Env, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ArbitrationKey::SlashedBondTreasury(token))
+            .unwrap_or(0)
+    }
+
+    /// Transfers all slashed bond funds in `token` to `to` (#908).
+    ///
+    /// # Errors
+    /// `Unauthorized` if `admin` is not the contract admin;
+    /// `InsufficientTreasuryFees` if nothing has been slashed in `token`.
+    pub fn withdraw_slashed_bonds(
+        env: Env,
+        admin: Address,
+        token: Address,
+        to: Address,
+    ) -> Result<i128, Error> {
+        Self::require_admin(&env, &admin)?;
+        let key = ArbitrationKey::SlashedBondTreasury(token.clone());
+        let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        if balance <= 0 {
+            return Err(Error::Core(CoreError::InsufficientTreasuryFees));
+        }
+        env.storage().instance().remove(&key);
+        token::Client::new(&env, &token).transfer(&env.current_contract_address(), &to, &balance);
+        Ok(balance)
     }
 
     /// Set the processing deadline for approved refunds.
@@ -8055,11 +8583,102 @@ impl RefundContract {
             .unwrap_or(Vec::new(env));
         let mut available = Vec::new(env);
         for a in all.iter() {
-            if Self::is_arbitrator_available_inner(env, &a) {
+            if Self::is_arbitrator_available_inner(env, &a) && Self::is_arbitrator_bonded(env, &a) {
                 available.push_back(a);
             }
         }
         available
+    }
+
+    /// True when bonding is disabled, or the arbitrator holds a bond meeting
+    /// the configured token and amount (#908).
+    fn is_arbitrator_bonded(env: &Env, arbitrator: &Address) -> bool {
+        let config: Option<ArbitratorBondConfig> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorBondConfig);
+        let Some(config) = config else {
+            return true;
+        };
+        env.storage()
+            .instance()
+            .get::<ArbitrationKey, ArbitratorBond>(&ArbitrationKey::ArbitratorBond(
+                arbitrator.clone(),
+            ))
+            .map(|b| b.token == config.token && b.amount >= config.amount)
+            .unwrap_or(false)
+    }
+
+    /// Slashes `slash_bps` of each assigned arbitrator's bond who did not vote
+    /// on `case_id`, moving it to the slashed-bond treasury (#908).
+    fn slash_non_voting_arbitrators(env: &Env, case_id: u64, arbitrators: &Vec<Address>) {
+        let config: Option<ArbitratorBondConfig> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitratorBondConfig);
+        let Some(config) = config else {
+            return;
+        };
+        if config.slash_bps == 0 {
+            return;
+        }
+        for arbitrator in arbitrators.iter() {
+            if env
+                .storage()
+                .instance()
+                .has(&ArbitrationKey::ArbitratorVote(case_id, arbitrator.clone()))
+            {
+                continue;
+            }
+            let bond_key = ArbitrationKey::ArbitratorBond(arbitrator.clone());
+            let Some(mut bond) = env
+                .storage()
+                .instance()
+                .get::<ArbitrationKey, ArbitratorBond>(&bond_key)
+            else {
+                continue;
+            };
+            let slash = bond.amount.saturating_mul(config.slash_bps as i128) / 10_000;
+            if slash <= 0 {
+                continue;
+            }
+            bond.amount -= slash;
+            env.storage().instance().set(&bond_key, &bond);
+            let treasury_key = ArbitrationKey::SlashedBondTreasury(bond.token.clone());
+            let balance: i128 = env.storage().instance().get(&treasury_key).unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&treasury_key, &balance.saturating_add(slash));
+            ArbitratorBondSlashed {
+                case_id,
+                arbitrator: arbitrator.clone(),
+                token: bond.token.clone(),
+                amount: slash,
+                remaining: bond.amount,
+            }
+            .publish(env);
+        }
+    }
+
+    /// True when `arbitrator` is assigned to any `Open` arbitration case (#908).
+    fn arbitrator_has_open_cases(env: &Env, arbitrator: &Address) -> bool {
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCounter)
+            .unwrap_or(0);
+        for case_id in 1..=counter {
+            if let Some(case) = env
+                .storage()
+                .instance()
+                .get::<ArbitrationKey, ArbitrationCase>(&ArbitrationKey::ArbitrationCase(case_id))
+            {
+                if case.status == ArbitrationStatus::Open && case.arbitrators.contains(arbitrator) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn set_arbitrator_availability_inner(
@@ -8999,6 +9618,48 @@ impl RefundContract {
             }
         }
 
+        results
+    }
+
+    /// Get a customer's refunds in `status`, newest-first (#913).
+    ///
+    /// Pagination matches `get_customer_refund_history`: `offset` skips that
+    /// many matching refunds and at most `limit` are returned. A `limit` of 0
+    /// returns an empty list.
+    pub fn get_customer_refunds_by_status(
+        env: Env,
+        customer: Address,
+        status: RefundStatus,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<Refund> {
+        let mut results: Vec<Refund> = Vec::new(&env);
+        if limit == 0 {
+            return results;
+        }
+        let mut index = Self::get_customer_refund_count(&env, &customer);
+        let mut skipped = 0u64;
+        while index > 0 && (results.len() as u64) < limit {
+            index -= 1;
+            let Some(refund_id) = Self::get_customer_refund_id_at(&env, &customer, index) else {
+                continue;
+            };
+            let Some(refund) = env
+                .storage()
+                .instance()
+                .get::<_, Refund>(&DataKey::Refund(refund_id))
+            else {
+                continue;
+            };
+            if refund.status != status {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            results.push_back(refund);
+        }
         results
     }
 
@@ -11480,6 +12141,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has already been used.
     /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
@@ -11501,6 +12163,9 @@ impl RefundContract {
 
         if voucher.customer != customer {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -11565,6 +12230,7 @@ impl RefundContract {
     /// Returns `InvalidAmount` if `amount` is zero or negative.
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
     /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
@@ -11590,6 +12256,9 @@ impl RefundContract {
 
         if voucher.customer != customer {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -11715,6 +12384,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller does not own the voucher.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been redeemed.
     /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
@@ -11737,6 +12407,9 @@ impl RefundContract {
 
         if voucher.customer != owner {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -11816,6 +12489,260 @@ impl RefundContract {
         !env.storage()
             .instance()
             .has(&VoucherKey::NonTransferable(voucher_id))
+    }
+
+    // ── Issue #911: Merchant-extended voucher expiry ─────────────────────
+
+    /// Move an unredeemed voucher's expiry later.
+    ///
+    /// Lets the issuing merchant give customers more time to use a voucher,
+    /// including one that has already expired. Expiry can only move later.
+    /// Emits `VoucherExpiryExtended`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The voucher's issuing merchant (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to extend.
+    /// * `new_expires_at` - The new expiry timestamp; must be later than the
+    ///   voucher's current `expires_at`.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if `merchant` did not issue the voucher.
+    /// Returns `VoucherRevoked` if the voucher was revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `InvalidVoucherExpiry` if `new_expires_at` is not later than the
+    /// current expiry.
+    pub fn extend_voucher_expiry(
+        env: Env,
+        merchant: Address,
+        voucher_id: u64,
+        new_expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "extend_voucher_expiry")?;
+        merchant.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if new_expires_at <= voucher.expires_at {
+            return Err(Error::Core(CoreError::InvalidVoucherExpiry));
+        }
+
+        let old_expires_at = voucher.expires_at;
+        voucher.expires_at = new_expires_at;
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+
+        VoucherExpiryExtended {
+            voucher_id,
+            merchant,
+            old_expires_at,
+            new_expires_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── Issue #912: Voucher revocation ────────────────────────────────────
+
+    /// Set the remaining-balance threshold above which revoking a voucher
+    /// needs admin co-approval. `0` (the default) means no revocation needs
+    /// co-approval. Emits `VoucherRevokeThresholdSet`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `threshold` - The threshold amount; must not be negative.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `threshold` is negative.
+    pub fn set_voucher_revoke_threshold(
+        env: Env,
+        admin: Address,
+        threshold: i128,
+    ) -> Result<(), Error> {
+        Self::require_voucher_admin(&env, &admin)?;
+        if threshold < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&VoucherKey::RevokeApprovalThreshold, &threshold);
+
+        VoucherRevokeThresholdSet { threshold, admin }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the revocation co-approval threshold (`0` if none is set).
+    pub fn get_voucher_revoke_threshold(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::RevokeApprovalThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Co-approve the revocation of a voucher whose remaining balance is above
+    /// the revocation threshold. The merchant then calls `revoke_voucher`.
+    /// Emits `VoucherRevocationApproved`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to approve for revocation.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `VoucherRevoked` if the voucher was already revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    pub fn approve_voucher_revocation(
+        env: Env,
+        admin: Address,
+        voucher_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_voucher_admin(&env, &admin)?;
+
+        let voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+
+        env.storage()
+            .instance()
+            .set(&VoucherKey::RevocationApproved(voucher_id), &true);
+
+        VoucherRevocationApproved { voucher_id, admin }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Revoke a voucher's remaining balance so it can no longer be redeemed
+    /// or transferred.
+    ///
+    /// Only the remaining balance is revoked, so amounts already paid out by
+    /// partial redemptions are unaffected. Promotional vouchers (funded from
+    /// the merchant's refund reserve, `refund_id == 0`) return their remaining
+    /// balance to the reserve for the voucher's token. When the remaining
+    /// balance is above `get_voucher_revoke_threshold` (and the threshold is
+    /// non-zero), the admin must first call `approve_voucher_revocation`.
+    /// Emits `VoucherRevoked`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The voucher's issuing merchant (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to revoke.
+    /// * `reason_hash` - Hash of the off-chain revocation reason.
+    ///
+    /// # Returns
+    /// The revoked (remaining) amount.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if `merchant` did not issue the voucher.
+    /// Returns `VoucherRevoked` if the voucher was already revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `VoucherRevocationNeedsApproval` if the remaining balance is
+    /// above the threshold and the admin has not co-approved.
+    pub fn revoke_voucher(
+        env: Env,
+        merchant: Address,
+        voucher_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "revoke_voucher")?;
+        merchant.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+
+        let remaining = Self::voucher_balance(&env, &voucher);
+        let threshold = Self::get_voucher_revoke_threshold(env.clone());
+        let approval_key = VoucherKey::RevocationApproved(voucher_id);
+        let approved = env.storage().instance().has(&approval_key);
+        if threshold > 0 && remaining > threshold && !approved {
+            return Err(Error::Core(CoreError::VoucherRevocationNeedsApproval));
+        }
+
+        // Promotional vouchers were debited from the merchant's reserve at
+        // issuance; hand the unredeemed part back.
+        let returned_to_reserve = voucher.refund_id == 0;
+        if returned_to_reserve && remaining > 0 {
+            let token = voucher.token.clone();
+            let reserve_key = RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone());
+            let reserve_balance =
+                Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone());
+            let new_balance = reserve_balance
+                .checked_add(remaining)
+                .ok_or(Error::Core(CoreError::InvalidAmount))?;
+            if env.storage().persistent().has(&reserve_key) {
+                Self::extend_refund_ext_ttl(&env, &reserve_key);
+            }
+            Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+        }
+
+        voucher.redeemed = true;
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+        env.storage()
+            .instance()
+            .remove(&VoucherKey::RemainingBalance(voucher_id));
+        env.storage().instance().remove(&approval_key);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Revoked(voucher_id), &true);
+
+        VoucherRevoked {
+            voucher_id,
+            merchant,
+            customer: voucher.customer,
+            revoked_amount: remaining,
+            returned_to_reserve,
+            reason_hash,
+        }
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
+    /// Whether a voucher has been revoked.
+    pub fn is_voucher_revoked(env: Env, voucher_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .has(&VoucherKey::Revoked(voucher_id))
     }
 
     // ── Issue #806: Bulk promotional voucher issuance ─────────────────────
@@ -12665,6 +13592,19 @@ impl RefundContract {
             .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
     }
 
+    fn require_voucher_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if *admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        Ok(())
+    }
+
     fn voucher_balance(env: &Env, voucher: &RefundVoucher) -> i128 {
         if voucher.redeemed
             || env
@@ -13048,6 +13988,9 @@ mod test_notification_hooks;
 mod test_arbitration_timeout;
 
 #[cfg(test)]
+mod test_arbitrator_bond;
+
+#[cfg(test)]
 mod test_merchant_eligibility;
 
 #[cfg(test)]
@@ -13100,6 +14043,12 @@ mod test_upgrade;
 
 #[cfg(test)]
 mod test_refund_reserve;
+
+#[cfg(test)]
+mod test_third_party_reserve;
+
+#[cfg(test)]
+mod test_customer_refunds_by_status;
 
 #[cfg(test)]
 mod test_multi_token_arbitrator;

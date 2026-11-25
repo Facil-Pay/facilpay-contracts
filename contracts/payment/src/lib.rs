@@ -55,6 +55,8 @@ pub enum ConfigKey {
     RefundContract,
     // Issue #772: configurable batch size limit for recurring payments
     RecurringPaymentBatchLimit,
+    // Issue #903: cap on open payment requests per (merchant, customer)
+    MaxOpenRequests,
 }
 
 #[derive(Clone)]
@@ -85,11 +87,16 @@ pub enum PaymentKey {
     // Issue #662: merchant-initiated payment requests
     RequestCounter,
     Request(u64),
+    // Issue #903: ids of open payment requests per (merchant, customer)
+    OpenRequests(Address, Address),
     // Issue #809: refund-contract refund ids already applied to a payment
     RefundSynced(u64),
     // Reusable merchant payment links
     PaymentLinkCounter,
     PaymentLink(u64),
+    // Issue #904: per-link revenue stats and payer-seen markers
+    PaymentLinkStats(u64),
+    PaymentLinkPayer(u64, Address),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -123,6 +130,8 @@ pub enum SubscriptionKey {
     // Issue #753: seat-based subscriptions
     Seats(u64),
     SeatCredit(u64),
+    // Issue #902: merchant-set min/max seat bounds
+    SeatBounds(u64),
     // Issue #770: churn reason recorded on cancellation
     CancellationReason(u64),
 }
@@ -299,6 +308,11 @@ pub enum SubscriptionError {
     // Subscription transfers
     SubscriptionNotTransferable = 329,
     InvalidTransferRecipient = 330,
+    // Issue #906: price lock and price proposals
+    PriceLocked = 331,
+    PriceProposalNotFound = 332,
+    PriceProposalExpired = 333,
+    InvalidPriceLock = 334,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -370,9 +384,9 @@ pub enum FeatureError {
     // Issue #767: auto-complete escrowed payment after confirmation timeout
     NoConfirmationTimeout = 546,
     ConfirmationTimeoutNotExpired = 547,
-    // Issue #901: rolling reserve on merchant payouts
-    InvalidRollingReserve = 548,
-    NoReleasableReserve = 549,
+    // Issue #900: partial payments on payment requests
+    RequestOverpayment = 548,
+    PartialPaymentNotAllowed = 549,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -428,7 +442,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=330).contains(&code) {
+            if (300..=334).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
@@ -527,13 +541,8 @@ pub enum MerchantDataKey {
     ChurnCount(Address, u32),
     // Issue #765: per-day merchant settlement bucket
     DailySettlement(Address, u64),
-    // Issue #901: rolling reserve config, held slices (merchant, index) with a
-    // head/count cursor, and the total currently held per (merchant, token).
-    RollingReserveConfig(Address),
-    RollingReserveSlice(Address, u64),
-    RollingReserveHead(Address),
-    RollingReserveCount(Address),
-    RollingReserveHeld(Address, Address),
+    // Issue #906: price lock for subscriptions created before a cutoff
+    PriceLock(Address),
 }
 
 // State and proposal data keys
@@ -775,6 +784,17 @@ pub struct Subscription {
 pub struct SubscriptionPriceProposal {
     pub new_amount: i128,
     pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
+    /// Set by `accept_subscription_price`; only accepted proposals are applied.
+    pub accepted: bool,
+}
+
+/// Merchant-level price lock (#906): subscriptions created before
+/// `created_before` keep their price until `lock_until`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MerchantPriceLock {
+    pub created_before: u64,
+    pub lock_until: u64,
 }
 
 // issue #753: seat count and per-seat price of a subscription. The billed
@@ -785,6 +805,14 @@ pub struct SubscriptionPriceProposal {
 pub struct SubscriptionSeats {
     pub quantity: u32,
     pub unit_amount: i128,
+}
+
+// Issue #902: optional seat bounds on a seat-based subscription.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct SeatBounds {
+    pub min_seats: Option<u32>,
+    pub max_seats: Option<u32>,
 }
 
 /// Reason a subscription was cancelled (#770).
@@ -1200,6 +1228,34 @@ pub struct PaymentRequestCancelled {
     pub merchant: Address,
 }
 
+// Issue #900: merchant toggled partial payments on a payment request
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartialSet {
+    pub request_id: u64,
+    pub merchant: Address,
+    pub allow_partial: bool,
+}
+
+// Issue #900: a customer paid part of a payment request
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartiallyPaid {
+    pub request_id: u64,
+    pub customer: Address,
+    pub amount: i128,
+    pub paid_amount: i128,
+}
+
+// Issue #900: a partial contribution was returned when a request was cancelled
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentRequestPartialRefunded {
+    pub request_id: u64,
+    pub payer: Address,
+    pub amount: i128,
+}
+
 // Issue #669: merchant registry
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1255,6 +1311,10 @@ pub struct PaymentLinkUsed {
     pub payment_id: u64,
     pub customer: Address,
     pub usage_count: u32,
+    /// Running total collected through the link (#904).
+    pub total_collected: i128,
+    /// Running count of distinct payers (#904).
+    pub unique_payers: u32,
 }
 
 #[contractevent]
@@ -1683,6 +1743,16 @@ pub struct SubscriptionCancelUndone {
     pub subscription_id: u64,
 }
 
+// Issue #902: merchant set seat bounds on a subscription
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionSeatBoundsSet {
+    pub subscription_id: u64,
+    pub merchant: Address,
+    pub min_seats: Option<u32>,
+    pub max_seats: Option<u32>,
+}
+
 // issue #753: seat count changed mid-cycle
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1710,6 +1780,15 @@ pub struct SubscriptionPriceAccepted {
     pub subscription_id: u64,
     pub new_amount: i128,
     pub effective_from: u64,
+}
+
+// issue #906: merchant set or cleared a price lock for existing subscribers
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceLockSet {
+    pub merchant: Address,
+    pub created_before: u64,
+    pub lock_until: u64,
 }
 
 #[contractevent]
@@ -2021,6 +2100,21 @@ pub struct PaymentLink {
     pub last_used_at: Option<u64>,
 }
 
+/// Revenue stats for a payment link (#904), updated in the same call as
+/// `use_payment_link`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentLinkStats {
+    pub link_id: u64,
+    /// Number of payments created through the link.
+    pub usage_count: u32,
+    /// Sum of payment amounts created through the link, in token base units.
+    pub total_collected: i128,
+    /// Number of distinct customers that have paid through the link.
+    pub unique_payers: u32,
+    pub last_used_at: Option<u64>,
+}
+
 /// Maximum length, in bytes, of a registered merchant's display name (#669).
 pub const MAX_MERCHANT_NAME_LEN: u32 = 64;
 
@@ -2049,6 +2143,21 @@ pub struct EscrowedPayment {
     pub auto_release_on_complete: bool,
     pub confirmation_timeout_seconds: Option<u64>,
     pub created_at: u64,
+}
+
+/// Optional settings for `create_escrowed_payment_v2` (#905).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct EscrowedPaymentOptions {
+    /// Timestamp after which escrow funds can be released.
+    pub release_timestamp: u64,
+    /// Minimum seconds funds must remain in escrow.
+    pub min_hold_period: u64,
+    pub metadata: String,
+    /// Release the escrow automatically when the payment completes.
+    pub auto_release_on_complete: bool,
+    /// Seconds after creation before `auto_complete_escrowed_payment` may run.
+    pub confirmation_timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -3510,7 +3619,9 @@ impl PaymentContract {
     /// # Returns
     /// `Ok(request_id)` on success, or an error if the amount is not positive, the
     /// token is not allowed, the currency is invalid, the metadata is too large,
-    /// `expires_at` is not in the future, or the contract or merchant is paused.
+    /// `expires_at` is not in the future, the contract or merchant is paused, or
+    /// the merchant already has `get_max_open_requests` open requests for
+    /// `customer` (`OpenRequestLimitReached`, #903).
     pub fn create_payment_request(
         env: Env,
         merchant: Address,
@@ -3543,6 +3654,16 @@ impl PaymentContract {
             return Err(Error::Payment(PaymentError::RequestExpired));
         }
 
+        // Issue #903: cap open requests per (merchant, customer).
+        let mut open_requests = Vec::new(&env);
+        if let Some(c) = &customer {
+            open_requests = Self::live_open_requests(&env, &merchant, c);
+            let max_open = Self::get_max_open_requests(env.clone());
+            if max_open > 0 && open_requests.len() >= max_open {
+                return Err(Error::Feature(FeatureError::OpenRequestLimitReached));
+            }
+        }
+
         let request_id = env
             .store()
             .get::<u64>(&DataKey::Payment(PaymentKey::RequestCounter))
@@ -3565,6 +3686,13 @@ impl PaymentContract {
             .set(&DataKey::Payment(PaymentKey::Request(request_id)), &request);
         env.store()
             .set(&DataKey::Payment(PaymentKey::RequestCounter), &request_id);
+        if let Some(c) = &customer {
+            open_requests.push_back(request_id);
+            env.store().set(
+                &DataKey::Payment(PaymentKey::OpenRequests(merchant.clone(), c.clone())),
+                &open_requests,
+            );
+        }
 
         (PaymentRequestCreated {
             request_id,
@@ -3621,6 +3749,16 @@ impl PaymentContract {
             }
         }
 
+        // Issue #900: a partially paid request is settled by paying the remainder.
+        let paid_amount = Self::get_payment_request_paid_amount(env.clone(), request_id);
+        if paid_amount > 0 {
+            let remaining = request.amount - paid_amount;
+            Self::do_pay_payment_request_partial(&env, customer, request_id, remaining)?;
+            return Self::get_payment_request(env, request_id)?
+                .payment_id
+                .ok_or(Error::Payment(PaymentError::RequestNotFound));
+        }
+
         let payment_id = PaymentContract::do_create_payment(
             &env,
             customer.clone(),
@@ -3636,6 +3774,7 @@ impl PaymentContract {
         request.status = PaymentRequestStatus::Paid;
         request.payment_id = Some(payment_id);
         env.store().set(&key, &request);
+        Self::release_open_request(&env, &request);
 
         (PaymentRequestPaid {
             request_id,
@@ -3683,6 +3822,28 @@ impl PaymentContract {
 
         request.status = PaymentRequestStatus::Cancelled;
         env.store().set(&key, &request);
+        Self::release_open_request(&env, &request);
+
+        // Issue #900: return any partial payments to the payers that made them.
+        let contributions_key = DataKey::Payment(PaymentKey::RequestContributions(request_id));
+        if let Some(contributions) = env.store().get::<Map<Address, i128>>(&contributions_key) {
+            let token_client = token::Client::new(&env, &request.token);
+            let contract_address = env.current_contract_address();
+            for (payer, amount) in contributions.iter() {
+                if amount > 0 {
+                    token_client.transfer(&contract_address, &payer, &amount);
+                    (PaymentRequestPartialRefunded {
+                        request_id,
+                        payer,
+                        amount,
+                    })
+                    .publish(&env);
+                }
+            }
+            env.store().remove(&contributions_key);
+            env.store()
+                .remove(&DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)));
+        }
 
         (PaymentRequestCancelled {
             request_id,
@@ -3691,6 +3852,204 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Lets customers pay a payment request in several transfers (#900).
+    ///
+    /// Only the issuing merchant may change this, only while the request is
+    /// `Open`, and partial payments cannot be disabled once any have been made.
+    ///
+    /// # Errors
+    /// `RequestNotFound`, `Unauthorized` (not the request's merchant),
+    /// `RequestAlreadyPaid` / `RequestCancelled`, or `InvalidStatus` when
+    /// disabling a request that already has partial payments.
+    pub fn set_payment_request_partial(
+        env: Env,
+        merchant: Address,
+        request_id: u64,
+        allow_partial: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let request = Self::get_payment_request(env.clone(), request_id)?;
+        if request.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+        if !allow_partial && Self::get_payment_request_paid_amount(env.clone(), request_id) > 0 {
+            return Err(Error::Payment(PaymentError::InvalidStatus));
+        }
+        let key = DataKey::Payment(PaymentKey::RequestAllowPartial(request_id));
+        if allow_partial {
+            env.store().set(&key, &true);
+        } else {
+            env.store().remove(&key);
+        }
+        (PaymentRequestPartialSet {
+            request_id,
+            merchant,
+            allow_partial,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Whether partial payments are enabled on a request (#900).
+    pub fn get_request_allows_partial(env: Env, request_id: u64) -> bool {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::RequestAllowPartial(
+                request_id,
+            )))
+            .unwrap_or(false)
+    }
+
+    /// Total paid so far towards a payment request through partial payments (#900).
+    pub fn get_payment_request_paid_amount(env: Env, request_id: u64) -> i128 {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)))
+            .unwrap_or(0)
+    }
+
+    /// Pays part of an open payment request that allows partial payments (#900).
+    ///
+    /// `amount` is transferred from `customer` into the contract and added to
+    /// the request's `paid_amount`. When `paid_amount` reaches the request's
+    /// `amount`, the request becomes `Paid` and a payment record is created
+    /// for the full amount with `customer` (the final payer) as its customer,
+    /// exactly as `pay_payment_request` does.
+    ///
+    /// # Returns
+    /// The request's `paid_amount` after this payment.
+    ///
+    /// # Errors
+    /// `RequestNotFound`, `RequestAlreadyPaid`, `RequestCancelled`,
+    /// `RequestExpired`, `RequestCustomerMismatch`, `InvalidAmount`
+    /// (`amount <= 0`), `PartialPaymentNotAllowed` (merchant has not opted in),
+    /// `RequestOverpayment` (`paid_amount + amount > request.amount`), or any
+    /// `create_payment` check when the final payment completes the request.
+    pub fn pay_payment_request_partial(
+        env: Env,
+        customer: Address,
+        request_id: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "pay_payment_request")?;
+        Self::require_not_paused(&env, "create_payment")?;
+        customer.require_auth();
+        Self::do_pay_payment_request_partial(&env, customer, request_id, amount)
+    }
+
+    fn do_pay_payment_request_partial(
+        env: &Env,
+        customer: Address,
+        request_id: u64,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        let env = env.clone();
+        let key = DataKey::Payment(PaymentKey::Request(request_id));
+        let mut request: PaymentRequest = env
+            .store()
+            .get(&key)
+            .ok_or(Error::Payment(PaymentError::RequestNotFound))?;
+        match request.status {
+            PaymentRequestStatus::Open => {}
+            PaymentRequestStatus::Paid => {
+                return Err(Error::Payment(PaymentError::RequestAlreadyPaid))
+            }
+            PaymentRequestStatus::Cancelled => {
+                return Err(Error::Payment(PaymentError::RequestCancelled))
+            }
+        }
+        if request.expires_at != 0 && env.ledger().timestamp() >= request.expires_at {
+            return Err(Error::Payment(PaymentError::RequestExpired));
+        }
+        if let Some(allowed) = &request.customer {
+            if *allowed != customer {
+                return Err(Error::Payment(PaymentError::RequestCustomerMismatch));
+            }
+        }
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        if !Self::get_request_allows_partial(env.clone(), request_id) {
+            return Err(Error::Feature(FeatureError::PartialPaymentNotAllowed));
+        }
+        let paid_amount = Self::get_payment_request_paid_amount(env.clone(), request_id)
+            .checked_add(amount)
+            .ok_or(Error::Feature(FeatureError::RequestOverpayment))?;
+        if paid_amount > request.amount {
+            return Err(Error::Feature(FeatureError::RequestOverpayment));
+        }
+
+        token::Client::new(&env, &request.token).transfer(
+            &customer,
+            env.current_contract_address(),
+            &amount,
+        );
+
+        let contributions_key = DataKey::Payment(PaymentKey::RequestContributions(request_id));
+        let mut contributions: Map<Address, i128> = env
+            .store()
+            .get(&contributions_key)
+            .unwrap_or_else(|| Map::new(&env));
+        let previous = contributions.get(customer.clone()).unwrap_or(0);
+        contributions.set(customer.clone(), previous + amount);
+
+        (PaymentRequestPartiallyPaid {
+            request_id,
+            customer: customer.clone(),
+            amount,
+            paid_amount,
+        })
+        .publish(&env);
+
+        if paid_amount < request.amount {
+            env.store().set(&contributions_key, &contributions);
+            env.store().set(
+                &DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)),
+                &paid_amount,
+            );
+            return Ok(paid_amount);
+        }
+
+        // Fully paid: create the payment record now.
+        let payment_id = PaymentContract::do_create_payment(
+            &env,
+            customer.clone(),
+            customer.clone(),
+            request.merchant.clone(),
+            request.amount,
+            request.token.clone(),
+            request.currency.clone(),
+            0,
+            request.metadata.clone(),
+        )?;
+        env.store()
+            .set(&DataKey::Payment(PaymentKey::Prefunded(payment_id)), &true);
+        env.store().remove(&contributions_key);
+        env.store().set(
+            &DataKey::Payment(PaymentKey::RequestPaidAmount(request_id)),
+            &paid_amount,
+        );
+        request.status = PaymentRequestStatus::Paid;
+        request.payment_id = Some(payment_id);
+        env.store().set(&key, &request);
+
+        (PaymentRequestPaid {
+            request_id,
+            payment_id,
+            customer,
+        })
+        .publish(&env);
+
+        Ok(paid_amount)
     }
 
     /// Returns a payment request by id (#662).
@@ -3787,7 +4146,8 @@ impl PaymentContract {
     /// The created payment's ID, or an error if the link is inactive, expired,
     /// or has reached its usage cap.
     pub fn use_payment_link(env: Env, customer: Address, link_id: u64) -> Result<u64, Error> {
-        customer.require_auth();
+        // `customer` authorization is required by `create_payment` below;
+        // requiring it here too fails with "frame is already authorized".
         Self::require_not_paused(&env, "use_payment_link")?;
         Self::require_not_paused(&env, "create_payment")?;
 
@@ -3827,16 +4187,35 @@ impl PaymentContract {
             link.metadata.clone(),
         )?;
 
+        // Issue #904: revenue stats, written in the same invocation as the payment.
+        // Loaded before the usage increment so legacy links backfill correctly.
+        let mut stats = Self::load_payment_link_stats(&env, &link);
+
         // Update link usage
         link.usage_count += 1;
         link.last_used_at = Some(current_time);
         env.store().set(&link_key, &link);
+
+        stats.usage_count = link.usage_count;
+        stats.total_collected = stats.total_collected.saturating_add(link.amount);
+        stats.last_used_at = Some(current_time);
+        let payer_key = DataKey::Payment(PaymentKey::PaymentLinkPayer(link_id, customer.clone()));
+        if !env.store().has(&payer_key) {
+            env.store().set(&payer_key, &true);
+            stats.unique_payers = stats.unique_payers.saturating_add(1);
+        }
+        env.store().set(
+            &DataKey::Payment(PaymentKey::PaymentLinkStats(link_id)),
+            &stats,
+        );
 
         PaymentLinkUsed {
             link_id,
             payment_id,
             customer,
             usage_count: link.usage_count,
+            total_collected: stats.total_collected,
+            unique_payers: stats.unique_payers,
         }
         .publish(&env);
 
@@ -3917,6 +4296,33 @@ impl PaymentContract {
         env.store()
             .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
             .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))
+    }
+
+    /// Returns revenue stats for a payment link (#904).
+    ///
+    /// # Returns
+    /// The link's `PaymentLinkStats`, or `PaymentLinkNotFound` if the link
+    /// does not exist. A link that has never been used reports zero totals.
+    pub fn get_payment_link_stats(env: Env, link_id: u64) -> Result<PaymentLinkStats, Error> {
+        let link: PaymentLink = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+        Ok(Self::load_payment_link_stats(&env, &link))
+    }
+
+    /// Stored stats for `link`, or a zeroed record. Links used before #904
+    /// carry their prior usage forward with `amount * usage_count` as the total.
+    fn load_payment_link_stats(env: &Env, link: &PaymentLink) -> PaymentLinkStats {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLinkStats(link.id)))
+            .unwrap_or(PaymentLinkStats {
+                link_id: link.id,
+                usage_count: link.usage_count,
+                total_collected: link.amount.saturating_mul(link.usage_count as i128),
+                unique_payers: 0,
+                last_used_at: link.last_used_at,
+            })
     }
 
     /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
@@ -4811,6 +5217,52 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        Self::create_escrowed_payment_v2(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            currency,
+            escrow_contract,
+            EscrowedPaymentOptions {
+                release_timestamp,
+                min_hold_period,
+                metadata,
+                auto_release_on_complete,
+                confirmation_timeout_seconds: None,
+            },
+        )
+    }
+
+    /// Creates an escrow-backed payment with all options in one struct (#905),
+    /// so the confirmation timeout is set atomically with creation.
+    ///
+    /// # Arguments
+    /// * `customer`, `merchant`, `amount`, `token`, `currency`, `escrow_contract` -
+    ///   as for `create_escrowed_payment`
+    /// * `opts` - release timestamp, hold period, metadata, auto-release flag and
+    ///   optional confirmation timeout
+    ///
+    /// # Returns
+    /// `Ok((payment_id, escrow_id))`, or the same errors as `create_escrowed_payment`.
+    pub fn create_escrowed_payment_v2(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        escrow_contract: Address,
+        opts: EscrowedPaymentOptions,
+    ) -> Result<(u64, u64), Error> {
+        let EscrowedPaymentOptions {
+            release_timestamp,
+            min_hold_period,
+            metadata,
+            auto_release_on_complete,
+            confirmation_timeout_seconds,
+        } = opts;
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
@@ -4840,9 +5292,7 @@ impl PaymentContract {
             escrow_id,
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
-            // Set separately via `set_escrow_confirm_timeout`
-            // (contract functions are capped at 10 parameters).
-            confirmation_timeout_seconds: None,
+            confirmation_timeout_seconds,
             created_at: env.ledger().timestamp(),
         };
         env.store().set(
@@ -5781,12 +6231,20 @@ impl PaymentContract {
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
 
-        token_client.transfer_from(
-            &contract_address,
-            &payment.payer,
-            &contract_address,
-            &merchant_amount,
-        );
+        // Issue #900: payments created from partially paid requests are already
+        // funded by the payers' transfers into the contract.
+        let prefunded = env
+            .store()
+            .get::<bool>(&DataKey::Payment(PaymentKey::Prefunded(payment_id)))
+            .unwrap_or(false);
+        if !prefunded {
+            token_client.transfer_from(
+                &contract_address,
+                &payment.payer,
+                &contract_address,
+                &merchant_amount,
+            );
+        }
 
         let reserve_held = PaymentContract::settle_or_accumulate(
             env,
@@ -7807,6 +8265,165 @@ impl PaymentContract {
 
     // ── RECURRING / SUBSCRIPTION METHODS ────────────────────────────────────
 
+    /// Sets a merchant-level price lock (#906): subscriptions created before
+    /// `created_before` reject price proposals until `lock_until`. Pass
+    /// `lock_until = 0` to clear the lock.
+    ///
+    /// # Errors
+    /// `InvalidPriceLock` if `created_before` is in the future or `lock_until`
+    /// is non-zero and not in the future.
+    pub fn set_subscription_price_lock(
+        env: Env,
+        merchant: Address,
+        created_before: u64,
+        lock_until: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let now = env.ledger().timestamp();
+        let key = DataKey::Merchant(MerchantDataKey::PriceLock(merchant.clone()));
+        if lock_until == 0 {
+            env.store().remove(&key);
+        } else {
+            if created_before > now || lock_until <= now {
+                return Err(Error::Subscription(SubscriptionError::InvalidPriceLock));
+            }
+            env.store().set(
+                &key,
+                &MerchantPriceLock {
+                    created_before,
+                    lock_until,
+                },
+            );
+        }
+        (SubscriptionPriceLockSet {
+            merchant,
+            created_before,
+            lock_until,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns a merchant's price lock, if one is set (#906).
+    pub fn get_subscription_price_lock(env: Env, merchant: Address) -> Option<MerchantPriceLock> {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::PriceLock(merchant)))
+    }
+
+    /// Returns the timestamp until which a subscription's price is locked, or
+    /// `None` if it is not currently locked (#906).
+    pub fn get_sub_price_locked_until(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<Option<u64>, Error> {
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        Ok(Self::price_lock_end(&env, &sub, env.ledger().timestamp()))
+    }
+
+    /// `Some(lock_until)` while `sub` is covered by its merchant's price lock.
+    fn price_lock_end(env: &Env, sub: &Subscription, now: u64) -> Option<u64> {
+        let lock: MerchantPriceLock =
+            env.store()
+                .get(&DataKey::Merchant(MerchantDataKey::PriceLock(
+                    sub.merchant.clone(),
+                )))?;
+        (sub.created_at < lock.created_before && now < lock.lock_until).then_some(lock.lock_until)
+    }
+
+    /// Merchant proposes a new price for an active subscription (#665). The
+    /// proposal only takes effect once the customer accepts it.
+    ///
+    /// # Errors
+    /// `InvalidAmount`, `Unauthorized` (not the merchant), `NotFound`,
+    /// `NotActive`, or `PriceLocked` while the subscription is price-locked (#906).
+    pub fn propose_subscription_price(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        new_amount: i128,
+        effective_from: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if new_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+        if Self::price_lock_end(&env, &sub, env.ledger().timestamp()).is_some() {
+            return Err(Error::Subscription(SubscriptionError::PriceLocked));
+        }
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::PriceProposal(subscription_id)),
+            &SubscriptionPriceProposal {
+                new_amount,
+                effective_from,
+                accepted: false,
+            },
+        );
+        (SubscriptionPriceProposed {
+            subscription_id,
+            new_amount,
+            effective_from,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Customer accepts a pending price proposal (#665). It is applied on the
+    /// first charge at or after `effective_from` (0 = next charge).
+    ///
+    /// # Errors
+    /// `NotFound`, `Unauthorized` (not the customer), `PriceProposalNotFound`,
+    /// or `PriceProposalExpired` if `effective_from` has already passed.
+    pub fn accept_subscription_price(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let key = DataKey::Subscription(SubscriptionKey::PriceProposal(subscription_id));
+        let mut proposal: SubscriptionPriceProposal = env.store().get(&key).ok_or(
+            Error::Subscription(SubscriptionError::PriceProposalNotFound),
+        )?;
+        if proposal.effective_from > 0 && env.ledger().timestamp() > proposal.effective_from {
+            env.store().remove(&key);
+            return Err(Error::Subscription(SubscriptionError::PriceProposalExpired));
+        }
+        proposal.accepted = true;
+        env.store().set(&key, &proposal);
+        (SubscriptionPriceAccepted {
+            subscription_id,
+            new_amount: proposal.new_amount,
+            effective_from: proposal.effective_from,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
     /// Create a new subscription. The customer authorises the creation.
     /// `interval`             – seconds between each automatic payment
     /// `duration`             – total lifetime in seconds (0 = indefinite)
@@ -8356,11 +8973,15 @@ impl PaymentContract {
             }
 
             // issue #665: apply an accepted price proposal once effective_from is reached
-            if let Some(proposal) =
-                env.store()
-                    .get::<SubscriptionPriceProposal>(&DataKey::Subscription(
-                        SubscriptionKey::PriceProposal(subscription_id),
-                    ))
+            // issue #906: deferred while the subscription is price-locked
+            if let Some(proposal) = env
+                .store()
+                .get::<SubscriptionPriceProposal>(&DataKey::Subscription(
+                    SubscriptionKey::PriceProposal(subscription_id),
+                ))
+                .filter(|p| {
+                    p.accepted && PaymentContract::price_lock_end(&env, &sub, now).is_none()
+                })
             {
                 let effective = if proposal.effective_from == 0 {
                     now
@@ -13395,6 +14016,50 @@ impl PaymentContract {
         Ok(())
     }
 
+    /// Returns the ids of `merchant`'s requests to `customer` that are still open:
+    /// unpaid, uncancelled and unexpired (#903). Expired entries drop out here,
+    /// which is how expiry frees a slot.
+    fn live_open_requests(env: &Env, merchant: &Address, customer: &Address) -> Vec<u64> {
+        let tracked: Vec<u64> = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::OpenRequests(
+                merchant.clone(),
+                customer.clone(),
+            )))
+            .unwrap_or(Vec::new(env));
+        let now = env.ledger().timestamp();
+        let mut live = Vec::new(env);
+        for id in tracked.iter() {
+            let request: Option<PaymentRequest> =
+                env.store().get(&DataKey::Payment(PaymentKey::Request(id)));
+            if let Some(r) = request {
+                let expired = r.expires_at != 0 && now >= r.expires_at;
+                if r.status == PaymentRequestStatus::Open && !expired {
+                    live.push_back(id);
+                }
+            }
+        }
+        live
+    }
+
+    /// Removes a paid or cancelled request from its (merchant, customer) open
+    /// request list, freeing its slot (#903).
+    fn release_open_request(env: &Env, request: &PaymentRequest) {
+        if let Some(customer) = &request.customer {
+            let key = DataKey::Payment(PaymentKey::OpenRequests(
+                request.merchant.clone(),
+                customer.clone(),
+            ));
+            let tracked: Option<Vec<u64>> = env.store().get(&key);
+            if let Some(mut ids) = tracked {
+                if let Some(pos) = ids.first_index_of(request.id) {
+                    ids.remove(pos);
+                    env.store().set(&key, &ids);
+                }
+            }
+        }
+    }
+
     fn require_registry_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         let config: MultiSigConfig = env
@@ -14264,6 +14929,14 @@ impl PaymentContract {
         if sub.status != SubscriptionStatus::Active {
             return Err(Error::Subscription(SubscriptionError::NotActive));
         }
+        // Issue #902: enforce merchant-set seat bounds.
+        if let Some(bounds) = Self::get_subscription_seat_bounds(env.clone(), subscription_id) {
+            let below = bounds.min_seats.is_some_and(|min| new_quantity < min);
+            let above = bounds.max_seats.is_some_and(|max| new_quantity > max);
+            if below || above {
+                return Err(Error::Subscription(SubscriptionError::SeatsOutOfBounds));
+            }
+        }
 
         let mut seats = Self::load_subscription_seats(&env, &sub);
         let old_quantity = seats.quantity;
@@ -14347,6 +15020,72 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    /// Set or update the min/max seat bounds on a seat-based subscription (#902).
+    ///
+    /// Called by the subscription's merchant, typically right after the
+    /// subscription is created, and again whenever the plan changes. Passing
+    /// `None` for both bounds clears them. Bounds only constrain later
+    /// `update_subscription_quantity` calls; the current quantity is unchanged.
+    ///
+    /// # Errors
+    /// `NotFound` if the subscription does not exist, `Unauthorized` if the
+    /// caller is not its merchant, `InvalidSeatBounds` if a bound is 0 or
+    /// `min_seats > max_seats`.
+    pub fn set_subscription_seat_bounds(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        min_seats: Option<u32>,
+        max_seats: Option<u32>,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if min_seats == Some(0) || max_seats == Some(0) {
+            return Err(Error::Subscription(SubscriptionError::InvalidSeatBounds));
+        }
+        if let (Some(min), Some(max)) = (min_seats, max_seats) {
+            if min > max {
+                return Err(Error::Subscription(SubscriptionError::InvalidSeatBounds));
+            }
+        }
+        let key = DataKey::Subscription(SubscriptionKey::SeatBounds(subscription_id));
+        if min_seats.is_none() && max_seats.is_none() {
+            env.store().remove(&key);
+        } else {
+            env.store().set(
+                &key,
+                &SeatBounds {
+                    min_seats,
+                    max_seats,
+                },
+            );
+        }
+        (SubscriptionSeatBoundsSet {
+            subscription_id,
+            merchant,
+            min_seats,
+            max_seats,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Seat bounds on a subscription, or `None` if unbounded (#902).
+    pub fn get_subscription_seat_bounds(env: Env, subscription_id: u64) -> Option<SeatBounds> {
+        env.store()
+            .get(&DataKey::Subscription(SubscriptionKey::SeatBounds(
+                subscription_id,
+            )))
     }
 
     /// Seat record for a subscription, defaulting to one seat at the full
@@ -17720,6 +18459,9 @@ mod test;
 mod test_analytics;
 
 #[cfg(test)]
+mod test_issues_904_905_906;
+
+#[cfg(test)]
 mod test_issues_678_679_680_681;
 
 #[cfg(test)]
@@ -17788,6 +18530,12 @@ mod test_storage_tiers;
 mod test_payment_request;
 
 #[cfg(test)]
+mod test_partial_payment_request;
+
+#[cfg(test)]
+mod test_seat_bounds;
+
+#[cfg(test)]
 mod test_merchant_registry;
 
 #[cfg(test)]
@@ -17800,4 +18548,4 @@ mod test_refund_sync;
 mod test_dunning;
 
 #[cfg(test)]
-mod test_rolling_reserve;
+mod test_scheduled_auto_resume;
