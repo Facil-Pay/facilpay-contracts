@@ -259,6 +259,44 @@ Emits `CounterOfferMade` from `counter_offer`. Emits `CounterOfferAccepted` and 
 - `escalate_arbitration_case()` — Escalates a case from junior to senior panel.
 - `get_arbitration_tier()` — Returns Senior or Junior tier for a case.
 
+#### Arbitrator Bonds (Issue #908)
+
+Arbitrators who ignore assigned cases now lose part of a bond. While bonding is configured, only arbitrators holding a full bond can be assigned to cases (manual `assign_arbitrator`, escalation panels and `auto_assign_arbitrators` all use the same check). When `trigger_arbitration_timeout` resolves a case, each assigned arbitrator who did not vote loses `slash_bps` of their bond to the slashed-bond treasury.
+
+| Function | Description |
+| --- | --- |
+| `set_arbitrator_bond(admin, token, amount, slash_bps)` | Admin sets the bond requirement. `amount = 0` disables bonding (existing bonds stay withdrawable). |
+| `get_arbitrator_bond_config()` | Returns `Option<ArbitratorBondConfig { token, amount, slash_bps }>`. |
+| `post_arbitrator_bond(arbitrator)` | A registered arbitrator posts their bond, or tops it up after a slash. Only the shortfall up to `amount` is transferred. Returns the bond total. |
+| `withdraw_arbitrator_bond(arbitrator)` | Returns the arbitrator's full remaining bond. Only allowed when they are not assigned to any open case. |
+| `get_arbitrator_bond(arbitrator)` | Returns `Option<ArbitratorBond { token, amount, posted_at }>`. |
+| `get_slashed_bond_balance(token)` | Slashed funds held for the treasury in `token`. |
+| `withdraw_slashed_bonds(admin, token, to)` | Admin transfers all slashed funds in `token` to `to`. |
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `token` | `Address` | Token the bond is held in |
+| `amount` | `i128` | `>= 0`; `0` disables bonding |
+| `slash_bps` | `u32` | `0..=10000`; share of a non-voter's bond slashed per timed-out case |
+
+Notes:
+
+- An arbitrator whose bond falls below `amount` after a slash is not assignable until they call `post_arbitrator_bond` again.
+- If the admin changes the bond token, bonds held in the old token must be withdrawn before a new one can be posted.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `Unauthorized` | `3` | Caller is not the admin (`set_arbitrator_bond`, `withdraw_slashed_bonds`) |
+| `InvalidAmount` | `1` | `amount < 0` or `slash_bps > 10000` |
+| `NotArbitrator` | `16` | `post_arbitrator_bond` caller is not a registered arbitrator |
+| `InsufficientTreasuryFees` | `31` | No slashed funds to withdraw in `token` |
+| `ArbitratorBondNotConfigured` | `87` | Bonding is disabled |
+| `ArbitratorNotBonded` | `88` | `assign_arbitrator` target has no full bond, or `withdraw_arbitrator_bond` caller has no bond |
+| `ArbitratorHasOpenCases` | `89` | Withdrawal while assigned to an open case |
+| `ArbitratorBondAlreadyPosted` | `90` | Bond already meets the requirement, or is held in a different token |
+
+Events: `ArbitratorBondConfigured { token, amount, slash_bps }`, `ArbitratorBondPosted { arbitrator, token, amount, total }`, `ArbitratorBondSlashed { case_id, arbitrator, token, amount, remaining }`, `ArbitratorBondWithdrawn { arbitrator, token, amount }`.
+
 ### Policy Templates
 
 - `create_policy_template()` — Admin creates a reusable refund policy template.

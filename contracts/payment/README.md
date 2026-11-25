@@ -296,6 +296,28 @@ Merchants can optionally attach a **schedule** to a `Pending` payment, specifyin
 - `PaymentError::InstallmentScheduleAlreadySet` (227) — a schedule is already attached to this payment.
 - `PaymentError::InstallmentScheduleTotalMismatch` (229) — the entries do not sum to `payment.amount`.
 
+### Payment Link Revenue Stats (Issue #904)
+
+`use_payment_link(customer, link_id)` now records revenue stats for the link in the same call that creates the payment, so stats and payments cannot drift apart: if the payment fails, nothing is recorded.
+
+| Function | Description |
+| --- | --- |
+| `get_payment_link_stats(link_id)` | Returns `PaymentLinkStats { link_id, usage_count, total_collected, unique_payers, last_used_at }`. |
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `link_id` | `u64` | An existing payment link |
+
+- `total_collected` is the sum of payment amounts created through the link, in token base units.
+- `unique_payers` counts distinct customer addresses; a customer paying twice is counted once.
+- Links used before this feature start with `total_collected = amount * usage_count` and `unique_payers = 0`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `PaymentError::PaymentLinkNotFound` | `246` | No link with this ID |
+
+The `PaymentLinkUsed` event now also carries the running totals: `PaymentLinkUsed { link_id, payment_id, customer, usage_count, total_collected, unique_payers }`.
+
 ### Escrowed Payments
 
 | Function                                                                                          | Description                                                          |
@@ -307,6 +329,27 @@ Merchants can optionally attach a **schedule** to a `Pending` payment, specifyin
 | `resolve_escrowed_payment_dispute(admin, payment_id, favor_customer)`                             | Resolve a dispute in favour of the customer or merchant.             |
 | `get_escrowed_payment(payment_id)`                                                                | Retrieve the `EscrowedPayment` record.                               |
 | `get_escrowed_payment_dispute(payment_id)`                                                        | Retrieve the active dispute record for an escrowed payment.          |
+
+#### Options Struct for Escrowed Payments (Issue #905)
+
+`create_escrowed_payment` already uses Soroban's 10-parameter limit, so its confirmation timeout used to need a second `set_escrow_confirm_timeout` call, leaving the payment briefly live without one. `create_escrowed_payment_v2` takes the optional settings in one struct and stores the timeout in the same call.
+
+| Function | Description |
+| --- | --- |
+| `create_escrowed_payment_v2(customer, merchant, amount, token, currency, escrow_contract, opts)` | Creates the payment and escrow and stores every option, including the confirmation timeout, atomically. Returns `(payment_id, escrow_id)`. |
+| `create_escrowed_payment(customer, merchant, amount, token, currency, escrow_contract, release_timestamp, min_hold_period, metadata, auto_release_on_complete)` | Unchanged signature. Now a thin wrapper that calls `create_escrowed_payment_v2` with `confirmation_timeout_seconds: None`. |
+
+`EscrowedPaymentOptions` fields:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `release_timestamp` | `u64` | Timestamp after which escrow funds can be released |
+| `min_hold_period` | `u64` | Minimum seconds the funds stay in escrow |
+| `metadata` | `String` | Payment metadata (same limits as `create_payment`) |
+| `auto_release_on_complete` | `bool` | Release the escrow when the payment completes |
+| `confirmation_timeout_seconds` | `Option<u64>` | Seconds after creation before `auto_complete_escrowed_payment` may run; `None` = no timeout (`set_escrow_confirm_timeout` can still set one later) |
+
+Errors are the same as `create_escrowed_payment`: `ContractPaused` / `FunctionPaused` (the `create_escrowed_payment` pause flag applies to both), `SubscriptionError::MerchantPaused`, any `create_payment` validation error, and `FeatureError::EscrowBridgeFailed` if the escrow call fails. The whole call reverts on any error. Emits `EscrowedPaymentCreated { payment_id, escrow_id, escrow_contract }`; no new events.
 
 ### Cross-Contract Escrow Verification
 
@@ -584,6 +627,43 @@ Example: a 30-day subscription at 10 per seat, 5 seats (`amount = 50`), with pro
 | `FeatureError::SpendLimitExceeded` | `527` | The prorated charge would exceed the customer's spend limit |
 
 Emits `SubscriptionQuantityChanged { subscription_id, old_quantity, new_quantity, unit_amount, new_amount, proration_amount }`. `proration_amount` is positive when charged, negative when credited, and `0` when nothing was prorated.
+
+#### Price Lock for Existing Subscribers (Issue #906)
+
+A merchant can keep existing subscribers on their current price for a while when prices go up. Subscriptions created before `created_before` reject price proposals until `lock_until`. Subscriptions created at or after `created_before` are not affected.
+
+| Function | Description |
+| --- | --- |
+| `set_subscription_price_lock(merchant, created_before, lock_until)` | Merchant (must authorize) sets or replaces its price lock. Pass `lock_until = 0` to clear it. |
+| `get_subscription_price_lock(merchant)` | Returns `Option<MerchantPriceLock { created_before, lock_until }>`. |
+| `get_sub_price_locked_until(subscription_id)` | Returns `Some(lock_until)` while that subscription is locked, otherwise `None`. |
+| `propose_subscription_price(merchant, subscription_id, new_amount, effective_from)` | Merchant proposes a new price (#665). Rejected with `PriceLocked` while the subscription is locked. |
+| `accept_subscription_price(customer, subscription_id)` | Customer accepts the pending proposal. It is applied on the first charge at or after `effective_from` (`0` = next charge). |
+
+| Parameter | Type | Rule |
+| --- | --- | --- |
+| `created_before` | `u64` | Must not be in the future, so new subscriptions are never locked |
+| `lock_until` | `u64` | `0` clears the lock; otherwise must be in the future |
+| `new_amount` | `i128` | `> 0` |
+
+How it works:
+
+- A subscription is locked when `created_at < created_before` and `now < lock_until`.
+- Only accepted proposals are applied by `execute_recurring_payment`. An accepted proposal made before a lock was set is held, not applied, until the lock ends.
+- Setting a new lock replaces the previous one.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | Caller is not the subscription's merchant (propose) or customer (accept) |
+| `BasicError::InvalidAmount` | `121` | `new_amount <= 0` |
+| `SubscriptionError::NotFound` | `300` | No subscription with this ID |
+| `SubscriptionError::NotActive` | `301` | Proposal for a subscription that is not `Active` |
+| `SubscriptionError::PriceLocked` | `331` | The subscription is covered by an active price lock |
+| `SubscriptionError::PriceProposalNotFound` | `332` | No pending proposal to accept |
+| `SubscriptionError::PriceProposalExpired` | `333` | `effective_from` passed before the customer accepted; the proposal is removed |
+| `SubscriptionError::InvalidPriceLock` | `334` | `created_before` is in the future, or `lock_until` is non-zero and not in the future |
+
+Events: `SubscriptionPriceLockSet { merchant, created_before, lock_until }` (also emitted when clearing, with `lock_until = 0`), `SubscriptionPriceProposed { subscription_id, new_amount, effective_from }`, `SubscriptionPriceAccepted { subscription_id, new_amount, effective_from }`.
 
 ### Metered Billing
 

@@ -90,6 +90,9 @@ pub enum PaymentKey {
     // Reusable merchant payment links
     PaymentLinkCounter,
     PaymentLink(u64),
+    // Issue #904: per-link revenue stats and payer-seen markers
+    PaymentLinkStats(u64),
+    PaymentLinkPayer(u64, Address),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -299,6 +302,11 @@ pub enum SubscriptionError {
     // Subscription transfers
     SubscriptionNotTransferable = 329,
     InvalidTransferRecipient = 330,
+    // Issue #906: price lock and price proposals
+    PriceLocked = 331,
+    PriceProposalNotFound = 332,
+    PriceProposalExpired = 333,
+    InvalidPriceLock = 334,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -425,7 +433,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
                     core::mem::transmute::<u32, ProposalError>(code)
                 }));
             }
-            if (300..=330).contains(&code) {
+            if (300..=334).contains(&code) {
                 return Ok(Error::Subscription(unsafe {
                     core::mem::transmute::<u32, SubscriptionError>(code)
                 }));
@@ -524,6 +532,8 @@ pub enum MerchantDataKey {
     ChurnCount(Address, u32),
     // Issue #765: per-day merchant settlement bucket
     DailySettlement(Address, u64),
+    // Issue #906: price lock for subscriptions created before a cutoff
+    PriceLock(Address),
 }
 
 // State and proposal data keys
@@ -765,6 +775,17 @@ pub struct Subscription {
 pub struct SubscriptionPriceProposal {
     pub new_amount: i128,
     pub effective_from: u64, // billing-cycle timestamp; 0 = apply on next billing
+    /// Set by `accept_subscription_price`; only accepted proposals are applied.
+    pub accepted: bool,
+}
+
+/// Merchant-level price lock (#906): subscriptions created before
+/// `created_before` keep their price until `lock_until`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct MerchantPriceLock {
+    pub created_before: u64,
+    pub lock_until: u64,
 }
 
 // issue #753: seat count and per-seat price of a subscription. The billed
@@ -1245,6 +1266,10 @@ pub struct PaymentLinkUsed {
     pub payment_id: u64,
     pub customer: Address,
     pub usage_count: u32,
+    /// Running total collected through the link (#904).
+    pub total_collected: i128,
+    /// Running count of distinct payers (#904).
+    pub unique_payers: u32,
 }
 
 #[contractevent]
@@ -1702,6 +1727,15 @@ pub struct SubscriptionPriceAccepted {
     pub effective_from: u64,
 }
 
+// issue #906: merchant set or cleared a price lock for existing subscribers
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionPriceLockSet {
+    pub merchant: Address,
+    pub created_before: u64,
+    pub lock_until: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddressFlagged {
@@ -2011,6 +2045,21 @@ pub struct PaymentLink {
     pub last_used_at: Option<u64>,
 }
 
+/// Revenue stats for a payment link (#904), updated in the same call as
+/// `use_payment_link`.
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PaymentLinkStats {
+    pub link_id: u64,
+    /// Number of payments created through the link.
+    pub usage_count: u32,
+    /// Sum of payment amounts created through the link, in token base units.
+    pub total_collected: i128,
+    /// Number of distinct customers that have paid through the link.
+    pub unique_payers: u32,
+    pub last_used_at: Option<u64>,
+}
+
 /// Maximum length, in bytes, of a registered merchant's display name (#669).
 pub const MAX_MERCHANT_NAME_LEN: u32 = 64;
 
@@ -2039,6 +2088,21 @@ pub struct EscrowedPayment {
     pub auto_release_on_complete: bool,
     pub confirmation_timeout_seconds: Option<u64>,
     pub created_at: u64,
+}
+
+/// Optional settings for `create_escrowed_payment_v2` (#905).
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct EscrowedPaymentOptions {
+    /// Timestamp after which escrow funds can be released.
+    pub release_timestamp: u64,
+    /// Minimum seconds funds must remain in escrow.
+    pub min_hold_period: u64,
+    pub metadata: String,
+    /// Release the escrow automatically when the payment completes.
+    pub auto_release_on_complete: bool,
+    /// Seconds after creation before `auto_complete_escrowed_payment` may run.
+    pub confirmation_timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -3732,7 +3796,8 @@ impl PaymentContract {
     /// The created payment's ID, or an error if the link is inactive, expired,
     /// or has reached its usage cap.
     pub fn use_payment_link(env: Env, customer: Address, link_id: u64) -> Result<u64, Error> {
-        customer.require_auth();
+        // `customer` authorization is required by `create_payment` below;
+        // requiring it here too fails with "frame is already authorized".
         Self::require_not_paused(&env, "use_payment_link")?;
         Self::require_not_paused(&env, "create_payment")?;
 
@@ -3772,16 +3837,35 @@ impl PaymentContract {
             link.metadata.clone(),
         )?;
 
+        // Issue #904: revenue stats, written in the same invocation as the payment.
+        // Loaded before the usage increment so legacy links backfill correctly.
+        let mut stats = Self::load_payment_link_stats(&env, &link);
+
         // Update link usage
         link.usage_count += 1;
         link.last_used_at = Some(current_time);
         env.store().set(&link_key, &link);
+
+        stats.usage_count = link.usage_count;
+        stats.total_collected = stats.total_collected.saturating_add(link.amount);
+        stats.last_used_at = Some(current_time);
+        let payer_key = DataKey::Payment(PaymentKey::PaymentLinkPayer(link_id, customer.clone()));
+        if !env.store().has(&payer_key) {
+            env.store().set(&payer_key, &true);
+            stats.unique_payers = stats.unique_payers.saturating_add(1);
+        }
+        env.store().set(
+            &DataKey::Payment(PaymentKey::PaymentLinkStats(link_id)),
+            &stats,
+        );
 
         PaymentLinkUsed {
             link_id,
             payment_id,
             customer,
             usage_count: link.usage_count,
+            total_collected: stats.total_collected,
+            unique_payers: stats.unique_payers,
         }
         .publish(&env);
 
@@ -3862,6 +3946,33 @@ impl PaymentContract {
         env.store()
             .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
             .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))
+    }
+
+    /// Returns revenue stats for a payment link (#904).
+    ///
+    /// # Returns
+    /// The link's `PaymentLinkStats`, or `PaymentLinkNotFound` if the link
+    /// does not exist. A link that has never been used reports zero totals.
+    pub fn get_payment_link_stats(env: Env, link_id: u64) -> Result<PaymentLinkStats, Error> {
+        let link: PaymentLink = env
+            .store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLink(link_id)))
+            .ok_or(Error::Payment(PaymentError::PaymentLinkNotFound))?;
+        Ok(Self::load_payment_link_stats(&env, &link))
+    }
+
+    /// Stored stats for `link`, or a zeroed record. Links used before #904
+    /// carry their prior usage forward with `amount * usage_count` as the total.
+    fn load_payment_link_stats(env: &Env, link: &PaymentLink) -> PaymentLinkStats {
+        env.store()
+            .get(&DataKey::Payment(PaymentKey::PaymentLinkStats(link.id)))
+            .unwrap_or(PaymentLinkStats {
+                link_id: link.id,
+                usage_count: link.usage_count,
+                total_collected: link.amount.saturating_mul(link.usage_count as i128),
+                unique_payers: 0,
+                last_used_at: link.last_used_at,
+            })
     }
 
     /// Adds a fee-exempt tip for the merchant to a pending payment (#675).
@@ -4687,6 +4798,52 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        Self::create_escrowed_payment_v2(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            currency,
+            escrow_contract,
+            EscrowedPaymentOptions {
+                release_timestamp,
+                min_hold_period,
+                metadata,
+                auto_release_on_complete,
+                confirmation_timeout_seconds: None,
+            },
+        )
+    }
+
+    /// Creates an escrow-backed payment with all options in one struct (#905),
+    /// so the confirmation timeout is set atomically with creation.
+    ///
+    /// # Arguments
+    /// * `customer`, `merchant`, `amount`, `token`, `currency`, `escrow_contract` -
+    ///   as for `create_escrowed_payment`
+    /// * `opts` - release timestamp, hold period, metadata, auto-release flag and
+    ///   optional confirmation timeout
+    ///
+    /// # Returns
+    /// `Ok((payment_id, escrow_id))`, or the same errors as `create_escrowed_payment`.
+    pub fn create_escrowed_payment_v2(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        currency: Currency,
+        escrow_contract: Address,
+        opts: EscrowedPaymentOptions,
+    ) -> Result<(u64, u64), Error> {
+        let EscrowedPaymentOptions {
+            release_timestamp,
+            min_hold_period,
+            metadata,
+            auto_release_on_complete,
+            confirmation_timeout_seconds,
+        } = opts;
         Self::require_not_paused(&env, "create_escrowed_payment")?;
         Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
@@ -4716,9 +4873,7 @@ impl PaymentContract {
             escrow_id,
             escrow_contract: escrow_contract.clone(),
             auto_release_on_complete,
-            // Set separately via `set_escrow_confirm_timeout`
-            // (contract functions are capped at 10 parameters).
-            confirmation_timeout_seconds: None,
+            confirmation_timeout_seconds,
             created_at: env.ledger().timestamp(),
         };
         env.store().set(
@@ -7682,6 +7837,165 @@ impl PaymentContract {
 
     // ── RECURRING / SUBSCRIPTION METHODS ────────────────────────────────────
 
+    /// Sets a merchant-level price lock (#906): subscriptions created before
+    /// `created_before` reject price proposals until `lock_until`. Pass
+    /// `lock_until = 0` to clear the lock.
+    ///
+    /// # Errors
+    /// `InvalidPriceLock` if `created_before` is in the future or `lock_until`
+    /// is non-zero and not in the future.
+    pub fn set_subscription_price_lock(
+        env: Env,
+        merchant: Address,
+        created_before: u64,
+        lock_until: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        let now = env.ledger().timestamp();
+        let key = DataKey::Merchant(MerchantDataKey::PriceLock(merchant.clone()));
+        if lock_until == 0 {
+            env.store().remove(&key);
+        } else {
+            if created_before > now || lock_until <= now {
+                return Err(Error::Subscription(SubscriptionError::InvalidPriceLock));
+            }
+            env.store().set(
+                &key,
+                &MerchantPriceLock {
+                    created_before,
+                    lock_until,
+                },
+            );
+        }
+        (SubscriptionPriceLockSet {
+            merchant,
+            created_before,
+            lock_until,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns a merchant's price lock, if one is set (#906).
+    pub fn get_subscription_price_lock(env: Env, merchant: Address) -> Option<MerchantPriceLock> {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::PriceLock(merchant)))
+    }
+
+    /// Returns the timestamp until which a subscription's price is locked, or
+    /// `None` if it is not currently locked (#906).
+    pub fn get_sub_price_locked_until(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<Option<u64>, Error> {
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        Ok(Self::price_lock_end(&env, &sub, env.ledger().timestamp()))
+    }
+
+    /// `Some(lock_until)` while `sub` is covered by its merchant's price lock.
+    fn price_lock_end(env: &Env, sub: &Subscription, now: u64) -> Option<u64> {
+        let lock: MerchantPriceLock =
+            env.store()
+                .get(&DataKey::Merchant(MerchantDataKey::PriceLock(
+                    sub.merchant.clone(),
+                )))?;
+        (sub.created_at < lock.created_before && now < lock.lock_until).then_some(lock.lock_until)
+    }
+
+    /// Merchant proposes a new price for an active subscription (#665). The
+    /// proposal only takes effect once the customer accepts it.
+    ///
+    /// # Errors
+    /// `InvalidAmount`, `Unauthorized` (not the merchant), `NotFound`,
+    /// `NotActive`, or `PriceLocked` while the subscription is price-locked (#906).
+    pub fn propose_subscription_price(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        new_amount: i128,
+        effective_from: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        if new_amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if sub.status != SubscriptionStatus::Active {
+            return Err(Error::Subscription(SubscriptionError::NotActive));
+        }
+        if Self::price_lock_end(&env, &sub, env.ledger().timestamp()).is_some() {
+            return Err(Error::Subscription(SubscriptionError::PriceLocked));
+        }
+        env.store().set(
+            &DataKey::Subscription(SubscriptionKey::PriceProposal(subscription_id)),
+            &SubscriptionPriceProposal {
+                new_amount,
+                effective_from,
+                accepted: false,
+            },
+        );
+        (SubscriptionPriceProposed {
+            subscription_id,
+            new_amount,
+            effective_from,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Customer accepts a pending price proposal (#665). It is applied on the
+    /// first charge at or after `effective_from` (0 = next charge).
+    ///
+    /// # Errors
+    /// `NotFound`, `Unauthorized` (not the customer), `PriceProposalNotFound`,
+    /// or `PriceProposalExpired` if `effective_from` has already passed.
+    pub fn accept_subscription_price(
+        env: Env,
+        customer: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        let sub: Subscription = env
+            .store()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(
+                subscription_id,
+            )))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+        if sub.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        let key = DataKey::Subscription(SubscriptionKey::PriceProposal(subscription_id));
+        let mut proposal: SubscriptionPriceProposal = env.store().get(&key).ok_or(
+            Error::Subscription(SubscriptionError::PriceProposalNotFound),
+        )?;
+        if proposal.effective_from > 0 && env.ledger().timestamp() > proposal.effective_from {
+            env.store().remove(&key);
+            return Err(Error::Subscription(SubscriptionError::PriceProposalExpired));
+        }
+        proposal.accepted = true;
+        env.store().set(&key, &proposal);
+        (SubscriptionPriceAccepted {
+            subscription_id,
+            new_amount: proposal.new_amount,
+            effective_from: proposal.effective_from,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
     /// Create a new subscription. The customer authorises the creation.
     /// `interval`             – seconds between each automatic payment
     /// `duration`             – total lifetime in seconds (0 = indefinite)
@@ -8231,11 +8545,15 @@ impl PaymentContract {
             }
 
             // issue #665: apply an accepted price proposal once effective_from is reached
-            if let Some(proposal) =
-                env.store()
-                    .get::<SubscriptionPriceProposal>(&DataKey::Subscription(
-                        SubscriptionKey::PriceProposal(subscription_id),
-                    ))
+            // issue #906: deferred while the subscription is price-locked
+            if let Some(proposal) = env
+                .store()
+                .get::<SubscriptionPriceProposal>(&DataKey::Subscription(
+                    SubscriptionKey::PriceProposal(subscription_id),
+                ))
+                .filter(|p| {
+                    p.accepted && PaymentContract::price_lock_end(&env, &sub, now).is_none()
+                })
             {
                 let effective = if proposal.effective_from == 0 {
                     now
@@ -17400,6 +17718,9 @@ mod test;
 mod test_analytics;
 
 #[cfg(test)]
+mod test_issues_904_905_906;
+
+#[cfg(test)]
 mod test_issues_678_679_680_681;
 
 #[cfg(test)]
@@ -17478,3 +17799,6 @@ mod test_refund_sync;
 
 #[cfg(test)]
 mod test_dunning;
+
+#[cfg(test)]
+mod test_scheduled_auto_resume;

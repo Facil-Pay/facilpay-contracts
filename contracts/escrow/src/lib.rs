@@ -110,6 +110,11 @@ pub enum EscrowKey {
     // Issue #880: bounded status history (escrow_id, index)
     StatusHistory(u64, u32),
     StatusHistoryCount(u64),
+    // Issue #877: hashlock escrows released by a preimage
+    Hashlock(u64),
+    // Private escrow notes (escrow_id, index) and per-escrow count
+    Note(u64, u64),
+    NoteCount(u64),
 }
 
 #[derive(Clone)]
