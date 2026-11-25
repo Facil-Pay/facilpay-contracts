@@ -97,6 +97,11 @@ pub enum EscrowKey {
     // Issue #685: status index for paginated queries
     StatusList(EscrowStatus, u64),
     StatusCount(EscrowStatus),
+    // Issue #877: hashlock escrow released by a preimage
+    Hashlock(u64),
+    // Issue #884: shared per-escrow note log (escrow_id, index) and count
+    Note(u64, u64),
+    NoteCount(u64),
     // Per-escrow third-party dispute resolver
     ThirdPartyResolver(u64),
     // Merchant acceptance step
@@ -110,6 +115,11 @@ pub enum EscrowKey {
     // Issue #880: bounded status history (escrow_id, index)
     StatusHistory(u64, u32),
     StatusHistoryCount(u64),
+    // Issue #877: hashlock escrows released by a preimage
+    Hashlock(u64),
+    // Private escrow notes (escrow_id, index) and per-escrow count
+    Note(u64, u64),
+    NoteCount(u64),
 }
 
 #[derive(Clone)]
