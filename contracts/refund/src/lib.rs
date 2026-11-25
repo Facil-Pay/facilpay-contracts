@@ -913,6 +913,62 @@ pub struct PromotionalVouchersIssued {
     pub new_reserve_balance: i128,
 }
 
+// Issue #915: merchant toggles the one-open-request-per-payment rule
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SingleOpenRequestSet {
+    pub merchant: Address,
+    pub enabled: bool,
+}
+
+// Issue #914: admin sets or clears a merchant's outstanding voucher liability cap
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherLiabilityCapSet {
+    pub merchant: Address,
+    pub token: Address,
+    pub cap: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherLiabilityCapCleared {
+    pub merchant: Address,
+    pub token: Address,
+}
+
+// Issue #914: admin revokes a voucher; its remaining balance leaves the liability
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevoked {
+    pub voucher_id: u64,
+    pub revoked_by: Address,
+    pub released_amount: i128,
+}
+
+// Issue #914: an expired voucher's remaining balance is released from the liability
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExpiredVoucherReleased {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub token: Address,
+    pub released_amount: i128,
+}
+
+// Issue #910: several vouchers combined into one
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VouchersMerged {
+    pub customer: Address,
+    pub merchant: Address,
+    pub token: Address,
+    pub source_voucher_ids: Vec<u64>,
+    pub merged_voucher_id: u64,
+    pub amount: i128,
+    pub expires_at: u64,
+}
+
 // Issue #194: Tiered arbitration escalation
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
@@ -2344,6 +2400,8 @@ impl RefundContract {
     /// # Errors
     /// Returns errors for invalid amounts, unsupported tokens, policy violations,
     /// fraud signals, eligibility blocks, or payment ownership mismatches.
+    /// Returns `OpenRefundRequestExists` if the merchant enabled the single
+    /// open request rule (#915) and the payment already has an open request.
     pub fn request_refund(
         env: Env,
         merchant: Address,
@@ -2375,6 +2433,13 @@ impl RefundContract {
                 Some(t) if t.active => {}
                 _ => return Err(Error::Ext(ExtError::UnsupportedRefundToken)),
             }
+        }
+
+        // Issue #915: optional one-open-request-per-payment rule.
+        if Self::get_single_open_request(env.clone(), merchant.clone())
+            && Self::has_open_refund_for_payment(&env, payment_id)
+        {
+            return Err(Error::Core(CoreError::OpenRefundRequestExists));
         }
 
         Self::create_refund(
@@ -11974,6 +12039,8 @@ impl RefundContract {
     /// # Errors
     /// Returns `Unauthorized` if the caller is not the contract admin.
     /// Returns `RefundNotFound` if the refund does not exist.
+    /// Returns `VoucherLiabilityCapExceeded` if the voucher would push the
+    /// merchant's outstanding voucher liability for the token above its cap (#914).
     pub fn issue_refund_voucher(
         env: Env,
         admin: Address,
@@ -12010,6 +12077,9 @@ impl RefundContract {
         {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
+
+        // Issue #914: the new voucher must fit under the merchant's liability cap.
+        Self::check_voucher_liability_cap(&env, &refund.merchant, &refund.token, refund.amount)?;
 
         let counter: u64 = env
             .storage()
@@ -12051,6 +12121,7 @@ impl RefundContract {
         }
 
         Self::add_customer_voucher(&env, &refund.customer, voucher_id);
+        Self::track_voucher_liability(&env, &voucher);
 
         Ok(voucher_id)
     }
@@ -12072,6 +12143,7 @@ impl RefundContract {
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
     /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has already been used.
+    /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherMinPurchaseNotMet` if the merchant has a minimum purchase
     /// amount configured and `payment_id`'s amount is below it.
@@ -12097,6 +12169,9 @@ impl RefundContract {
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if env.ledger().timestamp() > voucher.expires_at {
             return Err(Error::Ext(ExtError::VoucherExpired));
@@ -12128,6 +12203,7 @@ impl RefundContract {
         env.storage()
             .instance()
             .remove(&VoucherKey::RemainingBalance(voucher_id));
+        Self::release_voucher_liability(&env, &voucher, balance, true);
 
         Ok(())
     }
@@ -12156,6 +12232,7 @@ impl RefundContract {
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
     /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherInsufficientBalance` if `amount` exceeds the remaining balance.
     pub fn redeem_voucher_amount(
@@ -12186,6 +12263,9 @@ impl RefundContract {
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
         }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
         if env.ledger().timestamp() > voucher.expires_at {
             return Err(Error::Ext(ExtError::VoucherExpired));
         }
@@ -12212,6 +12292,7 @@ impl RefundContract {
         } else {
             env.storage().instance().set(&balance_key, &remaining);
         }
+        Self::release_voucher_liability(&env, &voucher, amount, remaining == 0);
 
         VoucherAmountRedeemed {
             voucher_id,
@@ -12227,7 +12308,8 @@ impl RefundContract {
     /// Get a voucher's remaining redeemable balance.
     ///
     /// Returns the full voucher amount if nothing has been redeemed yet, and
-    /// `0` for a fully redeemed voucher. Expiry is not taken into account.
+    /// `0` for a fully redeemed, revoked or merged-away voucher. Expiry is not
+    /// taken into account.
     ///
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
@@ -12304,6 +12386,7 @@ impl RefundContract {
     /// Returns `Unauthorized` if the caller does not own the voucher.
     /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been redeemed.
+    /// Returns `VoucherRevoked` if an admin revoked the voucher (#914).
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherNotTransferable` if the voucher was issued non-transferable.
     /// Returns `InvalidVoucherRecipient` if `new_owner` is the current owner.
@@ -12330,6 +12413,9 @@ impl RefundContract {
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if env.ledger().timestamp() > voucher.expires_at {
             return Err(Error::Ext(ExtError::VoucherExpired));
@@ -12688,6 +12774,8 @@ impl RefundContract {
     /// Returns `PromotionalBatchTooLarge` if `recipients` exceeds `MAX_PROMOTIONAL_BATCH`.
     /// Returns `InvalidAmount` if any amount is not positive or the total overflows.
     /// Returns `InvalidVoucherRecipient` if any recipient is the merchant itself.
+    /// Returns `VoucherLiabilityCapExceeded` if the batch total would push the
+    /// merchant's outstanding voucher liability for `token` above its cap (#914).
     /// Returns `InsufficientRefundReserve` if the reserve can't cover the batch total.
     pub fn issue_promotional_vouchers(
         env: Env,
@@ -12719,6 +12807,9 @@ impl RefundContract {
                 .checked_add(amount)
                 .ok_or(Error::Core(CoreError::InvalidAmount))?;
         }
+
+        // Issue #914: the whole batch must fit under the merchant's liability cap.
+        Self::check_voucher_liability_cap(&env, &merchant, &token, total)?;
 
         // Check the reserve covers the whole batch before issuing anything.
         let balance = Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone());
@@ -12774,6 +12865,7 @@ impl RefundContract {
                     .set(&VoucherKey::NonTransferable(voucher_id), &true);
             }
             Self::add_customer_voucher(&env, &customer, voucher_id);
+            Self::track_voucher_liability(&env, &voucher);
             voucher_ids.push_back(voucher_id);
 
             PromotionalVoucherIssued {
@@ -12801,6 +12893,391 @@ impl RefundContract {
         .publish(&env);
 
         Ok(voucher_ids)
+    }
+
+    // ── Issue #915: One open refund request per payment ───────────────────
+
+    /// Turn the one-open-request-per-payment rule on or off for a merchant.
+    ///
+    /// While enabled, `request_refund` rejects a new request for a payment that
+    /// already has a request in `Requested`, `PendingAppeal` or `Approved`
+    /// (approved but not yet processed) status. The rule is off by default.
+    /// Emits `SingleOpenRequestSet`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant (must authenticate).
+    /// * `enabled` - `true` to enforce the rule, `false` to turn it off.
+    ///
+    /// # Errors
+    /// Returns `ContractPaused` / `FunctionPaused` if the contract or this
+    /// function is paused.
+    pub fn set_single_open_request(
+        env: Env,
+        merchant: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_single_open_request")?;
+        merchant.require_auth();
+
+        let key = RefundExtKey::SingleOpenRequest(merchant.clone());
+        if enabled {
+            env.storage().instance().set(&key, &true);
+        } else {
+            env.storage().instance().remove(&key);
+        }
+
+        SingleOpenRequestSet { merchant, enabled }.publish(&env);
+        Ok(())
+    }
+
+    /// Whether the merchant enforces one open refund request per payment.
+    /// Returns `false` unless the merchant enabled it.
+    pub fn get_single_open_request(env: Env, merchant: Address) -> bool {
+        env.storage()
+            .instance()
+            .has(&RefundExtKey::SingleOpenRequest(merchant))
+    }
+
+    // ── Issue #914: Outstanding voucher liability ─────────────────────────
+
+    /// Cap the total outstanding voucher value a merchant may have in `token`.
+    ///
+    /// `issue_refund_voucher` and `issue_promotional_vouchers` reject issuance
+    /// that would push the outstanding liability above `cap`. Lowering the cap
+    /// below the current liability does not affect existing vouchers; it only
+    /// blocks new issuance until the liability falls. Emits `VoucherLiabilityCapSet`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `merchant` - The merchant the cap applies to.
+    /// * `token` - The voucher token the cap applies to.
+    /// * `cap` - Maximum outstanding voucher value; `0` blocks all new issuance.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `cap` is negative.
+    pub fn set_voucher_liability_cap(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+        cap: i128,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if cap < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage().instance().set(
+            &VoucherKey::LiabilityCap(merchant.clone(), token.clone()),
+            &cap,
+        );
+        VoucherLiabilityCapSet {
+            merchant,
+            token,
+            cap,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Remove a merchant's voucher liability cap for `token` (no limit).
+    /// Emits `VoucherLiabilityCapCleared`.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn clear_voucher_liability_cap(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        token: Address,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .remove(&VoucherKey::LiabilityCap(merchant.clone(), token.clone()));
+        VoucherLiabilityCapCleared { merchant, token }.publish(&env);
+        Ok(())
+    }
+
+    /// The merchant's voucher liability cap for `token`, or `None` if uncapped.
+    pub fn get_voucher_liability_cap(env: Env, merchant: Address, token: Address) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::LiabilityCap(merchant, token))
+    }
+
+    /// The merchant's current outstanding voucher liability in `token`: the
+    /// remaining balance of every unredeemed, unrevoked voucher that has not
+    /// been released by `expire_voucher`.
+    ///
+    /// Expired vouchers keep counting until `expire_voucher` is called for
+    /// them, because the contract cannot react to time passing on its own.
+    /// Vouchers issued before liability tracking existed are not counted.
+    pub fn get_voucher_liability(env: Env, merchant: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::OutstandingLiability(merchant, token))
+            .unwrap_or(0)
+    }
+
+    /// Revoke a voucher so it can no longer be redeemed, transferred or merged.
+    ///
+    /// The voucher's remaining balance is removed from the merchant's
+    /// outstanding liability. Expired vouchers can be revoked too. Emits
+    /// `VoucherRevoked`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `voucher_id` - The voucher to revoke.
+    ///
+    /// # Returns
+    /// The amount released from the merchant's outstanding liability.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher was fully redeemed or merged.
+    /// Returns `VoucherRevoked` if the voucher was already revoked.
+    pub fn revoke_voucher(env: Env, admin: Address, voucher_id: u64) -> Result<i128, Error> {
+        Self::require_admin(&env, &admin)?;
+        let voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+
+        let balance = Self::voucher_balance(&env, &voucher);
+        let released_amount = Self::release_voucher_liability(&env, &voucher, balance, true);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Revoked(voucher_id), &true);
+
+        VoucherRevoked {
+            voucher_id,
+            revoked_by: admin,
+            released_amount,
+        }
+        .publish(&env);
+        Ok(released_amount)
+    }
+
+    /// Whether an admin has revoked the voucher.
+    pub fn is_voucher_revoked(env: Env, voucher_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .has(&VoucherKey::Revoked(voucher_id))
+    }
+
+    /// Release an expired voucher's remaining balance from its merchant's
+    /// outstanding liability. Anyone can call this once the voucher has expired.
+    ///
+    /// Calling it again for the same voucher (or for a voucher issued before
+    /// liability tracking existed) releases nothing and returns `0`. Emits
+    /// `ExpiredVoucherReleased` when an amount is released.
+    ///
+    /// # Arguments
+    /// * `voucher_id` - The expired voucher.
+    ///
+    /// # Returns
+    /// The amount released from the merchant's outstanding liability.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher was fully redeemed or merged.
+    /// Returns `VoucherRevoked` if the voucher was revoked.
+    /// Returns `VoucherNotExpired` if the voucher has not expired yet.
+    pub fn expire_voucher(env: Env, voucher_id: u64) -> Result<i128, Error> {
+        let voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if env.ledger().timestamp() <= voucher.expires_at {
+            return Err(Error::Core(CoreError::VoucherNotExpired));
+        }
+
+        let balance = Self::voucher_balance(&env, &voucher);
+        let released_amount = Self::release_voucher_liability(&env, &voucher, balance, true);
+        if released_amount > 0 {
+            ExpiredVoucherReleased {
+                voucher_id,
+                merchant: voucher.merchant,
+                token: voucher.token,
+                released_amount,
+            }
+            .publish(&env);
+        }
+        Ok(released_amount)
+    }
+
+    // ── Issue #910: Merge refund vouchers ─────────────────────────────────
+
+    /// Maximum number of vouchers `merge_vouchers` combines per call.
+    pub const MAX_VOUCHER_MERGE: u32 = 20;
+
+    /// Combine several of a customer's vouchers into one.
+    ///
+    /// Every source voucher must belong to `customer`, be unredeemed, unrevoked,
+    /// unexpired and transferable, and share the same merchant and token. The
+    /// merged voucher holds the sum of the sources' remaining balances, takes
+    /// the earliest source expiry, carries `refund_id == 0`, and is
+    /// transferable. Each source is marked consumed: `redeemed` is set, its
+    /// balance becomes `0`, and `get_voucher_merged_into` returns the merged
+    /// voucher's ID. The merchant's outstanding liability is unchanged.
+    /// Emits `VouchersMerged`.
+    ///
+    /// # Arguments
+    /// * `customer` - The owner of every source voucher (must authenticate).
+    /// * `voucher_ids` - 2 to `MAX_VOUCHER_MERGE` distinct voucher IDs.
+    ///
+    /// # Returns
+    /// The ID of the merged voucher.
+    ///
+    /// # Errors
+    /// Returns `InvalidVoucherMerge` for fewer than 2 IDs, more than
+    /// `MAX_VOUCHER_MERGE` IDs, or a duplicated ID.
+    /// Returns `VoucherNotFound` if a voucher does not exist.
+    /// Returns `Unauthorized` if a voucher is not owned by `customer`.
+    /// Returns `VoucherAlreadyRedeemed` if a voucher was fully redeemed or merged.
+    /// Returns `VoucherRevoked` if a voucher was revoked.
+    /// Returns `VoucherExpired` if a voucher has expired.
+    /// Returns `VoucherNotTransferable` if a voucher was issued non-transferable.
+    /// Returns `VoucherMergeMismatch` if the vouchers span merchants or tokens.
+    pub fn merge_vouchers(
+        env: Env,
+        customer: Address,
+        voucher_ids: Vec<u64>,
+    ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "merge_vouchers")?;
+        customer.require_auth();
+
+        let count = voucher_ids.len();
+        if !(2..=Self::MAX_VOUCHER_MERGE).contains(&count) {
+            return Err(Error::Core(CoreError::InvalidVoucherMerge));
+        }
+
+        let now = env.ledger().timestamp();
+        let mut sources: Vec<RefundVoucher> = Vec::new(&env);
+        let mut total: i128 = 0;
+        let mut expires_at = u64::MAX;
+        for (i, voucher_id) in voucher_ids.iter().enumerate() {
+            if voucher_ids
+                .iter()
+                .skip(i + 1)
+                .any(|other| other == voucher_id)
+            {
+                return Err(Error::Core(CoreError::InvalidVoucherMerge));
+            }
+            let voucher: RefundVoucher = env
+                .storage()
+                .instance()
+                .get(&VoucherKey::Voucher(voucher_id))
+                .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+            if voucher.customer != customer {
+                return Err(Error::Core(CoreError::Unauthorized));
+            }
+            if voucher.redeemed {
+                return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+            }
+            if Self::is_voucher_revoked(env.clone(), voucher_id) {
+                return Err(Error::Core(CoreError::VoucherRevoked));
+            }
+            if now > voucher.expires_at {
+                return Err(Error::Ext(ExtError::VoucherExpired));
+            }
+            if !Self::is_voucher_transferable(env.clone(), voucher_id) {
+                return Err(Error::Ext(ExtError::VoucherNotTransferable));
+            }
+            if let Some(first) = sources.first() {
+                if voucher.merchant != first.merchant || voucher.token != first.token {
+                    return Err(Error::Core(CoreError::VoucherMergeMismatch));
+                }
+            }
+            total = total
+                .checked_add(Self::voucher_balance(&env, &voucher))
+                .ok_or(Error::Core(CoreError::InvalidAmount))?;
+            expires_at = expires_at.min(voucher.expires_at);
+            sources.push_back(voucher);
+        }
+
+        let merged_voucher_id: u64 = env
+            .storage()
+            .instance()
+            .get::<_, u64>(&VoucherKey::VoucherCounter)
+            .unwrap_or(0)
+            + 1;
+        let first = sources.get_unchecked(0);
+        let merged = RefundVoucher {
+            voucher_id: merged_voucher_id,
+            refund_id: 0,
+            customer: customer.clone(),
+            merchant: first.merchant.clone(),
+            amount: total,
+            token: first.token.clone(),
+            issued_at: now,
+            expires_at,
+            redeemed: false,
+        };
+
+        // Consume the sources. Their balances move to the merged voucher, so
+        // the liability released here is tracked again on the merged voucher.
+        for mut source in sources.iter() {
+            let balance = Self::voucher_balance(&env, &source);
+            Self::release_voucher_liability(&env, &source, balance, true);
+            source.redeemed = true;
+            env.storage()
+                .instance()
+                .set(&VoucherKey::Voucher(source.voucher_id), &source);
+            env.storage()
+                .instance()
+                .remove(&VoucherKey::RemainingBalance(source.voucher_id));
+            env.storage().instance().set(
+                &VoucherKey::MergedInto(source.voucher_id),
+                &merged_voucher_id,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(merged_voucher_id), &merged);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::VoucherCounter, &merged_voucher_id);
+        Self::add_customer_voucher(&env, &customer, merged_voucher_id);
+        Self::track_voucher_liability(&env, &merged);
+
+        VouchersMerged {
+            customer,
+            merchant: merged.merchant,
+            token: merged.token,
+            source_voucher_ids: voucher_ids,
+            merged_voucher_id,
+            amount: total,
+            expires_at,
+        }
+        .publish(&env);
+
+        Ok(merged_voucher_id)
+    }
+
+    /// The ID of the voucher a consumed source voucher was merged into, or
+    /// `None` if the voucher was never merged.
+    pub fn get_voucher_merged_into(env: Env, voucher_id: u64) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::MergedInto(voucher_id))
     }
 
     // ── Issue #194: Tiered arbitration escalation ─────────────────────────
@@ -13129,13 +13606,121 @@ impl RefundContract {
     }
 
     fn voucher_balance(env: &Env, voucher: &RefundVoucher) -> i128 {
-        if voucher.redeemed {
+        if voucher.redeemed
+            || env
+                .storage()
+                .instance()
+                .has(&VoucherKey::Revoked(voucher.voucher_id))
+        {
             return 0;
         }
         env.storage()
             .instance()
             .get(&VoucherKey::RemainingBalance(voucher.voucher_id))
             .unwrap_or(voucher.amount)
+    }
+
+    /// Whether `payment_id` has a refund request that is still open: awaiting a
+    /// decision (`Requested`), awaiting an appeal (`PendingAppeal`), or approved
+    /// but not yet processed (`Approved`) (#915).
+    fn has_open_refund_for_payment(env: &Env, payment_id: u64) -> bool {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentRefundCount(payment_id))
+            .unwrap_or(0);
+        let mut i = 0u64;
+        while i < count {
+            if let Some(refund_id) = env
+                .storage()
+                .instance()
+                .get::<_, u64>(&DataKey::PaymentRefunds(payment_id, i))
+            {
+                if let Some(refund) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Refund>(&DataKey::Refund(refund_id))
+                {
+                    if matches!(
+                        refund.status,
+                        RefundStatus::Requested
+                            | RefundStatus::Approved
+                            | RefundStatus::PendingAppeal
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Fails if issuing `additional` more voucher value would push the
+    /// merchant's outstanding liability for `token` above its cap (#914).
+    fn check_voucher_liability_cap(
+        env: &Env,
+        merchant: &Address,
+        token: &Address,
+        additional: i128,
+    ) -> Result<(), Error> {
+        if let Some(cap) = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&VoucherKey::LiabilityCap(merchant.clone(), token.clone()))
+        {
+            let outstanding =
+                Self::get_voucher_liability(env.clone(), merchant.clone(), token.clone());
+            let projected = outstanding
+                .checked_add(additional)
+                .ok_or(Error::Core(CoreError::InvalidAmount))?;
+            if projected > cap {
+                return Err(Error::Core(CoreError::VoucherLiabilityCapExceeded));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a newly issued voucher's balance to its (merchant, token) liability (#914).
+    fn track_voucher_liability(env: &Env, voucher: &RefundVoucher) {
+        let key = VoucherKey::OutstandingLiability(voucher.merchant.clone(), voucher.token.clone());
+        let outstanding: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let balance = Self::voucher_balance(env, voucher);
+        env.storage()
+            .instance()
+            .set(&key, &outstanding.saturating_add(balance));
+        env.storage()
+            .instance()
+            .set(&VoucherKey::LiabilityTracked(voucher.voucher_id), &true);
+    }
+
+    /// Removes `amount` of a voucher's value from its (merchant, token)
+    /// liability (#914). `fully_released` stops tracking the voucher, so later
+    /// releases for it are no-ops. Vouchers that were never tracked are ignored.
+    /// Returns the amount actually released.
+    fn release_voucher_liability(
+        env: &Env,
+        voucher: &RefundVoucher,
+        amount: i128,
+        fully_released: bool,
+    ) -> i128 {
+        let tracked_key = VoucherKey::LiabilityTracked(voucher.voucher_id);
+        if !env.storage().instance().has(&tracked_key) {
+            return 0;
+        }
+        let key = VoucherKey::OutstandingLiability(voucher.merchant.clone(), voucher.token.clone());
+        let outstanding: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        let released = amount.clamp(0, outstanding);
+        let remaining = outstanding - released;
+        if remaining == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &remaining);
+        }
+        if fully_released {
+            env.storage().instance().remove(&tracked_key);
+        }
+        released
     }
 
     fn add_customer_voucher(env: &Env, customer: &Address, voucher_id: u64) {
@@ -13431,6 +14016,15 @@ mod test_counter_offer;
 
 #[cfg(test)]
 mod test_voucher_transfer;
+
+#[cfg(test)]
+mod test_single_open_request;
+
+#[cfg(test)]
+mod test_voucher_liability;
+
+#[cfg(test)]
+mod test_voucher_merge;
 
 #[cfg(test)]
 mod test_category_refund_caps;

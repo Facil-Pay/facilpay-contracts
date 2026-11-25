@@ -183,6 +183,17 @@ pub enum HookKey {
     BySubscriberCount(Address),
 }
 
+// Overflow escrow keys: `EscrowKey` is at the Soroban 50-case union limit.
+#[derive(Clone)]
+#[contracttype]
+pub enum EscrowExtKey {
+    // Issue #877: hashlock escrow parameters keyed by escrow id.
+    Hashlock(u64),
+    // Issue #884: shared escrow note log (escrow_id, index) and per-escrow count.
+    Note(u64, u64),
+    NoteCount(u64),
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
@@ -193,6 +204,7 @@ pub enum DataKey {
     VoteWeight(u64, Address),
     ReleaseThresholdBps(u64),
     Hook(HookKey),
+    EscrowExt(EscrowExtKey),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3685,7 +3697,7 @@ impl EscrowContract {
             None,
         )?;
         env.storage().instance().set(
-            &DataKey::Escrow(EscrowKey::Hashlock(escrow_id)),
+            &DataKey::EscrowExt(EscrowExtKey::Hashlock(escrow_id)),
             &HashlockEscrow {
                 escrow_id,
                 hash: hash.clone(),
@@ -3715,7 +3727,7 @@ impl EscrowContract {
         let lock: HashlockEscrow = env
             .storage()
             .instance()
-            .get(&DataKey::Escrow(EscrowKey::Hashlock(escrow_id)))
+            .get(&DataKey::EscrowExt(EscrowExtKey::Hashlock(escrow_id)))
             .ok_or(Error::Escrow(EscrowError::NotFound))?;
         let mut escrow: Escrow = env
             .storage()
@@ -3761,7 +3773,7 @@ impl EscrowContract {
         let lock: HashlockEscrow = env
             .storage()
             .instance()
-            .get(&DataKey::Escrow(EscrowKey::Hashlock(escrow_id)))
+            .get(&DataKey::EscrowExt(EscrowExtKey::Hashlock(escrow_id)))
             .ok_or(Error::Escrow(EscrowError::NotFound))?;
         let mut escrow: Escrow = env
             .storage()
@@ -16741,13 +16753,13 @@ impl EscrowContract {
             return Err(Error::Basic(BasicError::Unauthorized));
         }
 
-        let count_key = DataKey::Escrow(EscrowKey::NoteCount(escrow_id));
+        let count_key = DataKey::EscrowExt(EscrowExtKey::NoteCount(escrow_id));
         let count: u64 = env.storage().instance().get(&count_key).unwrap_or(0);
         if count >= MAX_NOTES_PER_ESCROW {
             return Err(Error::Action(ActionError::MaxNotesPerEscrowReached));
         }
         env.storage().instance().set(
-            &DataKey::Escrow(EscrowKey::Note(escrow_id, count)),
+            &DataKey::EscrowExt(EscrowExtKey::Note(escrow_id, count)),
             &EscrowNote {
                 escrow_id,
                 author: caller.clone(),
@@ -16772,7 +16784,7 @@ impl EscrowContract {
         let count: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::Escrow(EscrowKey::NoteCount(escrow_id)))
+            .get(&DataKey::EscrowExt(EscrowExtKey::NoteCount(escrow_id)))
             .unwrap_or(0);
         let start = offset as u64;
         if start >= count || limit == 0 {
@@ -16786,7 +16798,7 @@ impl EscrowContract {
             if let Some(note) = env
                 .storage()
                 .instance()
-                .get::<DataKey, EscrowNote>(&DataKey::Escrow(EscrowKey::Note(escrow_id, i)))
+                .get::<DataKey, EscrowNote>(&DataKey::EscrowExt(EscrowExtKey::Note(escrow_id, i)))
             {
                 notes.push_back(note);
             }

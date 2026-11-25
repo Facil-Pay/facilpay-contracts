@@ -144,11 +144,36 @@ stellar contract invoke \
 - `finalize_denial()` — Finalizes a denied refund after the appeal window expires.
 - `process_refund()` — Processes an approved refund, deducting platform fees.
 - `withdraw_refund_request()` — Customer withdraws a refund still in `Requested` status. See [Withdrawing a Refund Request](#withdrawing-a-refund-request).
+- `set_single_open_request()` / `get_single_open_request()` — Merchant opt-in rule allowing only one open request per payment. See [One Open Request per Payment](#one-open-request-per-payment).
 - `counter_offer()` — Merchant offers a smaller refund than requested. See [Counter-Offers](#counter-offers).
 - `accept_counter_offer()` — Customer accepts the merchant's counter-offer, approving the refund at the offered amount.
 - `reject_counter_offer()` — Customer rejects the merchant's counter-offer; the refund goes back to review.
 - `reject_counter_offer_escalate()` — Customer rejects the counter-offer and escalates the refund to arbitration in one call.
 - `get_counter_offer()` — Gets the pending counter-offer for a refund, if any.
+
+### One Open Request per Payment
+
+By default, only the total-refunded cap limits how many requests a payment can have, so requests can stack while earlier ones are still pending. A merchant can opt in to a stricter rule: while it is on, `request_refund` rejects a new request for a payment that already has an open request.
+
+| Function | Parameters | Returns |
+| --- | --- | --- |
+| `set_single_open_request` | `merchant: Address` (must authorize), `enabled: bool` | `Result<(), Error>` |
+| `get_single_open_request` | `merchant: Address` | `bool` (`false` unless enabled) |
+
+- **Off by default.** Merchants that never call `set_single_open_request` keep the old behaviour.
+- **What counts as open.** A request is open while it is `Requested`, `PendingAppeal` (rejected, but its appeal window is still running), or `Approved` but not yet processed. Once it is `Processed`, `Rejected` (after `finalize_denial`) or `Withdrawn`, the payment can take a new request.
+- **Scope.** The rule is per merchant and is checked against the requesting merchant's setting. It applies to `request_refund` only. Refunds created by auto-refund triggers (`evaluate_auto_refund`) are not affected.
+- **Turning it off** with `enabled: false` lets requests stack again straight away.
+- `set_single_open_request` can be paused on its own with `pause_function("set_single_open_request")`.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `CoreError::OpenRefundRequestExists` | `87` | `request_refund`: the rule is on and the payment already has an open request |
+| `CoreError::FunctionPaused` / `ContractPaused` | `18` / `17` | The contract or `set_single_open_request` is paused |
+
+| Event | Fields | Emitted |
+| --- | --- | --- |
+| `SingleOpenRequestSet` | `merchant`, `enabled` | `set_single_open_request()` turns the rule on or off |
 
 ### Withdrawing a Refund Request
 
@@ -946,6 +971,7 @@ The merchant's `set_vouchers_transferable` setting is snapshotted onto each vouc
 | `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
 | `ExtError::VoucherExpired` | `53` | Ledger time is past the voucher's `expires_at` |
 | `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher has been redeemed |
+| `CoreError::VoucherRevoked` | `89` | The voucher was revoked by the admin |
 | `ExtError::VoucherNotTransferable` | `75` | The voucher was issued while its merchant had transfers disabled |
 | `ExtError::InvalidVoucherRecipient` | `76` | `new_owner` is the current owner |
 
@@ -973,6 +999,7 @@ Expiry covers the remaining balance. After `expires_at`, neither function can re
 | `ExtError::VoucherNotFound` | `52` | No voucher with this ID |
 | `ExtError::VoucherExpired` | `53` | Ledger time is past the voucher's `expires_at` |
 | `ExtError::VoucherAlreadyRedeemed` | `54` | The voucher's balance is already `0` |
+| `CoreError::VoucherRevoked` | `89` | The voucher was revoked by the admin |
 | `ExtError::VoucherInsufficientBalance` | `77` | `amount` is greater than the remaining balance |
 
 Emits `VoucherAmountRedeemed` from `redeem_voucher_amount`. `redeem_voucher_amount` can be paused on its own with `pause_function("redeem_voucher_amount")`.
@@ -993,6 +1020,7 @@ Each voucher expires `expiry_seconds` after the ledger time of the call. Promoti
 | --- | --- | --- |
 | `CoreError::InvalidAmount` | `1` | An amount is zero or negative, or the batch total overflows `i128` |
 | `ExtError::InsufficientRefundReserve` | `67` | The merchant's reserve for `token` is less than the batch total, or the merchant has no reserve in `token` |
+| `CoreError::VoucherLiabilityCapExceeded` | `88` | The batch total would push the merchant's outstanding voucher liability for `token` above its cap |
 | `ExtError::InvalidVoucherRecipient` | `76` | A recipient is the merchant itself |
 | `ExtError::EmptyPromotionalBatch` | `80` | `recipients` is empty |
 | `ExtError::PromotionalBatchTooLarge` | `81` | `recipients` has more than `MAX_PROMOTIONAL_BATCH` entries |
@@ -1254,6 +1282,7 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `RefundPaymentSynced` | `refund_payment_synced` | `refund_id`, `payment_id`, `amount` | A processed refund is recorded on the payment contract (#809) |
 | `RefundPaymentSyncFailed` | `refund_payment_sync_failed` | `refund_id`, `payment_id`, `payment_contract_set` | The payment-contract sync is skipped or rejected; the payout stands (#809) |
 | `RefundWithdrawn` | `refund_withdrawn` | `refund_id`, `payment_id`, `customer`, `amount`, `withdrawn_at` | `withdraw_refund_request()` moves refund to `Withdrawn` status |
+| `SingleOpenRequestSet` | `single_open_request_set` | `merchant`, `enabled` | `set_single_open_request()` turns the one-open-request-per-payment rule on or off |
 | `CounterOfferMade` | `counter_offer_made` | `refund_id`, `merchant`, `requested_amount`, `offered_amount`, `expires_at` | `counter_offer()` records a merchant counter-offer |
 | `CounterOfferAccepted` | `counter_offer_accepted` | `refund_id`, `customer`, `requested_amount`, `accepted_amount` | `accept_counter_offer()` approves the refund at the offered amount |
 | `RefundReserveLow` | `refund_reserve_low` | `merchant`, `token`, `balance`, `warning_level` | A withdrawal or refund drops the merchant's reserve below its warning level (fires once per crossing) |
@@ -1276,6 +1305,11 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `VoucherTransferred` | `voucher_transferred` | `voucher_id`, `from`, `to` | `transfer_voucher()` moves a voucher to a new owner |
 | `VoucherTransferabilitySet` | `voucher_transferability_set` | `merchant`, `transferable` | `set_vouchers_transferable()` changes a merchant's voucher setting |
 | `VoucherAmountRedeemed` | `voucher_amount_redeemed` | `voucher_id`, `customer`, `amount`, `remaining_balance` | `redeem_voucher_amount()` redeems part (or the rest) of a voucher |
+| `VouchersMerged` | `vouchers_merged` | `customer`, `merchant`, `token`, `source_voucher_ids`, `merged_voucher_id`, `amount`, `expires_at` | `merge_vouchers()` combines vouchers into one |
+| `VoucherLiabilityCapSet` | `voucher_liability_cap_set` | `merchant`, `token`, `cap` | `set_voucher_liability_cap()` sets a merchant's liability cap |
+| `VoucherLiabilityCapCleared` | `voucher_liability_cap_cleared` | `merchant`, `token` | `clear_voucher_liability_cap()` removes the cap |
+| `VoucherRevoked` | `voucher_revoked` | `voucher_id`, `revoked_by`, `released_amount` | `revoke_voucher()` revokes a voucher |
+| `ExpiredVoucherReleased` | `expired_voucher_released` | `voucher_id`, `merchant`, `token`, `released_amount` | `expire_voucher()` releases an expired voucher from the liability |
 
 ### Auto-Refund Trigger Events
 

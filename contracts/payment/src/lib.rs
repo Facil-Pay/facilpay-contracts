@@ -2795,6 +2795,51 @@ pub struct PendingSettlement {
     pub release_at: u64,
 }
 
+/// Rolling reserve withheld from a merchant's settlements (#901).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveConfig {
+    /// Share of each settlement withheld, in basis points (1..=10_000).
+    pub bps: u32,
+    /// Seconds each withheld slice is held before it can be released.
+    pub hold_seconds: u64,
+}
+
+/// One withheld portion of a settlement, released after `release_at` (#901).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveSlice {
+    pub token: Address,
+    pub amount: i128,
+    pub held_at: u64,
+    pub release_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveSet {
+    pub merchant: Address,
+    pub bps: u32,
+    pub hold_seconds: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveWithheld {
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub release_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollingReserveReleased {
+    pub merchant: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 // Issue #678: channel settlement awaiting the end of its challenge window.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -4542,12 +4587,20 @@ impl PaymentContract {
             .ok_or(Error::Payment(PaymentError::NotFound))
     }
 
+    /// Pays `amount` to the merchant, or accumulates it under their payout
+    /// schedule, after withholding any rolling reserve (#901).
+    ///
+    /// Returns the amount withheld into the rolling reserve.
     fn settle_or_accumulate(
         env: &Env,
         merchant: Address,
         token: Address,
         amount: i128,
-    ) -> Result<(), Error> {
+    ) -> Result<i128, Error> {
+        // Issue #901: hold back the merchant's rolling reserve share first.
+        let held = Self::withhold_rolling_reserve(env, &merchant, &token, amount);
+        let amount = amount - held;
+
         // If merchant has a payout schedule for this token and it's not Immediate, accumulate
         if let Some(mut schedule) =
             env.store()
@@ -4561,7 +4614,7 @@ impl PaymentContract {
                     &DataKey::Merchant(MerchantDataKey::PayoutSchedule(merchant.clone())),
                     &schedule,
                 );
-                return Ok(());
+                return Ok(held);
             }
         }
 
@@ -4569,7 +4622,68 @@ impl PaymentContract {
         let token_client = token::Client::new(env, &token);
         let contract_address = env.current_contract_address();
         token_client.transfer(&contract_address, &merchant, &amount);
-        Ok(())
+        Ok(held)
+    }
+
+    /// Withholds the merchant's rolling reserve share of a settlement and
+    /// records it as a slice released after the configured hold (#901).
+    ///
+    /// Returns the amount withheld (`0` when no reserve is configured).
+    fn withhold_rolling_reserve(
+        env: &Env,
+        merchant: &Address,
+        token: &Address,
+        amount: i128,
+    ) -> i128 {
+        if amount <= 0 {
+            return 0;
+        }
+        let config: Option<RollingReserveConfig> =
+            env.store()
+                .get(&DataKey::Merchant(MerchantDataKey::RollingReserveConfig(
+                    merchant.clone(),
+                )));
+        let Some(config) = config else {
+            return 0;
+        };
+        let held = amount.saturating_mul(config.bps as i128) / 10_000;
+        if held <= 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        let release_at = now.saturating_add(config.hold_seconds);
+        let count_key = DataKey::Merchant(MerchantDataKey::RollingReserveCount(merchant.clone()));
+        let index: u64 = env.store().get(&count_key).unwrap_or(0);
+        env.store().set(
+            &DataKey::Merchant(MerchantDataKey::RollingReserveSlice(
+                merchant.clone(),
+                index,
+            )),
+            &RollingReserveSlice {
+                token: token.clone(),
+                amount: held,
+                held_at: now,
+                release_at,
+            },
+        );
+        env.store().set(&count_key, &(index + 1));
+
+        let held_key = DataKey::Merchant(MerchantDataKey::RollingReserveHeld(
+            merchant.clone(),
+            token.clone(),
+        ));
+        let total: i128 = env.store().get(&held_key).unwrap_or(0);
+        env.store().set(&held_key, &(total + held));
+
+        (RollingReserveWithheld {
+            merchant: merchant.clone(),
+            token: token.clone(),
+            amount: held,
+            release_at,
+        })
+        .publish(env);
+        held
     }
 
     /// Configures a merchant's payout schedule for accumulating payments before settlement.
@@ -6132,7 +6246,7 @@ impl PaymentContract {
             );
         }
 
-        PaymentContract::settle_or_accumulate(
+        let reserve_held = PaymentContract::settle_or_accumulate(
             env,
             payment.merchant.clone(),
             payment.token.clone(),
@@ -6164,9 +6278,10 @@ impl PaymentContract {
                 PaymentContract::get_forward_config(env.clone(), payment.merchant.clone())
             {
                 if forward_config.active {
-                    // Calculate the forward amount based on forward_bps
-                    let forward_amount =
-                        (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
+                    // Calculate the forward amount based on forward_bps, on
+                    // the proceeds actually paid out after the rolling reserve (#901).
+                    let paid_out = (merchant_amount - reserve_held).max(0);
+                    let forward_amount = (paid_out * (forward_config.forward_bps as i128)) / 10000;
 
                     // Transfer the forward amount from merchant to forward_to address
                     if forward_amount > 0 {
@@ -16867,17 +16982,212 @@ impl PaymentContract {
         if now < settlement.release_at {
             return Err(Error::Feature(FeatureError::SettlementNotReady));
         }
+        // Issue #901: the rolling reserve applies when held funds are paid out.
+        let held = Self::withhold_rolling_reserve(
+            &env,
+            &settlement.merchant,
+            &settlement.token,
+            settlement.amount,
+        );
         let token_client = token::Client::new(&env, &settlement.token);
         token_client.transfer(
             &env.current_contract_address(),
             &settlement.merchant,
-            &settlement.amount,
+            &(settlement.amount - held),
         );
         env.store().set(
             &DataKey::State(StateDataKey::SettlementFinalized(payment_id)),
             &true,
         );
         Ok(())
+    }
+
+    // ── Issue #901: Rolling reserve on merchant payouts ──────────────────
+
+    /// Maximum number of held slices `release_rolling_reserve` releases per call.
+    pub const MAX_RESERVE_RELEASE_SLICES: u32 = 50;
+
+    /// Configures a rolling reserve on a merchant's settlements.
+    ///
+    /// While configured, `bps` of every settlement paid to the merchant is
+    /// withheld in the contract as a slice that `release_rolling_reserve` pays
+    /// out `hold_seconds` after it was withheld. Passing `bps == 0` disables
+    /// the reserve for future settlements; slices already held keep their
+    /// original release time and are never released early. Changing the
+    /// reserve only affects settlements made afterwards.
+    ///
+    /// # Arguments
+    /// * `admin` - A multisig admin (must authorize).
+    /// * `merchant` - The merchant whose settlements are held back.
+    /// * `bps` - Share withheld, in basis points (`0` disables, max `10_000`).
+    /// * `hold_seconds` - How long each slice is held; must be positive when `bps > 0`.
+    ///
+    /// # Errors
+    /// * `MultiSigNotInitialized` / `Unauthorized` - caller is not an admin.
+    /// * `InvalidRollingReserve` - `bps > 10_000`, or `bps > 0` with `hold_seconds == 0`.
+    ///
+    /// # Events
+    /// Emits `RollingReserveSet`.
+    pub fn set_rolling_reserve(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        bps: u32,
+        hold_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let ms_config: MultiSigConfig = env
+            .store()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !ms_config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        if bps > 10_000 || (bps > 0 && hold_seconds == 0) {
+            return Err(Error::Feature(FeatureError::InvalidRollingReserve));
+        }
+
+        let key = DataKey::Merchant(MerchantDataKey::RollingReserveConfig(merchant.clone()));
+        if bps == 0 {
+            env.store().remove(&key);
+        } else {
+            env.store()
+                .set(&key, &RollingReserveConfig { bps, hold_seconds });
+        }
+
+        (RollingReserveSet {
+            merchant,
+            bps,
+            hold_seconds,
+        })
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns a merchant's rolling reserve configuration, or `None` if disabled.
+    pub fn get_rolling_reserve(env: Env, merchant: Address) -> Option<RollingReserveConfig> {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::RollingReserveConfig(
+                merchant,
+            )))
+    }
+
+    /// Returns the total amount of `token` currently held in the merchant's
+    /// rolling reserve (withheld and not yet released).
+    pub fn get_rolling_reserve_held(env: Env, merchant: Address, token: Address) -> i128 {
+        env.store()
+            .get(&DataKey::Merchant(MerchantDataKey::RollingReserveHeld(
+                merchant, token,
+            )))
+            .unwrap_or(0)
+    }
+
+    /// Returns the merchant's unreleased rolling reserve slices, oldest first,
+    /// up to `MAX_RESERVE_RELEASE_SLICES` entries.
+    pub fn get_rolling_reserve_slices(env: Env, merchant: Address) -> Vec<RollingReserveSlice> {
+        let head: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::RollingReserveHead(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::RollingReserveCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let mut slices = Vec::new(&env);
+        let mut index = head;
+        while index < count && slices.len() < Self::MAX_RESERVE_RELEASE_SLICES {
+            if let Some(slice) = env.store().get::<RollingReserveSlice>(&DataKey::Merchant(
+                MerchantDataKey::RollingReserveSlice(merchant.clone(), index),
+            )) {
+                slices.push_back(slice);
+            }
+            index += 1;
+        }
+        slices
+    }
+
+    /// Pays out the merchant's rolling reserve slices whose hold has elapsed.
+    ///
+    /// Slices are released oldest first and release stops at the first slice
+    /// still on hold, so no slice is ever released before its `release_at`.
+    /// At most `MAX_RESERVE_RELEASE_SLICES` slices are released per call; call
+    /// again to release more. Anyone may call this; funds always go to the
+    /// merchant.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant whose held funds are released.
+    ///
+    /// # Returns
+    /// The number of slices released.
+    ///
+    /// # Errors
+    /// * `ContractPaused` / `FunctionPaused` - the contract or function is paused.
+    /// * `NoReleasableReserve` - no held slice has reached its release time.
+    ///
+    /// # Events
+    /// Emits one `RollingReserveReleased` per token released.
+    pub fn release_rolling_reserve(env: Env, merchant: Address) -> Result<u32, Error> {
+        Self::require_not_paused(&env, "release_rolling_reserve")?;
+        let head_key = DataKey::Merchant(MerchantDataKey::RollingReserveHead(merchant.clone()));
+        let head: u64 = env.store().get(&head_key).unwrap_or(0);
+        let count: u64 = env
+            .store()
+            .get(&DataKey::Merchant(MerchantDataKey::RollingReserveCount(
+                merchant.clone(),
+            )))
+            .unwrap_or(0);
+        let now = env.ledger().timestamp();
+
+        let mut totals: Map<Address, i128> = Map::new(&env);
+        let mut released: u32 = 0;
+        let mut index = head;
+        while index < count && released < Self::MAX_RESERVE_RELEASE_SLICES {
+            let slice_key = DataKey::Merchant(MerchantDataKey::RollingReserveSlice(
+                merchant.clone(),
+                index,
+            ));
+            if let Some(slice) = env.store().get::<RollingReserveSlice>(&slice_key) {
+                if slice.release_at > now {
+                    break;
+                }
+                let sum = totals.get(slice.token.clone()).unwrap_or(0) + slice.amount;
+                totals.set(slice.token, sum);
+                env.store().remove(&slice_key);
+                released += 1;
+            }
+            index += 1;
+        }
+        if released == 0 {
+            return Err(Error::Feature(FeatureError::NoReleasableReserve));
+        }
+        env.store().set(&head_key, &index);
+
+        let contract_address = env.current_contract_address();
+        for (token, amount) in totals.iter() {
+            let held_key = DataKey::Merchant(MerchantDataKey::RollingReserveHeld(
+                merchant.clone(),
+                token.clone(),
+            ));
+            let held: i128 = env.store().get(&held_key).unwrap_or(0);
+            let remaining = held - amount;
+            if remaining > 0 {
+                env.store().set(&held_key, &remaining);
+            } else {
+                env.store().remove(&held_key);
+            }
+            token::Client::new(&env, &token).transfer(&contract_address, &merchant, &amount);
+            (RollingReserveReleased {
+                merchant: merchant.clone(),
+                token,
+                amount,
+            })
+            .publish(&env);
+        }
+        Ok(released)
     }
 
     /// Returns all pending (non-finalized) settlements for a merchant.

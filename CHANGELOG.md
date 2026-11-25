@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Payment rolling reserve (#901)** — `set_rolling_reserve(admin, merchant, bps, hold_seconds)` withholds `bps` of each merchant settlement as a slice that `release_rolling_reserve(merchant)` pays out after `hold_seconds`. Held funds are visible through `get_rolling_reserve_held` and `get_rolling_reserve_slices`. Disabling the reserve (`bps = 0`) never releases held slices early.
+
+- **Merge refund vouchers (#910)** — `merge_vouchers(customer, voucher_ids)` combines same-merchant, same-token, transferable, unexpired vouchers into one voucher with the earliest source expiry. Sources are marked consumed and `get_voucher_merged_into` points to the merged voucher.
+
+- **Voucher liability cap (#914)** — The refund contract tracks outstanding voucher value per `(merchant, token)` (`get_voucher_liability`). `set_voucher_liability_cap` / `clear_voucher_liability_cap` cap it, and issuance beyond the cap fails with `VoucherLiabilityCapExceeded`. Redemption, the new `revoke_voucher` and the new `expire_voucher` reduce the liability.
+
+- **One open refund request per payment (#915)** — Merchants can opt in with `set_single_open_request(merchant, true)`; `request_refund` then rejects a new request while the payment has one that is requested, pending appeal, or approved but unprocessed. Off by default.
+
 - **Bounded emergency pause (#820)** — `emergency_pause_all` can set a maximum pause duration. Once it is reached, anyone may call `expire_emergency_pause()` to unpause all child contracts, which emits `EmergencyPauseAutoExpired`. Admin-set members can push the expiry back with `extend_emergency_pause(admin, additional_seconds)` before it is reached, and `get_emergency_pause_expiry()` returns the current expiry.
 
 - **Refund contract in-place upgrades (#643)** — `upgrade(admin, new_wasm_hash)` replaces the refund contract's WASM without changing its address or storage, gated by the refund admin, and emits `ContractUpgraded`.
@@ -41,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     3. If upgrading a deployed instance with existing data, plan a storage/data migration for historical refunds before reading them as the new `Refund` shape.
 
 ### Fixed
+
+- **Workspace build restored** — Recent merges had dropped storage-key variants (`TrustBoostConfig` in refund; `Hashlock`, `Note`, `NoteCount` in escrow) and the admin contract's `cancelled` proposal field and child-upgrade types, so `admin`, `escrow` and `refund` no longer compiled. The escrow keys now live in a new `EscrowExtKey` enum because `EscrowKey` is at Soroban's 50-case limit. Admin tests were updated for the `propose_action` description-hash argument.
 
 - Restored enum variants and types dropped by earlier merges so the escrow, refund and payment contracts compile again; renumbered the refund counter-offer/voucher errors to `72`–`76` and the payment `PauseLimitExceeded` error to `320` to remove code collisions.
 

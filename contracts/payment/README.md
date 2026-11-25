@@ -1391,6 +1391,39 @@ Subscriber contracts can register to receive a callback whenever a payment reach
 | `finalize_pending_settlement(payment_id)`        | Release a settlement that has passed its finality delay.              |
 | `get_pending_settlements(merchant)`              | List all settlements waiting out their finality delay for a merchant. |
 
+### Rolling Reserve
+
+New merchants carry the highest refund and chargeback risk. A rolling reserve holds back part of each of a merchant's settlements and pays each held slice out once its hold period has passed.
+
+| Function | Parameters | Returns | Auth |
+| --- | --- | --- | --- |
+| `set_rolling_reserve` | `admin: Address`, `merchant: Address`, `bps: u32`, `hold_seconds: u64` | `Result<(), Error>` | multisig admin |
+| `get_rolling_reserve` | `merchant: Address` | `Option<RollingReserveConfig>` (`bps`, `hold_seconds`; `None` when disabled) | — |
+| `get_rolling_reserve_held` | `merchant: Address`, `token: Address` | `i128` — amount of `token` currently held (`0` if none) | — |
+| `get_rolling_reserve_slices` | `merchant: Address` | `Vec<RollingReserveSlice>` (`token`, `amount`, `held_at`, `release_at`), oldest first, up to `MAX_RESERVE_RELEASE_SLICES` (50) | — |
+| `release_rolling_reserve` | `merchant: Address` | `Result<u32, Error>` (number of slices released) | anyone |
+
+**Withholding.** While a reserve is configured, `bps` basis points of every settlement paid to the merchant are kept in the contract as a slice that becomes releasable `hold_seconds` later. This applies to every settlement that goes through the standard payout path: `complete_payment` (including payouts accumulated under a payout schedule), `execute_scheduled_payment`, completing a partially paid payment, and `finalize_pending_settlement` for finality-delayed settlements (withheld when the settlement is finalised). Platform fees are taken first, so the reserve applies to the merchant's net proceeds (plus any tip). When payment forwarding is active, the forwarded share is computed on the amount actually paid out. Payment-channel settlements are not affected.
+
+**Releasing.** `release_rolling_reserve` pays out held slices whose `release_at` has passed, oldest first, grouped into one transfer per token. It stops at the first slice that is still on hold, so a slice is never released before its own `release_at`, even if a shorter hold was configured later. It releases at most 50 slices per call; call it again to release more. Anyone may call it: funds always go to the merchant.
+
+**Changing or disabling.** Setting a new `bps` or `hold_seconds` only affects later settlements. Passing `bps = 0` disables the reserve for future settlements (`hold_seconds` is ignored). Disabling does **not** release funds already held early: each held slice stays in the contract until its original `release_at`, and it is then released with `release_rolling_reserve` as usual.
+
+| Error | Code | When |
+| --- | --- | --- |
+| `BasicError::Unauthorized` | `100` | `set_rolling_reserve`: caller is not a multisig admin |
+| `BasicError::MultiSigNotInitialized` | `111` | `set_rolling_reserve`: the contract has no multisig config |
+| `FeatureError::InvalidRollingReserve` | `548` | `set_rolling_reserve`: `bps > 10_000`, or `bps > 0` with `hold_seconds == 0` |
+| `FeatureError::NoReleasableReserve` | `549` | `release_rolling_reserve`: no held slice has reached its release time |
+
+`release_rolling_reserve` also fails with `ContractPaused` / `FunctionPaused` while the contract or the function is paused.
+
+| Event | Topic Name | Payload Fields | Fires When |
+| --- | --- | --- | --- |
+| `RollingReserveSet` | `rolling_reserve_set` | `merchant`, `bps`, `hold_seconds` | `set_rolling_reserve()` sets, changes or disables a reserve |
+| `RollingReserveWithheld` | `rolling_reserve_withheld` | `merchant`, `token`, `amount`, `release_at` | A settlement is paid and part of it is withheld |
+| `RollingReserveReleased` | `rolling_reserve_released` | `merchant`, `token`, `amount` | `release_rolling_reserve()` pays out held funds (once per token) |
+
 ### Fee Management
 
 | Function                                            | Description                                                                        |
@@ -1874,6 +1907,14 @@ The contract emits Soroban events for all state-changing operations. Off-chain i
 | `MerchantDeactivated`           | `merchant_deactivated`          | `merchant`, `admin`                 | `deactivate_merchant()` marks the merchant inactive             |
 | `MerchantReactivated`           | `merchant_reactivated`          | `merchant`, `admin`                 | `reactivate_merchant()` marks the merchant active again         |
 | `RequireRegisteredMerchantsSet` | `require_registered_merchants_set` | `required`, `admin`              | `set_require_registered_merchants()` toggles enforcement        |
+
+### Rolling Reserve Events
+
+| Event | Topic Name | Payload Fields | Fires When |
+| --- | --- | --- | --- |
+| `RollingReserveSet` | `rolling_reserve_set` | `merchant`, `bps`, `hold_seconds` | `set_rolling_reserve()` sets, changes or disables a reserve |
+| `RollingReserveWithheld` | `rolling_reserve_withheld` | `merchant`, `token`, `amount`, `release_at` | A settlement is paid and part of it is withheld |
+| `RollingReserveReleased` | `rolling_reserve_released` | `merchant`, `token`, `amount` | `release_rolling_reserve()` pays out held funds (once per token) |
 
 ### Contract Control Events
 

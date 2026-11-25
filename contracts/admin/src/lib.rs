@@ -143,10 +143,34 @@ pub struct AdminProposal {
     pub created_at: u64,
     pub expires_at: u64,
     pub executed: bool,
+    /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
+    pub cancelled: bool,
     /// Optional hash of the off-chain rationale for this proposal (#875).
     pub description_hash: Option<BytesN<32>>,
     /// Set by `cancel_proposal` (#872); cancelled proposals stay readable.
     pub cancelled: bool,
+}
+
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
 }
 
 /// Proposal shape used before #875, kept so existing stored proposals stay readable.
@@ -885,6 +909,7 @@ fn load_proposal(env: &Env, proposal_id: u64) -> Result<AdminProposal, Error> {
         created_at: legacy.created_at,
         expires_at: legacy.expires_at,
         executed: legacy.executed,
+        cancelled: false,
         description_hash: None,
         cancelled: false,
     })
@@ -1588,6 +1613,7 @@ impl AdminContract {
             created_at,
             expires_at,
             executed: false,
+            cancelled: false,
             description_hash: description_hash.clone(),
             cancelled: false,
         };
