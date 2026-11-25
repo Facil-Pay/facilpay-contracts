@@ -230,6 +230,12 @@ pub enum VoucherKey {
     // Absent until the first partial redemption; the voucher's full `amount`
     // is the balance until then.
     RemainingBalance(u64),
+    // Issue #912: present (true) once a voucher has been revoked.
+    Revoked(u64),
+    // Issue #912: remaining balance above which revocation needs admin co-approval.
+    RevokeApprovalThreshold,
+    // Issue #912: present (true) once the admin co-approved a voucher's revocation.
+    RevocationApproved(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -847,6 +853,42 @@ pub struct VoucherAmountRedeemed {
     pub customer: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+// Issue #911: merchant-extended voucher expiry
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherExpiryExtended {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub old_expires_at: u64,
+    pub new_expires_at: u64,
+}
+
+// Issue #912: voucher revocation
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevoked {
+    pub voucher_id: u64,
+    pub merchant: Address,
+    pub customer: Address,
+    pub revoked_amount: i128,
+    pub returned_to_reserve: bool,
+    pub reason_hash: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevocationApproved {
+    pub voucher_id: u64,
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VoucherRevokeThresholdSet {
+    pub threshold: i128,
+    pub admin: Address,
 }
 
 // Issue #806: bulk promotional voucher issuance
@@ -12028,6 +12070,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has already been used.
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherMinPurchaseNotMet` if the merchant has a minimum purchase
@@ -12048,6 +12091,9 @@ impl RefundContract {
 
         if voucher.customer != customer {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -12108,6 +12154,7 @@ impl RefundContract {
     /// Returns `InvalidAmount` if `amount` is zero or negative.
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller is not the voucher's current owner.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherInsufficientBalance` if `amount` exceeds the remaining balance.
@@ -12132,6 +12179,9 @@ impl RefundContract {
 
         if voucher.customer != customer {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -12252,6 +12302,7 @@ impl RefundContract {
     /// # Errors
     /// Returns `VoucherNotFound` if the voucher does not exist.
     /// Returns `Unauthorized` if the caller does not own the voucher.
+    /// Returns `VoucherRevoked` if the merchant revoked the voucher.
     /// Returns `VoucherAlreadyRedeemed` if the voucher has been redeemed.
     /// Returns `VoucherExpired` if the voucher has expired.
     /// Returns `VoucherNotTransferable` if the voucher was issued non-transferable.
@@ -12273,6 +12324,9 @@ impl RefundContract {
 
         if voucher.customer != owner {
             return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
         }
         if voucher.redeemed {
             return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
@@ -12349,6 +12403,260 @@ impl RefundContract {
         !env.storage()
             .instance()
             .has(&VoucherKey::NonTransferable(voucher_id))
+    }
+
+    // ── Issue #911: Merchant-extended voucher expiry ─────────────────────
+
+    /// Move an unredeemed voucher's expiry later.
+    ///
+    /// Lets the issuing merchant give customers more time to use a voucher,
+    /// including one that has already expired. Expiry can only move later.
+    /// Emits `VoucherExpiryExtended`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The voucher's issuing merchant (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to extend.
+    /// * `new_expires_at` - The new expiry timestamp; must be later than the
+    ///   voucher's current `expires_at`.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if `merchant` did not issue the voucher.
+    /// Returns `VoucherRevoked` if the voucher was revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `InvalidVoucherExpiry` if `new_expires_at` is not later than the
+    /// current expiry.
+    pub fn extend_voucher_expiry(
+        env: Env,
+        merchant: Address,
+        voucher_id: u64,
+        new_expires_at: u64,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "extend_voucher_expiry")?;
+        merchant.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+        if new_expires_at <= voucher.expires_at {
+            return Err(Error::Core(CoreError::InvalidVoucherExpiry));
+        }
+
+        let old_expires_at = voucher.expires_at;
+        voucher.expires_at = new_expires_at;
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+
+        VoucherExpiryExtended {
+            voucher_id,
+            merchant,
+            old_expires_at,
+            new_expires_at,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // ── Issue #912: Voucher revocation ────────────────────────────────────
+
+    /// Set the remaining-balance threshold above which revoking a voucher
+    /// needs admin co-approval. `0` (the default) means no revocation needs
+    /// co-approval. Emits `VoucherRevokeThresholdSet`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `threshold` - The threshold amount; must not be negative.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `InvalidAmount` if `threshold` is negative.
+    pub fn set_voucher_revoke_threshold(
+        env: Env,
+        admin: Address,
+        threshold: i128,
+    ) -> Result<(), Error> {
+        Self::require_voucher_admin(&env, &admin)?;
+        if threshold < 0 {
+            return Err(Error::Core(CoreError::InvalidAmount));
+        }
+        env.storage()
+            .instance()
+            .set(&VoucherKey::RevokeApprovalThreshold, &threshold);
+
+        VoucherRevokeThresholdSet { threshold, admin }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the revocation co-approval threshold (`0` if none is set).
+    pub fn get_voucher_revoke_threshold(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&VoucherKey::RevokeApprovalThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Co-approve the revocation of a voucher whose remaining balance is above
+    /// the revocation threshold. The merchant then calls `revoke_voucher`.
+    /// Emits `VoucherRevocationApproved`.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to approve for revocation.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `VoucherRevoked` if the voucher was already revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    pub fn approve_voucher_revocation(
+        env: Env,
+        admin: Address,
+        voucher_id: u64,
+    ) -> Result<(), Error> {
+        Self::require_voucher_admin(&env, &admin)?;
+
+        let voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+
+        env.storage()
+            .instance()
+            .set(&VoucherKey::RevocationApproved(voucher_id), &true);
+
+        VoucherRevocationApproved { voucher_id, admin }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Revoke a voucher's remaining balance so it can no longer be redeemed
+    /// or transferred.
+    ///
+    /// Only the remaining balance is revoked, so amounts already paid out by
+    /// partial redemptions are unaffected. Promotional vouchers (funded from
+    /// the merchant's refund reserve, `refund_id == 0`) return their remaining
+    /// balance to the reserve for the voucher's token. When the remaining
+    /// balance is above `get_voucher_revoke_threshold` (and the threshold is
+    /// non-zero), the admin must first call `approve_voucher_revocation`.
+    /// Emits `VoucherRevoked`.
+    ///
+    /// # Arguments
+    /// * `merchant` - The voucher's issuing merchant (must authenticate).
+    /// * `voucher_id` - The ID of the voucher to revoke.
+    /// * `reason_hash` - Hash of the off-chain revocation reason.
+    ///
+    /// # Returns
+    /// The revoked (remaining) amount.
+    ///
+    /// # Errors
+    /// Returns `VoucherNotFound` if the voucher does not exist.
+    /// Returns `Unauthorized` if `merchant` did not issue the voucher.
+    /// Returns `VoucherRevoked` if the voucher was already revoked.
+    /// Returns `VoucherAlreadyRedeemed` if the voucher has been fully redeemed.
+    /// Returns `VoucherRevocationNeedsApproval` if the remaining balance is
+    /// above the threshold and the admin has not co-approved.
+    pub fn revoke_voucher(
+        env: Env,
+        merchant: Address,
+        voucher_id: u64,
+        reason_hash: BytesN<32>,
+    ) -> Result<i128, Error> {
+        Self::require_not_paused(&env, "revoke_voucher")?;
+        merchant.require_auth();
+
+        let mut voucher: RefundVoucher = env
+            .storage()
+            .instance()
+            .get(&VoucherKey::Voucher(voucher_id))
+            .ok_or(Error::Ext(ExtError::VoucherNotFound))?;
+
+        if voucher.merchant != merchant {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        if Self::is_voucher_revoked(env.clone(), voucher_id) {
+            return Err(Error::Core(CoreError::VoucherRevoked));
+        }
+        if voucher.redeemed {
+            return Err(Error::Ext(ExtError::VoucherAlreadyRedeemed));
+        }
+
+        let remaining = Self::voucher_balance(&env, &voucher);
+        let threshold = Self::get_voucher_revoke_threshold(env.clone());
+        let approval_key = VoucherKey::RevocationApproved(voucher_id);
+        let approved = env.storage().instance().has(&approval_key);
+        if threshold > 0 && remaining > threshold && !approved {
+            return Err(Error::Core(CoreError::VoucherRevocationNeedsApproval));
+        }
+
+        // Promotional vouchers were debited from the merchant's reserve at
+        // issuance; hand the unredeemed part back.
+        let returned_to_reserve = voucher.refund_id == 0;
+        if returned_to_reserve && remaining > 0 {
+            let token = voucher.token.clone();
+            let reserve_key = RefundExtKey::MerchantRefundReserve(merchant.clone(), token.clone());
+            let reserve_balance =
+                Self::get_refund_reserve(env.clone(), merchant.clone(), token.clone());
+            let new_balance = reserve_balance
+                .checked_add(remaining)
+                .ok_or(Error::Core(CoreError::InvalidAmount))?;
+            if env.storage().persistent().has(&reserve_key) {
+                Self::extend_refund_ext_ttl(&env, &reserve_key);
+            }
+            Self::set_refund_reserve(&env, &merchant, &token, new_balance);
+        }
+
+        voucher.redeemed = true;
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Voucher(voucher_id), &voucher);
+        env.storage()
+            .instance()
+            .remove(&VoucherKey::RemainingBalance(voucher_id));
+        env.storage().instance().remove(&approval_key);
+        env.storage()
+            .instance()
+            .set(&VoucherKey::Revoked(voucher_id), &true);
+
+        VoucherRevoked {
+            voucher_id,
+            merchant,
+            customer: voucher.customer,
+            revoked_amount: remaining,
+            returned_to_reserve,
+            reason_hash,
+        }
+        .publish(&env);
+
+        Ok(remaining)
+    }
+
+    /// Whether a voucher has been revoked.
+    pub fn is_voucher_revoked(env: Env, voucher_id: u64) -> bool {
+        env.storage()
+            .instance()
+            .has(&VoucherKey::Revoked(voucher_id))
     }
 
     // ── Issue #806: Bulk promotional voucher issuance ─────────────────────
@@ -12805,6 +13113,19 @@ impl RefundContract {
         env.storage()
             .instance()
             .remove(&RefundExtKey::RefundSlaDeadline(refund_id));
+    }
+
+    fn require_voucher_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if *admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        Ok(())
     }
 
     fn voucher_balance(env: &Env, voucher: &RefundVoucher) -> i128 {
