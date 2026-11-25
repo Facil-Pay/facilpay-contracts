@@ -396,6 +396,13 @@ pub enum ExtError {
     ProcessingDeadlineNotConfigured = 83,
     // Refund sync to payment contract
     RefundAlreadySynced = 84,
+    // Arbitrator case load
+    ArbitratorAtCapacity = 87,
+    // Evidence deadline
+    EvidenceDeadlinePassed = 88,
+    EvidenceDeadlineNotReached = 89,
+    // Appeal withdrawal
+    AppealNotPending = 90,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -767,6 +774,7 @@ pub struct CounterOffer {
     pub refund_id: u64,
     pub merchant: Address,
     pub amount: i128,
+    pub voucher_bps: u32, // Basis points of amount to pay as store credit voucher
     pub offered_at: u64,
     pub expires_at: u64,
 }
@@ -788,6 +796,8 @@ pub struct CounterOfferAccepted {
     pub customer: Address,
     pub requested_amount: i128,
     pub accepted_amount: i128,
+    pub voucher_amount: i128,
+    pub token_amount: i128,
 }
 
 // Issue #813: customer rejection of a counter-offer
@@ -979,6 +989,8 @@ pub struct Refund {
     pub appeal_deadline: Option<u64>,
     // Issue #199: TTL expiry
     pub expires_at: Option<u64>,
+    // Partial refund with voucher: basis points of refund to pay as voucher (0-10000)
+    pub voucher_bps: u32,
 }
 
 #[derive(Clone)]
@@ -1052,6 +1064,10 @@ pub struct ArbitrationCase {
     pub fee_pool: i128,
     pub timeout_at: u64,
     pub default_favor_customer: bool,
+    // Evidence deadline: timestamp after which evidence is rejected
+    pub evidence_deadline: u64,
+    // Tracks whether both parties have waived the evidence deadline
+    pub evidence_waived: bool,
 }
 
 /// Admin-set arbitrator bond requirement (#908). While configured, only
@@ -1926,6 +1942,60 @@ pub struct RefundReserveLow {
     pub token: Address,
     pub balance: i128,
     pub warning_level: i128,
+}
+
+// ── New feature events ─────────────────────────────────────────────────────
+
+/// Event emitted when admin sets max active cases per arbitrator
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxActiveCasesSet {
+    pub admin: Address,
+    pub max_cases: u32,
+}
+
+/// Event emitted when an arbitrator's open case count changes
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorOpenCaseCountUpdated {
+    pub arbitrator: Address,
+    pub case_count: u32,
+}
+
+/// Event emitted when a customer withdraws their appeal
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealWithdrawn {
+    pub appeal_id: u64,
+    pub refund_id: u64,
+    pub customer: Address,
+    pub withdrawn_at: u64,
+}
+
+/// Event emitted when evidence deadline config is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineConfigUpdated {
+    pub admin: Address,
+    pub deadline_seconds: u64,
+}
+
+/// Event emitted when evidence is rejected due to deadline
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceRejectedDueToDeadline {
+    pub case_id: u64,
+    pub submitter: Address,
+    pub submitted_at: u64,
+    pub deadline: u64,
+}
+
+/// Event emitted when both parties waive the evidence deadline
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineWaived {
+    pub case_id: u64,
+    pub waived_at: u64,
 }
 
 /// Event emitted when the admin sets a merchant's minimum refund reserve.
