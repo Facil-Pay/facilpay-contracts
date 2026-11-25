@@ -162,6 +162,28 @@ struct LegacyAdminProposal {
     pub executed: bool,
 }
 
+/// Configuration for the child-upgrade veto window (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildUpgradeConfig {
+    /// Seconds that must elapse between queueing and execution.
+    pub delay_seconds: u64,
+    /// Number of distinct admin vetoes that cancel a queued upgrade.
+    pub veto_threshold: u32,
+}
+
+/// A queued, not-yet-executed child upgrade (#874).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedChildUpgrade {
+    pub child_kind: ChildKind,
+    pub wasm_hash: BytesN<32>,
+    pub queued_at: u64,
+    pub execute_after: u64,
+    pub vetoes: Vec<Address>,
+    pub vetoed: bool,
+}
+
 /// Schema versions across the platform (#817). A child is `None` when its
 /// address is not set or it could not be queried.
 #[contracttype]
